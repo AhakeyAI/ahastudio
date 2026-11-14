@@ -112,7 +112,18 @@ async function main() {
   throw lastErr ?? new Error('all mirrors failed');
 }
 
+// dev/build pass --optional so an offline machine still starts; packaging stays strict.
+const optional = process.argv.includes('--optional');
+
 main().catch((e) => {
-  process.stderr.write(`[fetch-speaker] FAILED: ${e.message ?? e}\n`);
+  const message = e.message ?? String(e);
+  if (optional) {
+    process.stderr.write(
+      `[fetch-speaker] skipped (optional): ${message}\n` +
+        '[fetch-speaker] Voice lock will stay disabled until the model can be downloaded.\n'
+    );
+    process.exit(0);
+  }
+  process.stderr.write(`[fetch-speaker] FAILED: ${message}\n`);
   process.exit(1);
 });

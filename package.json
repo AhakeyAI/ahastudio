@@ -6,13 +6,13 @@
   "type": "module",
   "main": "dist-electron/main.js",
   "scripts": {
-    "dev:vite": "vite",
+    "dev:vite": "node scripts/fetch-speaker-model.mjs --optional && vite",
     "dev:electron": "node scripts/dev-electron.mjs",
     "typecheck": "npm run typecheck:renderer && npm run typecheck:electron",
     "typecheck:renderer": "tsc --noEmit -p tsconfig.json",
     "typecheck:electron": "tsc --noEmit -p tsconfig.electron.json",
     "build:electron": "node scripts/clean-dist-electron.mjs && tsc -p tsconfig.electron.json && node scripts/copy-preloads.mjs",
-    "build": "vite build && npm run build:electron",
+    "build": "node scripts/fetch-speaker-model.mjs --optional && vite build && npm run build:electron",
     "test": "npm run build:electron && node --import ./tests/register-electron-stub.mjs --test tests/*.test.mjs",
     "dist": "node scripts/fetch-speaker-model.mjs && npm run build && electron-builder --publish never",
     "dist:dmg": "node scripts/fetch-speaker-model.mjs && npm run build && electron-builder --mac --arm64 --publish never && node scripts/verify-macos-signing.mjs"

@@ -17,3 +17,15 @@ deliveries/
 .vibe-assets/
 .vibe-attachments/
 .vibe-docs/
+
+# electron-builder packaging assets (a global gitignore may exclude build/)
+!build/
+build/*
+!build/ahastationicon.jpg
+!build/entitlements.mac.plist
+!build/icon.icns
+!build/icon.ico
+!build/icon.png
+
+# Downloaded by scripts/fetch-speaker-model.mjs at dev/build time
+public/voice-id/
