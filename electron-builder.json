@@ -1,0 +1,40 @@
+{
+  "appId": "com.ahastation.localcli",
+  "productName": "AhaStation Local CLI",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**/*",
+    "dist-electron/**/*",
+    "package.json"
+  ],
+  "asarUnpack": [
+    "node_modules/@lydell/node-pty-*/**/*",
+    "dist/vad/**/*",
+    "dist/voice-id/**/*",
+    "dist-electron/orchestration/aha-orchestration-cli.cjs"
+  ],
+  "mac": {
+    "category": "public.app-category.developer-tools",
+    "icon": "build/icon.icns",
+    "entitlements": "build/entitlements.mac.plist",
+    "entitlementsInherit": "build/entitlements.mac.plist",
+    "extendInfo": {
+      "NSMicrophoneUsageDescription": "需要使用麦克风进行语音识别输入与声纹锁定。"
+    }
+  },
+  "win": {
+    "target": [
+      "nsis"
+    ],
+    "icon": "build/icon.ico"
+  },
+  "linux": {
+    "target": [
+      "AppImage"
+    ],
+    "category": "Development",
+    "icon": "build/icon.png"
+  }
+}

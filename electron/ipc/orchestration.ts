@@ -1,0 +1,488 @@
+import { z } from 'zod';
+import {
+  ORCHESTRATION_MESSAGE_TYPES,
+  OrchestrationError,
+} from '../orchestration/orchestration-types.js';
+import type { IpcContext } from './context.js';
+import { handleSecure, mainWindowSenderPolicy } from './validators.js';
+
+const optionalSchema = <T extends z.ZodTypeAny>(schema: T): z.ZodType<z.output<T>> =>
+  z.preprocess((val) => (val === undefined ? {} : val), schema) as unknown as z.ZodType<z.output<T>>;
+
+const nonEmptyId = z.string().trim().min(1).max(200);
+const messageTypeEnum = z.enum(ORCHESTRATION_MESSAGE_TYPES);
+const priorityEnum = z.enum(['low', 'normal', 'high', 'urgent']);
+const taskStatusEnum = z.enum(['pending', 'ready', 'dispatched', 'completed', 'failed', 'blocked']);
+const gateStatusEnum = z.enum(['pending', 'resolved', 'timeout']);
+const workerOutcomeEnum = z.enum(['completed', 'failed', 'blocked', 'escalated', 'abandoned']);
+
+const getSnapshotSchema = optionalSchema(
+  z.object({ runId: nonEmptyId.optional() }).strict()
+);
+
+const runCreateSchema = z
+  .object({
+    id: nonEmptyId.optional(),
+    objective: z.string().trim().min(1).max(8_000),
+    from: nonEmptyId.optional(),
+    paneId: nonEmptyId.optional(),
+  })
+  .strict();
+
+const runUseSchema = z
+  .object({
+    id: nonEmptyId,
+    from: nonEmptyId.optional(),
+    paneId: nonEmptyId.optional(),
+  })
+  .strict();
+
+const runCurrentSchema = optionalSchema(
+  z.object({ from: nonEmptyId.optional() }).strict()
+);
+
+const runListSchema = optionalSchema(
+  z.object({ status: z.string().trim().min(1).max(64).optional() }).strict()
+);
+
+const runShowSchema = z.object({ id: nonEmptyId }).strict();
+
+const taskCreateSchema = z
+  .object({
+    id: nonEmptyId.optional(),
+    runId: nonEmptyId.optional(),
+    from: nonEmptyId.optional(),
+    spec: z.string().trim().min(1).max(64_000),
+    taskTitle: z.string().trim().min(1).max(200).optional(),
+    displayName: z.string().trim().min(1).max(200).optional(),
+    deps: z.array(nonEmptyId).max(100).optional(),
+    priority: priorityEnum.optional(),
+    worktreePath: z.string().trim().min(1).max(1024).optional(),
+  })
+  .strict();
+
+const taskListSchema = optionalSchema(
+  z
+    .object({
+      runId: nonEmptyId.optional(),
+      from: nonEmptyId.optional(),
+      status: taskStatusEnum.optional(),
+      priority: priorityEnum.optional(),
+    })
+    .strict()
+);
+
+const taskShowSchema = z
+  .object({
+    id: nonEmptyId,
+  })
+  .strict();
+
+const taskUpdateSchema = z
+  .object({
+    id: nonEmptyId,
+    status: taskStatusEnum,
+  })
+  .strict();
+
+const dispatchSchema = z
+  .object({
+    taskId: nonEmptyId,
+    to: nonEmptyId.optional(),
+    from: nonEmptyId.optional(),
+    inject: z.boolean().optional(),
+    dryRun: z.boolean().optional(),
+  })
+  .strict();
+
+const dispatchShowSchema = z
+  .object({
+    taskId: nonEmptyId,
+    preamble: z.boolean().optional(),
+  })
+  .strict();
+
+const coordinatorStartSchema = optionalSchema(
+  z
+    .object({
+      runId: nonEmptyId.optional(),
+      spec: z.string().trim().min(1).max(64_000).optional(),
+      from: nonEmptyId.optional(),
+      pollIntervalMs: z.number().int().min(50).max(60_000).optional(),
+      maxConcurrent: z.number().int().min(1).max(32).optional(),
+      autoSpawnWorkers: z.boolean().optional(),
+      workerCliId: nonEmptyId.optional(),
+      cwd: z.string().trim().min(1).max(1024).optional(),
+      workerPaneIds: z.array(nonEmptyId).max(64).optional(),
+    })
+    .strict()
+);
+
+const emptyObjSchema = optionalSchema(z.object({}).strict());
+
+const coordinatorTickSchema = optionalSchema(
+  z
+    .object({
+      runId: nonEmptyId.optional(),
+      workerPaneIds: z.array(nonEmptyId).max(64).optional(),
+    })
+    .strict()
+);
+
+const coordinatorStatusSchema = optionalSchema(
+  z.object({ runId: nonEmptyId.optional() }).strict()
+);
+
+const sendSchema = z
+  .object({
+    capability: nonEmptyId.optional(),
+    from: nonEmptyId.optional(),
+    to: nonEmptyId,
+    type: messageTypeEnum.optional(),
+    priority: priorityEnum.optional(),
+    subject: z.string().trim().min(1).max(500),
+    body: z.string().max(64_000).optional(),
+    payload: z.union([z.string().max(64_000), z.record(z.string(), z.unknown()), z.null()]).optional(),
+    runId: nonEmptyId.optional(),
+    threadId: nonEmptyId.optional(),
+  })
+  .strict();
+
+const workerDoneSchema = z
+  .object({
+    capability: nonEmptyId.optional(),
+    from: nonEmptyId.optional(),
+    taskId: nonEmptyId,
+    dispatchId: nonEmptyId,
+    outcome: workerOutcomeEnum.optional(),
+    summary: z.string().max(16_000).optional(),
+  })
+  .strict();
+
+const checkSchema = optionalSchema(
+  z
+    .object({
+      from: nonEmptyId.optional(),
+      runId: nonEmptyId.optional(),
+      unread: z.boolean().optional(),
+      peek: z.boolean().optional(),
+      all: z.boolean().optional(),
+      wait: z.boolean().optional(),
+      timeoutMs: z.number().int().min(0).max(3_600_000).optional(),
+      types: z.array(messageTypeEnum).max(20).optional(),
+      ack: nonEmptyId.optional(),
+      holdAck: z.boolean().optional(),
+      format: z.boolean().optional(),
+    })
+    .strict()
+);
+
+const inboxSchema = optionalSchema(
+  z
+    .object({
+      from: nonEmptyId.optional(),
+      runId: nonEmptyId.optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+      types: z.array(messageTypeEnum).max(20).optional(),
+      unreadOnly: z.boolean().optional(),
+    })
+    .strict()
+);
+
+const askSchema = z
+  .object({
+    capability: nonEmptyId.optional(),
+    from: nonEmptyId.optional(),
+    to: nonEmptyId.optional(),
+    question: z.string().trim().min(1).max(16_000).optional(),
+    options: z.array(z.string().trim().min(1).max(500)).max(20).optional(),
+    wait: z.boolean().optional(),
+    timeoutMs: z.number().int().min(0).max(3_600_000).optional(),
+    resume: nonEmptyId.optional(),
+    dispatchId: nonEmptyId.optional(),
+    runId: nonEmptyId.optional(),
+  })
+  .strict();
+
+const replySchema = z
+  .object({
+    id: nonEmptyId,
+    body: z.string().trim().min(1).max(64_000),
+    from: nonEmptyId.optional(),
+  })
+  .strict();
+
+const gateCreateSchema = z
+  .object({
+    taskId: nonEmptyId,
+    question: z.string().trim().min(1).max(16_000),
+    options: z.array(z.string().trim().min(1).max(500)).max(20).optional(),
+    from: nonEmptyId.optional(),
+  })
+  .strict();
+
+const gateResolveSchema = z
+  .object({
+    id: nonEmptyId,
+    resolution: z.string().trim().min(1).max(16_000),
+    from: nonEmptyId.optional(),
+  })
+  .strict();
+
+const gateListSchema = optionalSchema(
+  z
+    .object({
+      runId: nonEmptyId.optional(),
+      taskId: nonEmptyId.optional(),
+      status: gateStatusEnum.optional(),
+    })
+    .strict()
+);
+
+function formatIpcFailure(error: unknown): {
+  ok: false;
+  code: string;
+  error: string;
+  data?: Record<string, unknown>;
+} {
+  if (error instanceof OrchestrationError) {
+    return {
+      ok: false,
+      code: error.code,
+      error: error.message,
+      ...(error.data ? { data: error.data } : {}),
+    };
+  }
+  return {
+    ok: false,
+    code: 'internal_error',
+    error: error instanceof Error ? error.message : String(error),
+  };
+}
+
+async function runAction<T extends Record<string, unknown>>(
+  fn: () => Promise<T> | T,
+  drain?: () => Promise<void>
+): Promise<({ ok: true } & T) | ReturnType<typeof formatIpcFailure>> {
+  try {
+    const data = await fn();
+    if (drain) {
+      // Acknowledge only after the snapshot write is durable on disk.
+      await drain();
+    }
+    return { ok: true, ...data };
+  } catch (error) {
+    return formatIpcFailure(error);
+  }
+}
+
+export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void } {
+  const service = ctx.orchestrationService;
+  const authorize = mainWindowSenderPolicy(() => ctx.liveWindow()?.webContents.id ?? null);
+  const authorizeError = 'Sender is not the main window';
+
+  const act = <T extends Record<string, unknown>>(fn: () => Promise<T> | T) =>
+    runAction(fn, () => requireService().waitForPendingWrites());
+
+  const requireService = () => {
+    if (!service) {
+      throw new OrchestrationError('not_found', 'Orchestration service is not initialized.');
+    }
+    return service;
+  };
+
+  handleSecure('orchestration:get-snapshot', {
+    schema: getSnapshotSchema,
+    authorize,
+    authorizeError,
+    handler: ({ runId }) => act(() => ({ snapshot: requireService().getSnapshot(runId) })),
+  });
+
+  handleSecure('orchestration:run-create', {
+    schema: runCreateSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().runCreate(payload)),
+  });
+
+  handleSecure('orchestration:run-use', {
+    schema: runUseSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().runUse(payload)),
+  });
+
+  handleSecure('orchestration:run-current', {
+    schema: runCurrentSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().runCurrent(payload)),
+  });
+
+  handleSecure('orchestration:run-list', {
+    schema: runListSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().runList(payload)),
+  });
+
+  handleSecure('orchestration:run-show', {
+    schema: runShowSchema,
+    authorize,
+    authorizeError,
+    handler: ({ id }) => act(() => requireService().runShow(id)),
+  });
+
+  handleSecure('orchestration:task-create', {
+    schema: taskCreateSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().taskCreate(payload)),
+  });
+
+  handleSecure('orchestration:task-list', {
+    schema: taskListSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().taskList(payload)),
+  });
+
+  handleSecure('orchestration:task-show', {
+    schema: taskShowSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().taskShow(payload)),
+  });
+
+  handleSecure('orchestration:task-update', {
+    schema: taskUpdateSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().taskUpdate(payload)),
+  });
+
+  handleSecure('orchestration:dispatch', {
+    schema: dispatchSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().dispatchTask(payload)),
+  });
+
+  handleSecure('orchestration:dispatch-show', {
+    schema: dispatchShowSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().dispatchShow(payload)),
+  });
+
+  handleSecure('orchestration:coordinator-start', {
+    schema: coordinatorStartSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().coordinatorStart(payload)),
+  });
+
+  handleSecure('orchestration:coordinator-stop', {
+    schema: emptyObjSchema,
+    authorize,
+    authorizeError,
+    handler: () => act(() => requireService().coordinatorStop()),
+  });
+
+  handleSecure('orchestration:coordinator-tick', {
+    schema: coordinatorTickSchema,
+    authorize,
+    authorizeError,
+    handler: ({ runId, workerPaneIds }) =>
+      act(() => requireService().coordinatorTick(runId, { workerPaneIds })),
+  });
+
+  handleSecure('orchestration:coordinator-status', {
+    schema: coordinatorStatusSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().coordinatorStatus(payload)),
+  });
+
+  handleSecure('orchestration:send', {
+    schema: sendSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().send(payload)),
+  });
+
+  handleSecure('orchestration:worker-done', {
+    schema: workerDoneSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().workerDone(payload)),
+  });
+
+  handleSecure('orchestration:check', {
+    schema: checkSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().check(payload)),
+  });
+
+  handleSecure('orchestration:inbox', {
+    schema: inboxSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().inbox(payload)),
+  });
+
+  handleSecure('orchestration:ask', {
+    schema: askSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().ask(payload)),
+  });
+
+  handleSecure('orchestration:reply', {
+    schema: replySchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().reply(payload)),
+  });
+
+  handleSecure('orchestration:gate-create', {
+    schema: gateCreateSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().gateCreate(payload)),
+  });
+
+  handleSecure('orchestration:gate-resolve', {
+    schema: gateResolveSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().gateResolve(payload)),
+  });
+
+  handleSecure('orchestration:gate-list', {
+    schema: gateListSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().gateList(payload)),
+  });
+
+  if (!service) {
+    return { dispose: () => {} };
+  }
+
+  const offEvent = service.onEvent((event) => {
+    ctx.liveWindow()?.webContents.send('orchestration:event', event);
+  });
+
+  const offSpawned = service.onPaneSpawned((event) => {
+    ctx.liveWindow()?.webContents.send('orchestration:pane-spawned', event);
+  });
+
+  return {
+    dispose: () => {
+      offEvent();
+      offSpawned();
+    },
+  };
+}

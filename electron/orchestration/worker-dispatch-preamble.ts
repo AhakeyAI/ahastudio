@@ -1,0 +1,100 @@
+export interface BuildDispatchPreambleInput {
+  taskId: string;
+  dispatchId: string;
+  taskSpec: string;
+  coordinatorHandle: string;
+  workerHandle: string;
+  runId?: string;
+  worktreePath?: string | null;
+  canDispatchSubWorkers?: boolean;
+  cliCommand?: string;
+  /** Per-dispatch worker credential; only ever written to the assignee's own PTY. */
+  dispatchCapability?: string | null;
+}
+
+/**
+ * Prompt delivery rejects writes over 8 KiB, so long specs are clipped inline and the worker
+ * reads the full text through the CLI.
+ */
+export const INLINE_SPEC_MAX_BYTES = 4_096;
+
+function clipUtf8(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (Buffer.byteLength(text.slice(0, mid), 'utf8') <= maxBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  let end = lo;
+  // Do not split a surrogate pair.
+  if (end > 0 && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end -= 1;
+  return text.slice(0, end);
+}
+
+/**
+ * Audit messages and previews are readable by other workers and the renderer, so they must never
+ * carry the assignee's credential. Only the PTY write may contain the clear-text capability.
+ */
+export function redactDispatchCapability(text: string, capability?: string | null): string {
+  if (!capability) {
+    return text;
+  }
+  return text.split(capability).join('<redacted>');
+}
+
+export function buildDispatchPreamble(input: BuildDispatchPreambleInput): string {
+  const cli = input.cliCommand?.trim() || 'aha';
+  const fromFlag = `--from ${input.workerHandle}`;
+  const capabilityFlag = input.dispatchCapability ? ` --capability ${input.dispatchCapability}` : '';
+  const spec = input.taskSpec.trim();
+  const clipped = clipUtf8(spec, INLINE_SPEC_MAX_BYTES);
+  const specLines =
+    clipped === spec
+      ? [spec]
+      : [
+          clipped.trimEnd(),
+          '…',
+          `[Specification truncated. Read the full text with: ${cli} orchestration task-show --id ${input.taskId} --json]`,
+        ];
+
+  const lines: string[] = [
+    `[ORCHESTRATION DISPATCH ${input.dispatchId}]`,
+    `Task: ${input.taskId}`,
+    ...(input.runId ? [`Run: ${input.runId}`] : []),
+    `Worker Handle: ${input.workerHandle}`,
+    `Coordinator Handle: ${input.coordinatorHandle}`,
+    ...(input.dispatchCapability ? [`Dispatch Capability: ${input.dispatchCapability}`] : []),
+    ...(input.worktreePath ? [`Workspace CWD: ${input.worktreePath}`] : []),
+    '',
+    '=== TASK SPECIFICATION ===',
+    ...specLines,
+    '=== END TASK SPECIFICATION ===',
+    '',
+    '=== ORCHESTRATION PROTOCOL ===',
+    `- Ask coordinator if requirements are ambiguous (waits for reply):`,
+    `  ${cli} orchestration ask ${fromFlag} --to ${input.coordinatorHandle} --question "<question>" --wait${capabilityFlag}`,
+    `- Escalate an unresolvable blocker:`,
+    `  ${cli} orchestration send ${fromFlag} --to ${input.coordinatorHandle} --type escalation --subject "Blocker on ${input.taskId}" --body "<details>"`,
+    `- Check incoming coordinator messages or guidance:`,
+    `  ${cli} orchestration check ${fromFlag}`,
+    `- Report completion or failure when done (REQUIRED):`,
+    `  ${cli} orchestration worker-done ${fromFlag} --task ${input.taskId} --dispatch ${input.dispatchId} --outcome completed --summary "<brief summary>"${capabilityFlag}`,
+    `  (Valid --outcome values: completed | failed | blocked | escalated | abandoned)`,
+    ...(input.dispatchCapability
+      ? [
+          `- The dispatch capability above is your per-dispatch credential. Pass it with --capability for worker-done, ask, and heartbeat sends; it is required, not optional.`,
+        ]
+      : []),
+  ];
+
+  if (input.canDispatchSubWorkers) {
+    lines.push(
+      `- Sub-workers permitted: you may create dependent subtasks via \`${cli} orchestration task-create\` if needed.`
+    );
+  }
+
+  lines.push('Begin working on the task now.');
+  return lines.join('\n');
+}

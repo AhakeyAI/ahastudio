@@ -1,0 +1,48 @@
+{
+  "name": "ahastation-local-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone Local CLI Workspace with Voice ASR Input extracted from AhaStation",
+  "type": "module",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev:vite": "vite",
+    "dev:electron": "node scripts/dev-electron.mjs",
+    "typecheck": "npm run typecheck:renderer && npm run typecheck:electron",
+    "typecheck:renderer": "tsc --noEmit -p tsconfig.json",
+    "typecheck:electron": "tsc --noEmit -p tsconfig.electron.json",
+    "build:electron": "node scripts/clean-dist-electron.mjs && tsc -p tsconfig.electron.json && node scripts/copy-preloads.mjs",
+    "build": "vite build && npm run build:electron",
+    "test": "npm run build:electron && node --import ./tests/register-electron-stub.mjs --test tests/*.test.mjs",
+    "dist": "node scripts/fetch-speaker-model.mjs && npm run build && electron-builder --publish never",
+    "dist:dmg": "node scripts/fetch-speaker-model.mjs && npm run build && electron-builder --mac --arm64 --publish never && node scripts/verify-macos-signing.mjs"
+  },
+  "dependencies": {
+    "@lydell/node-pty": "1.2.0-beta.12",
+    "@ricky0123/vad-web": "^0.0.30",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/addon-unicode11": "^0.9.0",
+    "@xterm/headless": "^6.0.0",
+    "@xterm/xterm": "^6.0.0",
+    "fft.js": "^4.0.4",
+    "lucide-react": "^1.16.0",
+    "onnxruntime-web": "1.26.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ws": "^8.19.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.7",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^45.1.0",
+    "electron-builder": "^26.8.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  }
+}

@@ -1,0 +1,324 @@
+import type {
+  OrchestrationCoordinatorStatus,
+  OrchestrationDispatchRecord,
+  OrchestrationDispatchStatus,
+  OrchestrationGateRecord,
+  OrchestrationMessagePriority,
+  OrchestrationMessageRecord,
+  OrchestrationMessageType,
+  OrchestrationQuestionRecord,
+  OrchestrationRunRecord,
+  OrchestrationRunStatus,
+  OrchestrationSnapshot,
+  OrchestrationStartObservation,
+  OrchestrationTaskStatus,
+  OrchestrationTaskWithDispatch,
+} from '../types';
+
+/** Mailbox the desktop UI acts as; matches the service's default `from`. */
+export const UI_HANDLE = 'coordinator';
+
+export const EMPTY_SNAPSHOT: OrchestrationSnapshot = {
+  runs: [],
+  tasks: [],
+  dispatches: [],
+  gates: [],
+  messages: [],
+  questions: [],
+  coordinatorRuns: [],
+  activeCoordinatorRun: null,
+  currentRunByConsumer: {},
+};
+
+export const TASK_STATUS_LABELS: Record<OrchestrationTaskStatus, string> = {
+  pending: '等待依赖',
+  ready: '就绪',
+  dispatched: '执行中',
+  completed: '已完成',
+  failed: '失败',
+  blocked: '受阻',
+};
+
+export const RUN_STATUS_LABELS: Record<OrchestrationRunStatus, string> = {
+  active: '进行中',
+  completed: '已完成',
+  failed: '失败',
+  stopped: '已停止',
+};
+
+export const DISPATCH_STATUS_LABELS: Record<OrchestrationDispatchStatus, string> = {
+  pending: '待派发',
+  dispatched: '已派发',
+  completed: '已完成',
+  failed: '失败',
+  circuit_broken: '已熔断',
+};
+
+export const START_OBSERVATION_LABELS: Record<OrchestrationStartObservation, string> = {
+  pending: '待确认',
+  observed: '已开始',
+  queued: '排队中',
+  permission: '等待授权',
+  unobserved: '未确认启动',
+  unsupported: '未启用观测',
+};
+
+export const COORDINATOR_STATUS_LABELS: Record<OrchestrationCoordinatorStatus, string> = {
+  idle: '空闲',
+  running: '运行中',
+  paused: '已暂停',
+  completed: '已完成',
+  failed: '失败',
+  stopped: '已停止',
+};
+
+export const MESSAGE_TYPE_LABELS: Record<OrchestrationMessageType, string> = {
+  status: '状态',
+  dispatch: '派发',
+  worker_done: '完成报告',
+  merge_ready: '可合并',
+  escalation: '升级',
+  handoff: '交接',
+  decision_gate: '决策',
+  question: '提问',
+  heartbeat: '心跳',
+};
+
+export const PRIORITY_LABELS: Record<OrchestrationMessagePriority, string> = {
+  low: '低',
+  normal: '普通',
+  high: '高',
+  urgent: '紧急',
+};
+
+export type StatusTone = 'neutral' | 'accent' | 'ok' | 'warn' | 'error';
+
+export const START_OBSERVATION_TONES: Record<OrchestrationStartObservation, StatusTone> = {
+  pending: 'neutral',
+  observed: 'ok',
+  queued: 'accent',
+  permission: 'warn',
+  unobserved: 'warn',
+  unsupported: 'neutral',
+};
+
+const DIAGNOSTIC_START_OBSERVATIONS = new Set<OrchestrationStartObservation>(['unobserved', 'permission', 'queued']);
+
+export interface DispatchStartDiagnostic {
+  observation: OrchestrationStartObservation;
+  label: string;
+  tone: StatusTone;
+  reason: string | null;
+}
+
+/** Diagnostic badge info for an active dispatch whose turn start needs context or attention. */
+export function dispatchStartDiagnostic(
+  dispatch: Pick<OrchestrationDispatchRecord, 'status' | 'startObservation' | 'startObservationReason'> | null | undefined,
+): DispatchStartDiagnostic | null {
+  if (!dispatch || dispatch.status !== 'dispatched' || !dispatch.startObservation) return null;
+  if (!DIAGNOSTIC_START_OBSERVATIONS.has(dispatch.startObservation)) return null;
+  return {
+    observation: dispatch.startObservation,
+    label: START_OBSERVATION_LABELS[dispatch.startObservation],
+    tone: START_OBSERVATION_TONES[dispatch.startObservation],
+    reason: dispatch.startObservationReason?.trim() || null,
+  };
+}
+
+export function taskStatusTone(status: OrchestrationTaskStatus): StatusTone {
+  switch (status) {
+    case 'completed':
+      return 'ok';
+    case 'dispatched':
+      return 'accent';
+    case 'ready':
+      return 'accent';
+    case 'failed':
+      return 'error';
+    case 'blocked':
+      return 'warn';
+    default:
+      return 'neutral';
+  }
+}
+
+export function sortRuns(runs: OrchestrationRunRecord[]): OrchestrationRunRecord[] {
+  return [...runs].sort((a, b) => {
+    const activeDiff = Number(b.status === 'active') - Number(a.status === 'active');
+    if (activeDiff !== 0) return activeDiff;
+    return b.createdAt.localeCompare(a.createdAt);
+  });
+}
+
+/**
+ * Picks the run the panel shows: the user's explicit choice if it still exists,
+ * otherwise the coordinator's run, the UI mailbox's current run, then the newest active run.
+ */
+export function pickRunId(snapshot: OrchestrationSnapshot, preferred: string | null): string | null {
+  const ids = new Set(snapshot.runs.map((run) => run.id));
+  if (preferred && ids.has(preferred)) return preferred;
+  const coordinatorRunId = snapshot.activeCoordinatorRun?.runId;
+  if (coordinatorRunId && ids.has(coordinatorRunId)) return coordinatorRunId;
+  const current = snapshot.currentRunByConsumer[UI_HANDLE];
+  if (current && ids.has(current)) return current;
+  return sortRuns(snapshot.runs)[0]?.id ?? null;
+}
+
+export function tasksForRun(snapshot: OrchestrationSnapshot, runId: string | null): OrchestrationTaskWithDispatch[] {
+  if (!runId) return [];
+  return snapshot.tasks.filter((task) => task.runId === runId);
+}
+
+export interface TaskRow {
+  task: OrchestrationTaskWithDispatch;
+  /** Longest dependency chain below this task; 0 for tasks without deps. */
+  level: number;
+  /** Dependency ids that are not completed yet. */
+  waitingOn: string[];
+  /** Dependency ids that do not exist in the run. */
+  missingDeps: string[];
+  pendingGates: number;
+}
+
+/** Orders tasks by dependency level (a layered DAG), then by creation time. Cycles are tolerated. */
+export function buildTaskRows(
+  tasks: OrchestrationTaskWithDispatch[],
+  gates: OrchestrationGateRecord[] = [],
+): TaskRow[] {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const levels = new Map<string, number>();
+  const visiting = new Set<string>();
+  const levelOf = (id: string): number => {
+    const cached = levels.get(id);
+    if (cached !== undefined) return cached;
+    const task = byId.get(id);
+    if (!task || visiting.has(id)) return 0;
+    visiting.add(id);
+    let level = 0;
+    for (const dep of task.deps) {
+      if (byId.has(dep)) level = Math.max(level, levelOf(dep) + 1);
+    }
+    visiting.delete(id);
+    levels.set(id, level);
+    return level;
+  };
+  const pendingGateCount = new Map<string, number>();
+  for (const gate of gates) {
+    if (gate.status === 'pending') pendingGateCount.set(gate.taskId, (pendingGateCount.get(gate.taskId) ?? 0) + 1);
+  }
+  return tasks
+    .map((task) => ({
+      task,
+      level: levelOf(task.id),
+      waitingOn: task.deps.filter((dep) => byId.has(dep) && byId.get(dep)!.status !== 'completed'),
+      missingDeps: task.deps.filter((dep) => !byId.has(dep)),
+      pendingGates: pendingGateCount.get(task.id) ?? 0,
+    }))
+    .sort((a, b) => a.level - b.level || a.task.createdAt.localeCompare(b.task.createdAt) || a.task.id.localeCompare(b.task.id));
+}
+
+export type TaskCounts = Record<OrchestrationTaskStatus, number> & { total: number };
+
+export function countTasks(tasks: OrchestrationTaskWithDispatch[]): TaskCounts {
+  const counts: TaskCounts = { total: tasks.length, pending: 0, ready: 0, dispatched: 0, completed: 0, failed: 0, blocked: 0 };
+  for (const task of tasks) counts[task.status] += 1;
+  return counts;
+}
+
+export function taskTitle(task: { taskTitle: string; displayName: string; spec: string; id: string }): string {
+  const title = task.displayName?.trim() || task.taskTitle?.trim();
+  if (title) return title;
+  const firstLine = task.spec.split(/\r?\n/).find((line) => line.trim())?.trim();
+  return firstLine ? (firstLine.length > 60 ? `${firstLine.slice(0, 59)}…` : firstLine) : task.id;
+}
+
+export interface AttentionItems {
+  gates: OrchestrationGateRecord[];
+  questions: OrchestrationQuestionRecord[];
+}
+
+/** Pending gates and worker questions; the user supervises the run and may answer any of them. */
+export function attentionItems(snapshot: OrchestrationSnapshot, runId?: string | null): AttentionItems {
+  const inRun = (id: string) => runId === undefined || runId === null || id === runId;
+  return {
+    gates: snapshot.gates.filter((gate) => gate.status === 'pending' && inRun(gate.runId)),
+    questions: snapshot.questions.filter((question) => question.status === 'pending' && inRun(question.runId)),
+  };
+}
+
+export function attentionCount(snapshot: OrchestrationSnapshot): number {
+  const items = attentionItems(snapshot);
+  return items.gates.length + items.questions.length;
+}
+
+/** Ids of gates/questions in `next` that were not pending in `prev`. */
+export function newAttention(prev: OrchestrationSnapshot | null, next: OrchestrationSnapshot): AttentionItems {
+  const after = attentionItems(next);
+  if (!prev) return { gates: [], questions: [] };
+  const before = attentionItems(prev);
+  const gateIds = new Set(before.gates.map((gate) => gate.id));
+  const questionIds = new Set(before.questions.map((question) => question.messageId));
+  return {
+    gates: after.gates.filter((gate) => !gateIds.has(gate.id)),
+    questions: after.questions.filter((question) => !questionIds.has(question.messageId)),
+  };
+}
+
+export function messagesForRun(
+  snapshot: OrchestrationSnapshot,
+  runId: string | null,
+  opts: { includeHeartbeats?: boolean; limit?: number } = {},
+): OrchestrationMessageRecord[] {
+  if (!runId) return [];
+  const list = snapshot.messages
+    .filter((message) => message.runId === runId && (opts.includeHeartbeats || message.type !== 'heartbeat'))
+    .sort((a, b) => b.seq - a.seq || b.createdAt.localeCompare(a.createdAt));
+  return opts.limit ? list.slice(0, opts.limit) : list;
+}
+
+/** Messages whose arrival should interrupt the user with a toast. */
+export function newUrgentMessages(
+  prev: OrchestrationSnapshot | null,
+  next: OrchestrationSnapshot,
+): OrchestrationMessageRecord[] {
+  if (!prev) return [];
+  const seen = new Set(prev.messages.map((message) => message.id));
+  return next.messages.filter(
+    (message) =>
+      !seen.has(message.id) &&
+      (message.type === 'escalation' || message.priority === 'urgent'),
+  );
+}
+
+/** Renderer terminal leaf id for a PTY the orchestrator spawned (`local-<terminalId>`). */
+export function leafIdForSpawnedPty(ptyId: string): string | null {
+  if (!ptyId.startsWith('local-')) return null;
+  const leafId = ptyId.slice('local-'.length);
+  return /^[a-zA-Z0-9._-]{1,128}$/.test(leafId) ? leafId : null;
+}
+
+const KNOWN_CLI_IDS = new Set(['codex', 'claude', 'opencode', 'qoder', 'kimi', 'qwen', 'pi', 'antigravity', 'grok']);
+const KNOWN_SHELL_IDS = new Set(['default', 'pwsh', 'powershell', 'cmd', 'git-bash']);
+
+/** Stage-window launch fields that re-attach to a worker PTY created by the main process. */
+export function workerWindowTarget(cliId: string | undefined): { localCliId: string; shellId?: string } {
+  const id = cliId?.trim();
+  if (id && KNOWN_CLI_IDS.has(id)) return { localCliId: id };
+  return { localCliId: 'shell', shellId: id && KNOWN_SHELL_IDS.has(id) ? id : 'default' };
+}
+
+export function shortId(id: string): string {
+  const parts = id.split('-');
+  return parts.length > 1 ? parts.at(-1)!.slice(0, 8) : id.slice(0, 8);
+}
+
+export function formatRelativeTime(iso: string | null | undefined, now = Date.now()): string {
+  if (!iso) return '';
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return '';
+  const diff = Math.max(0, now - ts);
+  if (diff < 45_000) return '刚刚';
+  if (diff < 3_600_000) return `${Math.round(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)} 小时前`;
+  return `${Math.round(diff / 86_400_000)} 天前`;
+}
