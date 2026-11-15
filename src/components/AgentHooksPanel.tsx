@@ -10,16 +10,16 @@ const STATE_LABEL: Record<AgentHookCliStatus['state'], string> = {
 };
 
 const STATE_COLOR: Record<AgentHookCliStatus['state'], string> = {
-  'not-installed': 'rgba(230,232,236,0.55)',
-  installed: '#7ee2a8',
-  outdated: '#ffd27a',
-  conflict: '#ffb070',
-  error: '#ff8a8a',
+  'not-installed': 'var(--text-muted)',
+  installed: 'var(--success)',
+  outdated: 'var(--warn)',
+  conflict: 'var(--warn)',
+  error: 'var(--danger)',
 };
 
 const buttonStyle = {
   background: 'transparent',
-  border: '1px solid rgba(255,255,255,0.18)',
+  border: '1px solid var(--border-strong)',
   borderRadius: 6,
   color: 'inherit',
   padding: '4px 10px',
@@ -77,7 +77,7 @@ export function AgentHooksPanel() {
           <div
             key={s.cliId}
             className="drawer-settings-row"
-            style={{ padding: '6px 0', borderTop: '1px solid rgba(255,255,255,0.06)' }}
+            style={{ padding: '6px 0', borderTop: '1px solid var(--border-soft)' }}
           >
             <div className="drawer-settings-label">
               <div className="drawer-settings-title" style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
@@ -115,7 +115,7 @@ export function AgentHooksPanel() {
         );
       })}
       {error && (
-        <div className="drawer-settings-hint" style={{ color: '#ff8a8a', marginTop: 8 }}>
+        <div className="drawer-settings-hint" style={{ color: 'var(--danger)', marginTop: 8 }}>
           {error}
         </div>
       )}

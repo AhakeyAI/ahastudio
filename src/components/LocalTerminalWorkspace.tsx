@@ -14,6 +14,7 @@ import {
   Equal,
   FolderOpen,
   FolderPlus,
+  Monitor,
   Moon,
   PanelLeft,
   PanelRight,
@@ -49,6 +50,7 @@ import {
   isTerminalSearchShortcut,
   shouldConfirmPaneClose,
 } from '../lib/terminal-search-options';
+import { type TerminalAppearancePreference } from '../lib/terminal-appearance';
 import { terminalSessionStore } from '../lib/terminal-session-store';
 import { usePickCwd } from './DirPickerModal';
 import { formatCommandDuration, SplitPaneContainer } from './SplitPaneContainer';
@@ -133,6 +135,7 @@ export function LocalTerminalWorkspace({
   const agents = useAgentStatuses();
   const fontSize = terminalSessionStore.getFontSize();
   const appearance = terminalSessionStore.getAppearance();
+  const appearancePreference = terminalSessionStore.getAppearancePreference();
   const windows = stage.windows.filter((win) => win.localCliId);
   const windowFolder = (win: { cwd?: string }) => win.cwd ?? defaultCwd;
   const selectedCwd =
@@ -1020,16 +1023,31 @@ export function LocalTerminalWorkspace({
           {folderWindows.length} 个终端
           {activeLeafIds.length > 1 ? ` · ${activeLeafIds.length} 窗格` : ''}
         </span>
-        <button
-          type="button"
-          aria-label={appearance === 'light' ? '切换深色终端' : '切换浅色终端'}
-          title="终端主题"
-          onClick={() =>
-            terminalSessionStore.setAppearance(appearance === 'light' ? 'dark' : 'light')
-          }
+        <label
+          className="local-terminal-appearance"
+          title={`界面与终端主题（当前：${appearance === 'dark' ? '深色' : '浅色'}）`}
         >
-          {appearance === 'light' ? <Sun size={14} /> : <Moon size={14} />}
-        </button>
+          {appearancePreference === 'system' ? (
+            <Monitor size={13} aria-hidden />
+          ) : appearance === 'light' ? (
+            <Sun size={13} aria-hidden />
+          ) : (
+            <Moon size={13} aria-hidden />
+          )}
+          <select
+            aria-label="界面主题"
+            value={appearancePreference}
+            onChange={(event) =>
+              terminalSessionStore.setAppearance(
+                event.target.value as TerminalAppearancePreference,
+              )
+            }
+          >
+            <option value="system">跟随系统</option>
+            <option value="light">浅色</option>
+            <option value="dark">深色</option>
+          </select>
+        </label>
         <label className="local-terminal-font">
           字号{' '}
           <select

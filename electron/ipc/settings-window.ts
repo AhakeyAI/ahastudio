@@ -38,7 +38,15 @@ function createSettingsWindow(focus?: string | null): BrowserWindow {
     },
   });
 
+  const onThemeUpdated = () => {
+    if (!win.isDestroyed()) {
+      win.setBackgroundColor(getThemeBackgroundColor());
+    }
+  };
+  nativeTheme.on('updated', onThemeUpdated);
+
   win.on('closed', () => {
+    nativeTheme.removeListener('updated', onThemeUpdated);
     settingsWindow = null;
   });
 

@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react';
+import { Fragment, useEffect, useId, useMemo, useState, useSyncExternalStore, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react';
 import { Bot, ClipboardPaste, FileDiff, FileText, LoaderCircle, RefreshCw, Send, X } from 'lucide-react';
+import type { BundledLanguage } from 'shiki/langs';
 import {
   agentStatusLabel,
   buildDiffSnippet,
@@ -7,6 +8,18 @@ import {
   isAgentStatusVisible,
   relativeFromDir,
 } from '../lib/agent-status-view';
+import { detectCodeLanguage } from '../lib/code-language';
+import {
+  requestCodeHighlight,
+  type CodeHighlightSource,
+  type CodeHighlightTokens,
+} from '../lib/code-syntax-highlight-client';
+import type {
+  CodeHighlightAppearance,
+  DiffHighlightRow,
+  SyntaxToken,
+} from '../lib/code-syntax-highlight';
+import { terminalSessionStore } from '../lib/terminal-session-store';
 import {
   countDiffStats,
   formatFileSize,
@@ -49,6 +62,75 @@ interface PromptContext {
 const MAX_DIFF_ROWS = 4000;
 const MAX_FILE_LINES = 6000;
 const CODE_LINE_HEIGHT = 18;
+
+function useCodeLanguage(filePath: string): BundledLanguage | null {
+  return useMemo(() => detectCodeLanguage(filePath), [filePath]);
+}
+
+interface CodeHighlightResult {
+  kind: 'code' | 'diff';
+  content: readonly string[] | readonly DiffHighlightRow[];
+  lang: BundledLanguage;
+  appearance: CodeHighlightAppearance;
+  tokens: CodeHighlightTokens;
+}
+
+function useCodeHighlight(
+  kind: 'code' | 'diff',
+  content: readonly string[] | readonly DiffHighlightRow[],
+  lang: BundledLanguage | null,
+  appearance: CodeHighlightAppearance,
+): CodeHighlightTokens {
+  const consumer = useId();
+  const [result, setResult] = useState<CodeHighlightResult | null>(null);
+
+  useEffect(() => {
+    if (!lang || content.length === 0) return;
+    let cancelled = false;
+    const source: CodeHighlightSource = kind === 'code'
+      ? { kind, lines: content as readonly string[] }
+      : { kind, rows: content as readonly DiffHighlightRow[] };
+    void requestCodeHighlight(consumer, source, lang, appearance).then((tokens) => {
+      if (!cancelled) setResult({ kind, content, lang, appearance, tokens });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [consumer, kind, content, lang, appearance]);
+
+  if (
+    !lang ||
+    result?.kind !== kind ||
+    result.content !== content ||
+    result.lang !== lang ||
+    result.appearance !== appearance
+  ) {
+    return null;
+  }
+  return result.tokens;
+}
+
+function renderLineTokens(tokens: readonly SyntaxToken[]): ReactNode {
+  if (tokens.length === 0) return null;
+  return tokens.map((tok, i) =>
+    tok.color || tok.italic ? (
+      <span
+        key={i}
+        style={
+          tok.color && tok.italic
+            ? { color: tok.color, fontStyle: 'italic' }
+            : tok.color
+              ? { color: tok.color }
+              : { fontStyle: 'italic' }
+        }
+      >
+        {tok.text}
+      </span>
+    ) : (
+      tok.text
+    )
+  );
+}
 
 export function previewKey(target: PanelPreviewTarget | null): string {
   if (!target) return '';
@@ -194,7 +276,19 @@ function DiffBody({
   }, [cwd, path, staged, token]);
 
   const rows = useMemo(() => (result?.ok ? parseUnifiedDiff(result.diff) : []), [result]);
+  const shown = useMemo(() => rows.slice(0, MAX_DIFF_ROWS), [rows]);
   const stats = useMemo(() => countDiffStats(rows), [rows]);
+  const appearance = useSyncExternalStore(terminalSessionStore.subscribe, terminalSessionStore.getAppearance);
+  const codeLang = useCodeLanguage(path);
+  const tokenRows = useCodeHighlight('diff', shown, codeLang, appearance);
+  const highlightedRows = useMemo(
+    () => tokenRows?.map((rowTokens, index) =>
+      rowTokens?.length && shown[index].text
+        ? renderLineTokens(rowTokens)
+        : shown[index].text || ' '
+    ),
+    [tokenRows, shown],
+  );
   const lo = selection ? Math.min(selection.anchor, selection.focus) : -1;
   const hi = selection ? Math.max(selection.anchor, selection.focus) : -1;
 
@@ -219,7 +313,6 @@ function DiffBody({
   if (!result.diff.trim()) {
     return <p className="wrp-preview-empty">{loading ? '加载中…' : '没有可显示的差异（可能仅为模式变更或已被还原）'}</p>;
   }
-  const shown = rows.slice(0, MAX_DIFF_ROWS);
   const pick = (index: number) => (event: MouseEvent) => {
     event.preventDefault();
     onSelectLine(index, event.shiftKey);
@@ -233,24 +326,28 @@ function DiffBody({
         {result.truncated && <span className="wrp-warn">差异过大，已截断</span>}
       </div>
       <div className="wrp-diff" role="table" aria-label="文件差异">
-        {shown.map((row, index) => (
-          <div
-            key={index}
-            className={`wrp-diff-row is-${row.kind} ${index >= lo && index <= hi ? 'is-picked' : ''}`}
-            role="row"
-          >
-            <span className="wrp-diff-ln is-pickable" aria-hidden onMouseDown={pick(index)} title="点击选择行，Shift+点击扩展">
-              {row.oldLine ?? ''}
-            </span>
-            <span className="wrp-diff-ln is-pickable" aria-hidden onMouseDown={pick(index)} title="点击选择行，Shift+点击扩展">
-              {row.newLine ?? ''}
-            </span>
-            <span className="wrp-diff-sign" aria-hidden>
-              {row.kind === 'add' ? '+' : row.kind === 'del' ? '-' : ''}
-            </span>
-            <span className="wrp-diff-text">{row.text || ' '}</span>
-          </div>
-        ))}
+        {shown.map((row, index) => {
+          return (
+            <div
+              key={index}
+              className={`wrp-diff-row is-${row.kind} ${index >= lo && index <= hi ? 'is-picked' : ''}`}
+              role="row"
+            >
+              <span className="wrp-diff-ln is-pickable" aria-hidden onMouseDown={pick(index)} title="点击选择行，Shift+点击扩展">
+                {row.oldLine ?? ''}
+              </span>
+              <span className="wrp-diff-ln is-pickable" aria-hidden onMouseDown={pick(index)} title="点击选择行，Shift+点击扩展">
+                {row.newLine ?? ''}
+              </span>
+              <span className="wrp-diff-sign" aria-hidden>
+                {row.kind === 'add' ? '+' : row.kind === 'del' ? '-' : ''}
+              </span>
+              <span className="wrp-diff-text">
+                {highlightedRows ? highlightedRows[index] : row.text || ' '}
+              </span>
+            </div>
+          );
+        })}
       </div>
       {rows.length > MAX_DIFF_ROWS && (
         <p className="wrp-preview-empty">仅显示前 {MAX_DIFF_ROWS} 行差异，共 {rows.length} 行。</p>
@@ -306,6 +403,19 @@ function FileBody({
     return all;
   }, [result]);
 
+  const shown = useMemo(() => lines.slice(0, MAX_FILE_LINES), [lines]);
+  const appearance = useSyncExternalStore(terminalSessionStore.subscribe, terminalSessionStore.getAppearance);
+  const codeLang = useCodeLanguage(relativePath);
+  const tokenLines = useCodeHighlight('code', shown, codeLang, appearance);
+  const highlightedCode = useMemo(
+    () => tokenLines?.map((lineTokens, i) => (
+      <Fragment key={i}>
+        {lineTokens?.length && shown[i] ? renderLineTokens(lineTokens) : shown[i]}
+        {i < tokenLines.length - 1 ? '\n' : null}
+      </Fragment>
+    )),
+    [tokenLines, shown],
+  );
   const shownCount = Math.min(lines.length, MAX_FILE_LINES);
   const lo = selection ? Math.min(selection.anchor, selection.focus, shownCount - 1) : -1;
   const hi = selection ? Math.min(Math.max(selection.anchor, selection.focus), shownCount - 1) : -1;
@@ -332,7 +442,7 @@ function FileBody({
   if (result.binary) {
     return <p className="wrp-preview-empty">二进制文件（{formatFileSize(result.size)}），不支持预览。</p>;
   }
-  const shown = lines.slice(0, MAX_FILE_LINES);
+  const hasVisibleCode = shown.length > 1 || (shown[0] ?? '') !== '';
   const onGutter = (event: MouseEvent<HTMLPreElement>) => {
     event.preventDefault();
     const rect = event.currentTarget.getBoundingClientRect();
@@ -357,7 +467,11 @@ function FileBody({
         <pre className="wrp-code-gutter is-pickable" aria-hidden onMouseDown={onGutter} title="点击选择行，Shift+点击扩展">
           {shown.map((_, i) => i + 1).join('\n')}
         </pre>
-        <pre className="wrp-code-text">{shown.join('\n') || ' '}</pre>
+        <pre className="wrp-code-text">
+          {highlightedCode && hasVisibleCode
+            ? highlightedCode
+            : shown.join('\n') || ' '}
+        </pre>
       </div>
       {lines.length > MAX_FILE_LINES && (
         <p className="wrp-preview-empty">仅显示前 {MAX_FILE_LINES} 行。</p>

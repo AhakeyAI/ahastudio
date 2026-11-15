@@ -1,4 +1,4 @@
-import { app, ipcMain } from 'electron';
+import { app, ipcMain, nativeTheme } from 'electron';
 import { requestMicrophoneAccess } from '../microphone-access.js';
 
 export function registerDesktopIpc(): void {
@@ -11,5 +11,12 @@ export function registerDesktopIpc(): void {
 
   ipcMain.handle('mic:request-permission', async () => {
     return await requestMicrophoneAccess(true);
+  });
+
+  ipcMain.handle('theme:set-source', (_event, source: unknown) => {
+    if (source === 'system' || source === 'light' || source === 'dark') {
+      nativeTheme.themeSource = source;
+    }
+    return { shouldUseDarkColors: nativeTheme.shouldUseDarkColors };
   });
 }

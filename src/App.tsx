@@ -122,17 +122,16 @@ export function App() {
               ? 'ASR 不可用'
               : '正在连接麦克风…';
 
+  const statusToneClass = asr.lastError
+    ? 'is-error'
+    : asr.listening && !micMuted
+      ? 'is-ok'
+      : '';
+
   const toolbarExtra = (
-    <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+    <div className="terminal-toolbar-voice">
       <span
-        style={{
-          fontSize: 12,
-          color: asr.lastError ? '#f87171' : asr.listening && !micMuted ? '#4ade80' : '#9aa3b2',
-          maxWidth: 280,
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-        }}
+        className={`terminal-toolbar-status ${statusToneClass}`}
         title={statusText}
       >
         {statusText}
@@ -160,11 +159,7 @@ export function App() {
         onClick={handleToggleMic}
         title={micEnabled ? '关闭语音输入' : '开启语音输入 (写入当前终端)'}
         aria-label={micEnabled ? '关闭语音输入' : '开启语音输入'}
-        style={
-          micEnabled && !micMuted
-            ? { color: '#4ade80', borderColor: 'rgba(74, 222, 128, 0.5)' }
-            : undefined
-        }
+        className={micEnabled && !micMuted ? 'terminal-toolbar-mic-active' : undefined}
       >
         {micEnabled ? <Mic size={16} /> : <MicOff size={16} />}
       </button>

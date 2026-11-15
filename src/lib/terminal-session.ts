@@ -84,12 +84,20 @@ export class TerminalSession {
     },
   });
 
-  constructor(private transport: PtyTerminalHandle, fontSize: number, private changed: () => void, theme?: ITheme) {
+  constructor(
+    private transport: PtyTerminalHandle,
+    fontSize: number,
+    private changed: () => void,
+    theme?: ITheme,
+    minimumContrastRatio?: number,
+  ) {
     this.element.className = 'terminal-session-surface';
     this.terminal = new Terminal({
-      allowProposedApi: true, cursorBlink: true, scrollback: 5000,
+      allowProposedApi: true, cursorBlink: true, cursorInactiveStyle: 'outline', scrollback: 5000,
       fontFamily: '"Cascadia Mono", "Consolas", "Menlo", "Sarasa Mono SC", "Noto Sans Mono CJK SC", "Microsoft YaHei UI", "Microsoft YaHei", monospace',
-      fontSize, theme, fontWeight: '300', fontWeightBold: '400',
+      fontSize, theme,
+      ...(minimumContrastRatio !== undefined ? { minimumContrastRatio } : {}),
+      fontWeight: '300', fontWeightBold: '400',
     });
     this.terminal.loadAddon(this.fit);
     this.terminal.loadAddon(new Unicode11Addon());
@@ -304,8 +312,11 @@ export class TerminalSession {
     this.scheduleFit();
   }
 
-  setTheme(theme: ITheme) {
+  setTheme(theme: ITheme, minimumContrastRatio?: number) {
     this.terminal.options.theme = theme;
+    if (minimumContrastRatio !== undefined) {
+      this.terminal.options.minimumContrastRatio = minimumContrastRatio;
+    }
   }
 
   close() {

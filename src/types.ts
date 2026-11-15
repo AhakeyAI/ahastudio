@@ -123,6 +123,9 @@ export interface VibeMeetApi {
 
   appVersion: () => Promise<string>;
   relaunchApp: () => Promise<void>;
+  setThemeSource?: (
+    source: 'system' | 'light' | 'dark',
+  ) => Promise<{ shouldUseDarkColors: boolean }>;
   onDisplayChanged?: (cb: () => void) => () => void;
 
   shellPty: {

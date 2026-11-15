@@ -10,6 +10,8 @@ import { useEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
+import { TERMINAL_MIN_CONTRAST_RATIO, TERMINAL_THEMES } from '../lib/terminal-appearance';
+import { terminalSessionStore } from '../lib/terminal-session-store';
 
 export interface PtyTerminalHandle {
   /** Acquire the pty on mount. Returns the ptyId + base64 replay for the
@@ -49,11 +51,36 @@ export function usePtyTerminal(opts: PtyTerminalHandle) {
     setExited(false);
     setError(null);
 
-    const term = new Terminal({ cursorBlink: true, scrollback: 5000 });
+    const initialAppearance = terminalSessionStore.getAppearance();
+    const term = new Terminal({
+      cursorBlink: true,
+      cursorInactiveStyle: 'outline',
+      scrollback: 5000,
+      fontSize: terminalSessionStore.getFontSize(),
+      theme: TERMINAL_THEMES[initialAppearance],
+      minimumContrastRatio: TERMINAL_MIN_CONTRAST_RATIO[initialAppearance],
+    });
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
     term.open(container);
     fitAddon.fit();
+
+    let lastAppearance = initialAppearance;
+    let lastFontSize = terminalSessionStore.getFontSize();
+    const unsubscribeAppearance = terminalSessionStore.subscribe(() => {
+      const nextAppearance = terminalSessionStore.getAppearance();
+      if (nextAppearance !== lastAppearance) {
+        lastAppearance = nextAppearance;
+        term.options.theme = TERMINAL_THEMES[nextAppearance];
+        term.options.minimumContrastRatio = TERMINAL_MIN_CONTRAST_RATIO[nextAppearance];
+      }
+      const nextFontSize = terminalSessionStore.getFontSize();
+      if (nextFontSize !== lastFontSize) {
+        lastFontSize = nextFontSize;
+        term.options.fontSize = nextFontSize;
+        fitAddon.fit();
+      }
+    });
 
     let disposed = false;
     let ptyId: string | null = null;
@@ -116,6 +143,7 @@ export function usePtyTerminal(opts: PtyTerminalHandle) {
 
     return () => {
       disposed = true;
+      unsubscribeAppearance();
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeObserver.disconnect();
       dataSub.dispose();

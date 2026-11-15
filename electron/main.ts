@@ -162,7 +162,15 @@ function createWindow(): void {
   installSecurityGuards(win);
   mainWindow = win;
 
+  const onThemeUpdated = () => {
+    if (!win.isDestroyed()) {
+      win.setBackgroundColor(themeBackgroundColor(nativeTheme.shouldUseDarkColors));
+    }
+  };
+  nativeTheme.on('updated', onThemeUpdated);
+
   win.on('closed', () => {
+    nativeTheme.removeListener('updated', onThemeUpdated);
     if (mainWindow === win) mainWindow = null;
   });
 

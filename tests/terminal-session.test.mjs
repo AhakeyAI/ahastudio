@@ -6,7 +6,7 @@ import ts from 'typescript';
 // Exercise the renderer owner with deterministic create/terminate promises.
 // Real xterm/ConPTY rendering is validated separately in the browser smoke.
 class TestTerminal {
-  options = {};
+  constructor(opts = {}) { this.options = { ...opts }; }
   unicode = {};
   rows = 24;
   cols = 80;
@@ -317,4 +317,68 @@ test('a failed restore does not block later saves', async () => {
     await store.createWindow('terminal', { localCliId: 'shell', title: 'after failure' });
     assert.equal(sets.length, 1);
   } finally { delete globalThis.window; console.warn = warn; }
+});
+
+test('terminal appearance defaults to system, tracks OS color-scheme changes, and supports light/dark/system switching', async () => {
+  const origStorage = globalThis.localStorage;
+  const saved = new Map();
+  let osDark = true;
+  const mediaListeners = new Set();
+  const themeSourceCalls = [];
+  globalThis.localStorage = {
+    getItem: (k) => saved.get(k) ?? null,
+    setItem: (k, v) => saved.set(k, String(v)),
+  };
+  globalThis.window = {
+    matchMedia: () => ({
+      get matches() { return osDark; },
+      addEventListener: (_type, fn) => mediaListeners.add(fn),
+      removeEventListener: (_type, fn) => mediaListeners.delete(fn),
+    }),
+    addEventListener() {},
+    vibeMeet: {
+      setThemeSource: async (source) => {
+        themeSourceCalls.push(source);
+        return { shouldUseDarkColors: source === 'system' ? osDark : source === 'dark' };
+      },
+    },
+  };
+  try {
+    const freshStoreUrl = `${storeUrl}#appearance-system`;
+    const { terminalSessionStore: store } = await import(freshStoreUrl);
+    const f = fixture();
+    const session = store.acquire('term-appearance', f.transport);
+
+    assert.equal(store.getAppearancePreference(), 'system');
+    assert.equal(store.getAppearance(), 'dark');
+    assert.equal(session.terminal.options.theme.background, '#1e1e1e');
+    assert.equal(session.terminal.options.minimumContrastRatio, 3);
+
+    // OS switches to light while in system mode -> updates session automatically.
+    osDark = false;
+    for (const fn of mediaListeners) fn({ matches: false });
+    assert.equal(store.getAppearance(), 'light');
+    assert.equal(session.terminal.options.theme.background, '#ffffff');
+    assert.equal(session.terminal.options.minimumContrastRatio, 4.5);
+
+    // Explicit override ignores OS changes.
+    store.setAppearance('dark');
+    assert.equal(store.getAppearancePreference(), 'dark');
+    assert.equal(store.getAppearance(), 'dark');
+    assert.equal(saved.get('aha.terminal.appearance'), 'dark');
+    for (const fn of mediaListeners) fn({ matches: false });
+    assert.equal(store.getAppearance(), 'dark');
+
+    // Switching back to system re-syncs with real OS state via IPC.
+    osDark = true;
+    store.setAppearance('system');
+    await tick();
+    assert.equal(store.getAppearancePreference(), 'system');
+    assert.equal(store.getAppearance(), 'dark');
+    assert.equal(saved.get('aha.terminal.appearance'), 'system');
+    assert.deepEqual(themeSourceCalls.slice(-2), ['dark', 'system']);
+  } finally {
+    delete globalThis.window;
+    globalThis.localStorage = origStorage;
+  }
 });

@@ -55,6 +55,7 @@ const api = {
 
   appVersion: () => ipcRenderer.invoke('app:version'),
   relaunchApp: () => ipcRenderer.invoke('app:relaunch'),
+  setThemeSource: (source) => ipcRenderer.invoke('theme:set-source', source),
 
   onDisplayChanged: (cb) => {
     const listener = () => cb();
