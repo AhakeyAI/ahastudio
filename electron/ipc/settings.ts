@@ -1,8 +1,14 @@
-import { ipcMain, shell, webContents } from 'electron';
-import { getSettings, updateSettings, clearVoicePrint, type Settings, type VoicePrint, type XfyunAsrCredentials } from '../store.js';
+import { ipcMain, webContents } from 'electron';
+import { listLocalCliInventory } from '../local-cli.js';
+import {
+  getSettings,
+  updateSettings,
+  clearVoicePrint,
+  type Settings,
+  type VoicePrint,
+  type XfyunAsrCredentials,
+} from '../store.js';
 
-// Tell every other window that the stored voice config (voiceprint / lock
-// toggle) changed, so their hooks re-fetch instead of running on stale state.
 function broadcastVoiceConfigChanged(excludeWebContentsId?: number): void {
   for (const wc of webContents.getAllWebContents()) {
     if (wc.id === excludeWebContentsId) continue;
@@ -10,78 +16,71 @@ function broadcastVoiceConfigChanged(excludeWebContentsId?: number): void {
   }
 }
 
+function broadcastVoiceInputChanged(): void {
+  for (const wc of webContents.getAllWebContents()) {
+    wc.send('settings:voice-input-changed');
+  }
+}
+
 export interface VoicePrefPatch {
-  selectedVoiceName?: string | null;
-  guidanceDismissed?: boolean;
-  speechFilterMode?: 'strict' | 'off';
   voicePolishEnabled?: boolean;
-  reportModeEnabled?: boolean;
-  handheldMode?: 'auto' | 'handheld' | 'desktop';
+  voicePolishApiKey?: string;
+  voicePolishBaseUrl?: string;
+  voicePolishModel?: string;
   xfyunAsr?: XfyunAsrCredentials;
 }
 
-// Pure validation/mapping for the settings:set-voice-pref payload. Exported
-// so node:test can drive it without booting electron. Unknown enum values
-// and wrong-typed fields are rejected with an error instead of being
-// silently dropped (a renderer bug used to pass a boolean for an enum field
-// and the write vanished without a trace).
+const VOICE_PREF_KEYS = new Set([
+  'voicePolishEnabled',
+  'voicePolishApiKey',
+  'voicePolishBaseUrl',
+  'voicePolishModel',
+  'xfyunAsr',
+]);
+
 export function buildVoicePrefUpdate(
   patch: VoicePrefPatch,
 ): { ok: true; next: Partial<Settings> } | { ok: false; error: string } {
-  if (typeof patch !== 'object' || patch === null) {
-    return { ok: false, error: 'voice pref patch must be an object' };
+  if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+    return { ok: false, error: 'voice input patch must be an object' };
   }
+  for (const key of Object.keys(patch)) {
+    if (!VOICE_PREF_KEYS.has(key)) return { ok: false, error: `unknown voice input field: ${key}` };
+  }
+
   const next: Partial<Settings> = {};
-  if (Object.prototype.hasOwnProperty.call(patch, 'selectedVoiceName')) {
-    if (patch.selectedVoiceName !== null && typeof patch.selectedVoiceName !== 'string') {
-      return { ok: false, error: 'selectedVoiceName must be a string or null' };
-    }
-    next.selectedVoiceName = patch.selectedVoiceName ?? null;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, 'guidanceDismissed')) {
-    if (typeof patch.guidanceDismissed !== 'boolean') {
-      return { ok: false, error: 'guidanceDismissed must be a boolean' };
-    }
-    next.voiceGuidanceDismissed = patch.guidanceDismissed;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, 'speechFilterMode')) {
-    if (patch.speechFilterMode !== 'strict' && patch.speechFilterMode !== 'off') {
-      return { ok: false, error: `invalid speechFilterMode: ${String(patch.speechFilterMode)}` };
-    }
-    next.speechFilterMode = patch.speechFilterMode;
-  }
   if (Object.prototype.hasOwnProperty.call(patch, 'voicePolishEnabled')) {
     if (typeof patch.voicePolishEnabled !== 'boolean') {
       return { ok: false, error: 'voicePolishEnabled must be a boolean' };
     }
     next.voicePolishEnabled = patch.voicePolishEnabled;
   }
-  if (Object.prototype.hasOwnProperty.call(patch, 'reportModeEnabled')) {
-    if (typeof patch.reportModeEnabled !== 'boolean') {
-      return { ok: false, error: 'reportModeEnabled must be a boolean' };
-    }
-    next.reportModeEnabled = patch.reportModeEnabled;
+
+  for (const key of ['voicePolishApiKey', 'voicePolishBaseUrl', 'voicePolishModel'] as const) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    const value = patch[key];
+    if (typeof value !== 'string') return { ok: false, error: `${key} must be a string` };
+    next[key] = value.trim() || undefined;
   }
-  if (Object.prototype.hasOwnProperty.call(patch, 'handheldMode')) {
-    if (patch.handheldMode !== 'auto' && patch.handheldMode !== 'handheld' && patch.handheldMode !== 'desktop') {
-      return { ok: false, error: `invalid handheldMode: ${String(patch.handheldMode)}` };
-    }
-    next.handheldMode = patch.handheldMode;
-  }
+
   if (Object.prototype.hasOwnProperty.call(patch, 'xfyunAsr')) {
-    const c = patch.xfyunAsr;
-    if (typeof c !== 'object' || c === null) {
+    const credentials = patch.xfyunAsr;
+    if (typeof credentials !== 'object' || credentials === null || Array.isArray(credentials)) {
       return { ok: false, error: 'xfyunAsr must be an object' };
     }
-    for (const key of ['appId', 'apiKey', 'apiSecret'] as const) {
-      if (c[key] !== undefined && typeof c[key] !== 'string') {
-        return { ok: false, error: `xfyunAsr.${key} must be a string` };
+    for (const key of Object.keys(credentials)) {
+      if (!['appId', 'apiKey', 'apiSecret'].includes(key)) {
+        return { ok: false, error: `unknown xfyunAsr field: ${key}` };
       }
     }
     const cleaned: XfyunAsrCredentials = {};
-    if (typeof c.appId === 'string') cleaned.appId = c.appId.trim();
-    if (typeof c.apiKey === 'string') cleaned.apiKey = c.apiKey.trim();
-    if (typeof c.apiSecret === 'string') cleaned.apiSecret = c.apiSecret.trim();
+    for (const key of ['appId', 'apiKey', 'apiSecret'] as const) {
+      const value = credentials[key];
+      if (value !== undefined && typeof value !== 'string') {
+        return { ok: false, error: `xfyunAsr.${key} must be a string` };
+      }
+      if (typeof value === 'string') cleaned[key] = value.trim();
+    }
     next.xfyunAsr = cleaned;
   }
   return { ok: true, next };
@@ -89,104 +88,76 @@ export function buildVoicePrefUpdate(
 
 export function registerSettingsIpc(): void {
   ipcMain.handle('settings:get-voice-config', async () => {
-    const s = getSettings();
+    const settings = getSettings();
     return {
-      enabled: Boolean(s.voiceLockEnabled),
-      voicePrint: s.voicePrint ?? null,
+      enabled: Boolean(settings.voiceLockEnabled),
+      voicePrint: settings.voicePrint ?? null,
     };
   });
 
-  ipcMain.handle('settings:set-voice-lock-enabled', async (e, enabled: boolean) => {
-    await updateSettings({ voiceLockEnabled: !!enabled });
-    broadcastVoiceConfigChanged(e.sender.id);
+  ipcMain.handle('settings:set-voice-lock-enabled', async (event, enabled: boolean) => {
+    updateSettings({ voiceLockEnabled: Boolean(enabled) });
+    broadcastVoiceConfigChanged(event.sender.id);
     return { ok: true };
   });
 
-  ipcMain.handle('settings:set-voice-print', async (e, vp: VoicePrint | null) => {
-    if (!vp) {
-      await clearVoicePrint();
-    } else {
-      await updateSettings({ voicePrint: vp });
-    }
-    broadcastVoiceConfigChanged(e.sender.id);
+  ipcMain.handle('settings:set-voice-print', async (event, voicePrint: VoicePrint | null) => {
+    if (voicePrint) updateSettings({ voicePrint });
+    else clearVoicePrint();
+    broadcastVoiceConfigChanged(event.sender.id);
     return { ok: true };
   });
 
-  // Voice-lock enrollment bridge. The enrollment UI lives in the settings
-  // window, but the mic/VAD/embedding pipeline only exists in the main
-  // window's App. Commands travel settings -> here -> main window; the main
-  // window streams enrollment progress back on 'voicelock:enroll-state'.
   ipcMain.handle('voicelock:enroll-start', async () => {
-    for (const wc of webContents.getAllWebContents()) {
-      wc.send('voicelock:enroll-cmd', 'start');
-    }
+    for (const wc of webContents.getAllWebContents()) wc.send('voicelock:enroll-cmd', 'start');
     return { ok: true };
   });
 
   ipcMain.handle('voicelock:enroll-cancel', async () => {
-    for (const wc of webContents.getAllWebContents()) {
-      wc.send('voicelock:enroll-cmd', 'cancel');
-    }
+    for (const wc of webContents.getAllWebContents()) wc.send('voicelock:enroll-cmd', 'cancel');
     return { ok: true };
   });
 
-  ipcMain.on('voicelock:enroll-state', (e, state: unknown) => {
+  ipcMain.on('voicelock:enroll-state', (event, state: unknown) => {
     for (const wc of webContents.getAllWebContents()) {
-      if (wc.id !== e.sender.id) wc.send('voicelock:enroll-state', state);
+      if (wc.id !== event.sender.id) wc.send('voicelock:enroll-state', state);
     }
   });
 
-  ipcMain.on('voiceconfig:changed', (e) => {
-    broadcastVoiceConfigChanged(e.sender.id);
+  ipcMain.on('voiceconfig:changed', (event) => {
+    broadcastVoiceConfigChanged(event.sender.id);
   });
 
-  ipcMain.handle('settings:get-voice-pref', async () => {
-    const s = getSettings();
+  ipcMain.handle('settings:get-voice-input', async () => {
+    const settings = getSettings();
     return {
-      selectedVoiceName: s.selectedVoiceName ?? null,
-      guidanceDismissed: Boolean(s.voiceGuidanceDismissed),
-      speechFilterMode: s.speechFilterMode ?? 'strict',
-      voicePolishEnabled: Boolean(s.voicePolishEnabled),
-      reportModeEnabled: Boolean(s.reportModeEnabled),
-      handheldMode: s.handheldMode ?? 'auto',
+      voicePolishEnabled: Boolean(settings.voicePolishEnabled),
+      voicePolishApiKeyConfigured: Boolean(settings.voicePolishApiKey),
+      voicePolishBaseUrl: settings.voicePolishBaseUrl ?? '',
+      voicePolishModel: settings.voicePolishModel ?? '',
       xfyunAsr: {
-        appId: s.xfyunAsr?.appId ?? '',
-        apiKey: s.xfyunAsr?.apiKey ?? '',
-        apiSecret: s.xfyunAsr?.apiSecret ?? '',
+        appId: settings.xfyunAsr?.appId ?? '',
+        apiKeyConfigured: Boolean(settings.xfyunAsr?.apiKey),
+        apiSecretConfigured: Boolean(settings.xfyunAsr?.apiSecret),
       },
     };
   });
 
-  ipcMain.handle('settings:set-voice-pref', async (_e, patch: VoicePrefPatch) => {
+  ipcMain.handle('settings:set-voice-input', async (_event, patch: VoicePrefPatch) => {
     const result = buildVoicePrefUpdate(patch);
     if (!result.ok) return { ok: false, error: result.error };
     const next = result.next;
-    // xfyunAsr arrives as a partial — merge onto the stored entry so the
-    // renderer can update one field without resending secrets.
     if (next.xfyunAsr) {
       next.xfyunAsr = { ...(getSettings().xfyunAsr ?? {}), ...next.xfyunAsr };
     }
-    await updateSettings(next);
-    // ASR availability is probed once at renderer mount; when credentials
-    // change mid-session, notify every window so hooks re-probe instead of
-    // requiring an app restart for the mic to unlock. A "don't show again"
-    // write likewise needs to reach every already-open window so their
-    // useVoicePreferences re-fetches and the voice guide stops nagging.
-    if (next.xfyunAsr || next.voiceGuidanceDismissed !== undefined) {
-      for (const wc of webContents.getAllWebContents()) {
-        wc.send('settings:voice-pref-changed');
-      }
+    try {
+      updateSettings(next);
+      broadcastVoiceInputChanged();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
-    return { ok: true };
   });
 
-  // Deep-link into System Settings → Accessibility → Spoken Content so the
-  // user can install the higher-quality Siri / Premium / Enhanced Chinese
-  // voices. Apple gives us no API to trigger the download programmatically;
-  // this is the closest we get to one click.
-  ipcMain.handle('system:open-voice-settings', async () => {
-    if (process.platform !== 'darwin') return { ok: false };
-    await shell.openExternal('x-apple.systempreferences:com.apple.preference.universalaccess?Speech');
-    return { ok: true };
-  });
+  ipcMain.handle('settings:list-cli-inventory', async () => ({ ok: true, clis: listLocalCliInventory() }));
 }

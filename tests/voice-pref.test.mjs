@@ -3,78 +3,62 @@ import test from 'node:test';
 
 import { buildVoicePrefUpdate } from '../dist-electron/ipc/settings.js';
 
-// buildVoicePrefUpdate is the pure validation gate behind
-// settings:set-voice-pref. Historically an unknown enum value (or a boolean
-// passed where an enum belongs) was silently dropped; it must now fail
-// loudly so renderer bugs surface instead of vanishing.
-
-test('accepts a full valid patch and maps renderer keys to settings keys', () => {
-  const r = buildVoicePrefUpdate({
-    selectedVoiceName: 'Tingting',
-    guidanceDismissed: true,
-    speechFilterMode: 'off',
+test('maps ASR credentials and dedicated voice polish settings', () => {
+  const result = buildVoicePrefUpdate({
     voicePolishEnabled: true,
-    reportModeEnabled: false,
-    handheldMode: 'handheld',
+    voicePolishApiKey: ' polish-key ',
+    voicePolishBaseUrl: ' https://polish.example.test ',
+    voicePolishModel: ' polish-model ',
     xfyunAsr: { appId: ' test-appid ', apiKey: ' test-key ', apiSecret: ' test-secret ' },
   });
-  assert.equal(r.ok, true);
-  assert.deepEqual(r.next, {
-    selectedVoiceName: 'Tingting',
-    voiceGuidanceDismissed: true,
-    speechFilterMode: 'off',
-    voicePolishEnabled: true,
-    reportModeEnabled: false,
-    handheldMode: 'handheld',
-    xfyunAsr: { appId: 'test-appid', apiKey: 'test-key', apiSecret: 'test-secret' },
+  assert.deepEqual(result, {
+    ok: true,
+    next: {
+      voicePolishEnabled: true,
+      voicePolishApiKey: 'polish-key',
+      voicePolishBaseUrl: 'https://polish.example.test',
+      voicePolishModel: 'polish-model',
+      xfyunAsr: { appId: 'test-appid', apiKey: 'test-key', apiSecret: 'test-secret' },
+    },
   });
 });
 
-test('selectedVoiceName accepts an explicit null clear', () => {
-  const r = buildVoicePrefUpdate({ selectedVoiceName: null });
-  assert.equal(r.ok, true);
-  assert.deepEqual(r.next, { selectedVoiceName: null });
+test('blank voice polish fields clear their stored values', () => {
+  const result = buildVoicePrefUpdate({ voicePolishApiKey: '', voicePolishBaseUrl: '', voicePolishModel: '' });
+  assert.equal(result.ok, true);
+  assert.equal(Object.hasOwn(result.next, 'voicePolishApiKey'), true);
+  assert.equal(result.next.voicePolishApiKey, undefined);
+  assert.equal(result.next.voicePolishBaseUrl, undefined);
+  assert.equal(result.next.voicePolishModel, undefined);
 });
 
-test('rejects invalid enum values instead of silently ignoring them', () => {
+test('obsolete broadcast and UI preferences are rejected by the voice input API', () => {
   for (const patch of [
-    { speechFilterMode: 'loud' },
-    { handheldMode: 'tablet' },
-    { xfyunAsr: 'remote' },
-    // A boolean where an object belongs.
-    { xfyunAsr: true },
-    { speechFilterMode: true },
-  ]) {
-    const r = buildVoicePrefUpdate(patch);
-    assert.equal(r.ok, false, `expected rejection for ${JSON.stringify(patch)}`);
-    assert.equal(typeof r.error, 'string');
-  }
-});
-
-test('rejects wrong-typed boolean fields', () => {
-  for (const patch of [
-    { guidanceDismissed: 'yes' },
-    { voicePolishEnabled: 1 },
-    { reportModeEnabled: null },
+    { selectedVoiceName: null },
+    { guidanceDismissed: true },
+    { speechFilterMode: 'off' },
+    { reportModeEnabled: false },
+    { handheldMode: 'handheld' },
   ]) {
     assert.equal(buildVoicePrefUpdate(patch).ok, false, `expected rejection for ${JSON.stringify(patch)}`);
   }
 });
 
-test('rejects malformed xfyunAsr payloads', () => {
-  assert.equal(buildVoicePrefUpdate({ xfyunAsr: 'x' }).ok, false);
-  assert.equal(buildVoicePrefUpdate({ xfyunAsr: { apiKey: 42 } }).ok, false);
-  assert.equal(buildVoicePrefUpdate({ xfyunAsr: { appId: null } }).ok, false);
-});
-
-test('rejects a non-object patch', () => {
-  for (const patch of [null, 42, 'x']) {
-    assert.equal(buildVoicePrefUpdate(patch).ok, false);
+test('rejects malformed voice input patches', () => {
+  for (const patch of [
+    null,
+    42,
+    { voicePolishEnabled: 1 },
+    { voicePolishApiKey: 42 },
+    { voicePolishBaseUrl: null },
+    { voicePolishModel: true },
+    { xfyunAsr: 'remote' },
+    { xfyunAsr: { apiKey: 42 } },
+  ]) {
+    assert.equal(buildVoicePrefUpdate(patch).ok, false, `expected rejection for ${JSON.stringify(patch)}`);
   }
 });
 
-test('omitted keys produce no settings writes', () => {
-  const r = buildVoicePrefUpdate({});
-  assert.equal(r.ok, true);
-  assert.deepEqual(r.next, {});
+test('omitted voice input keys produce no settings writes', () => {
+  assert.deepEqual(buildVoicePrefUpdate({}), { ok: true, next: {} });
 });

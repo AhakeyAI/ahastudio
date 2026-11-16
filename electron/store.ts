@@ -1,6 +1,15 @@
 import { app, safeStorage } from 'electron';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  constants,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
+import { migrateSettings, type LegacySettings } from './settings-migration.js';
 
 export interface VoicePrint {
   embedding: number[];
@@ -16,22 +25,17 @@ export interface XfyunAsrCredentials {
 }
 
 export interface Settings {
-  authMode?: 'subscription' | 'apikey';
-  anthropicApiKey?: string;
-  anthropicApiKeyEncrypted?: string;
-  anthropicBaseUrl?: string;
-  anthropicModel?: string;
+  schemaVersion?: 2;
   voiceLockEnabled?: boolean;
   voicePrint?: VoicePrint;
-  selectedVoiceName?: string | null;
-  voiceGuidanceDismissed?: boolean;
-  speechFilterMode?: 'strict' | 'off';
   voicePolishEnabled?: boolean;
-  reportModeEnabled?: boolean;
+  voicePolishApiKey?: string;
+  voicePolishApiKeyEncrypted?: string;
+  voicePolishBaseUrl?: string;
+  voicePolishModel?: string;
   handheldMode?: 'auto' | 'desktop' | 'handheld';
   xfyunAsr?: XfyunAsrCredentials;
   xfyunAsrEncrypted?: string;
-  uiFontScale?: number;
 }
 
 let cachedSettings: Settings | null = null;
@@ -41,62 +45,49 @@ function settingsFilePath(): string {
   return join(app.getPath('userData'), 'settings.json');
 }
 
-function decryptString(b64: string): string | undefined {
-  if (!b64 || !safeStorage.isEncryptionAvailable()) return undefined;
+function decryptString(b64: string): string {
+  if (!safeStorage.isEncryptionAvailable()) throw new Error('Settings encryption is unavailable');
   try {
     return safeStorage.decryptString(Buffer.from(b64, 'base64'));
   } catch {
-    return undefined;
+    throw new Error('Failed to decrypt settings');
   }
 }
 
-function encryptString(plain: string): string | undefined {
-  if (!plain || !safeStorage.isEncryptionAvailable()) return undefined;
+function encryptString(plain: string): string {
+  if (!safeStorage.isEncryptionAvailable()) throw new Error('Settings encryption is unavailable');
   try {
     return safeStorage.encryptString(plain).toString('base64');
   } catch {
-    return undefined;
+    throw new Error('Failed to encrypt settings');
   }
 }
 
 function decodeLoadedSettings(raw: Settings): Settings {
   const out: Settings = { ...raw };
-  if (raw.anthropicApiKeyEncrypted) {
-    const decrypted = decryptString(raw.anthropicApiKeyEncrypted);
-    if (decrypted !== undefined) {
-      out.anthropicApiKey = decrypted;
-    }
+  if (raw.voicePolishApiKeyEncrypted) {
+    out.voicePolishApiKey = decryptString(raw.voicePolishApiKeyEncrypted);
   }
   if (raw.xfyunAsrEncrypted) {
-    const decrypted = decryptString(raw.xfyunAsrEncrypted);
-    if (decrypted) {
-      try {
-        out.xfyunAsr = JSON.parse(decrypted) as XfyunAsrCredentials;
-      } catch { /* ignore malformed encrypted payload */ }
-    }
+    out.xfyunAsr = JSON.parse(decryptString(raw.xfyunAsrEncrypted)) as XfyunAsrCredentials;
   }
   return out;
 }
 
 function encodeSettingsForDisk(settings: Settings): Settings {
   const disk: Settings = { ...settings };
-  if (disk.anthropicApiKey) {
-    const enc = encryptString(disk.anthropicApiKey);
-    if (enc) {
-      disk.anthropicApiKeyEncrypted = enc;
-      delete disk.anthropicApiKey;
-    }
-  } else {
-    delete disk.anthropicApiKeyEncrypted;
+  if (disk.voicePolishApiKey) {
+    disk.voicePolishApiKeyEncrypted = encryptString(disk.voicePolishApiKey);
+    delete disk.voicePolishApiKey;
+  } else if (!disk.voicePolishApiKeyEncrypted) {
+    delete disk.voicePolishApiKey;
   }
-  if (disk.xfyunAsr && (disk.xfyunAsr.appId || disk.xfyunAsr.apiKey || disk.xfyunAsr.apiSecret)) {
-    const enc = encryptString(JSON.stringify(disk.xfyunAsr));
-    if (enc) {
-      disk.xfyunAsrEncrypted = enc;
-      delete disk.xfyunAsr;
-    }
-  } else {
-    delete disk.xfyunAsrEncrypted;
+  const xfyun = disk.xfyunAsr;
+  if (xfyun && (xfyun.appId || xfyun.apiKey || xfyun.apiSecret)) {
+    disk.xfyunAsrEncrypted = encryptString(JSON.stringify(xfyun));
+    delete disk.xfyunAsr;
+  } else if (!disk.xfyunAsrEncrypted) {
+    delete disk.xfyunAsr;
   }
   return disk;
 }
@@ -109,15 +100,18 @@ function writeSettingsNow(settings: Settings): void {
   renameSync(tmp, file);
 }
 
+function backupV1Settings(): void {
+  const file = settingsFilePath();
+  const backup = `${file}.v1.bak`;
+  if (!existsSync(file) || existsSync(backup)) return;
+  copyFileSync(file, backup, constants.COPYFILE_EXCL);
+}
+
 function scheduleSettingsWrite(): void {
   if (writeTimer) clearTimeout(writeTimer);
   writeTimer = setTimeout(() => {
     writeTimer = null;
-    if (cachedSettings) {
-      try {
-        writeSettingsNow(cachedSettings);
-      } catch { /* non-fatal on background flush */ }
-    }
+    if (cachedSettings) writeSettingsNow(cachedSettings);
   }, 50);
   writeTimer.unref();
 }
@@ -126,25 +120,32 @@ export function getSettings(): Settings {
   if (cachedSettings) return cachedSettings;
   const file = settingsFilePath();
   if (!existsSync(file)) {
-    cachedSettings = {};
+    cachedSettings = { schemaVersion: 2 };
     return cachedSettings;
   }
-  try {
-    const raw = JSON.parse(readFileSync(file, 'utf8')) as Settings;
-    cachedSettings = decodeLoadedSettings(raw ?? {});
-  } catch {
-    cachedSettings = {};
+
+  const raw = JSON.parse(readFileSync(file, 'utf8')) as LegacySettings;
+  const migration = migrateSettings(raw ?? {});
+  if (migration.changed) {
+    backupV1Settings();
+    writeSettingsNow(migration.settings);
   }
+  cachedSettings = decodeLoadedSettings(migration.settings);
   return cachedSettings;
 }
 
 export function updateSettings(patch: Partial<Settings>): Settings {
-  const next: Settings = { ...getSettings(), ...patch };
+  const next: Settings = { ...getSettings(), ...patch, schemaVersion: 2 };
   for (const key of Object.keys(patch) as (keyof Settings)[]) {
-    if (patch[key] === undefined) {
-      delete next[key];
-    }
+    if (patch[key] === undefined) delete next[key];
   }
+  if (Object.prototype.hasOwnProperty.call(patch, 'voicePolishApiKey')) {
+    delete next.voicePolishApiKeyEncrypted;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'xfyunAsr')) {
+    delete next.xfyunAsrEncrypted;
+  }
+  encodeSettingsForDisk(next);
   cachedSettings = next;
   scheduleSettingsWrite();
   return cachedSettings;
@@ -159,9 +160,5 @@ export function flushSettingsWrites(): void {
     clearTimeout(writeTimer);
     writeTimer = null;
   }
-  if (cachedSettings) {
-    try {
-      writeSettingsNow(cachedSettings);
-    } catch { /* best-effort on quit */ }
-  }
+  if (cachedSettings) writeSettingsNow(cachedSettings);
 }

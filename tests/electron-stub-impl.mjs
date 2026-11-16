@@ -34,7 +34,15 @@ export const dialog = { showMessageBox: async () => ({ response: 1 }) };
 export const BrowserWindow = class {
   static getFocusedWindow() { return null; }
 };
-export const safeStorage = { encryptString: () => Buffer.alloc(0), decryptString: () => '' };
+export const safeStorage = {
+  isEncryptionAvailable: () => true,
+  encryptString: value => Buffer.from(`encrypted:${value}`, 'utf8'),
+  decryptString: value => {
+    const text = value.toString('utf8');
+    if (!text.startsWith('encrypted:')) throw new Error('invalid encrypted test value');
+    return text.slice('encrypted:'.length);
+  },
+};
 export const screen = { getPrimaryDisplay: () => ({ workAreaSize: { width: 1920, height: 1080 } }) };
 export const nativeTheme = { shouldUseDarkColors: false, themeSource: 'system', on: () => {}, removeListener: () => {} };
 export const webContents = { fromId: () => null };

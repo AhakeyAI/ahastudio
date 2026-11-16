@@ -28,14 +28,29 @@ const api = {
     return () => ipcRenderer.removeListener('voicelock:enroll-state', listener);
   },
 
-  getVoicePref: () => ipcRenderer.invoke('settings:get-voice-pref'),
-  setVoicePref: (patch) => ipcRenderer.invoke('settings:set-voice-pref', patch),
-  onVoicePrefChanged: (cb) => {
-    const listener = () => cb();
-    ipcRenderer.on('voicepref:changed', listener);
-    return () => ipcRenderer.removeListener('voicepref:changed', listener);
+  voiceInput: {
+    get: () => ipcRenderer.invoke('settings:get-voice-input'),
+    set: (patch) => ipcRenderer.invoke('settings:set-voice-input', patch),
+    onChanged: (cb) => {
+      const listener = () => cb();
+      ipcRenderer.on('settings:voice-input-changed', listener);
+      return () => ipcRenderer.removeListener('settings:voice-input-changed', listener);
+    },
   },
-  openVoiceSettings: () => ipcRenderer.invoke('system:open-voice-settings'),
+
+  uiPreferences: {
+    get: () => ipcRenderer.invoke('settings:get-ui-preferences'),
+    set: (patch) => ipcRenderer.invoke('settings:set-ui-preferences', patch),
+    onChanged: (cb) => {
+      const listener = () => cb();
+      ipcRenderer.on('settings:ui-preferences-changed', listener);
+      return () => ipcRenderer.removeListener('settings:ui-preferences-changed', listener);
+    },
+  },
+
+  cliInventory: {
+    list: () => ipcRenderer.invoke('settings:list-cli-inventory'),
+  },
 
   asrAvailable: () => ipcRenderer.invoke('asr:available'),
   startAsrStream: (lang, includePreRoll) =>
@@ -49,8 +64,13 @@ const api = {
   requestMicPermission: () => ipcRenderer.invoke('mic:request-permission'),
 
   settingsWindow: {
-    open: () => ipcRenderer.invoke('settings:open-window'),
+    open: (focus) => ipcRenderer.invoke('settings:open-window', { focus }),
     close: () => ipcRenderer.invoke('settings:close-window'),
+    onFocusSection: (cb) => {
+      const listener = (_, payload) => cb(payload.section);
+      ipcRenderer.on('settings:focus-section', listener);
+      return () => ipcRenderer.removeListener('settings:focus-section', listener);
+    },
   },
 
   appVersion: () => ipcRenderer.invoke('app:version'),

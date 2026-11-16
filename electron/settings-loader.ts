@@ -2,7 +2,6 @@ import { dialog } from 'electron';
 import { readFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { getSettings } from './store.js';
 
 export interface ClaudeEnv {
   ANTHROPIC_API_KEY?: string;
@@ -42,7 +41,7 @@ export function loadClaudeEnv(): ClaudeEnv {
 // (AWS_*, GITHUB_TOKEN, OpenAI keys, DATABASE_URL, …) into a process that
 // talks to a remote LLM and can shell out arbitrary commands. Anything not
 // listed here gets dropped; Anthropic credentials still come from
-// ~/.claude/settings.json or app settings below.
+// the process environment or ~/.claude/settings.json.
 const ENV_ALLOWLIST: ReadonlySet<string> = new Set([
   // Process essentials
   'PATH',
@@ -132,31 +131,6 @@ export function mergedSubprocessEnv(): NodeJS.ProcessEnv {
   //    process env where they collide).
   for (const [k, v] of Object.entries(claudeEnv)) {
     if (typeof v === 'string' && v.length > 0) out[k] = v;
-  }
-  // 3. App settings: explicit API key / gateway / model entered in the UI.
-  //    Base URL + model are only honored alongside an apikey so a stray
-  //    override can't silently break subscription auth.
-  const appSettings = getSettings();
-  if (appSettings.authMode === 'apikey' && appSettings.anthropicApiKey) {
-    // Some gateways (e.g. Alibaba idealab) authenticate via ANTHROPIC_AUTH_TOKEN
-    // instead of ANTHROPIC_API_KEY. When the user has already configured
-    // ANTHROPIC_AUTH_TOKEN externally (process env or ~/.claude/settings.json),
-    // respect that and map the app's key to the token field so the CLI
-    // authenticates correctly.
-    const authTokenConfigured = typeof out['ANTHROPIC_AUTH_TOKEN'] === 'string'
-      && out['ANTHROPIC_AUTH_TOKEN']!.length > 0;
-    if (authTokenConfigured) {
-      // Remove API_KEY so the CLI uses AUTH_TOKEN exclusively.
-      delete out['ANTHROPIC_API_KEY'];
-    } else {
-      out['ANTHROPIC_API_KEY'] = appSettings.anthropicApiKey;
-    }
-    if (appSettings.anthropicBaseUrl) {
-      out['ANTHROPIC_BASE_URL'] = appSettings.anthropicBaseUrl;
-    }
-    if (appSettings.anthropicModel) {
-      out['ANTHROPIC_MODEL'] = appSettings.anthropicModel;
-    }
   }
   return out;
 }

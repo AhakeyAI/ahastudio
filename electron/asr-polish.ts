@@ -1,7 +1,6 @@
 // asr-polish.ts — Polish raw ASR output into clean written text via the
-// configured LLM. Reuses the same API credentials (key, base URL, model) that
-// the Claude subprocess uses. On any failure (no key, API error, timeout) the
-// raw text is returned unchanged so the user's message is never lost.
+// dedicated voice-polish API credentials. On any failure (no key, API error,
+// timeout) the raw text is returned unchanged so the user's message is never lost.
 
 import { createRequire } from 'node:module';
 import { getSettings } from './store.js';
@@ -43,16 +42,16 @@ function detectLanguage(text: string): 'zh' | 'en' {
 
 function getClientAndModel(): { client: AnthropicClient; model: string } | null {
   const settings = getSettings();
-  if (settings.authMode !== 'apikey' || !settings.anthropicApiKey) return null;
+  if (!settings.voicePolishEnabled || !settings.voicePolishApiKey) return null;
 
   try {
     const Anthropic = require_('@anthropic-ai/sdk');
     const Ctor = Anthropic.default || Anthropic;
     const client = new Ctor({
-      apiKey: settings.anthropicApiKey,
-      baseURL: settings.anthropicBaseUrl || undefined,
+      apiKey: settings.voicePolishApiKey,
+      baseURL: settings.voicePolishBaseUrl || undefined,
     });
-    const model = settings.anthropicModel || 'claude-sonnet-4-20250514';
+    const model = settings.voicePolishModel || 'claude-sonnet-4-20250514';
     return { client, model };
   } catch (err) {
     console.warn('[asr-polish] failed to load Anthropic SDK:', err);
