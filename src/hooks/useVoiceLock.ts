@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { EnrollmentToast } from '../components/VoiceLockPanel';
-import { cancelSpeech } from './useSpeech';
 import {
   averageEmbeddings,
   embedSpeaker,
@@ -155,7 +154,6 @@ export function useVoiceLock({ muted, setMuted, setAiSpeaking, speakingRef }: Us
   }, []);
 
   const handleStartEnrollment = useCallback(() => {
-    cancelSpeech();
     speakingRef.current = false;
     setAiSpeaking(false);
     if (prevMutedRef.current === null) {

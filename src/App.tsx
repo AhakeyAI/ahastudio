@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Mic, MicOff, RotateCw, Settings, Volume2, VolumeX } from 'lucide-react';
 import { LocalTerminalWorkspace } from './components/LocalTerminalWorkspace';
-import { VoiceGuideModal } from './components/VoiceGuideModal';
 import { useAsr } from './hooks/useAsr';
 import { useSpacebarMute } from './hooks/useSpacebarMute';
 import { useStageWindows } from './hooks/useStageWindows';
 import { useVoiceLock } from './hooks/useVoiceLock';
-import { useVoicePreferences } from './hooks/useVoicePreferences';
+import { useVoiceInputPreferences } from './hooks/useVoiceInputPreferences';
 
 export function App() {
   const { windows, activeWindowId } = useStageWindows();
@@ -16,11 +15,10 @@ export function App() {
 
   const [micEnabled, setMicEnabled] = useState(false);
   const [micMuted, setMicMuted] = useState(false);
-  const [guideOpen, setGuideOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
   const speakingRef = useRef(false);
-  const prefs = useVoicePreferences();
+  const { preferences } = useVoiceInputPreferences();
   const voiceLock = useVoiceLock({
     muted: micMuted,
     setMuted: setMicMuted,
@@ -62,7 +60,7 @@ export function App() {
       const cleaned = rawText.trim();
       if (!cleaned) return;
       let textToSend = cleaned;
-      if (prefs.voicePolishEnabled || prefs.reportModeEnabled) {
+      if (preferences.voicePolishEnabled) {
         try {
           const polished = await window.vibeMeet.polishAsrText(cleaned);
           if (polished.ok && polished.text) {
@@ -81,7 +79,7 @@ export function App() {
         setNotice(res.error ?? '无法写入当前终端');
       }
     },
-    [prefs.voicePolishEnabled, prefs.reportModeEnabled],
+    [preferences.voicePolishEnabled],
   );
 
   const asr = useAsr({
@@ -167,8 +165,8 @@ export function App() {
       <button
         type="button"
         onClick={() => void window.vibeMeet.settingsWindow.open()}
-        title="语音与声纹设置"
-        aria-label="语音与声纹设置"
+        title="应用设置"
+        aria-label="应用设置"
       >
         <Settings size={16} />
       </button>
@@ -176,16 +174,6 @@ export function App() {
   );
 
   return (
-    <>
-      <LocalTerminalWorkspace toolbarExtra={toolbarExtra} />
-      <VoiceGuideModal
-        open={guideOpen}
-        onClose={() => setGuideOpen(false)}
-        onDismissForever={() => {
-          prefs.handleDismissForever();
-          setGuideOpen(false);
-        }}
-      />
-    </>
+    <LocalTerminalWorkspace toolbarExtra={toolbarExtra} />
   );
 }

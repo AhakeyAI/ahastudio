@@ -34,13 +34,19 @@ export function useHandheldMode(): {
     width: typeof window !== 'undefined' ? window.screen.width : 1920,
   }));
 
-  // Load the persisted override once.
   useEffect(() => {
     let cancelled = false;
-    window.vibeMeet.getVoicePref().then((pref) => {
-      if (!cancelled) setOverrideState(pref.handheldMode);
-    }).catch(() => {});
-    return () => { cancelled = true; };
+    const load = () => {
+      window.vibeMeet.uiPreferences.get().then((pref) => {
+        if (!cancelled) setOverrideState(pref.handheldMode);
+      }).catch(() => {});
+    };
+    load();
+    const unsubscribe = window.vibeMeet.uiPreferences.onChanged(load);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, []);
 
   // Track the auto-heuristic inputs. The display-changed IPC (Phase 6a) is
@@ -70,7 +76,7 @@ export function useHandheldMode(): {
 
   const setOverride = useCallback((v: HandheldOverride) => {
     setOverrideState(v);
-    void window.vibeMeet.setVoicePref({ handheldMode: v });
+    void window.vibeMeet.uiPreferences.set({ handheldMode: v });
   }, []);
 
   return { mode, override, setOverride };

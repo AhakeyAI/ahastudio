@@ -14,23 +14,36 @@ export interface VoiceLockEnrollState {
   toast: 'saved' | 'tooShort' | 'cancelled' | null;
 }
 
-export interface XfyunAsrCredentials {
-  appId: string;
-  apiKey: string;
-  apiSecret: string;
+export type HandheldModeSetting = 'auto' | 'desktop' | 'handheld';
+export type SettingsSection = 'appearance' | 'terminal' | 'voice-input' | 'cli-agents';
+
+export interface VoiceInputPreferences {
+  voicePolishEnabled: boolean;
+  voicePolishApiKeyConfigured: boolean;
+  voicePolishBaseUrl: string;
+  voicePolishModel: string;
+  xfyunAsr: {
+    appId: string;
+    apiKeyConfigured: boolean;
+    apiSecretConfigured: boolean;
+  };
 }
 
-export type SpeechFilterMode = 'strict' | 'off';
-export type HandheldModeSetting = 'auto' | 'desktop' | 'handheld';
+export interface VoiceInputPatch {
+  voicePolishEnabled?: boolean;
+  voicePolishApiKey?: string;
+  voicePolishBaseUrl?: string;
+  voicePolishModel?: string;
+  xfyunAsr?: {
+    appId?: string;
+    apiKey?: string;
+    apiSecret?: string;
+  };
+}
 
-export interface VoicePreferences {
-  selectedVoiceName: string | null;
-  guidanceDismissed: boolean;
-  speechFilterMode: SpeechFilterMode;
-  voicePolishEnabled: boolean;
-  reportModeEnabled: boolean;
-  handheldMode: HandheldModeSetting;
-  xfyunAsr: XfyunAsrCredentials;
+export interface LocalCliInventoryEntry extends Omit<LocalCliInfo, 'binaryPath'> {
+  binaryPath: string | null;
+  installed: boolean;
 }
 
 export interface LocalCliInfo {
@@ -95,10 +108,21 @@ export interface VibeMeetApi {
   sendVoiceLockEnrollState?: (state: VoiceLockEnrollState) => void;
   onVoiceLockEnrollState?: (cb: (state: VoiceLockEnrollState) => void) => () => void;
 
-  getVoicePref: () => Promise<VoicePreferences>;
-  setVoicePref: (patch: Partial<VoicePreferences>) => Promise<{ ok: boolean; error?: string }>;
-  onVoicePrefChanged?: (cb: () => void) => () => void;
-  openVoiceSettings: () => Promise<void>;
+  voiceInput: {
+    get: () => Promise<VoiceInputPreferences>;
+    set: (patch: VoiceInputPatch) => Promise<{ ok: boolean; error?: string }>;
+    onChanged: (cb: () => void) => () => void;
+  };
+
+  uiPreferences: {
+    get: () => Promise<{ handheldMode: HandheldModeSetting }>;
+    set: (patch: { handheldMode?: HandheldModeSetting }) => Promise<{ ok: boolean; error?: string }>;
+    onChanged: (cb: () => void) => () => void;
+  };
+
+  cliInventory: {
+    list: () => Promise<{ ok: true; clis: LocalCliInventoryEntry[] } | { ok: false; error: string }>;
+  };
 
   asrAvailable: () => Promise<{ ok: boolean; available: boolean; error?: string; reason?: string }>;
   startAsrStream: (
@@ -117,8 +141,9 @@ export interface VibeMeetApi {
   requestMicPermission: () => Promise<boolean>;
 
   settingsWindow: {
-    open: () => Promise<{ ok: boolean }>;
+    open: (focus?: SettingsSection) => Promise<{ ok: boolean }>;
     close: () => Promise<{ ok: boolean }>;
+    onFocusSection: (cb: (section: SettingsSection) => void) => () => void;
   };
 
   appVersion: () => Promise<string>;

@@ -123,10 +123,10 @@ export function VoiceLockPanel({
           </div>
           <div className="drawer-settings-hint">
             {!enrolled
-              ? 'Record a sample of your voice so Claude only listens to you.'
+              ? '录入一段你的声音，让语音输入只识别你的声音。'
               : enabled
-                ? `Enrolled ${formatRelative(enrolledAt!)} · only your voice is transcribed.`
-                : `Enrolled ${formatRelative(enrolledAt!)} · turn on to filter other voices.`}
+                ? `已录入 ${formatRelative(enrolledAt!)} · 仅转写你的声音。`
+                : `已录入 ${formatRelative(enrolledAt!)} · 开启后过滤其他声音。`}
             {enrolledAt != null && !modelMatches && (
               <span className="voice-lock-toast voice-lock-toast-error"> · model changed, re-enrollment required</span>
             )}
@@ -138,7 +138,7 @@ export function VoiceLockPanel({
           aria-checked={enabled}
           onClick={onToggleEnabled}
           disabled={!enrolled}
-          title={!enrolled ? 'Record your voice first' : enabled ? 'Disable voice lock' : 'Enable voice lock'}
+          title={!enrolled ? '请先录入声纹' : enabled ? '关闭声纹锁' : '开启声纹锁'}
           style={!enrolled ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
         >
           <span className="drawer-toggle-knob" />
@@ -149,18 +149,18 @@ export function VoiceLockPanel({
           className="drawer-toggle"
           onClick={onStartEnroll}
           style={{ width: 'auto', padding: '4px 10px', fontSize: 12 }}
-          title="Record a fresh voice print"
+          title="重新录入声纹"
         >
-          <span style={{ padding: '0 4px' }}>{enrolled ? 'Re-record' : 'Record voice (8s)'}</span>
+          <span style={{ padding: '0 4px' }}>{enrolled ? '重新录入' : '录入声纹（8 秒）'}</span>
         </button>
         {enrolled && (
           <button
             className="drawer-toggle"
             onClick={onClearEnrollment}
             style={{ width: 'auto', padding: '4px 10px', fontSize: 12 }}
-            title="Forget the saved voice print"
+            title="清除已保存的声纹"
           >
-            <span style={{ padding: '0 4px' }}>Clear</span>
+            <span style={{ padding: '0 4px' }}>清除</span>
           </button>
         )}
       </div>

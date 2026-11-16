@@ -73,14 +73,11 @@ export function useAsr({
         });
     };
     probe();
-    // Credentials can be entered while the app is already running (设置 → 语音
-    // → 讯飞 ASR commits on blur). The main process broadcasts after a
-    // successful credentials write; re-probe so the mic unlocks without an
-    // app restart.
-    const unsubscribe = window.vibeMeet.onVoicePrefChanged?.(probe);
+    // Credential writes broadcast so an already-running mic can reconnect.
+    const unsubscribe = window.vibeMeet.voiceInput.onChanged(probe);
     return () => {
       cancelled = true;
-      unsubscribe?.();
+      unsubscribe();
     };
   }, []);
 
