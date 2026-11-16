@@ -23,6 +23,14 @@ const COMMANDS: Record<LocalCliId, { label: string; command: string }> = {
   grok: { label: 'Grok', command: 'grok' },
 };
 
+export function listLocalCliInventory() {
+  return LOCAL_CLI_IDS.map((id) => {
+    const entry = COMMANDS[id];
+    const binaryPath = resolveBinaryFromPath(entry.command);
+    return { id, ...entry, binaryPath, installed: binaryPath !== null };
+  });
+}
+
 export function listLocalClis() {
   return LOCAL_CLI_IDS.flatMap((id) => {
     const entry = COMMANDS[id];

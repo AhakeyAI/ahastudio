@@ -1,5 +1,26 @@
-import { app, ipcMain, nativeTheme } from 'electron';
+import { app, ipcMain, nativeTheme, webContents } from 'electron';
 import { requestMicrophoneAccess } from '../microphone-access.js';
+import { getSettings, updateSettings, type Settings } from '../store.js';
+
+export interface UiPreferencesPatch {
+  handheldMode?: 'auto' | 'desktop' | 'handheld';
+}
+
+export function buildUiPreferencesUpdate(
+  patch: UiPreferencesPatch,
+): { ok: true; next: Partial<Settings> } | { ok: false; error: string } {
+  if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+    return { ok: false, error: 'UI preferences patch must be an object' };
+  }
+  for (const key of Object.keys(patch)) {
+    if (key !== 'handheldMode') return { ok: false, error: `unknown UI preference: ${key}` };
+  }
+  if (!Object.prototype.hasOwnProperty.call(patch, 'handheldMode')) return { ok: true, next: {} };
+  if (patch.handheldMode !== 'auto' && patch.handheldMode !== 'desktop' && patch.handheldMode !== 'handheld') {
+    return { ok: false, error: 'invalid handheldMode' };
+  }
+  return { ok: true, next: { handheldMode: patch.handheldMode } };
+}
 
 export function registerDesktopIpc(): void {
   ipcMain.handle('app:version', () => app.getVersion());
@@ -18,5 +39,21 @@ export function registerDesktopIpc(): void {
       nativeTheme.themeSource = source;
     }
     return { shouldUseDarkColors: nativeTheme.shouldUseDarkColors };
+  });
+
+  ipcMain.handle('settings:get-ui-preferences', () => ({
+    handheldMode: getSettings().handheldMode ?? 'auto',
+  }));
+
+  ipcMain.handle('settings:set-ui-preferences', (_event, patch: UiPreferencesPatch) => {
+    const result = buildUiPreferencesUpdate(patch);
+    if (!result.ok) return { ok: false, error: result.error };
+    try {
+      updateSettings(result.next);
+      for (const wc of webContents.getAllWebContents()) wc.send('settings:ui-preferences-changed');
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
   });
 }

@@ -12,11 +12,19 @@ const __dirname = dirname(__filename);
 
 let settingsWindow: BrowserWindow | null = null;
 
+export type SettingsSection = 'appearance' | 'terminal' | 'voice-input' | 'cli-agents';
+
+export function normalizeSettingsSection(value: unknown): SettingsSection | null {
+  return value === 'appearance' || value === 'terminal' || value === 'voice-input' || value === 'cli-agents'
+    ? value
+    : null;
+}
+
 function getThemeBackgroundColor(): string {
   return nativeTheme.shouldUseDarkColors ? '#1c1c1e' : '#f2f2f7';
 }
 
-function createSettingsWindow(focus?: string | null): BrowserWindow {
+function createSettingsWindow(focus?: SettingsSection | null): BrowserWindow {
   const dev = !app.isPackaged && !!process.env.VITE_DEV_SERVER_URL;
 
   const win = new BrowserWindow({
@@ -126,13 +134,8 @@ function createSettingsWindow(focus?: string | null): BrowserWindow {
 }
 
 export function registerSettingsWindowIpc(): void {
-  // `focus` names a settings section the caller wants brought into view, e.g.
-  // 'backends-unconfigured' from the Participants sidebar's ＋ 新增 button.
-  // Fresh windows receive it as a URL query param (consumed on mount); an
-  // already-open window gets a 'settings:focus-section' push instead —
-  // reloading it would wipe half-typed form state.
-  ipcMain.handle('settings:open-window', (_e, payload?: { focus?: string }) => {
-    const focus = typeof payload?.focus === 'string' && payload.focus ? payload.focus : null;
+  ipcMain.handle('settings:open-window', (_e, payload?: { focus?: unknown }) => {
+    const focus = normalizeSettingsSection(payload?.focus);
     if (settingsWindow && !settingsWindow.isDestroyed()) {
       settingsWindow.focus();
       if (focus) {
