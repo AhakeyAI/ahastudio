@@ -9,7 +9,9 @@ const messageTypeEnum = z.enum(ORCHESTRATION_MESSAGE_TYPES);
 const priorityEnum = z.enum(['low', 'normal', 'high', 'urgent']);
 const taskStatusEnum = z.enum(['pending', 'ready', 'dispatched', 'completed', 'failed', 'blocked']);
 const gateStatusEnum = z.enum(['pending', 'resolved', 'timeout']);
-const workerOutcomeEnum = z.enum(['completed', 'failed', 'blocked', 'escalated', 'abandoned']);
+const workerOutcomeEnum = z
+  .enum(['completed', 'succeeded', 'failed', 'blocked', 'escalated', 'abandoned'])
+  .transform((v) => (v === 'succeeded' ? 'completed' : v));
 
 const runCreateSchema = z.object({
   id: z.string().trim().min(1).optional(),
@@ -100,7 +102,7 @@ const coordinatorStatusSchema = z.object({
 const sendSchema = z.object({
   capability: z.string().trim().min(1).optional(),
   from: z.string().trim().min(1).optional(),
-  to: z.string().trim().min(1),
+  to: z.string().trim().min(1).optional(),
   type: messageTypeEnum.optional(),
   priority: priorityEnum.optional(),
   subject: z.string().trim().min(1),
@@ -113,10 +115,94 @@ const sendSchema = z.object({
 const workerDoneSchema = z.object({
   capability: z.string().trim().min(1).optional(),
   from: z.string().trim().min(1).optional(),
-  taskId: z.string().trim().min(1),
-  dispatchId: z.string().trim().min(1),
+  taskId: z.string().trim().min(1).optional(),
+  dispatchId: z.string().trim().min(1).optional(),
   outcome: workerOutcomeEnum.optional(),
   summary: z.string().optional(),
+});
+
+const workerStartSchema = z.object({
+  from: z.string().trim().min(1).optional(),
+  runId: z.string().trim().min(1).optional(),
+  taskId: z.string().trim().min(1).optional(),
+  spec: z.string().trim().min(1).optional(),
+  taskTitle: z.string().trim().min(1).optional(),
+  displayName: z.string().trim().min(1).optional(),
+  deps: z.array(z.string().trim().min(1)).optional(),
+  priority: priorityEnum.optional(),
+  retryOfDispatchId: z.string().trim().min(1).optional(),
+  cliId: z.string().trim().min(1).optional(),
+  agent: z.string().trim().min(1).optional(),
+  model: z.string().trim().min(1).optional(),
+  effort: z.string().trim().min(1).optional(),
+  terminal: z.string().trim().min(1).optional(),
+  worktree: z.union([z.string().trim(), z.boolean()]).optional(),
+  noWorktree: z.boolean().optional(),
+  branch: z.string().trim().min(1).optional(),
+  baseBranch: z.string().trim().min(1).optional(),
+  name: z.string().trim().min(1).optional(),
+  cwd: z.string().trim().min(1).optional(),
+  callerCwd: z.string().trim().min(1).optional(),
+  keepOpen: z.boolean().optional(),
+});
+
+const workerListSchema = z.object({
+  runId: z.string().trim().min(1).optional(),
+  status: z.enum(['pending', 'dispatched', 'completed', 'failed', 'circuit_broken']).optional(),
+  includeSettled: z.boolean().optional(),
+});
+
+const workerTargetSchema = z.object({
+  dispatchId: z.string().trim().min(1).optional(),
+  worker: z.string().trim().min(1).optional(),
+  taskId: z.string().trim().min(1).optional(),
+});
+
+const workerReadSchema = workerTargetSchema.extend({
+  cursor: z.number().int().min(0).optional(),
+  limit: z.number().int().min(1).max(256_000).optional(),
+  screen: z.boolean().optional(),
+});
+
+const workerKeepOpenSchema = workerTargetSchema.extend({
+  keepOpen: z.boolean().optional(),
+});
+
+const workerReleaseSchema = workerTargetSchema.extend({
+  keepPane: z.boolean().optional(),
+  keepWorktree: z.boolean().optional(),
+  force: z.boolean().optional(),
+});
+
+const workerStopSchema = workerTargetSchema.extend({
+  reason: z.string().optional(),
+  removeWorktree: z.boolean().optional(),
+  force: z.boolean().optional(),
+});
+
+const workerAbandonSchema = workerTargetSchema.extend({
+  reason: z.string().optional(),
+});
+
+const resetSchema = z.object({
+  all: z.boolean().optional(),
+  tasks: z.boolean().optional(),
+  messages: z.boolean().optional(),
+});
+
+const approveSchema = z.object({
+  id: z.string().trim().min(1),
+  dispatchId: z.string().trim().min(1).optional(),
+  from: z.string().trim().min(1).optional(),
+  reason: z.string().optional(),
+  updatedInput: z.record(z.string(), z.unknown()).optional(),
+});
+
+const denySchema = z.object({
+  id: z.string().trim().min(1),
+  dispatchId: z.string().trim().min(1).optional(),
+  from: z.string().trim().min(1).optional(),
+  reason: z.string().optional(),
 });
 
 const checkSchema = z.object({
@@ -200,6 +286,9 @@ const READ_ONLY_ORCHESTRATION_ACTIONS = new Set([
   'task-list',
   'task-show',
   'dispatch-show',
+  'worker-list',
+  'worker-show',
+  'worker-read',
   'coordinator-status',
   'gate-list',
   'inbox',
@@ -210,7 +299,7 @@ export async function dispatchOrchestrationHttpAction(
   service: OrchestrationService,
   action: string,
   rawPayload: unknown,
-  context: { signal: AbortSignal }
+  context: { signal: AbortSignal; callerPaneId?: string | null }
 ): Promise<OrchestrationHttpDispatchResult> {
   const payload =
     typeof rawPayload === 'object' && rawPayload !== null && !Array.isArray(rawPayload)
@@ -218,16 +307,37 @@ export async function dispatchOrchestrationHttpAction(
       : {};
   const formatReceipt = payload.receiptText === true;
   const full = payload.full === true;
+  const requireCallerPane = (): string => {
+    if (!context.callerPaneId) {
+      throw new OrchestrationError(
+        'operation_rejected',
+        'This action requires an authenticated AhaStation terminal. Reopen older terminals or use the application UI.'
+      );
+    }
+    return context.callerPaneId;
+  };
+  const assertWorkerTarget = (target?: string): void => {
+    if (target && context.callerPaneId !== undefined && service.isCoordinatorTerminal(target)) {
+      throw new OrchestrationError('terminal_is_coordinator', 'Choose a worker terminal. This pane coordinates a run.');
+    }
+  };
 
   try {
     let result: unknown;
     switch (action) {
-      case 'run-create':
-        result = service.runCreate(runCreateSchema.parse(payload));
+      case 'run-create': {
+        const parsed = runCreateSchema.parse(payload);
+        const caller = context.callerPaneId;
+        result = service.runCreate(caller ? { ...parsed, from: caller, paneId: caller } : parsed);
         break;
-      case 'run-use':
-        result = service.runUse(runUseSchema.parse(payload));
+      }
+      case 'run-use': {
+        const parsed = runUseSchema.parse(payload);
+        const caller = requireCallerPane();
+        service.assertCanBindRunCoordinator(parsed.id, caller);
+        result = service.runUse({ ...parsed, from: caller, paneId: caller });
         break;
+      }
       case 'run-current':
         result = service.runCurrent(runCurrentSchema.parse(payload));
         break;
@@ -246,12 +356,20 @@ export async function dispatchOrchestrationHttpAction(
       case 'task-show':
         result = service.taskShow(taskShowSchema.parse(payload));
         break;
-      case 'task-update':
-        result = service.taskUpdate(taskUpdateSchema.parse(payload));
+      case 'task-update': {
+        const parsed = taskUpdateSchema.parse(payload);
+        if (context.callerPaneId !== undefined) {
+          service.assertTaskCoordinator(parsed.id, requireCallerPane());
+        }
+        result = service.taskUpdate(parsed);
         break;
-      case 'dispatch':
-        result = await service.dispatchTask(dispatchSchema.parse(payload));
+      }
+      case 'dispatch': {
+        const parsed = dispatchSchema.parse(payload);
+        if (!parsed.dryRun && parsed.inject !== false) assertWorkerTarget(parsed.to);
+        result = await service.dispatchTask(parsed);
         break;
+      }
       case 'dispatch-show':
         result = service.dispatchShow(dispatchShowSchema.parse(payload));
         break;
@@ -268,11 +386,86 @@ export async function dispatchOrchestrationHttpAction(
         result = service.coordinatorStatus(coordinatorStatusSchema.parse(payload));
         break;
       case 'send':
-        result = service.send(sendSchema.parse(payload));
+        result = await service.send(sendSchema.parse(payload));
         break;
       case 'worker-done':
         result = service.workerDone(workerDoneSchema.parse(payload));
         break;
+      case 'task-done':
+        result = service.taskDone(workerDoneSchema.parse(payload));
+        break;
+      case 'task-fail':
+        result = service.taskFail({
+          ...workerDoneSchema.parse(payload),
+          outcome: 'failed',
+        });
+        break;
+      case 'worker-start': {
+        const parsed = workerStartSchema.parse(payload);
+        assertWorkerTarget(parsed.terminal);
+        result = await service.workerStart(parsed);
+        break;
+      }
+      case 'worker-list':
+        result = service.workerList(workerListSchema.parse(payload));
+        break;
+      case 'worker-show':
+        result = service.workerShow(workerTargetSchema.parse(payload));
+        break;
+      case 'worker-read':
+        result = service.workerRead(workerReadSchema.parse(payload));
+        break;
+      case 'worker-keep-open':
+      case 'worker-retain': {
+        const parsed = workerKeepOpenSchema.parse(payload);
+        if (context.callerPaneId !== undefined) {
+          service.assertWorkerController(parsed, requireCallerPane());
+        }
+        result = service.workerKeepOpen(parsed);
+        break;
+      }
+      case 'worker-release': {
+        const parsed = workerReleaseSchema.parse(payload);
+        if (context.callerPaneId !== undefined) {
+          service.assertWorkerController(parsed, requireCallerPane());
+        }
+        result = await service.workerRelease(parsed);
+        break;
+      }
+      case 'worker-stop': {
+        const parsed = workerStopSchema.parse(payload);
+        if (context.callerPaneId !== undefined) {
+          service.assertWorkerController(parsed, requireCallerPane());
+        }
+        result = await service.workerStop(parsed);
+        break;
+      }
+      case 'worker-abandon': {
+        const parsed = workerAbandonSchema.parse(payload);
+        if (context.callerPaneId !== undefined) {
+          service.assertWorkerController(parsed, requireCallerPane());
+        }
+        result = service.workerAbandon(parsed);
+        break;
+      }
+      case 'reset': {
+        const parsed = resetSchema.parse(payload);
+        if (context.callerPaneId !== undefined) {
+          service.assertNotActiveWorker(requireCallerPane());
+        }
+        result = service.reset(parsed);
+        break;
+      }
+      case 'approve': {
+        const caller = requireCallerPane();
+        result = service.approve(approveSchema.parse(payload), caller);
+        break;
+      }
+      case 'deny': {
+        const caller = requireCallerPane();
+        result = service.deny(denySchema.parse(payload), caller);
+        break;
+      }
       case 'check':
         result = await service.check(checkSchema.parse(payload), context.signal);
         break;
@@ -282,15 +475,25 @@ export async function dispatchOrchestrationHttpAction(
       case 'ask':
         result = await service.ask(askSchema.parse(payload), context.signal);
         break;
-      case 'reply':
-        result = service.reply(replySchema.parse(payload));
+      case 'reply': {
+        const parsed = replySchema.parse(payload);
+        if (context.callerPaneId !== undefined) {
+          const caller = requireCallerPane();
+          service.assertCanReply(parsed.id, caller);
+          result = service.reply({ ...parsed, from: caller });
+        } else {
+          result = service.reply(parsed);
+        }
         break;
+      }
       case 'gate-create':
         result = service.gateCreate(gateCreateSchema.parse(payload));
         break;
-      case 'gate-resolve':
-        result = service.gateResolve(gateResolveSchema.parse(payload));
+      case 'gate-resolve': {
+        const caller = requireCallerPane();
+        result = service.gateResolve(gateResolveSchema.parse(payload), caller);
         break;
+      }
       case 'gate-list':
         result = service.gateList(gateListSchema.parse(payload));
         break;
@@ -339,10 +542,12 @@ export async function dispatchOrchestrationHttpAction(
         error.code === 'task_not_found' ||
         error.code === 'dispatch_not_found' ||
         error.code === 'delivery_not_found' ||
-        error.code === 'gate_not_found'
+        error.code === 'gate_not_found' ||
+        error.code === 'approval_not_found'
           ? 404
           : error.code === 'answer_conflict' ||
               error.code === 'gate_already_resolved' ||
+              error.code === 'approval_already_resolved' ||
               error.code === 'worker_busy' ||
               error.code === 'duplicate_run' ||
               error.code === 'duplicate_task' ||

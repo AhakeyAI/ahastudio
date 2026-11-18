@@ -14,7 +14,9 @@ const messageTypeEnum = z.enum(ORCHESTRATION_MESSAGE_TYPES);
 const priorityEnum = z.enum(['low', 'normal', 'high', 'urgent']);
 const taskStatusEnum = z.enum(['pending', 'ready', 'dispatched', 'completed', 'failed', 'blocked']);
 const gateStatusEnum = z.enum(['pending', 'resolved', 'timeout']);
-const workerOutcomeEnum = z.enum(['completed', 'failed', 'blocked', 'escalated', 'abandoned']);
+const workerOutcomeEnum = z
+  .enum(['completed', 'succeeded', 'failed', 'blocked', 'escalated', 'abandoned'])
+  .transform((v) => (v === 'succeeded' ? 'completed' : v));
 
 const getSnapshotSchema = optionalSchema(
   z.object({ runId: nonEmptyId.optional() }).strict()
@@ -137,7 +139,7 @@ const sendSchema = z
   .object({
     capability: nonEmptyId.optional(),
     from: nonEmptyId.optional(),
-    to: nonEmptyId,
+    to: nonEmptyId.optional(),
     type: messageTypeEnum.optional(),
     priority: priorityEnum.optional(),
     subject: z.string().trim().min(1).max(500),
@@ -152,10 +154,133 @@ const workerDoneSchema = z
   .object({
     capability: nonEmptyId.optional(),
     from: nonEmptyId.optional(),
-    taskId: nonEmptyId,
-    dispatchId: nonEmptyId,
+    taskId: nonEmptyId.optional(),
+    dispatchId: nonEmptyId.optional(),
     outcome: workerOutcomeEnum.optional(),
     summary: z.string().max(16_000).optional(),
+  })
+  .strict();
+
+const workerStartSchema = z
+  .object({
+    from: nonEmptyId.optional(),
+    runId: nonEmptyId.optional(),
+    taskId: nonEmptyId.optional(),
+    spec: z.string().trim().min(1).max(64_000).optional(),
+    taskTitle: z.string().trim().min(1).max(200).optional(),
+    displayName: z.string().trim().min(1).max(200).optional(),
+    deps: z.array(nonEmptyId).max(100).optional(),
+    priority: priorityEnum.optional(),
+    retryOfDispatchId: nonEmptyId.optional(),
+    cliId: nonEmptyId.optional(),
+    agent: nonEmptyId.optional(),
+    model: nonEmptyId.optional(),
+    effort: nonEmptyId.optional(),
+    terminal: nonEmptyId.optional(),
+    worktree: z.union([z.string().trim().max(1024), z.boolean()]).optional(),
+    noWorktree: z.boolean().optional(),
+    branch: nonEmptyId.optional(),
+    baseBranch: nonEmptyId.optional(),
+    name: nonEmptyId.optional(),
+    cwd: z.string().trim().min(1).max(1024).optional(),
+    callerCwd: z.string().trim().min(1).max(1024).optional(),
+    keepOpen: z.boolean().optional(),
+  })
+  .strict();
+
+const workerListSchema = optionalSchema(
+  z
+    .object({
+      runId: nonEmptyId.optional(),
+      status: z.enum(['pending', 'dispatched', 'completed', 'failed', 'circuit_broken']).optional(),
+      includeSettled: z.boolean().optional(),
+    })
+    .strict()
+);
+
+const workerTargetSchema = z
+  .object({
+    dispatchId: nonEmptyId.optional(),
+    worker: nonEmptyId.optional(),
+    taskId: nonEmptyId.optional(),
+  })
+  .strict();
+
+const workerReadSchema = z
+  .object({
+    dispatchId: nonEmptyId.optional(),
+    worker: nonEmptyId.optional(),
+    taskId: nonEmptyId.optional(),
+    cursor: z.number().int().min(0).optional(),
+    limit: z.number().int().min(1).max(256_000).optional(),
+    screen: z.boolean().optional(),
+  })
+  .strict();
+
+const workerKeepOpenSchema = z
+  .object({
+    dispatchId: nonEmptyId.optional(),
+    worker: nonEmptyId.optional(),
+    taskId: nonEmptyId.optional(),
+    keepOpen: z.boolean().optional(),
+  })
+  .strict();
+
+const workerReleaseSchema = z
+  .object({
+    dispatchId: nonEmptyId.optional(),
+    worker: nonEmptyId.optional(),
+    taskId: nonEmptyId.optional(),
+    keepPane: z.boolean().optional(),
+    keepWorktree: z.boolean().optional(),
+    force: z.boolean().optional(),
+  })
+  .strict();
+
+const workerStopSchema = z
+  .object({
+    dispatchId: nonEmptyId.optional(),
+    worker: nonEmptyId.optional(),
+    taskId: nonEmptyId.optional(),
+    reason: z.string().max(4_000).optional(),
+    removeWorktree: z.boolean().optional(),
+    force: z.boolean().optional(),
+  })
+  .strict();
+
+const workerAbandonSchema = z
+  .object({
+    dispatchId: nonEmptyId.optional(),
+    worker: nonEmptyId.optional(),
+    taskId: nonEmptyId.optional(),
+    reason: z.string().max(4_000).optional(),
+  })
+  .strict();
+
+const resetSchema = z
+  .object({
+    all: z.boolean().optional(),
+    tasks: z.boolean().optional(),
+    messages: z.boolean().optional(),
+  })
+  .strict();
+
+const approveSchema = z
+  .object({
+    id: nonEmptyId,
+    dispatchId: nonEmptyId.optional(),
+    from: nonEmptyId.optional(),
+    reason: z.string().max(4_000).optional(),
+    updatedInput: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict();
+
+const denySchema = z
+  .object({
+    id: nonEmptyId,
+    dispatchId: nonEmptyId.optional(),
+    from: nonEmptyId.optional(),
+    reason: z.string().max(4_000).optional(),
   })
   .strict();
 
@@ -173,6 +298,7 @@ const checkSchema = optionalSchema(
       ack: nonEmptyId.optional(),
       holdAck: z.boolean().optional(),
       format: z.boolean().optional(),
+      requestId: nonEmptyId.optional(),
     })
     .strict()
 );
@@ -201,8 +327,11 @@ const askSchema = z
     resume: nonEmptyId.optional(),
     dispatchId: nonEmptyId.optional(),
     runId: nonEmptyId.optional(),
+    requestId: nonEmptyId.optional(),
   })
   .strict();
+
+const cancelWaitSchema = z.object({ requestId: nonEmptyId }).strict();
 
 const replySchema = z
   .object({
@@ -283,6 +412,34 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
 
   const act = <T extends Record<string, unknown>>(fn: () => Promise<T> | T) =>
     runAction(fn, () => requireService().waitForPendingWrites());
+
+  const inFlightWaits = new Map<string, AbortController>();
+
+  const runCancellableWait = <T extends Record<string, unknown>>(
+    requestId: string | undefined,
+    sender: {
+      once?: (event: 'destroyed', listener: () => void) => unknown;
+      removeListener?: (event: 'destroyed', listener: () => void) => unknown;
+    },
+    fn: (signal: AbortSignal) => Promise<T>,
+  ) =>
+    act(async () => {
+      const controller = new AbortController();
+      if (requestId) {
+        inFlightWaits.get(requestId)?.abort();
+        inFlightWaits.set(requestId, controller);
+      }
+      const onDestroyed = () => controller.abort();
+      sender.once?.('destroyed', onDestroyed);
+      try {
+        return await fn(controller.signal);
+      } finally {
+        sender.removeListener?.('destroyed', onDestroyed);
+        if (requestId && inFlightWaits.get(requestId) === controller) {
+          inFlightWaits.delete(requestId);
+        }
+      }
+    });
 
   const requireService = () => {
     if (!service) {
@@ -418,11 +575,89 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     handler: (payload) => act(() => requireService().workerDone(payload)),
   });
 
+  handleSecure('orchestration:worker-start', {
+    schema: workerStartSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().workerStart(payload)),
+  });
+
+  handleSecure('orchestration:worker-list', {
+    schema: workerListSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => runAction(() => requireService().workerList(payload)),
+  });
+
+  handleSecure('orchestration:worker-show', {
+    schema: workerTargetSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => runAction(() => ({ ...requireService().workerShow(payload) })),
+  });
+
+  handleSecure('orchestration:worker-read', {
+    schema: workerReadSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => runAction(() => ({ ...requireService().workerRead(payload) })),
+  });
+
+  handleSecure('orchestration:worker-keep-open', {
+    schema: workerKeepOpenSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().workerKeepOpen(payload)),
+  });
+
+  handleSecure('orchestration:worker-release', {
+    schema: workerReleaseSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().workerRelease(payload)),
+  });
+
+  handleSecure('orchestration:worker-stop', {
+    schema: workerStopSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().workerStop(payload)),
+  });
+
+  handleSecure('orchestration:worker-abandon', {
+    schema: workerAbandonSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().workerAbandon(payload)),
+  });
+
+  handleSecure('orchestration:reset', {
+    schema: resetSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().reset(payload)),
+  });
+
+  handleSecure('orchestration:approve', {
+    schema: approveSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().approve(payload)),
+  });
+
+  handleSecure('orchestration:deny', {
+    schema: denySchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().deny(payload)),
+  });
+
   handleSecure('orchestration:check', {
     schema: checkSchema,
     authorize,
     authorizeError,
-    handler: (payload) => act(() => requireService().check(payload)),
+    handler: ({ requestId, ...payload }, event) =>
+      runCancellableWait(requestId, event.sender, (signal) => requireService().check(payload, signal)),
   });
 
   handleSecure('orchestration:inbox', {
@@ -436,7 +671,23 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     schema: askSchema,
     authorize,
     authorizeError,
-    handler: (payload) => act(() => requireService().ask(payload)),
+    handler: ({ requestId, ...payload }, event) =>
+      runCancellableWait(requestId, event.sender, (signal) => requireService().ask(payload, signal)),
+  });
+
+  handleSecure('orchestration:cancel-wait', {
+    schema: cancelWaitSchema,
+    authorize,
+    authorizeError,
+    handler: ({ requestId }) =>
+      runAction(() => {
+        const ctrl = inFlightWaits.get(requestId);
+        if (ctrl) {
+          ctrl.abort();
+          return { cancelled: true };
+        }
+        return { cancelled: false };
+      }),
   });
 
   handleSecure('orchestration:reply', {
@@ -468,7 +719,14 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
   });
 
   if (!service) {
-    return { dispose: () => {} };
+    return {
+      dispose: () => {
+        for (const ctrl of inFlightWaits.values()) {
+          ctrl.abort();
+        }
+        inFlightWaits.clear();
+      },
+    };
   }
 
   const offEvent = service.onEvent((event) => {
@@ -479,10 +737,19 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     ctx.liveWindow()?.webContents.send('orchestration:pane-spawned', event);
   });
 
+  const offClosed = service.onPaneClosed((event) => {
+    ctx.liveWindow()?.webContents.send('orchestration:pane-closed', event);
+  });
+
   return {
     dispose: () => {
+      for (const ctrl of inFlightWaits.values()) {
+        ctrl.abort();
+      }
+      inFlightWaits.clear();
       offEvent();
       offSpawned();
+      offClosed();
     },
   };
 }

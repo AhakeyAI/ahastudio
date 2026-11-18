@@ -14,7 +14,7 @@ import { registerGitIpc } from './ipc/git.js';
 import { registerSettingsIpc } from './ipc/settings.js';
 import { registerSettingsWindowIpc } from './ipc/settings-window.js';
 import { registerShellPtyIpc } from './ipc/shell-pty.js';
-import { LOCAL_CLI_IDS } from './local-cli.js';
+import { isOrchestrationCliId } from './local-cli.js';
 import { registerWorkspaceFsIpc } from './ipc/workspace-fs.js';
 import { getPtyHost } from './pty-host.js';
 import {
@@ -67,6 +67,7 @@ let mainWindow: BrowserWindow | null = null;
 let currentCwd: string | undefined;
 let agentHookServer: AgentHookServer | null = null;
 let disposeAgentIpc: (() => void) | null = null;
+let disposeAgentHooks: (() => void) | null = null;
 let disposeOrchestration: (() => void) | null = null;
 
 const MIME_TYPES: Record<string, string> = {
@@ -215,6 +216,11 @@ app.whenReady().then(async () => {
 
   const agentStatusStore = new AgentStatusStore();
   agentHookServer = new AgentHookServer(agentStatusStore);
+  try {
+    agentHookServer.setPaneKeyFile(join(app.getPath('userData'), 'orchestration-pane.key'));
+  } catch (error) {
+    console.warn('[orchestration] could not retain pane identities across restarts:', error);
+  }
   agentHookServer.setEndpointFile(join(app.getPath('userData'), 'agent-hook-endpoint.json'));
   try {
     const { createOrchestrationBinShim } = await import(
@@ -257,22 +263,45 @@ app.whenReady().then(async () => {
   const { dispatchOrchestrationHttpAction } = await import(
     './orchestration/orchestration-http-router.js'
   );
+  const { dispatchCompanionHttpAction } = await import(
+    './orchestration/companion-cli-router.js'
+  );
+  const { syncBundledOrchestrationSkills } = await import(
+    './orchestration/orchestration-skill-sync.js'
+  );
   const { registerOrchestrationIpc } = await import('./ipc/orchestration.js');
 
-  const isLocalCliId = (id: string) => (LOCAL_CLI_IDS as readonly string[]).includes(id);
+  try {
+    syncBundledOrchestrationSkills();
+  } catch (error) {
+    console.warn('[orchestration] failed to sync bundled orchestration skills:', error);
+  }
+
+  const resolveFallbackCwd = (): string | undefined =>
+    currentCwd ?? shellPtyCtrl.tracker.listTerminals()[0]?.cwd;
+
   const orchestrationStore = OrchestrationStore.forUserDataDir(() => app.getPath('userData'));
   const orchestrationService = new OrchestrationService({
     store: orchestrationStore,
     agentStatusStore,
     writePty: shellPtyCtrl.sendInput,
-    spawnWorkerPty: async ({ cliId, cwd }) => {
-      if (!cliId || !isLocalCliId(cliId)) {
+    spawnWorkerPty: async ({ cliId, cwd, extraArgs }) => {
+      if (!cliId || !isOrchestrationCliId(cliId)) {
         throw new Error(`Worker CLI must be an agent CLI: ${cliId ?? '(none)'}`);
       }
       // The dispatch prompt is typed as soon as this resolves; let the agent UI start first.
-      return shellPtyCtrl.createPty({ cliId, cwd, waitForReady: { quietMs: 1_500, maxMs: 20_000 } });
+      return shellPtyCtrl.createPty({
+        cliId,
+        cwd,
+        extraArgs,
+        waitForReady: { quietMs: 1_500, maxMs: 20_000 },
+      });
     },
-    isAgentCliId: isLocalCliId,
+    closeWorkerPty: (ptyId) => shellPtyCtrl.closePty(ptyId),
+    isPtyAlive: shellPtyCtrl.isPtyAlive,
+    isAgentCliId: isOrchestrationCliId,
+    terminalTracker: shellPtyCtrl.tracker,
+    getDefaultCwd: resolveFallbackCwd,
     turnStartObserveTimeoutMs: 2_000,
     startConfirmationTimeoutMs: 60_000,
     heartbeatTimeoutMs: 300_000,
@@ -283,6 +312,37 @@ app.whenReady().then(async () => {
   agentHookServer.setOrchestrationHandler((action, payload, context) =>
     dispatchOrchestrationHttpAction(orchestrationService, action, payload, context)
   );
+  agentHookServer.setPermissionHookInterceptor((req) =>
+    orchestrationService.handlePermissionHookRequest(req)
+  );
+  agentHookServer.setCompanionHandler((namespace, action, payload, context) =>
+    dispatchCompanionHttpAction(
+      {
+        terminalTracker: shellPtyCtrl.tracker,
+        agentStatusStore,
+        writePty: shellPtyCtrl.sendInput,
+        createPty: shellPtyCtrl.createPty,
+        closePty: shellPtyCtrl.closePty,
+        getDefaultCwd: resolveFallbackCwd,
+        orchestrationService: () => orchestrationService,
+        onWorktreeTerminalSpawned: (ev) => {
+          ipcCtx.liveWindow()?.webContents.send('orchestration:pane-spawned', {
+            ptyId: ev.ptyId,
+            runId: '',
+            taskId: ev.branch ?? 'worktree',
+            cwd: ev.cwd,
+            worktreePath: ev.cwd,
+            branch: ev.branch,
+            cliId: ev.cliId,
+          });
+        },
+      },
+      namespace,
+      action,
+      payload,
+      context
+    )
+  );
   const orchestrationIpc = registerOrchestrationIpc(ipcCtx);
   const offPtyExit = shellPtyCtrl.onPtyExit((ptyId) => {
     orchestrationService.markPtyExited(ptyId);
@@ -292,7 +352,7 @@ app.whenReady().then(async () => {
     orchestrationIpc.dispose();
     orchestrationService.dispose();
   };
-  registerAgentHooksIpc();
+  disposeAgentHooks = registerAgentHooksIpc().dispose;
   registerGitIpc(ipcCtx);
   registerWorkspaceFsIpc(ipcCtx);
   registerDialogIpc(ipcCtx);
@@ -325,6 +385,10 @@ app.on('before-quit', () => {
   try {
     disposeOrchestration?.();
     disposeOrchestration = null;
+  } catch { /* ignore */ }
+  try {
+    disposeAgentHooks?.();
+    disposeAgentHooks = null;
   } catch { /* ignore */ }
   try {
     disposeAgentIpc?.();

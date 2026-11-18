@@ -6,10 +6,13 @@ export interface BuildDispatchPreambleInput {
   workerHandle: string;
   runId?: string;
   worktreePath?: string | null;
+  branch?: string | null;
   canDispatchSubWorkers?: boolean;
   cliCommand?: string;
   /** Per-dispatch worker credential; only ever written to the assignee's own PTY. */
   dispatchCapability?: string | null;
+  isFollowUp?: boolean;
+  previousDispatchId?: string | null;
 }
 
 /**
@@ -59,18 +62,24 @@ export function buildDispatchPreamble(input: BuildDispatchPreambleInput): string
           `[Specification truncated. Read the full text with: ${cli} orchestration task-show --id ${input.taskId} --json]`,
         ];
 
+  const headerTitle = input.isFollowUp
+    ? `[ORCHESTRATION FOLLOW-UP DISPATCH ${input.dispatchId}]`
+    : `[ORCHESTRATION DISPATCH ${input.dispatchId}]`;
+
   const lines: string[] = [
-    `[ORCHESTRATION DISPATCH ${input.dispatchId}]`,
+    headerTitle,
     `Task: ${input.taskId}`,
+    ...(input.previousDispatchId ? [`Previous Dispatch: ${input.previousDispatchId}`] : []),
     ...(input.runId ? [`Run: ${input.runId}`] : []),
     `Worker Handle: ${input.workerHandle}`,
     `Coordinator Handle: ${input.coordinatorHandle}`,
     ...(input.dispatchCapability ? [`Dispatch Capability: ${input.dispatchCapability}`] : []),
     ...(input.worktreePath ? [`Workspace CWD: ${input.worktreePath}`] : []),
+    ...(input.branch ? [`Git Branch: ${input.branch}`] : []),
     '',
-    '=== TASK SPECIFICATION ===',
+    input.isFollowUp ? '=== FOLLOW-UP INSTRUCTIONS ===' : '=== TASK SPECIFICATION ===',
     ...specLines,
-    '=== END TASK SPECIFICATION ===',
+    input.isFollowUp ? '=== END FOLLOW-UP INSTRUCTIONS ===' : '=== END TASK SPECIFICATION ===',
     '',
     '=== ORCHESTRATION PROTOCOL ===',
     `- Ask coordinator if requirements are ambiguous (waits for reply):`,
@@ -81,17 +90,17 @@ export function buildDispatchPreamble(input: BuildDispatchPreambleInput): string
     `  ${cli} orchestration check ${fromFlag}`,
     `- Report completion or failure when done (REQUIRED):`,
     `  ${cli} orchestration worker-done ${fromFlag} --task ${input.taskId} --dispatch ${input.dispatchId} --outcome completed --summary "<brief summary>"${capabilityFlag}`,
-    `  (Valid --outcome values: completed | failed | blocked | escalated | abandoned)`,
+    `  (Aliases: \`${cli} orchestration task-done\` / \`${cli} orchestration task-fail\`; valid --outcome values: completed | failed | blocked | escalated | abandoned)`,
     ...(input.dispatchCapability
       ? [
-          `- The dispatch capability above is your per-dispatch credential. Pass it with --capability for worker-done, ask, and heartbeat sends; it is required, not optional.`,
+          `- The dispatch capability above is your per-dispatch credential. Pass it with --capability for worker-done, task-done, task-fail, ask, and heartbeat sends; it is required, not optional.`,
         ]
       : []),
   ];
 
   if (input.canDispatchSubWorkers) {
     lines.push(
-      `- Sub-workers permitted: you may create dependent subtasks via \`${cli} orchestration task-create\` if needed.`
+      `- Sub-workers permitted: you may create dependent subtasks via \`${cli} orchestration task-create\` or launch a helper worker via \`${cli} orchestration worker-start ${fromFlag} --spec "<subtask>"\`.`
     );
   }
 

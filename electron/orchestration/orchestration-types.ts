@@ -68,6 +68,40 @@ export type OrchestrationStartObservation =
   | 'unobserved'
   | 'unsupported';
 
+export type OrchestrationDispatchStage =
+  | 'starting'
+  | 'working'
+  | 'waiting_permission'
+  | 'waiting_input'
+  | 'awaiting_review'
+  | 'done'
+  | 'failed'
+  | 'released'
+  | 'stopped';
+
+export type WorkerTurnStopReason = 'finished' | 'errored' | 'needs-input' | 'exited' | 'lost';
+
+export type WorkerApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired';
+
+export interface WorkerApprovalPayload {
+  approvalId: string;
+  dispatchId: string;
+  taskId: string;
+  runId: string;
+  workerHandle: string;
+  ptyId: string;
+  provider: string;
+  eventName: string;
+  toolName: string;
+  toolInput?: string;
+  message?: string;
+  status: WorkerApprovalStatus;
+  createdAt: string;
+  resolvedAt?: string | null;
+  resolvedBy?: string | null;
+  reason?: string | null;
+}
+
 export type OrchestrationErrorCode =
   | 'invalid_argument'
   | 'not_found'
@@ -89,6 +123,9 @@ export type OrchestrationErrorCode =
   | 'delivery_not_found'
   | 'gate_not_found'
   | 'gate_already_resolved'
+  | 'approval_not_found'
+  | 'approval_already_resolved'
+  | 'worktree_failed'
   | 'coordinator_already_running'
   | 'no_agent_detected'
   | 'terminal_is_coordinator'
@@ -142,10 +179,26 @@ export interface OrchestrationDispatchRecord {
   runId: string;
   creator: string;
   creatorRunId: string | null;
+  creatorDispatchId?: string | null;
+  parentPaneId?: string | null;
   depth: number;
   assigneeHandle: string;
   assigneePaneId: string | null;
   processIncarnation: string | null;
+  worktreePath?: string | null;
+  branch?: string | null;
+  ownsWorktree?: boolean;
+  ownsPane?: boolean;
+  cliId?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  processGeneration?: number;
+  stage?: OrchestrationDispatchStage;
+  turnStopReportedGeneration?: number | null;
+  followUpOfDispatchId?: string | null;
+  retained?: boolean;
+  releasedAt?: string | null;
+  archivedOutput?: string | null;
   status: OrchestrationDispatchStatus;
   failureCount: number;
   lastFailureReason: string | null;
@@ -308,6 +361,7 @@ export interface OrchestrationPersistedState {
   coordinatorRuns: OrchestrationCoordinatorRunRecord[];
   /** Per-dispatch worker credentials, keyed by dispatch id. Never part of the UI snapshot. */
   capabilities?: Record<string, string>;
+  deferredDispatchPrompts?: Record<string, { ptyId: string; prompt: string; submit: boolean }>;
 }
 
 export interface OrchestrationSnapshot {
@@ -317,6 +371,7 @@ export interface OrchestrationSnapshot {
   gates: OrchestrationGateRecord[];
   messages: OrchestrationMessageRecord[];
   questions: OrchestrationQuestionRecord[];
+  openApprovals?: WorkerApprovalPayload[];
   coordinatorRuns: OrchestrationCoordinatorRunRecord[];
   activeCoordinatorRun: OrchestrationCoordinatorRunRecord | null;
   currentRunByConsumer: Record<string, string>;

@@ -2,8 +2,9 @@ import type { BrowserWindow } from 'electron';
 import type { AgentStatusStore } from '../agent/agent-status-store.js';
 import type { PtyWriteFn } from '../agent/agent-prompt-delivery.js';
 import type { DaemonSessionConfig } from '../daemon-terminal-sessions.js';
-import type { LocalCliId } from '../local-cli.js';
+import type { OrchestrationCliId } from '../local-cli.js';
 import type { OrchestrationService } from '../orchestration/orchestration-service.js';
+import type { TerminalRuntimeTracker } from '../terminal-runtime-tracker.js';
 
 export interface IpcContext {
   liveWindow: () => BrowserWindow | null;
@@ -11,7 +12,8 @@ export interface IpcContext {
   daemon?: DaemonSessionConfig;
   userDataDir?: () => string;
   agentStatusStore?: AgentStatusStore;
-  agentHookEnv?: (ptyId: string, cliId?: LocalCliId) => Record<string, string>;
+  agentHookEnv?: (ptyId: string, cliId?: OrchestrationCliId) => Record<string, string>;
   sendPtyInput?: PtyWriteFn;
   orchestrationService?: OrchestrationService;
+  terminalTracker?: TerminalRuntimeTracker;
 }

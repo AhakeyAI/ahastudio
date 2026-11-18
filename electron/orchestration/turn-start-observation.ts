@@ -24,6 +24,7 @@ export type DeliverAndObserveAgentTurnResult =
       bytesWritten: number;
       startObservation: OrchestrationStartObservation;
       observationReason?: string;
+      promptDeferred?: boolean;
     }
   | {
       ok: false;
@@ -192,6 +193,19 @@ export async function deliverAndObserveAgentTurn(
   opts: DeliverAndObserveAgentTurnOptions,
 ): Promise<DeliverAndObserveAgentTurnResult> {
   const baseline = captureTurnActivityBaseline(opts.agentStatusStore, opts.ptyId);
+
+  if (baseline?.state === 'waiting') {
+    const reason =
+      opts.agentStatusStore.get(opts.ptyId)?.message ??
+      'Agent is waiting for confirmation before prompt delivery';
+    return {
+      ok: true,
+      bytesWritten: 0,
+      startObservation: 'permission',
+      observationReason: reason,
+      promptDeferred: true,
+    };
+  }
 
   let writeRes: { ok: true; bytesWritten: number } | { ok: false; error: string };
   try {

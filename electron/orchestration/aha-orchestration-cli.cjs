@@ -7,11 +7,14 @@ const https = require('node:https');
 
 const TWO_WORD_COMMANDS = {
   run: ['create', 'use', 'current', 'list', 'show'],
-  task: ['create', 'list', 'update', 'show'],
+  task: ['create', 'list', 'update', 'show', 'done', 'fail'],
   gate: ['create', 'resolve', 'list'],
   dispatch: ['show'],
+  worker: ['start', 'list', 'show', 'read', 'keep-open', 'retain', 'release', 'stop', 'abandon', 'done'],
   coordinator: ['start', 'stop', 'tick', 'status'],
 };
+
+const COMPANION_NAMESPACES = new Set(['terminal', 'worktree', 'skills']);
 
 const BOOLEAN_FLAGS = new Set([
   'json',
@@ -27,22 +30,57 @@ const BOOLEAN_FLAGS = new Set([
   'autoSpawn',
   'autoSpawnWorkers',
   'format',
+  'screen',
+  'keepOpen',
+  'keepPane',
+  'keepWorktree',
+  'removeWorktree',
+  'force',
+  'submit',
+  'enter',
+  'includeExited',
+  'includeSettled',
+  'detach',
+  'tasks',
+  'messages',
   'help',
+]);
+
+const FREE_TEXT_FLAGS = new Set([
+  'spec',
+  'body',
+  'subject',
+  'reason',
+  'summary',
+  'question',
+  'resolution',
+  'text',
+  'objective',
+  'title',
+  'taskTitle',
+  'displayName',
 ]);
 
 function parseCliArgs(argv) {
   let args = argv.slice();
+  let namespace = 'orchestration';
+
   if (args[0] === 'orchestration' || args[0] === 'orch') {
     args = args.slice(1);
+  } else if (COMPANION_NAMESPACES.has(args[0])) {
+    namespace = args.shift();
   }
+
   if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
-    return { help: true };
+    return { help: true, namespace };
   }
 
   let verb = args.shift();
-  const subVerbs = TWO_WORD_COMMANDS[verb];
-  if (subVerbs && args.length > 0 && !args[0].startsWith('-') && subVerbs.includes(args[0])) {
-    verb = `${verb}-${args.shift()}`;
+  if (namespace === 'orchestration') {
+    const subVerbs = TWO_WORD_COMMANDS[verb];
+    if (subVerbs && args.length > 0 && !args[0].startsWith('-') && subVerbs.includes(args[0])) {
+      verb = `${verb}-${args.shift()}`;
+    }
   }
 
   const flags = {};
@@ -58,7 +96,11 @@ function parseCliArgs(argv) {
       continue;
     }
     if (token.startsWith('--no-')) {
-      flags[toCamel(token.slice(5))] = false;
+      const noKey = toCamel(token.slice(5));
+      flags[noKey] = false;
+      if (noKey === 'worktree') {
+        flags.noWorktree = true;
+      }
       continue;
     }
     const eqIndex = token.indexOf('=');
@@ -76,7 +118,9 @@ function parseCliArgs(argv) {
       continue;
     }
     const next = args[i + 1];
-    if (next !== undefined && !next.startsWith('--')) {
+    const acceptsDashPrefix =
+      FREE_TEXT_FLAGS.has(key) || (namespace === 'worktree' && key === 'prompt');
+    if (next !== undefined && (acceptsDashPrefix || !next.startsWith('--'))) {
       flags[key] = next;
       i += 1;
     } else {
@@ -87,7 +131,7 @@ function parseCliArgs(argv) {
     }
   }
 
-  return { help: false, verb, flags, positional };
+  return { help: false, namespace, verb, flags, positional };
 }
 
 function toCamel(kebab) {
@@ -113,6 +157,69 @@ function splitCsv(value) {
   return items.length > 0 ? items : undefined;
 }
 
+function parseOptionsList(value) {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        const cleaned = parsed.map((item) => String(item).trim()).filter(Boolean);
+        return cleaned.length > 0 ? cleaned : undefined;
+      }
+    } catch {
+      // Fall through to CSV split.
+    }
+  }
+  return splitCsv(value);
+}
+
+function readSpecFile(filePath) {
+  const target = String(filePath);
+  if (target === '-') {
+    return fs.readFileSync(0, 'utf8');
+  }
+  return fs.readFileSync(target, 'utf8');
+}
+
+function buildStructuredSendPayload(flags) {
+  const taskId = flags.taskId ?? flags.task;
+  const dispatchId = flags.dispatchId ?? flags.dispatch;
+  const outcome = flags.outcome;
+  const filesModified = flags.filesModified;
+  const reportPath = flags.reportPath;
+  const phase = flags.phase;
+  const hasStructured =
+    taskId !== undefined ||
+    dispatchId !== undefined ||
+    outcome !== undefined ||
+    filesModified !== undefined ||
+    reportPath !== undefined ||
+    phase !== undefined;
+  if (!hasStructured) {
+    return flags.payload !== undefined ? String(flags.payload) : undefined;
+  }
+  if (flags.payload !== undefined) {
+    throw new Error('Use either --payload or structured payload flags (--task-id/--dispatch-id/--outcome), not both.');
+  }
+  if (outcome !== undefined && flags.type !== 'worker_done') {
+    throw new Error('--outcome is only valid with --type worker_done.');
+  }
+  const structured = {};
+  if (taskId) structured.taskId = String(taskId);
+  if (dispatchId) structured.dispatchId = String(dispatchId);
+  if (outcome) {
+    const norm = String(outcome).trim();
+    structured.outcome = norm === 'succeeded' ? 'completed' : norm;
+  }
+  if (filesModified) {
+    structured.filesModified = splitCsv(String(filesModified)) ?? [];
+  }
+  if (reportPath) structured.reportPath = String(reportPath);
+  if (phase) structured.phase = String(phase);
+  return JSON.stringify(structured);
+}
+
 function toNumber(value) {
   if (typeof value === 'number') return value;
   if (typeof value === 'string' && value.trim() !== '') {
@@ -126,7 +233,7 @@ function toNumber(value) {
  * Terminals survive app restarts with their original env, but the server port/token change.
  * The app keeps the live endpoint in a file whose path is stable, so prefer it when present.
  */
-function readEndpointFile() {
+function readEndpointFile(namespace = 'orchestration') {
   const file = process.env.AHA_AGENT_HOOK_ENDPOINT_FILE;
   if (!file) return null;
   try {
@@ -134,27 +241,29 @@ function readEndpointFile() {
     const port = Number(data && data.port);
     if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
     if (typeof data.token !== 'string' || !/^[a-f0-9]{16,128}$/i.test(data.token)) return null;
-    return { baseUrl: `http://127.0.0.1:${port}/orchestration`, token: data.token };
+    return { baseUrl: `http://127.0.0.1:${port}/${namespace}`, token: data.token };
   } catch {
     return null;
   }
 }
 
-function resolveEndpoint() {
-  const fromFile = readEndpointFile();
+function resolveEndpoint(namespace = 'orchestration') {
+  const fromFile = readEndpointFile(namespace);
   if (fromFile) return fromFile;
-  return { baseUrl: resolveBaseUrl(), token: process.env.AHA_AGENT_HOOK_TOKEN || '' };
+  return { baseUrl: resolveBaseUrl(namespace), token: process.env.AHA_AGENT_HOOK_TOKEN || '' };
 }
 
-function resolveBaseUrl() {
+function resolveBaseUrl(namespace = 'orchestration') {
   if (process.env.AHA_ORCHESTRATION_URL) {
-    return process.env.AHA_ORCHESTRATION_URL.replace(/\/+$/, '');
+    const orchUrl = process.env.AHA_ORCHESTRATION_URL.replace(/\/+$/, '');
+    if (namespace === 'orchestration') return orchUrl;
+    return orchUrl.replace(/\/orchestration$/, '') + `/${namespace}`;
   }
   if (process.env.AHA_AGENT_HOOK_URL) {
-    return process.env.AHA_AGENT_HOOK_URL.replace(/\/hook\/?$/, '') + '/orchestration';
+    return process.env.AHA_AGENT_HOOK_URL.replace(/\/hook\/?$/, '') + `/${namespace}`;
   }
   if (process.env.AHA_AGENT_HOOK_PORT) {
-    return `http://127.0.0.1:${process.env.AHA_AGENT_HOOK_PORT}/orchestration`;
+    return `http://127.0.0.1:${process.env.AHA_AGENT_HOOK_PORT}/${namespace}`;
   }
   throw new Error(
     'Missing orchestration endpoint env (AHA_ORCHESTRATION_URL or AHA_AGENT_HOOK_URL).'
@@ -177,6 +286,12 @@ function postJson(urlStr, token, bodyObj) {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(bodyText),
           ...(token ? { 'x-aha-agent-hook-token': token } : {}),
+          ...(process.env.AHA_TERMINAL_ID && process.env.AHA_ORCHESTRATION_PANE_TOKEN
+            ? {
+                'x-aha-pty-id': process.env.AHA_TERMINAL_ID,
+                'x-aha-pane-token': process.env.AHA_ORCHESTRATION_PANE_TOKEN,
+              }
+            : {}),
         },
       },
       (res) => {
@@ -215,11 +330,160 @@ function postJson(urlStr, token, bodyObj) {
   });
 }
 
-function buildPayload(verb, flags, positional) {
+function buildCompanionPayload(namespace, verb, flags, positional) {
   const defaultFrom =
     typeof flags.from === 'string' ? flags.from : process.env.AHA_TERMINAL_ID || undefined;
+  const wantJson = flags.json === true;
+
+  if (namespace === 'terminal') {
+    switch (verb) {
+      case 'list':
+        return {
+          action: 'list',
+          payload: {
+            ...(flags.includeExited !== undefined
+              ? { includeExited: toBoolean(flags.includeExited) }
+              : {}),
+            receiptText: !wantJson,
+          },
+        };
+      case 'show':
+        return {
+          action: 'show',
+          payload: {
+            id: String(
+              flags.id ?? flags.terminal ?? positional[0] ?? process.env.AHA_TERMINAL_ID ?? ''
+            ),
+            receiptText: !wantJson,
+          },
+        };
+      case 'read':
+        return {
+          action: 'read',
+          payload: {
+            id: String(
+              flags.id ?? flags.terminal ?? positional[0] ?? process.env.AHA_TERMINAL_ID ?? ''
+            ),
+            ...(flags.cursor !== undefined ? { cursor: toNumber(flags.cursor) } : {}),
+            ...(flags.limit !== undefined ? { limit: toNumber(flags.limit) } : {}),
+            ...(flags.screen !== undefined ? { screen: toBoolean(flags.screen) } : {}),
+            receiptText: !wantJson,
+          },
+        };
+      case 'send': {
+        const submitRaw = flags.submit !== undefined ? flags.submit : flags.enter;
+        return {
+          action: 'send',
+          payload: {
+            id: String(flags.id ?? flags.to ?? flags.terminal ?? positional[0] ?? ''),
+            text: String(flags.text ?? flags.body ?? positional.slice(1).join(' ')),
+            ...(submitRaw !== undefined ? { submit: toBoolean(submitRaw) } : {}),
+            ...(defaultFrom ? { from: defaultFrom } : {}),
+            receiptText: !wantJson,
+          },
+        };
+      }
+      case 'wait':
+        return {
+          action: 'wait',
+          payload: {
+            id: String(
+              flags.id ?? flags.terminal ?? positional[0] ?? process.env.AHA_TERMINAL_ID ?? ''
+            ),
+            ...(flags.for ? { for: String(flags.for) } : {}),
+            ...(flags.timeoutMs !== undefined ? { timeoutMs: toNumber(flags.timeoutMs) } : {}),
+            ...(flags.idleMs !== undefined ? { idleMs: toNumber(flags.idleMs) } : {}),
+            receiptText: !wantJson,
+          },
+        };
+      default:
+        throw new Error(`Unknown terminal command: ${verb}`);
+    }
+  }
+
+  if (namespace === 'worktree') {
+    switch (verb) {
+      case 'list':
+        return {
+          action: 'list',
+          payload: {
+            ...(flags.cwd ? { cwd: String(flags.cwd) } : { cwd: process.cwd() }),
+            receiptText: !wantJson,
+          },
+        };
+      case 'create':
+        return {
+          action: 'create',
+          payload: {
+            ...(flags.cwd ? { cwd: String(flags.cwd) } : { cwd: process.cwd() }),
+            ...(flags.path ? { path: String(flags.path) } : {}),
+            ...(flags.branch ? { branch: String(flags.branch) } : {}),
+            ...(flags.baseBranch ? { baseBranch: String(flags.baseBranch) } : {}),
+            ...(flags.name ? { name: String(flags.name) } : {}),
+            ...(flags.agent || flags.cli ? { agent: String(flags.agent ?? flags.cli) } : {}),
+            ...(flags.model ? { model: String(flags.model) } : {}),
+            ...(flags.effort ? { effort: String(flags.effort) } : {}),
+            ...(flags.prompt !== undefined ? { prompt: String(flags.prompt) } : {}),
+            ...(flags.detach !== undefined ? { detach: toBoolean(flags.detach) } : {}),
+            receiptText: !wantJson,
+          },
+        };
+      case 'remove':
+      case 'rm':
+      case 'delete':
+        return {
+          action: 'remove',
+          payload: {
+            ...(flags.cwd ? { cwd: String(flags.cwd) } : { cwd: process.cwd() }),
+            path: String(flags.path ?? flags.worktree ?? positional[0] ?? ''),
+            ...(flags.force !== undefined ? { force: toBoolean(flags.force) } : {}),
+            receiptText: !wantJson,
+          },
+        };
+      default:
+        throw new Error(`Unknown worktree command: ${verb}`);
+    }
+  }
+
+  // namespace === 'skills'
+  switch (verb) {
+    case 'list':
+      return { action: 'list', payload: { receiptText: !wantJson } };
+    case 'get':
+      return {
+        action: 'get',
+        payload: {
+          ...(flags.name || positional[0] ? { name: String(flags.name ?? positional[0]) } : {}),
+          ...(flags.reference || flags.ref
+            ? { reference: String(flags.reference ?? flags.ref) }
+            : {}),
+          ...(flags.full !== undefined ? { full: toBoolean(flags.full) } : {}),
+          receiptText: !wantJson,
+        },
+      };
+    case 'sync':
+      return {
+        action: 'sync',
+        payload: {
+          ...(flags.homeDir ? { homeDir: String(flags.homeDir) } : {}),
+          receiptText: !wantJson,
+        },
+      };
+    default:
+      throw new Error(`Unknown skills command: ${verb}`);
+  }
+}
+
+function buildPayload(verb, flags, positional, namespace = 'orchestration') {
+  if (namespace !== 'orchestration') {
+    return buildCompanionPayload(namespace, verb, flags, positional);
+  }
+
+  const defaultFrom =
+    typeof flags.from === 'string' ? flags.from : process.env.AHA_TERMINAL_ID || undefined;
+  const explicitCap = flags.capability ?? flags.dispatchCapability;
   const capability =
-    typeof flags.capability === 'string' ? flags.capability : process.env.AHA_DISPATCH_CAPABILITY || undefined;
+    typeof explicitCap === 'string' ? explicitCap : process.env.AHA_DISPATCH_CAPABILITY || undefined;
   const withCapability = (obj) => (capability ? { ...obj, capability } : obj);
   const runId = typeof flags.run === 'string' ? flags.run : flags.runId;
   const wantJson = flags.json === true;
@@ -258,20 +522,31 @@ function buildPayload(verb, flags, positional) {
         action: 'run-show',
         payload: { id: String(flags.id ?? positional[0] ?? '') },
       };
-    case 'task-create':
+    case 'task-create': {
+      if (flags.spec !== undefined && flags.specFile !== undefined) {
+        throw new Error('Cannot combine --spec and --spec-file.');
+      }
+      const specText =
+        flags.specFile !== undefined
+          ? readSpecFile(flags.specFile)
+          : (flags.spec ?? positional.join(' '));
       return {
         action: 'task-create',
         payload: {
           ...(flags.id ? { id: String(flags.id) } : {}),
           ...(runId ? { runId: String(runId) } : {}),
           ...(defaultFrom ? { from: defaultFrom } : {}),
-          spec: String(flags.spec ?? positional.join(' ')),
-          ...(flags.title ? { taskTitle: String(flags.title) } : {}),
+          spec: String(specText),
+          ...(flags.title || flags.taskTitle
+            ? { taskTitle: String(flags.title ?? flags.taskTitle) }
+            : {}),
+          ...(flags.displayName ? { displayName: String(flags.displayName) } : {}),
           ...(flags.priority ? { priority: String(flags.priority) } : {}),
           ...(flags.deps ? { deps: splitCsv(String(flags.deps)) } : {}),
-          ...(flags.worktree ? { worktreePath: String(flags.worktree) } : {}),
+          ...(typeof flags.worktree === 'string' ? { worktreePath: String(flags.worktree) } : {}),
         },
       };
+    }
     case 'task-list':
       return {
         action: 'task-list',
@@ -318,14 +593,186 @@ function buildPayload(verb, flags, positional) {
           ...(flags.preamble !== undefined ? { preamble: toBoolean(flags.preamble) } : {}),
         },
       };
+    case 'worker-start': {
+      if (flags.spec !== undefined && flags.specFile !== undefined) {
+        throw new Error('Cannot combine --spec and --spec-file.');
+      }
+      const workerCli = flags.agent ?? flags.cli ?? flags.cliId;
+      const specVal =
+        flags.specFile !== undefined
+          ? readSpecFile(flags.specFile)
+          : (flags.spec ??
+            (positional.length > 0 && !flags.task && !flags.taskId
+              ? positional.join(' ')
+              : undefined));
+      return {
+        action: 'worker-start',
+        payload: {
+          ...(defaultFrom ? { from: defaultFrom } : {}),
+          ...(runId ? { runId: String(runId) } : {}),
+          ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
+          ...(specVal !== undefined && String(specVal).length > 0 ? { spec: String(specVal) } : {}),
+          ...(flags.title || flags.taskTitle ? { taskTitle: String(flags.title ?? flags.taskTitle) } : {}),
+          ...(flags.displayName ? { displayName: String(flags.displayName) } : {}),
+          ...(flags.name ? { name: String(flags.name) } : {}),
+          ...(flags.deps ? { deps: splitCsv(String(flags.deps)) } : {}),
+          ...(flags.priority ? { priority: String(flags.priority) } : {}),
+          ...(flags.retryOf ? { retryOfDispatchId: String(flags.retryOf) } : {}),
+          ...(workerCli ? { cliId: String(workerCli) } : {}),
+          ...(flags.model ? { model: String(flags.model) } : {}),
+          ...(flags.effort ? { effort: String(flags.effort) } : {}),
+          ...(flags.terminal ? { terminal: String(flags.terminal) } : {}),
+          ...(flags.worktree !== undefined ? { worktree: flags.worktree } : {}),
+          ...(flags.noWorktree ? { noWorktree: true } : {}),
+          ...(flags.branch ? { branch: String(flags.branch) } : {}),
+          ...(flags.baseBranch ? { baseBranch: String(flags.baseBranch) } : {}),
+          ...(flags.cwd ? { cwd: String(flags.cwd) } : {}),
+          callerCwd: process.cwd(),
+          ...(flags.keepOpen !== undefined ? { keepOpen: toBoolean(flags.keepOpen) } : {}),
+          receiptText: !wantJson,
+          full,
+        },
+      };
+    }
+    case 'worker-list':
+      return {
+        action: 'worker-list',
+        payload: {
+          ...(runId ? { runId: String(runId) } : {}),
+          ...(flags.status ? { status: String(flags.status) } : {}),
+          ...(flags.includeSettled !== undefined
+            ? { includeSettled: toBoolean(flags.includeSettled) }
+            : {}),
+        },
+      };
+    case 'worker-show':
+      return {
+        action: 'worker-show',
+        payload: {
+          ...(flags.dispatch || flags.dispatchId || flags.id
+            ? { dispatchId: String(flags.dispatch ?? flags.dispatchId ?? flags.id) }
+            : positional[0]
+              ? { dispatchId: String(positional[0]) }
+              : {}),
+          ...(flags.worker ? { worker: String(flags.worker) } : {}),
+          ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
+          receiptText: !wantJson,
+          full,
+        },
+      };
+    case 'worker-read':
+      return {
+        action: 'worker-read',
+        payload: {
+          ...(flags.dispatch || flags.dispatchId || flags.id
+            ? { dispatchId: String(flags.dispatch ?? flags.dispatchId ?? flags.id) }
+            : positional[0]
+              ? { dispatchId: String(positional[0]) }
+              : {}),
+          ...(flags.worker ? { worker: String(flags.worker) } : {}),
+          ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
+          ...(flags.cursor !== undefined ? { cursor: toNumber(flags.cursor) } : {}),
+          ...(flags.limit !== undefined ? { limit: toNumber(flags.limit) } : {}),
+          ...(flags.screen !== undefined ? { screen: toBoolean(flags.screen) } : {}),
+          receiptText: !wantJson,
+          full,
+        },
+      };
+    case 'worker-keep-open':
+    case 'worker-retain':
+      return {
+        action: 'worker-keep-open',
+        payload: {
+          ...(flags.dispatch || flags.dispatchId || flags.id
+            ? { dispatchId: String(flags.dispatch ?? flags.dispatchId ?? flags.id) }
+            : positional[0]
+              ? { dispatchId: String(positional[0]) }
+              : {}),
+          ...(flags.worker ? { worker: String(flags.worker) } : {}),
+          ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
+          ...(flags.keepOpen !== undefined ? { keepOpen: toBoolean(flags.keepOpen) } : {}),
+        },
+      };
+    case 'worker-release':
+      return {
+        action: 'worker-release',
+        payload: {
+          ...(flags.dispatch || flags.dispatchId || flags.id
+            ? { dispatchId: String(flags.dispatch ?? flags.dispatchId ?? flags.id) }
+            : positional[0]
+              ? { dispatchId: String(positional[0]) }
+              : {}),
+          ...(flags.worker ? { worker: String(flags.worker) } : {}),
+          ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
+          ...(flags.keepPane !== undefined ? { keepPane: toBoolean(flags.keepPane) } : {}),
+          ...(flags.keepWorktree !== undefined
+            ? { keepWorktree: toBoolean(flags.keepWorktree) }
+            : {}),
+          ...(flags.force !== undefined ? { force: toBoolean(flags.force) } : {}),
+          receiptText: !wantJson,
+          full,
+        },
+      };
+    case 'worker-stop':
+      return {
+        action: 'worker-stop',
+        payload: {
+          ...(flags.dispatch || flags.dispatchId || flags.id
+            ? { dispatchId: String(flags.dispatch ?? flags.dispatchId ?? flags.id) }
+            : positional[0]
+              ? { dispatchId: String(positional[0]) }
+              : {}),
+          ...(flags.worker ? { worker: String(flags.worker) } : {}),
+          ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
+          ...(flags.reason ? { reason: String(flags.reason) } : {}),
+          ...(flags.removeWorktree !== undefined
+            ? { removeWorktree: toBoolean(flags.removeWorktree) }
+            : {}),
+          ...(flags.force !== undefined ? { force: toBoolean(flags.force) } : {}),
+          receiptText: !wantJson,
+          full,
+        },
+      };
+    case 'worker-abandon':
+      return {
+        action: 'worker-abandon',
+        payload: {
+          ...(flags.dispatch || flags.dispatchId || flags.id
+            ? { dispatchId: String(flags.dispatch ?? flags.dispatchId ?? flags.id) }
+            : positional[0]
+              ? { dispatchId: String(positional[0]) }
+              : {}),
+          ...(flags.worker ? { worker: String(flags.worker) } : {}),
+          ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
+          ...(flags.reason ? { reason: String(flags.reason) } : {}),
+          receiptText: !wantJson,
+          full,
+        },
+      };
+    case 'reset':
+      return {
+        action: 'reset',
+        payload: {
+          ...(flags.all !== undefined ? { all: toBoolean(flags.all) } : {}),
+          ...(flags.tasks !== undefined ? { tasks: toBoolean(flags.tasks) } : {}),
+          ...(flags.messages !== undefined ? { messages: toBoolean(flags.messages) } : {}),
+          receiptText: !wantJson,
+          full,
+        },
+      };
     case 'coordinator-start': {
+      if (flags.spec !== undefined && flags.specFile !== undefined) {
+        throw new Error('Cannot combine --spec and --spec-file.');
+      }
+      const coordSpec =
+        flags.specFile !== undefined ? readSpecFile(flags.specFile) : flags.spec;
       const autoSpawnRaw = flags.autoSpawnWorkers ?? flags.autoSpawn;
       const workerCli = flags.workerCli ?? flags.workerCliId ?? flags.cli;
       return {
         action: 'coordinator-start',
         payload: {
           ...(runId ? { runId: String(runId) } : {}),
-          ...(flags.spec ? { spec: String(flags.spec) } : {}),
+          ...(coordSpec ? { spec: String(coordSpec) } : {}),
           ...(defaultFrom ? { from: defaultFrom } : {}),
           ...(flags.pollIntervalMs ? { pollIntervalMs: toNumber(flags.pollIntervalMs) } : {}),
           ...(flags.maxConcurrent ? { maxConcurrent: toNumber(flags.maxConcurrent) } : {}),
@@ -352,41 +799,104 @@ function buildPayload(verb, flags, positional) {
           full,
         },
       };
-    case 'send':
+    case 'send': {
+      const sendPayload = buildStructuredSendPayload(flags);
+      const threadVal = flags.thread ?? flags.threadId;
       return {
         action: 'send',
         payload: withCapability({
           ...(defaultFrom ? { from: defaultFrom } : {}),
-          to: String(flags.to ?? ''),
+          ...(flags.to !== undefined ? { to: String(flags.to) } : {}),
           ...(flags.type ? { type: String(flags.type) } : {}),
           ...(flags.priority ? { priority: String(flags.priority) } : {}),
           subject: String(flags.subject ?? 'Message'),
           ...(flags.body !== undefined ? { body: String(flags.body) } : {}),
-          ...(flags.payload !== undefined ? { payload: String(flags.payload) } : {}),
+          ...(sendPayload !== undefined ? { payload: sendPayload } : {}),
           ...(runId ? { runId: String(runId) } : {}),
-          ...(flags.thread ? { threadId: String(flags.thread) } : {}),
+          ...(threadVal ? { threadId: String(threadVal) } : {}),
           receiptText: !wantJson,
           full,
         }),
       };
+    }
     case 'worker-done':
+    case 'task-done':
+    case 'task-fail':
       return {
-        action: 'worker-done',
+        action: verb,
         payload: withCapability({
           ...(defaultFrom ? { from: defaultFrom } : {}),
-          taskId: String(flags.task ?? flags.taskId ?? ''),
-          dispatchId: String(flags.dispatch ?? flags.dispatchId ?? ''),
-          ...(flags.outcome ? { outcome: String(flags.outcome) } : {}),
-          ...(flags.summary !== undefined ? { summary: String(flags.summary) } : {}),
+          ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
+          ...(flags.dispatch || flags.dispatchId
+            ? { dispatchId: String(flags.dispatch ?? flags.dispatchId) }
+            : {}),
+          ...(flags.outcome
+            ? { outcome: String(flags.outcome) }
+            : verb === 'task-done'
+              ? { outcome: 'completed' }
+              : verb === 'task-fail'
+                ? { outcome: 'failed' }
+                : {}),
+          ...(flags.summary !== undefined
+            ? { summary: String(flags.summary) }
+            : positional.length > 0
+              ? { summary: positional.join(' ') }
+              : {}),
           receiptText: !wantJson,
           full,
         }),
       };
-    case 'check':
+    case 'approve': {
+      const explicitApprovalId = flags.id ?? flags.prompt ?? flags.approval;
+      const explicitDispatchId = flags.dispatch ?? flags.dispatchId;
+      return {
+        action: 'approve',
+        payload: {
+          id: String(explicitApprovalId ?? explicitDispatchId ?? positional[0] ?? ''),
+          ...(explicitApprovalId && explicitDispatchId
+            ? { dispatchId: String(explicitDispatchId) }
+            : {}),
+          ...(defaultFrom ? { from: defaultFrom } : {}),
+          ...(flags.reason !== undefined
+            ? { reason: String(flags.reason) }
+            : positional.length > 1
+              ? { reason: positional.slice(1).join(' ') }
+              : {}),
+          receiptText: !wantJson,
+          full,
+        },
+      };
+    }
+    case 'deny': {
+      const explicitApprovalId = flags.id ?? flags.prompt ?? flags.approval;
+      const explicitDispatchId = flags.dispatch ?? flags.dispatchId;
+      return {
+        action: 'deny',
+        payload: {
+          id: String(explicitApprovalId ?? explicitDispatchId ?? positional[0] ?? ''),
+          ...(explicitApprovalId && explicitDispatchId
+            ? { dispatchId: String(explicitDispatchId) }
+            : {}),
+          ...(defaultFrom ? { from: defaultFrom } : {}),
+          ...(flags.reason !== undefined
+            ? { reason: String(flags.reason) }
+            : positional.length > 1
+              ? { reason: positional.slice(1).join(' ') }
+              : {}),
+          receiptText: !wantJson,
+          full,
+        },
+      };
+    }
+    case 'check': {
+      const checkFrom =
+        typeof flags.terminal === 'string' && flags.terminal.trim()
+          ? flags.terminal.trim()
+          : defaultFrom;
       return {
         action: 'check',
         payload: {
-          ...(defaultFrom ? { from: defaultFrom } : {}),
+          ...(checkFrom ? { from: checkFrom } : {}),
           ...(runId ? { runId: String(runId) } : {}),
           ...(flags.unread !== undefined ? { unread: toBoolean(flags.unread) } : {}),
           ...(flags.peek !== undefined ? { peek: toBoolean(flags.peek) } : {}),
@@ -401,17 +911,25 @@ function buildPayload(verb, flags, positional) {
           full,
         },
       };
-    case 'inbox':
+    }
+    case 'inbox': {
+      const inboxFrom =
+        typeof flags.terminal === 'string' && flags.terminal.trim()
+          ? flags.terminal.trim()
+          : defaultFrom;
       return {
         action: 'inbox',
         payload: {
-          ...(defaultFrom ? { from: defaultFrom } : {}),
+          ...(inboxFrom ? { from: inboxFrom } : {}),
           ...(runId ? { runId: String(runId) } : {}),
           ...(flags.limit ? { limit: toNumber(flags.limit) } : {}),
           ...(flags.types ? { types: splitCsv(String(flags.types)) } : {}),
           ...(flags.unread ? { unreadOnly: true } : {}),
+          receiptText: !wantJson,
+          full,
         },
       };
+    }
     case 'ask':
       return {
         action: 'ask',
@@ -421,7 +939,7 @@ function buildPayload(verb, flags, positional) {
           ...(flags.question || positional.length > 0
             ? { question: String(flags.question ?? positional.join(' ')) }
             : {}),
-          ...(flags.options ? { options: splitCsv(String(flags.options)) } : {}),
+          ...(flags.options ? { options: parseOptionsList(String(flags.options)) } : {}),
           ...(flags.wait ? { wait: true } : {}),
           ...(flags.timeoutMs ? { timeoutMs: toNumber(flags.timeoutMs) } : {}),
           ...(flags.resume ? { resume: String(flags.resume) } : {}),
@@ -453,7 +971,7 @@ function buildPayload(verb, flags, positional) {
         payload: {
           taskId: String(explicitTask ?? positional[0] ?? ''),
           question: String(gateQuestion ?? ''),
-          ...(flags.options ? { options: splitCsv(String(flags.options)) } : {}),
+          ...(flags.options ? { options: parseOptionsList(String(flags.options)) } : {}),
           ...(defaultFrom ? { from: defaultFrom } : {}),
         },
       };
@@ -464,6 +982,7 @@ function buildPayload(verb, flags, positional) {
         payload: {
           id: String(flags.id ?? positional[0] ?? ''),
           resolution: String(flags.resolution ?? positional.slice(1).join(' ')),
+          ...(defaultFrom ? { from: defaultFrom } : {}),
         },
       };
     case 'gate-list':
@@ -485,12 +1004,18 @@ async function main() {
   if (parsed.help) {
     console.log(
       [
-        'AhaStation Multi-Agent Orchestration CLI',
-        'Usage: aha orchestration <command> [options]',
+        'AhaStation Multi-Agent Orchestration & Companion CLI',
+        'Usage:',
+        '  aha orchestration <command> [options]',
+        '  aha terminal <list|show|read|send|wait> [options]',
+        '  aha worktree <list|create|remove> [options]',
+        '  aha skills <list|get|sync> [options]',
         '',
-        'Commands:',
+        'Orchestration Commands:',
+        '  worker-start | worker-list | worker-show | worker-read | worker-keep-open | worker-release | worker-stop | worker-abandon',
+        '  approve | deny | reset',
         '  run-create | run-use | run-current | run-list | run-show',
-        '  task-create | task-list | task-update | task-show',
+        '  task-create | task-list | task-update | task-show | task-done | task-fail',
         '  dispatch | dispatch-show',
         '  coordinator-start | coordinator-stop | coordinator-tick | coordinator-status',
         '  send | worker-done | check | inbox | ask | reply',
@@ -500,9 +1025,37 @@ async function main() {
     return;
   }
 
-  const { baseUrl, token } = resolveEndpoint();
-  const { action, payload } = buildPayload(parsed.verb, parsed.flags, parsed.positional);
-  const res = await postJson(`${baseUrl}/${action}`, token, payload);
+  const namespace = parsed.namespace || 'orchestration';
+  const { baseUrl, token } = resolveEndpoint(namespace);
+  const { action, payload } = buildPayload(parsed.verb, parsed.flags, parsed.positional, namespace);
+
+  const isWaitCall =
+    namespace === 'orchestration' &&
+    ((action === 'check' && Boolean(payload.wait)) ||
+      (action === 'ask' && Boolean(payload.wait || payload.resume)));
+  const rawKeepaliveMs = Number(process.env.AHA_CLI_KEEPALIVE_MS);
+  const keepaliveMs =
+    Number.isFinite(rawKeepaliveMs) && rawKeepaliveMs > 0 ? rawKeepaliveMs : 15_000;
+  let keepaliveTimer = null;
+  if (isWaitCall) {
+    keepaliveTimer = setInterval(() => {
+      try {
+        process.stderr.write(
+          `${JSON.stringify({ _keepalive: true, ts: new Date().toISOString() })}\n`
+        );
+      } catch {
+        // Ignore closed stderr stream.
+      }
+    }, keepaliveMs);
+    if (typeof keepaliveTimer.unref === 'function') keepaliveTimer.unref();
+  }
+
+  let res;
+  try {
+    res = await postJson(`${baseUrl}/${action}`, token, payload);
+  } finally {
+    if (keepaliveTimer !== null) clearInterval(keepaliveTimer);
+  }
 
   if (!res.body || res.body.ok !== true) {
     if (parsed.flags.json) {
@@ -511,6 +1064,25 @@ async function main() {
       const code = res.body && res.body.code ? `[${res.body.code}] ` : '';
       const msg = (res.body && res.body.error) || `HTTP ${res.status}`;
       console.error(`${code}${msg}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  if (
+    namespace === 'orchestration' &&
+    action === 'send' &&
+    res.body.result &&
+    res.body.result.lifecycle &&
+    res.body.result.lifecycle.action === 'rejected'
+  ) {
+    const reason = res.body.result.lifecycle.reason || 'Lifecycle report rejected';
+    if (parsed.flags.json) {
+      console.error(
+        JSON.stringify({ ok: false, code: 'lifecycle_rejected', error: reason, result: res.body.result })
+      );
+    } else {
+      console.error(`[lifecycle_rejected] ${reason}`);
     }
     process.exitCode = 1;
     return;

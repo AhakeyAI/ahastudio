@@ -97,6 +97,11 @@ const api = {
       ipcRenderer.on('shell-pty:data', listener);
       return () => ipcRenderer.removeListener('shell-pty:data', listener);
     },
+    onRestore: (cb) => {
+      const listener = (_, e) => cb(e);
+      ipcRenderer.on('shell-pty:restore', listener);
+      return () => ipcRenderer.removeListener('shell-pty:restore', listener);
+    },
     onExit: (cb) => {
       const listener = (_, e) => cb(e);
       ipcRenderer.on('shell-pty:exit', listener);
@@ -171,9 +176,21 @@ const api = {
     coordinatorStatus: (opts) => ipcRenderer.invoke('orchestration:coordinator-status', opts),
     send: (opts) => ipcRenderer.invoke('orchestration:send', opts),
     workerDone: (opts) => ipcRenderer.invoke('orchestration:worker-done', opts),
+    workerStart: (opts) => ipcRenderer.invoke('orchestration:worker-start', opts),
+    workerList: (opts) => ipcRenderer.invoke('orchestration:worker-list', opts),
+    workerShow: (opts) => ipcRenderer.invoke('orchestration:worker-show', opts),
+    workerRead: (opts) => ipcRenderer.invoke('orchestration:worker-read', opts),
+    workerKeepOpen: (opts) => ipcRenderer.invoke('orchestration:worker-keep-open', opts),
+    workerRelease: (opts) => ipcRenderer.invoke('orchestration:worker-release', opts),
+    workerStop: (opts) => ipcRenderer.invoke('orchestration:worker-stop', opts),
+    workerAbandon: (opts) => ipcRenderer.invoke('orchestration:worker-abandon', opts),
+    reset: (opts) => ipcRenderer.invoke('orchestration:reset', opts),
+    approve: (opts) => ipcRenderer.invoke('orchestration:approve', opts),
+    deny: (opts) => ipcRenderer.invoke('orchestration:deny', opts),
     check: (opts) => ipcRenderer.invoke('orchestration:check', opts),
     inbox: (opts) => ipcRenderer.invoke('orchestration:inbox', opts),
     ask: (opts) => ipcRenderer.invoke('orchestration:ask', opts),
+    cancelWait: (opts) => ipcRenderer.invoke('orchestration:cancel-wait', opts),
     reply: (opts) => ipcRenderer.invoke('orchestration:reply', opts),
     gateCreate: (opts) => ipcRenderer.invoke('orchestration:gate-create', opts),
     gateResolve: (opts) => ipcRenderer.invoke('orchestration:gate-resolve', opts),
@@ -187,6 +204,11 @@ const api = {
       const listener = (_, event) => cb(event);
       ipcRenderer.on('orchestration:pane-spawned', listener);
       return () => ipcRenderer.removeListener('orchestration:pane-spawned', listener);
+    },
+    onPaneClosed: (cb) => {
+      const listener = (_, event) => cb(event);
+      ipcRenderer.on('orchestration:pane-closed', listener);
+      return () => ipcRenderer.removeListener('orchestration:pane-closed', listener);
     },
   },
 };

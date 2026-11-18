@@ -6,6 +6,7 @@ import {
   AGENT_PROMPT_STALLED_ERROR,
   DEFAULT_NESTED_WORKER_MAX_DEPTH,
   DISPATCH_HEARTBEAT_TIMEOUT_ERROR,
+  type OrchestrationDispatchRecord,
   type OrchestrationMessagePriority,
   type OrchestrationMessageRecord,
   type OrchestrationStartObservation,
@@ -99,8 +100,14 @@ export function applyEscalationToDispatch(
   msg: OrchestrationMessageRecord
 ): boolean {
   const payload = parseJsonObject(msg.payload);
-  // Advisory escalations (stale warnings) only notify humans; they never settle a dispatch.
-  if (payload?.advisory === true) {
+  // Advisory, permission-hold, and non-fatal synthetic turn-stop escalations notify the parent without settling the dispatch.
+  if (
+    payload?.advisory === true ||
+    payload?.permissionApproval === true ||
+    (payload?.syntheticTurnStop === true &&
+      payload?.stopReason !== 'exited' &&
+      payload?.stopReason !== 'lost')
+  ) {
     return false;
   }
   const explicitDispatchId =
@@ -158,6 +165,8 @@ export interface StaleDispatchReconcileOptions {
   heartbeatTimeoutMs: number;
   /** Warn-only timeout for queued/unsupported dispatches; 0 disables. Never changes task state. */
   staleWarningTimeoutMs?: number;
+  /** True when the worker is legitimately parked waiting on coordinator/human/child/mailbox. */
+  isDeliberatelyWaiting?: (dispatch: OrchestrationDispatchRecord) => boolean;
   onEvent?: (reason: string, runId: string) => void;
 }
 
@@ -175,8 +184,19 @@ export function reconcileStaleDispatches(
   for (const dispatch of store.listDispatches({ runId })) {
     if (dispatch.runId !== runId || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) continue;
     const obs = dispatch.startObservation ?? 'pending';
+    const parkedOnWait =
+      dispatch.stage === 'awaiting_review' ||
+      dispatch.stage === 'waiting_permission' ||
+      dispatch.stage === 'waiting_input' ||
+      store.listQuestions({ dispatchId: dispatch.id, status: 'pending' }).length > 0 ||
+      store.hasActiveChildDispatches(dispatch.id) ||
+      Boolean(options.isDeliberatelyWaiting?.(dispatch));
 
-    if (options.startConfirmationTimeoutMs > 0 && (obs === 'unobserved' || obs === 'pending')) {
+    if (
+      !parkedOnWait &&
+      options.startConfirmationTimeoutMs > 0 &&
+      (obs === 'unobserved' || obs === 'pending')
+    ) {
       // Anchor on actual delivery: dispatches created without injection must never time out.
       const sentMs = dispatch.promptSentAt ? Date.parse(dispatch.promptSentAt) : Number.NaN;
       if (Number.isFinite(sentMs) && options.nowMs - sentMs >= options.startConfirmationTimeoutMs) {
@@ -193,7 +213,7 @@ export function reconcileStaleDispatches(
       }
     }
 
-    if (options.heartbeatTimeoutMs > 0 && obs === 'observed') {
+    if (!parkedOnWait && options.heartbeatTimeoutMs > 0 && obs === 'observed') {
       const anchorMs = Date.parse(
         dispatch.lastHeartbeatAt ??
           dispatch.turnStartedAt ??
@@ -246,6 +266,7 @@ export interface CoordinatorOptions {
   startConfirmationTimeoutMs?: number;
   heartbeatTimeoutMs?: number;
   staleWarningTimeoutMs?: number;
+  isDeliberatelyWaiting?: (dispatch: OrchestrationDispatchRecord) => boolean;
   now?: () => number;
 }
 
@@ -455,6 +476,7 @@ export class Coordinator {
       startConfirmationTimeoutMs: this.startConfirmationTimeoutMs,
       heartbeatTimeoutMs: this.heartbeatTimeoutMs,
       staleWarningTimeoutMs: this.staleWarningTimeoutMs,
+      isDeliberatelyWaiting: this.options.isDeliberatelyWaiting,
       onEvent: (reason, id) => this.runtime.notifyStateChanged(reason, id),
     });
   }
@@ -572,7 +594,7 @@ export class Coordinator {
         this.store.updateDispatchObservation(ctx.id, obs, {
           reason: delivery.observationReason ?? null,
           refreshHeartbeat: obs === 'observed' || obs === 'queued' || obs === 'permission',
-          promptSent: true,
+          ...(delivery.promptDeferred ? {} : { promptSent: true }),
         });
         const dispatchAuditMsg = this.store.insertMessage({
           runId,

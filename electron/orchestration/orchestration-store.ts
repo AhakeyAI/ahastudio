@@ -20,6 +20,7 @@ import {
   type OrchestrationCoordinatorRunRecord,
   type OrchestrationDeliveryRecord,
   type OrchestrationDispatchRecord,
+  type OrchestrationDispatchStage,
   type OrchestrationGateRecord,
   type OrchestrationGateStatus,
   type OrchestrationMessagePriority,
@@ -34,6 +35,7 @@ import {
   type OrchestrationTaskStatus,
   type OrchestrationTaskWithDispatch,
   type OrchestrationWorkerReportOutcome,
+  type WorkerTurnStopReason,
 } from './orchestration-types.js';
 
 export const ORCHESTRATION_STATE_FILENAME = 'orchestration-state.json';
@@ -72,13 +74,26 @@ function generatePrefixedId(prefix: string): string {
 export interface OrchestrationStoreOptions {
   resolveFile?: () => string;
   now?: () => string;
+  maxMessagesPerRun?: number;
+  maxMessages?: number;
+  maxDeliveries?: number;
+  maxRuns?: number;
 }
+
+const DEFAULT_MAX_MESSAGES_PER_RUN = 200;
+const DEFAULT_MAX_MESSAGES = 1000;
+const DEFAULT_MAX_DELIVERIES = 500;
+const DEFAULT_MAX_RUNS = 50;
 
 export class OrchestrationStore {
   private readonly customClock: boolean;
   private now: () => string;
   private readonly resolveFile: (() => string) | undefined;
   private readonly writer: AtomicSnapshotWriter | null;
+  private readonly maxMessagesPerRun: number;
+  private readonly maxMessages: number;
+  private readonly maxDeliveries: number;
+  private readonly maxRuns: number;
 
   private nextSequence = 1;
   private currentRunByConsumer = new Map<string, string>();
@@ -94,11 +109,18 @@ export class OrchestrationStore {
   private questions = new Map<string, OrchestrationQuestionRecord>();
   private coordinatorRuns = new Map<string, OrchestrationCoordinatorRunRecord>();
   private dispatchCapabilities = new Map<string, string>();
+  private readonly deferredPrompts = new Map<
+    string, { ptyId: string; prompt: string; submit: boolean }
+  >();
 
   constructor(options: OrchestrationStoreOptions = {}) {
     this.customClock = typeof options.now === 'function';
     this.now = options.now ?? (() => new Date().toISOString());
     this.resolveFile = options.resolveFile;
+    this.maxMessagesPerRun = Math.max(0, Math.floor(options.maxMessagesPerRun ?? DEFAULT_MAX_MESSAGES_PER_RUN));
+    this.maxMessages = Math.max(0, Math.floor(options.maxMessages ?? DEFAULT_MAX_MESSAGES));
+    this.maxDeliveries = Math.max(0, Math.floor(options.maxDeliveries ?? DEFAULT_MAX_DELIVERIES));
+    this.maxRuns = Math.max(0, Math.floor(options.maxRuns ?? DEFAULT_MAX_RUNS));
     this.writer = options.resolveFile
       ? new AtomicSnapshotWriter(options.resolveFile, {
           skipUnchanged: true,
@@ -223,8 +245,37 @@ export class OrchestrationStore {
     this.dispatches.clear();
     for (const dispatch of parsed.dispatches ?? []) {
       if (dispatch && typeof dispatch.id === 'string') {
+        const defaultStage: OrchestrationDispatchStage = dispatch.releasedAt
+          ? 'released'
+          : dispatch.status === 'completed'
+            ? 'done'
+            : dispatch.status === 'failed' || dispatch.status === 'circuit_broken'
+              ? dispatch.lastFailureReason === 'worker_stopped'
+                ? 'stopped'
+                : 'failed'
+              : dispatch.startObservation === 'permission'
+                ? 'waiting_permission'
+                : dispatch.startObservation === 'observed'
+                  ? 'working'
+                  : 'starting';
         this.dispatches.set(dispatch.id, {
           ...dispatch,
+          creatorDispatchId: dispatch.creatorDispatchId ?? null,
+          parentPaneId: dispatch.parentPaneId ?? null,
+          worktreePath: dispatch.worktreePath ?? null,
+          branch: dispatch.branch ?? null,
+          ownsWorktree: dispatch.ownsWorktree ?? false,
+          ownsPane: dispatch.ownsPane ?? false,
+          cliId: dispatch.cliId ?? null,
+          model: dispatch.model ?? null,
+          effort: dispatch.effort ?? null,
+          processGeneration: dispatch.processGeneration ?? 1,
+          stage: dispatch.stage ?? defaultStage,
+          turnStopReportedGeneration: dispatch.turnStopReportedGeneration ?? null,
+          followUpOfDispatchId: dispatch.followUpOfDispatchId ?? null,
+          retained: dispatch.retained ?? false,
+          releasedAt: dispatch.releasedAt ?? null,
+          archivedOutput: dispatch.archivedOutput ?? null,
           startObservation: dispatch.startObservation ?? 'pending',
           startObservationReason: dispatch.startObservationReason ?? null,
           turnStartedAt: dispatch.turnStartedAt ?? null,
@@ -307,6 +358,38 @@ export class OrchestrationStore {
         this.dispatchCapabilities.set(dispatchId, capability);
       }
     }
+    this.deferredPrompts.clear();
+    for (const [id, prompt] of Object.entries(parsed.deferredDispatchPrompts ?? {})) {
+      const dispatch = this.dispatches.get(id);
+      if (dispatch && ACTIVE_DISPATCH_STATUSES.has(dispatch.status) &&
+          prompt && typeof prompt.prompt === 'string' && typeof prompt.submit === 'boolean' &&
+          (dispatch.assigneePaneId ?? dispatch.assigneeHandle) === prompt.ptyId) {
+        this.deferredPrompts.set(id, prompt);
+      }
+    }
+    for (const dispatch of this.dispatches.values()) {
+      if (ACTIVE_DISPATCH_STATUSES.has(dispatch.status) &&
+          dispatch.startObservation === 'permission' && !dispatch.promptSentAt &&
+          !this.deferredPrompts.has(dispatch.id)) {
+        this.failDispatch(dispatch.id, 'Deferred prompt delivery could not be recovered after restart', {
+          forceFailTask: true,
+          summary: 'Check the worker terminal before retrying delivery.',
+        });
+      }
+    }
+
+    for (const run of this.runs.values()) {
+      if (run.id === UNBOUND_RUN_ID || run.status !== 'active') continue;
+      const runTasks = [...this.tasks.values()].filter((t) => t.runId === run.id);
+      if (runTasks.length > 0 && runTasks.every((t) => t.status === 'completed' || t.status === 'failed')) {
+        run.status = runTasks.some((t) => t.status === 'failed') ? 'failed' : 'completed';
+      } else {
+        run.status = 'stopped';
+      }
+      run.endedAt = run.endedAt ?? now;
+    }
+
+    this.prune();
   }
 
   private exportPersistedState(): OrchestrationPersistedState {
@@ -331,11 +414,31 @@ export class OrchestrationStore {
       questions: [...this.questions.values()],
       coordinatorRuns: [...this.coordinatorRuns.values()],
       capabilities: Object.fromEntries(this.dispatchCapabilities),
+      deferredDispatchPrompts: Object.fromEntries(this.listDeferredDispatchPrompts()),
     };
   }
 
   private persist(): void {
     this.writer?.write(() => JSON.stringify(this.exportPersistedState()));
+  }
+
+  listDeferredDispatchPrompts() {
+    return [...this.deferredPrompts.entries()].filter(([id]) => {
+      const dispatch = this.dispatches.get(id);
+      return dispatch && ACTIVE_DISPATCH_STATUSES.has(dispatch.status);
+    });
+  }
+
+  saveDeferredDispatchPrompt(id: string, prompt: { ptyId: string; prompt: string; submit: boolean }): void {
+    const dispatch = this.dispatches.get(id);
+    if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
+    this.deferredPrompts.set(id, prompt);
+    this.updateDispatchObservation(id, 'permission', { refreshHeartbeat: true });
+    this.persist();
+  }
+
+  deleteDeferredDispatchPrompt(id: string): void {
+    if (this.deferredPrompts.delete(id)) this.persist();
   }
 
   flushSync(): void {
@@ -398,6 +501,7 @@ export class OrchestrationStore {
     };
     this.runs.set(run.id, run);
     this.bindConsumerToRun(run.id, input.coordinatorHandle, input.coordinatorPaneId ?? null);
+    this.prune();
     this.persist();
     return { ...run };
   }
@@ -524,6 +628,7 @@ export class OrchestrationStore {
     } else if (status === 'active') {
       run.endedAt = null;
     }
+    this.prune();
     this.persist();
     return { ...run };
   }
@@ -791,6 +896,17 @@ export class OrchestrationStore {
     creator?: string;
     creatorRunId?: string | null;
     creatorDispatchId?: string | null;
+    parentPaneId?: string | null;
+    worktreePath?: string | null;
+    branch?: string | null;
+    ownsWorktree?: boolean;
+    ownsPane?: boolean;
+    cliId?: string | null;
+    model?: string | null;
+    effort?: string | null;
+    processGeneration?: number;
+    followUpOfDispatchId?: string | null;
+    retained?: boolean;
     maxDepth?: number;
     startObservation?: OrchestrationStartObservation;
     startObservationReason?: string | null;
@@ -816,11 +932,17 @@ export class OrchestrationStore {
     }
 
     const maxDepth = input.maxDepth ?? DEFAULT_NESTED_WORKER_MAX_DEPTH;
-    const depth = this.resolveChildDispatchDepth(input.creatorDispatchId);
+    const cleanCreatorDispatchId = input.creatorDispatchId
+      ? input.creatorDispatchId.startsWith('dispatch:')
+        ? input.creatorDispatchId.slice('dispatch:'.length)
+        : input.creatorDispatchId
+      : null;
+    const depth = this.resolveChildDispatchDepth(cleanCreatorDispatchId);
     if (depth > maxDepth) {
       throw new OrchestrationError(
         'operation_rejected',
-        `Nested worker dispatch depth ${depth} exceeds max depth ${maxDepth}.`
+        `Nested worker dispatch depth ${depth} exceeds max depth ${maxDepth}.`,
+        { depth, maxDepth }
       );
     }
 
@@ -853,16 +975,44 @@ export class OrchestrationStore {
     }
 
     const now = this.now();
+    const resolvedWorktreePath = input.worktreePath ?? task.worktreePath ?? null;
+    if (resolvedWorktreePath && !task.worktreePath) {
+      task.worktreePath = resolvedWorktreePath;
+    }
+    const initialObservation = input.startObservation ?? 'pending';
+    const initialStage: OrchestrationDispatchStage =
+      initialObservation === 'permission'
+        ? 'waiting_permission'
+        : initialObservation === 'observed'
+          ? 'working'
+          : 'starting';
+
     const ctx: OrchestrationDispatchRecord = {
       id: generatePrefixedId('ctx'),
       taskId: task.id,
       runId: task.runId,
       creator: input.creator ?? 'coordinator',
       creatorRunId: input.creatorRunId ?? task.runId,
+      creatorDispatchId: cleanCreatorDispatchId,
+      parentPaneId: input.parentPaneId ?? null,
       depth,
       assigneeHandle: input.assigneeHandle,
       assigneePaneId: input.assigneePaneId ?? null,
       processIncarnation: input.processIncarnation ?? null,
+      worktreePath: resolvedWorktreePath,
+      branch: input.branch ?? null,
+      ownsWorktree: input.ownsWorktree ?? false,
+      ownsPane: input.ownsPane ?? false,
+      cliId: input.cliId ?? null,
+      model: input.model ?? null,
+      effort: input.effort ?? null,
+      processGeneration: input.processGeneration ?? 1,
+      stage: initialStage,
+      turnStopReportedGeneration: null,
+      followUpOfDispatchId: input.followUpOfDispatchId ?? null,
+      retained: input.retained ?? false,
+      releasedAt: null,
+      archivedOutput: null,
       status: 'dispatched',
       failureCount: priorMaxFailureCount,
       lastFailureReason: null,
@@ -872,9 +1022,9 @@ export class OrchestrationStore {
       createdAt: now,
       updatedAt: now,
       completedAt: null,
-      startObservation: input.startObservation ?? 'pending',
+      startObservation: initialObservation,
       startObservationReason: input.startObservationReason ?? null,
-      turnStartedAt: input.startObservation === 'observed' ? now : null,
+      turnStartedAt: initialObservation === 'observed' ? now : null,
       promptSentAt: input.promptSentAt ?? null,
       queuedWorkingBaseline: input.queuedWorkingBaseline ?? null,
       staleWarningAt: null,
@@ -918,10 +1068,240 @@ export class OrchestrationStore {
     dispatch.startObservationReason = null;
     dispatch.staleWarningAt = null;
     dispatch.turnStartedAt = dispatch.turnStartedAt ?? now;
+    if (ACTIVE_DISPATCH_STATUSES.has(dispatch.status) && !dispatch.releasedAt) {
+      dispatch.stage = 'working';
+    }
     if (refreshHeartbeat) {
       dispatch.lastHeartbeatAt = now;
     }
     dispatch.updatedAt = now;
+  }
+
+  updateDispatchStage(
+    dispatchId: string,
+    stage: OrchestrationDispatchStage
+  ): OrchestrationDispatchRecord | null {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx) return null;
+    if (ctx.stage === stage) return { ...ctx };
+    ctx.stage = stage;
+    ctx.updatedAt = this.now();
+    this.persist();
+    return { ...ctx };
+  }
+
+  markTurnStopReported(
+    dispatchId: string,
+    generation: number,
+    stopReason: WorkerTurnStopReason
+  ): OrchestrationDispatchRecord | null {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx || !ACTIVE_DISPATCH_STATUSES.has(ctx.status)) {
+      return null;
+    }
+    ctx.turnStopReportedGeneration = generation;
+    ctx.stage =
+      stopReason === 'needs-input'
+        ? 'waiting_input'
+        : stopReason === 'errored' || stopReason === 'exited'
+          ? 'failed'
+          : 'awaiting_review';
+    ctx.updatedAt = this.now();
+    this.persist();
+    return { ...ctx };
+  }
+
+  bumpDispatchGenerationForSteering(dispatchId: string): OrchestrationDispatchRecord | null {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx || !ACTIVE_DISPATCH_STATUSES.has(ctx.status)) {
+      return null;
+    }
+    const currentGen = ctx.processGeneration ?? 1;
+    if (ctx.turnStopReportedGeneration === currentGen) {
+      ctx.processGeneration = currentGen + 1;
+      ctx.stage = 'working';
+      ctx.updatedAt = this.now();
+      this.persist();
+    }
+    return { ...ctx };
+  }
+
+  clearWaitingInputTurnStop(dispatchId: string): OrchestrationDispatchRecord | null {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx || !ACTIVE_DISPATCH_STATUSES.has(ctx.status)) {
+      return null;
+    }
+    const currentGen = ctx.processGeneration ?? 1;
+    if (ctx.stage === 'waiting_input' && ctx.turnStopReportedGeneration === currentGen) {
+      ctx.processGeneration = currentGen + 1;
+      ctx.stage = 'working';
+      ctx.updatedAt = this.now();
+      this.persist();
+    }
+    return { ...ctx };
+  }
+
+  hasActiveChildDispatches(parentDispatchId: string): boolean {
+    const lineageIds = new Set<string>([parentDispatchId]);
+    let prevId = this.dispatches.get(parentDispatchId)?.followUpOfDispatchId ?? null;
+    while (prevId && !lineageIds.has(prevId)) {
+      lineageIds.add(prevId);
+      prevId = this.dispatches.get(prevId)?.followUpOfDispatchId ?? null;
+    }
+    for (const d of this.dispatches.values()) {
+      if (d.creatorDispatchId && lineageIds.has(d.creatorDispatchId) && ACTIVE_DISPATCH_STATUSES.has(d.status)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  getFollowUpChildDispatch(dispatchId: string): OrchestrationDispatchRecord | undefined {
+    const matches = [...this.dispatches.values()]
+      .filter((d) => d.followUpOfDispatchId === dispatchId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const latest = matches[matches.length - 1];
+    return latest ? { ...latest } : undefined;
+  }
+
+  resolveDispatchLineage(dispatchId: string): OrchestrationDispatchRecord | undefined {
+    let current = this.dispatches.get(dispatchId);
+    if (!current) return undefined;
+    const visited = new Set<string>([current.id]);
+    while (true) {
+      const next = this.getFollowUpChildDispatch(current.id);
+      if (!next || visited.has(next.id)) break;
+      visited.add(next.id);
+      current = this.dispatches.get(next.id) ?? current;
+    }
+    return { ...current };
+  }
+
+  transferCustodyToFollowUp(prevDispatchId: string, nextDispatchId: string): void {
+    const prev = this.dispatches.get(prevDispatchId);
+    const next = this.dispatches.get(nextDispatchId);
+    if (!prev || !next) return;
+    const now = this.now();
+    if (prev.ownsWorktree) {
+      next.ownsWorktree = true;
+      prev.ownsWorktree = false;
+    }
+    if (prev.ownsPane) {
+      if (prev.assigneePaneId && prev.assigneePaneId === next.assigneePaneId) {
+        next.ownsPane = true;
+      }
+      prev.ownsPane = false;
+    }
+    prev.updatedAt = now;
+    next.updatedAt = now;
+    this.persist();
+  }
+
+  setDispatchRetained(dispatchId: string, retained: boolean): OrchestrationDispatchRecord {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx) {
+      throw new OrchestrationError('dispatch_not_found', `Dispatch not found: ${dispatchId}`);
+    }
+    ctx.retained = retained;
+    ctx.updatedAt = this.now();
+    this.persist();
+    return { ...ctx };
+  }
+
+  archiveDispatchOutput(dispatchId: string, output: string): void {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx || !output) return;
+    ctx.archivedOutput = output;
+    ctx.updatedAt = this.now();
+    this.persist();
+  }
+
+  markDispatchReleased(
+    dispatchId: string,
+    opts?: { keepPane?: boolean; keepWorktree?: boolean }
+  ): OrchestrationDispatchRecord {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx) {
+      throw new OrchestrationError('dispatch_not_found', `Dispatch not found: ${dispatchId}`);
+    }
+    const now = this.now();
+    ctx.releasedAt = ctx.releasedAt ?? now;
+    ctx.stage = 'released';
+    if (!opts?.keepPane) {
+      ctx.ownsPane = false;
+    }
+    if (!opts?.keepWorktree) {
+      ctx.ownsWorktree = false;
+    }
+    ctx.retained = false;
+    ctx.updatedAt = now;
+    this.persist();
+    return { ...ctx };
+  }
+
+  hasUnreadReportFromDispatch(dispatchId: string): boolean {
+    const lineageIds = new Set<string>();
+    let curId: string | null = dispatchId;
+    while (curId && !lineageIds.has(curId)) {
+      lineageIds.add(curId);
+      curId = this.dispatches.get(curId)?.followUpOfDispatchId ?? null;
+    }
+    const fromHandles = new Set<string>([...lineageIds].map((id) => `dispatch:${id}`));
+    const ctx = this.dispatches.get(dispatchId);
+    for (const id of this.messageOrder) {
+      const msg = this.messages.get(id);
+      if (!msg || msg.read) continue;
+      if (isBroadcastMailbox(msg.toHandle) && (this.consumerReadByMessageId.get(msg.id)?.size ?? 0) > 0) {
+        continue;
+      }
+      if (
+        fromHandles.has(msg.fromHandle) &&
+        (msg.type === 'worker_done' || msg.type === 'escalation' || msg.type === 'question')
+      ) {
+        return true;
+      }
+      if (msg.type === 'worker_done' && msg.payload) {
+        try {
+          const parsed = JSON.parse(msg.payload) as { dispatchId?: unknown };
+          if (typeof parsed?.dispatchId === 'string' && lineageIds.has(parsed.dispatchId)) {
+            return true;
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+      if (
+        ctx &&
+        msg.runId === ctx.runId &&
+        (msg.fromHandle === ctx.assigneeHandle ||
+          (ctx.assigneePaneId !== null && msg.fromHandle === ctx.assigneePaneId)) &&
+        (msg.type === 'worker_done' || msg.type === 'escalation' || msg.type === 'question')
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  requeueTaskForRetry(taskId: string): OrchestrationTaskRecord {
+    const task = this.tasks.get(taskId);
+    if (!task) {
+      throw new OrchestrationError('task_not_found', `Task not found: ${taskId}`);
+    }
+    if (task.status === 'ready') {
+      return { ...task, deps: [...task.deps] };
+    }
+    if (task.status === 'dispatched') {
+      throw new OrchestrationError(
+        'worker_busy',
+        `Task ${task.id} already has an active dispatch.`
+      );
+    }
+    const now = this.now();
+    task.status = 'ready';
+    task.updatedAt = now;
+    this.persist();
+    return { ...task, deps: [...task.deps] };
   }
 
   updateDispatchObservation(
@@ -968,6 +1348,11 @@ export class OrchestrationStore {
     if (ctx.startObservation !== observation) {
       ctx.startObservation = observation;
       ctx.staleWarningAt = null;
+      if (observation === 'permission') {
+        ctx.stage = 'waiting_permission';
+      } else if (observation === 'observed') {
+        ctx.stage = 'working';
+      }
       changed = true;
     }
 
@@ -1035,6 +1420,18 @@ export class OrchestrationStore {
     return { ...ctx };
   }
 
+  private refreshParentDispatchHeartbeat(child: OrchestrationDispatchRecord, now: string): void {
+    if (!child.creatorDispatchId) return;
+    const resolved = this.resolveDispatchLineage(child.creatorDispatchId);
+    const parent = resolved
+      ? this.dispatches.get(resolved.id)
+      : this.dispatches.get(child.creatorDispatchId);
+    if (parent && ACTIVE_DISPATCH_STATUSES.has(parent.status)) {
+      parent.lastHeartbeatAt = now;
+      parent.updatedAt = now;
+    }
+  }
+
   completeDispatch(dispatchId: string): OrchestrationDispatchRecord {
     const ctx = this.dispatches.get(dispatchId);
     if (!ctx) {
@@ -1046,8 +1443,10 @@ export class OrchestrationStore {
     assertDispatchTransition(ctx.id, ctx.status, 'completed');
     const now = this.now();
     ctx.status = 'completed';
+    ctx.stage = 'done';
     ctx.completedAt = now;
     ctx.updatedAt = now;
+    this.refreshParentDispatchHeartbeat(ctx, now);
     this.closeQuestionsForDispatch(ctx.id);
     this.routeUnreadDispatchMailboxToRun(ctx.id, ctx.runId);
     this.persist();
@@ -1064,12 +1463,14 @@ export class OrchestrationStore {
       if (d.taskId !== taskId || !ACTIVE_DISPATCH_STATUSES.has(d.status)) continue;
       assertDispatchTransition(d.id, d.status, targetStatus);
       d.status = targetStatus;
+      d.stage = targetStatus === 'completed' ? 'done' : 'failed';
       d.completedAt = now;
       d.updatedAt = now;
       if (targetStatus === 'failed') {
         d.lastFailureReason = reason;
         d.failureSummary = reason;
       }
+      this.refreshParentDispatchHeartbeat(d, now);
       this.closeQuestionsForDispatch(d.id);
       this.routeUnreadDispatchMailboxToRun(d.id, d.runId);
     }
@@ -1098,8 +1499,10 @@ export class OrchestrationStore {
     ctx.lastFailureReason = reason;
     ctx.failureSummary = options?.summary ?? reason;
     ctx.status = targetDispatchStatus;
+    ctx.stage = reason === 'worker_stopped' ? 'stopped' : 'failed';
     ctx.completedAt = now;
     ctx.updatedAt = now;
+    this.refreshParentDispatchHeartbeat(ctx, now);
 
     this.closeQuestionsForDispatch(ctx.id);
     this.routeUnreadDispatchMailboxToRun(ctx.id, ctx.runId);
@@ -1139,10 +1542,12 @@ export class OrchestrationStore {
     const now = this.now();
     assertDispatchTransition(ctx.id, ctx.status, 'failed');
     ctx.status = 'failed';
+    ctx.stage = 'failed';
     ctx.lastFailureReason = reason;
     ctx.failureSummary = reason;
     ctx.completedAt = now;
     ctx.updatedAt = now;
+    this.refreshParentDispatchHeartbeat(ctx, now);
 
     this.closeQuestionsForDispatch(ctx.id);
     this.routeUnreadDispatchMailboxToRun(ctx.id, ctx.runId);
@@ -1229,6 +1634,7 @@ export class OrchestrationStore {
 
     if (outcome === 'completed') {
       ctx.status = 'completed';
+      ctx.stage = 'done';
       ctx.lastFailureReason = null;
       ctx.failureSummary = null;
       ctx.completedAt = now;
@@ -1240,6 +1646,7 @@ export class OrchestrationStore {
       this.promoteReadyTasks(ctx.runId);
     } else if (outcome === 'blocked') {
       ctx.status = 'completed';
+      ctx.stage = 'done';
       ctx.lastFailureReason = null;
       ctx.failureSummary = null;
       ctx.completedAt = now;
@@ -1250,6 +1657,7 @@ export class OrchestrationStore {
       this.routeUnreadDispatchMailboxToRun(ctx.id, ctx.runId);
     } else if (outcome === 'escalated') {
       ctx.status = 'failed';
+      ctx.stage = 'failed';
       ctx.lastFailureReason = 'escalated';
       ctx.failureSummary = summary ?? 'Worker escalated task';
       ctx.completedAt = now;
@@ -1263,6 +1671,8 @@ export class OrchestrationStore {
       const failureText = rawReason.startsWith(AGENT_PROMPT_STALLED_ERROR)
         ? `Worker reported ${outcome}: ${rawReason}`
         : rawReason;
+      ctx.status = 'failed';
+      ctx.stage = 'failed';
       ctx.lastFailureReason = failureText;
       ctx.failureSummary = failureText;
       ctx.completedAt = now;
@@ -1357,8 +1767,10 @@ export class OrchestrationStore {
       assertTaskTransition(task.id, task.status, 'completed');
       this.promoteDispatchObserved(ctx, now);
       ctx.status = 'completed';
+      ctx.stage = 'done';
       ctx.completedAt = now;
       ctx.updatedAt = now;
+      this.refreshParentDispatchHeartbeat(ctx, now);
       this.closeQuestionsForDispatch(ctx.id);
       this.routeUnreadDispatchMailboxToRun(ctx.id, ctx.runId);
 
@@ -1382,8 +1794,10 @@ export class OrchestrationStore {
       }
       this.promoteDispatchObserved(ctx, now);
       ctx.status = 'completed';
+      ctx.stage = 'done';
       ctx.completedAt = now;
       ctx.updatedAt = now;
+      this.refreshParentDispatchHeartbeat(ctx, now);
       this.closeQuestionsForDispatch(ctx.id);
       this.routeUnreadDispatchMailboxToRun(ctx.id, ctx.runId);
 
@@ -1406,10 +1820,12 @@ export class OrchestrationStore {
       }
       this.promoteDispatchObserved(ctx, now);
       ctx.status = 'failed';
+      ctx.stage = 'failed';
       ctx.lastFailureReason = 'escalated';
       ctx.failureSummary = input.summary ?? 'Worker escalated task';
       ctx.completedAt = now;
       ctx.updatedAt = now;
+      this.refreshParentDispatchHeartbeat(ctx, now);
       this.closeQuestionsForDispatch(ctx.id);
       this.routeUnreadDispatchMailboxToRun(ctx.id, ctx.runId);
 
@@ -1615,6 +2031,17 @@ export class OrchestrationStore {
     const now = this.now();
     const type: OrchestrationMessageType = input.type ?? 'status';
     const isHeartbeat = type === 'heartbeat';
+    if (isHeartbeat) {
+      const staleHeartbeats = new Set<string>();
+      for (const existing of this.messages.values()) {
+        if (existing.type === 'heartbeat' && existing.runId === runId && existing.fromHandle === input.from) {
+          staleHeartbeats.add(existing.id);
+        }
+      }
+      if (staleHeartbeats.size > 0) {
+        this.deleteMessageIds(staleHeartbeats);
+      }
+    }
     const msg: OrchestrationMessageRecord = {
       id: input.id?.trim() || generatePrefixedId('msg'),
       runId,
@@ -1635,6 +2062,7 @@ export class OrchestrationStore {
 
     this.messages.set(msg.id, msg);
     this.messageOrder.push(msg.id);
+    this.prune();
     this.persist();
     return { ...msg };
   }
@@ -1822,6 +2250,7 @@ export class OrchestrationStore {
       }
     }
     if (changed) {
+      this.prune();
       this.persist();
     }
   }
@@ -1867,6 +2296,7 @@ export class OrchestrationStore {
       }
     }
     if (changed) {
+      this.prune();
       this.persist();
     }
   }
@@ -1952,6 +2382,7 @@ export class OrchestrationStore {
       }
     }
     if (changed) {
+      this.prune();
       this.persist();
     }
   }
@@ -2129,6 +2560,7 @@ export class OrchestrationStore {
       } else {
         this.markAsReadAndDelivered(d.messageIds);
       }
+      this.prune();
       this.persist();
     }
     return { ...d, messageIds: [...d.messageIds] };
@@ -2156,6 +2588,7 @@ export class OrchestrationStore {
       count += 1;
     }
     if (count > 0) {
+      this.prune();
       this.persist();
     }
     return count;
@@ -2410,6 +2843,214 @@ export class OrchestrationStore {
       activeCoordinatorRun,
       currentRunByConsumer: Object.fromEntries(this.currentRunByConsumer.entries()),
     };
+  }
+
+  private deleteMessageIds(ids: ReadonlySet<string>): void {
+    if (ids.size === 0) return;
+    for (const id of ids) {
+      this.messages.delete(id);
+      this.consumerReadByMessageId.delete(id);
+      this.consumerDeliveredByMessageId.delete(id);
+    }
+    this.messageOrder = this.messageOrder.filter((id) => !ids.has(id));
+  }
+
+  prune(): void {
+    const protectedMsgIds = new Set<string>();
+    for (const d of this.deliveries.values()) {
+      if (d.status === 'pending') {
+        for (const msgId of d.messageIds) {
+          protectedMsgIds.add(msgId);
+        }
+      }
+    }
+    for (const q of this.questions.values()) {
+      if (q.status === 'pending') {
+        protectedMsgIds.add(q.messageId);
+      }
+    }
+    for (const msg of this.messages.values()) {
+      if (!msg.read) {
+        protectedMsgIds.add(msg.id);
+      }
+    }
+
+    const toDeleteMsgIds = new Set<string>();
+    const runMsgCounts = new Map<string, number>();
+    for (const id of this.messageOrder) {
+      const msg = this.messages.get(id);
+      if (!msg) continue;
+      runMsgCounts.set(msg.runId, (runMsgCounts.get(msg.runId) ?? 0) + 1);
+    }
+
+    for (const id of this.messageOrder) {
+      const msg = this.messages.get(id);
+      if (!msg || protectedMsgIds.has(id)) continue;
+      const count = runMsgCounts.get(msg.runId) ?? 0;
+      if (count > this.maxMessagesPerRun) {
+        toDeleteMsgIds.add(id);
+        runMsgCounts.set(msg.runId, count - 1);
+      }
+    }
+
+    let remainingCount = this.messageOrder.length - toDeleteMsgIds.size;
+    if (remainingCount > this.maxMessages) {
+      for (const id of this.messageOrder) {
+        if (remainingCount <= this.maxMessages) break;
+        if (toDeleteMsgIds.has(id)) continue;
+        const msg = this.messages.get(id);
+        if (!msg || protectedMsgIds.has(id)) continue;
+        toDeleteMsgIds.add(id);
+        remainingCount -= 1;
+      }
+    }
+
+    if (toDeleteMsgIds.size > 0) {
+      this.deleteMessageIds(toDeleteMsgIds);
+    }
+
+    for (const [id, d] of this.deliveries.entries()) {
+      if (d.status !== 'pending' && d.messageIds.every((msgId) => !this.messages.has(msgId))) {
+        this.deliveries.delete(id);
+      }
+    }
+
+    if (this.deliveries.size > this.maxDeliveries) {
+      const settledDeliveries = [...this.deliveries.values()]
+        .filter((d) => d.status !== 'pending')
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      let overflow = this.deliveries.size - this.maxDeliveries;
+      for (const d of settledDeliveries) {
+        if (overflow <= 0) break;
+        this.deliveries.delete(d.id);
+        overflow -= 1;
+      }
+    }
+
+    const nonUnboundRuns = [...this.runs.values()].filter((r) => r.id !== UNBOUND_RUN_ID);
+    if (nonUnboundRuns.length > this.maxRuns) {
+      const boundRunIds = new Set(this.currentRunByConsumer.values());
+      const activeCoordRunIds = new Set(
+        [...this.coordinatorRuns.values()]
+          .filter((cr) => cr.status === 'running' || cr.status === 'paused')
+          .map((cr) => cr.runId)
+      );
+      const activeDispatchRunIds = new Set(
+        [...this.dispatches.values()]
+          .filter((d) => ACTIVE_DISPATCH_STATUSES.has(d.status))
+          .map((d) => d.runId)
+      );
+
+      const candidates = nonUnboundRuns
+        .filter(
+          (r) =>
+            (r.status === 'completed' || r.status === 'failed' || r.status === 'stopped') &&
+            !boundRunIds.has(r.id) &&
+            !activeCoordRunIds.has(r.id) &&
+            !activeDispatchRunIds.has(r.id)
+        )
+        .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+
+      const deleteCount = Math.min(candidates.length, nonUnboundRuns.length - this.maxRuns);
+      if (deleteCount > 0) {
+        const deletedRunIds = new Set(candidates.slice(0, deleteCount).map((r) => r.id));
+        for (const runId of deletedRunIds) {
+          this.runs.delete(runId);
+        }
+        for (const [id, t] of this.tasks.entries()) {
+          if (deletedRunIds.has(t.runId)) this.tasks.delete(id);
+        }
+        for (const [id, d] of this.dispatches.entries()) {
+          if (deletedRunIds.has(d.runId)) {
+            this.dispatches.delete(id);
+            this.dispatchCapabilities.delete(id);
+          }
+        }
+        for (const [id, g] of this.gates.entries()) {
+          if (deletedRunIds.has(g.runId)) this.gates.delete(id);
+        }
+        for (const [id, q] of this.questions.entries()) {
+          if (deletedRunIds.has(q.runId)) this.questions.delete(id);
+        }
+        for (const [id, d] of this.deliveries.entries()) {
+          if (deletedRunIds.has(d.runId)) this.deliveries.delete(id);
+        }
+        for (const [id, cr] of this.coordinatorRuns.entries()) {
+          if (deletedRunIds.has(cr.runId)) this.coordinatorRuns.delete(id);
+        }
+        const runMsgIds = new Set<string>();
+        for (const [id, m] of this.messages.entries()) {
+          if (deletedRunIds.has(m.runId)) runMsgIds.add(id);
+        }
+        if (runMsgIds.size > 0) {
+          this.deleteMessageIds(runMsgIds);
+        }
+      }
+    }
+  }
+
+  reset(scope: 'all' | 'tasks' | 'messages'): {
+    reset: 'all' | 'tasks' | 'messages';
+    removed: {
+      runs: number;
+      tasks: number;
+      dispatches: number;
+      gates: number;
+      messages: number;
+    };
+  } {
+    const removed = {
+      runs: 0,
+      tasks: 0,
+      dispatches: 0,
+      gates: 0,
+      messages: 0,
+    };
+
+    if (scope === 'all') {
+      removed.runs = [...this.runs.keys()].filter((id) => id !== UNBOUND_RUN_ID).length;
+      removed.tasks = this.tasks.size;
+      removed.dispatches = this.dispatches.size;
+      removed.gates = this.gates.size;
+      removed.messages = this.messages.size;
+      this.currentRunByConsumer.clear();
+      this.runs.clear();
+      this.tasks.clear();
+      this.dispatches.clear();
+      this.dispatchCapabilities.clear();
+      this.deferredPrompts.clear();
+      this.gates.clear();
+      this.messages.clear();
+      this.messageOrder = [];
+      this.deliveries.clear();
+      this.consumerReadByMessageId.clear();
+      this.consumerDeliveredByMessageId.clear();
+      this.questions.clear();
+      this.coordinatorRuns.clear();
+      this.nextSequence = 1;
+    } else if (scope === 'tasks') {
+      removed.tasks = this.tasks.size;
+      removed.dispatches = this.dispatches.size;
+      removed.gates = this.gates.size;
+      this.tasks.clear();
+      this.dispatches.clear();
+      this.dispatchCapabilities.clear();
+      this.deferredPrompts.clear();
+      this.gates.clear();
+      this.questions.clear();
+      this.coordinatorRuns.clear();
+    } else {
+      removed.messages = this.messages.size;
+      this.messages.clear();
+      this.messageOrder = [];
+      this.deliveries.clear();
+      this.consumerReadByMessageId.clear();
+      this.consumerDeliveredByMessageId.clear();
+      this.questions.clear();
+    }
+
+    this.persist();
+    return { reset: scope, removed };
   }
 }
 

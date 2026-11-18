@@ -88,7 +88,8 @@ export function reconcileLifecycleMessage(
 
   const taskId = typeof payload.taskId === 'string' ? payload.taskId.trim() : '';
   const dispatchId = typeof payload.dispatchId === 'string' ? payload.dispatchId.trim() : '';
-  const outcomeRaw = typeof payload.outcome === 'string' ? payload.outcome.trim() : 'completed';
+  const rawOutcomeField = typeof payload.outcome === 'string' ? payload.outcome.trim() : 'completed';
+  const outcomeRaw = rawOutcomeField === 'succeeded' ? 'completed' : rawOutcomeField;
   const summary = typeof payload.summary === 'string' ? payload.summary : message.body;
 
   if (!taskId || !dispatchId) {

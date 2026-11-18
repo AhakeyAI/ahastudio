@@ -116,6 +116,20 @@ export class RuntimeMessageWaiters {
     return false;
   }
 
+  hasActiveWaiterFor(handleOrConsumer: string): boolean {
+    if (!handleOrConsumer) return false;
+    const direct = this.waitersByHandle.get(handleOrConsumer);
+    if (direct && direct.size > 0) return true;
+    for (const waiters of this.waitersByHandle.values()) {
+      for (const entry of waiters) {
+        if (entry.consumerHandle === handleOrConsumer) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   notify(handle: string, messageType: string): boolean {
     const waiters = this.waitersByHandle.get(handle);
     if (!waiters || waiters.size === 0) {

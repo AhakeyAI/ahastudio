@@ -30,6 +30,7 @@ export interface CoordinatorRuntime {
     error?: string;
     startObservation?: OrchestrationStartObservation;
     observationReason?: string;
+    promptDeferred?: boolean;
   }>;
   notifyStateChanged: (reason: string, runId?: string) => void;
 }
