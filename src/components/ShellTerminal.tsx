@@ -87,6 +87,7 @@ function PersistentShellTerminal({
       },
       resize: (id, rows, cols) => { void api.resize(id, rows, cols); },
       onData: api.onData,
+      onRestore: api.onRestore,
       onExit: api.onExit,
       dispose: async (id) => {
         const result = await api.kill(id);

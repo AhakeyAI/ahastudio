@@ -74,5 +74,9 @@ export class TerminalClient {
     return this.request<T>(op, { terminalId, generation, ...body });
   }
   onEvent(listener: (event: DaemonEvent) => void) { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
+  onDisconnect(listener: () => void) {
+    this.socket.on('close', listener);
+    return () => { this.socket.off('close', listener); };
+  }
   disconnect() { this.socket.destroy(); }
 }

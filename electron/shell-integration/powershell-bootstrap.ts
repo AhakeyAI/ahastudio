@@ -14,17 +14,24 @@ if ($ExecutionContext.SessionState.LanguageMode -eq "FullLanguage" -and
         OriginalPrompt = $function:prompt
         OriginalReadLine = $function:PSConsoleHostReadLine
         HasSeenPrompt = $false
+        LastError = $global:Error[0]
         HasPSReadLine = $null -ne (Get-Module -Name PSReadLine)
         Esc = [char]27
         Bel = [char]7
     }
 
     function Global:prompt {
-        $fakeExitCode = [int](!$global:?)
+        $commandSucceeded = $global:?
         Set-StrictMode -Off
+        $exitCode = [int](!$commandSucceeded)
+        $lastError = $global:Error[0]
+        if (!$commandSucceeded -and [object]::ReferenceEquals($lastError, $Global:__AhaOsc133State.LastError) -and $global:LASTEXITCODE) {
+            $exitCode = $global:LASTEXITCODE
+        }
+        $Global:__AhaOsc133State.LastError = $lastError
         $result = ""
         if ($Global:__AhaOsc133State.HasSeenPrompt) {
-            $result += "$($Global:__AhaOsc133State.Esc)]133;D;$fakeExitCode$($Global:__AhaOsc133State.Bel)"
+            $result += "$($Global:__AhaOsc133State.Esc)]133;D;$exitCode$($Global:__AhaOsc133State.Bel)"
         }
         $Global:__AhaOsc133State.HasSeenPrompt = $true
         try {
@@ -35,7 +42,7 @@ if ($ExecutionContext.SessionState.LanguageMode -eq "FullLanguage" -and
             }
         } catch {}
         $result += "$($Global:__AhaOsc133State.Esc)]133;A$($Global:__AhaOsc133State.Bel)"
-        if ($fakeExitCode -ne 0) { Write-Error "failure" -ea ignore }
+        if ($exitCode -ne 0) { Write-Error "failure" -ea ignore }
         $result += $Global:__AhaOsc133State.OriginalPrompt.Invoke()
         $result += "$($Global:__AhaOsc133State.Esc)]133;B$($Global:__AhaOsc133State.Bel)"
         $result

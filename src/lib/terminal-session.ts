@@ -3,7 +3,7 @@ import type { ITheme, ITerminalAddon, ILinkProvider, IDisposable } from '@xterm/
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
-import type { TerminalScreenSnapshot } from '../types';
+import type { TerminalRestoreEvent, TerminalScreenSnapshot } from '../types';
 import { createTerminalOscTracker } from './terminal-osc-tracker';
 
 export interface PtyTerminalHandle {
@@ -22,6 +22,7 @@ export interface PtyTerminalHandle {
   input: (ptyId: string, data: string) => void | Promise<void>;
   resize: (ptyId: string, rows: number, cols: number) => void;
   onData: (cb: (event: { ptyId: string; data: string; sequence?: number }) => void) => () => void;
+  onRestore?: (cb: (snapshot: TerminalRestoreEvent) => void) => () => void;
   onExit: (cb: (event: { ptyId: string; exitCode: number | null }) => void) => () => void;
   dispose: (ptyId: string) => void | Promise<void>;
   /** A tab has a stable process id before create resolves. */
@@ -65,6 +66,7 @@ export class TerminalSession {
   private pendingSize = 0;
   private overflowed = false;
   private pendingExit: { exitCode: number | null } | null = null;
+  private pendingRestore: TerminalRestoreEvent | null = null;
   private sequence = 0;
   private lastSize = '';
   private cleanup: Array<() => void> = [];
@@ -134,6 +136,16 @@ export class TerminalSession {
       if (!this.connected) this.pendingExit = event;
       else this.setState({ phase: 'exited', exitCode: event.exitCode, commandRunning: false });
     }));
+    const unsubscribeRestore = transport.onRestore?.((snapshot) => {
+      if (snapshot.ptyId !== (this.ptyId ?? transport.expectedPtyId)) return;
+      if (this.destroyed || this.closeRequested || this.overflowed) return;
+      if (!this.connected) {
+        this.pendingRestore = snapshot;
+      } else if ((snapshot.sequence ?? 0) >= this.sequence) {
+        this.restoreScreen(snapshot, true);
+      }
+    });
+    if (unsubscribeRestore) this.streamCleanup.push(unsubscribeRestore);
   }
 
   getSnapshot = () => this.state;
@@ -231,36 +243,15 @@ export class TerminalSession {
       // close owns disposal after this promise settles. Never reopen input.
       if (this.closeRequested || this.destroyed) { this.releaseStream(); return; }
       if (this.overflowed) { this.releaseStream(); return; }
-      this.sequence = result.sequence ?? 0;
       this.connected = true;
-      const snapshot = result.screenSnapshot;
-      if (snapshot?.cwd) {
-        this.oscTracker.seedCwd(snapshot.cwd);
-      }
-      this.setState({
-        phase: result.exited || this.pendingExit ? 'exited' : 'running',
-        exitCode: this.pendingExit?.exitCode ?? result.exitCode,
-        ...(snapshot?.lastTitle ? { title: snapshot.lastTitle } : {}),
-        ...(snapshot?.cwd ? { cwd: snapshot.cwd } : {}),
+      const restored = this.pendingRestore;
+      this.restoreScreen(restored && (restored.sequence ?? 0) >= (result.sequence ?? 0)
+        ? restored : result, false);
+      if (this.pendingExit) this.setState({
+        phase: 'exited',
+        exitCode: this.pendingExit.exitCode,
+        commandRunning: false,
       });
-      if (snapshot && (snapshot.snapshotAnsi || snapshot.scrollbackAnsi)) {
-        const chunks: string[] = ['\x18'];
-        if (snapshot.modes?.alternateScreen) {
-          chunks.push('\x1b[?1049l\x1b[2J\x1b[H');
-          if (snapshot.scrollbackAnsi) chunks.push(snapshot.scrollbackAnsi);
-          chunks.push('\x1b[?1049h\x1b[2J\x1b[H');
-        } else {
-          chunks.push('\x1b[?1049l\x1b[2J\x1b[H');
-        }
-        if (snapshot.snapshotAnsi) chunks.push(snapshot.snapshotAnsi);
-        if (snapshot.rehydrateSequences) chunks.push(snapshot.rehydrateSequences);
-        if (snapshot.pendingEscapeTailAnsi) chunks.push(snapshot.pendingEscapeTailAnsi);
-        this.terminal.write(new TextEncoder().encode(chunks.join('')));
-      } else if (result.replay) {
-        const bytes = decode(result.replay);
-        this.oscTracker.feed(this.decoder.decode(bytes, { stream: true }));
-        this.terminal.write(bytes);
-      }
       for (const event of this.pending) this.write(event);
       this.clearPending();
       this.fitVisible();
@@ -270,10 +261,42 @@ export class TerminalSession {
     }
   }
 
+  private restoreScreen(result: TerminalRestoreEvent, replacing: boolean): void {
+    this.sequence = result.sequence ?? 0;
+    const snapshot = result.screenSnapshot;
+    if (replacing) {
+      this.oscTracker.reset();
+      this.decoder = new TextDecoder('utf-8', { fatal: false });
+    }
+    if (snapshot?.cwd) this.oscTracker.seedCwd(snapshot.cwd);
+    this.setState({
+      phase: result.exited ? 'exited' : 'running',
+      exitCode: result.exitCode,
+      ...(replacing || result.exited ? { commandRunning: false } : {}),
+      ...(snapshot?.lastTitle ? { title: snapshot.lastTitle } : {}),
+      ...(snapshot?.cwd ? { cwd: snapshot.cwd } : {}),
+    });
+    const clear = replacing ? '\x18\x1b[?1049l\x1b[3J\x1b[2J\x1b[H' : '\x18\x1b[?1049l\x1b[2J\x1b[H';
+    if (snapshot && (snapshot.snapshotAnsi || snapshot.scrollbackAnsi)) {
+      const normal = snapshot.modes?.alternateScreen
+        ? (snapshot.scrollbackAnsi ?? '') + '\x1b[?1049h\x1b[2J\x1b[H' : '';
+      this.terminal.write(new TextEncoder().encode(clear + normal + (snapshot.snapshotAnsi ?? '') +
+        (snapshot.rehydrateSequences ?? '') + (snapshot.pendingEscapeTailAnsi ?? '')));
+    } else {
+      if (replacing) this.terminal.write(clear);
+      if (result.replay) {
+        const bytes = decode(result.replay);
+        this.oscTracker.feed(this.decoder.decode(bytes, { stream: true }));
+        this.terminal.write(bytes);
+      }
+    }
+  }
+
   private clearPending() {
     this.pending = [];
     this.pendingSize = 0;
     this.pendingExit = null;
+    this.pendingRestore = null;
   }
 
   private releaseStream() {

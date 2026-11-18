@@ -13,7 +13,9 @@
     "node_modules/@lydell/node-pty-*/**/*",
     "dist/vad/**/*",
     "dist/voice-id/**/*",
-    "dist-electron/orchestration/aha-orchestration-cli.cjs"
+    "dist-electron/orchestration/aha-orchestration-cli.cjs",
+    "dist-electron/terminal-daemon/windows-pipe-acl.ps1",
+    "dist-electron/agent/agent-hook-relay.cjs"
   ],
   "mac": {
     "category": "public.app-category.developer-tools",

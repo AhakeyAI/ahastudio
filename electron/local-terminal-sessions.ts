@@ -1,17 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import { type PtyHost, resolveDefaultShell } from './pty-host.js';
-import { resolveLocalTerminal, type LocalCliId, type LocalShellId } from './local-cli.js';
+import { mergeTerminalProcessEnv, resolveLocalTerminal, type LocalShellId, type OrchestrationCliId } from './local-cli.js';
 import { mergedSubprocessEnv } from './settings-loader.js';
 import { TerminalSessions } from './terminal-sessions.js';
 import { applyShellIntegration } from './shell-integration/index.js';
 
 export interface LocalTerminalLaunch {
   terminalId?: string;
-  cliId?: LocalCliId;
+  cliId?: OrchestrationCliId;
   shellId?: LocalShellId;
   cwd?: string;
   cols?: number;
   rows?: number;
+  extraArgs?: string[];
 }
 
 export interface LocalTerminalData { ptyId: string; data: string; sequence: number }
@@ -25,7 +26,7 @@ export class LocalTerminalSessions {
     events: { data: (event: LocalTerminalData) => void; exit: (event: LocalTerminalExit) => void },
     private currentCwd: () => string | undefined,
     private wrapperBaseDir?: () => string | undefined,
-    private extraEnv?: (ptyId: string, cliId?: LocalCliId) => Record<string, string>,
+    private extraEnv?: (ptyId: string, cliId?: OrchestrationCliId) => Record<string, string>,
   ) { this.core = new TerminalSessions(host, events); }
 
   create(payload: LocalTerminalLaunch) {
@@ -33,15 +34,17 @@ export class LocalTerminalSessions {
     const existing = this.core.get(ptyId);
     if (existing) return existing;
     const target = payload.terminalId || payload.cliId || payload.shellId
-      ? resolveLocalTerminal(payload.cliId, payload.shellId) : null;
+      ? resolveLocalTerminal(payload.cliId, payload.shellId, payload.extraArgs) : null;
     const cwd = payload.cwd ?? target?.cwd ?? this.currentCwd() ?? process.cwd();
     const rawFile = target?.file ?? resolveDefaultShell();
-    const baseEnv: NodeJS.ProcessEnv = {
-      ...(target?.env ?? mergedSubprocessEnv()),
-      AHA_TERMINAL_ID: ptyId,
-      PI_PROGRAM_STATUS: '1',
-      ...(this.extraEnv?.(ptyId, payload.cliId) ?? {}),
-    };
+    const baseEnv = mergeTerminalProcessEnv(
+      target?.env ?? mergedSubprocessEnv(),
+      {
+        AHA_TERMINAL_ID: ptyId,
+        PI_PROGRAM_STATUS: '1',
+        ...(this.extraEnv?.(ptyId, payload.cliId) ?? {}),
+      },
+    );
     const integration = applyShellIntegration({
       file: rawFile,
       args: target?.args ?? [],

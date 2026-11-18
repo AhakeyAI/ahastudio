@@ -7,11 +7,20 @@ import { getPtyHost } from '../pty-host.js';
 import type { IpcContext } from './context.js';
 import { handleSecure, mainWindowSenderPolicy } from './validators.js';
 import { PTY_INPUT_MAX_BYTES } from '../pty-input-limiter.js';
-import { LOCAL_CLI_IDS, LOCAL_SHELL_IDS, listLocalClis, listLocalShells } from '../local-cli.js';
+import {
+  isOrchestrationCliId,
+  LOCAL_SHELL_IDS,
+  listLocalClis,
+  listLocalShells,
+  ORCHESTRATION_CLI_IDS,
+  type OrchestrationCliId,
+} from '../local-cli.js';
 import { LocalTerminalSessions } from '../local-terminal-sessions.js';
 import { DaemonTerminalSessions } from '../daemon-terminal-sessions.js';
+import type { Snapshot } from '../terminal-daemon/protocol.js';
 import { getDefaultWorkspaceStateStore } from '../persistence/workspace-state-store.js';
 import { parseFileUriPathParts } from '../terminal-daemon/emulation/osc7-file-uri.js';
+import { TerminalRuntimeTracker } from '../terminal-runtime-tracker.js';
 import { inspectLinkedFile } from './linked-file-inspection.js';
 
 const PTY_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
@@ -19,7 +28,7 @@ export const shellPtyCreateSchema = z.object({
   cwd: z.string().min(1).max(1024).optional(),
   cols: z.number().int().min(1).max(500).optional(),
   rows: z.number().int().min(1).max(500).optional(),
-  cliId: z.enum(LOCAL_CLI_IDS).optional(),
+  cliId: z.enum(ORCHESTRATION_CLI_IDS).optional(),
   shellId: z.enum(LOCAL_SHELL_IDS).optional(),
   // The process id is `local-<terminalId>` and must still pass PTY_ID_RE on input/resize/kill.
   terminalId: z.string().regex(PTY_ID_RE).max(128 - 'local-'.length).optional(),
@@ -189,6 +198,7 @@ export function registerShellPtyIpc(ctx: IpcContext): {
     terminalId?: string;
     cwd?: string;
     cliId?: string;
+    extraArgs?: string[];
     cols?: number;
     rows?: number;
     /** Resolve only after the program has printed output and then gone quiet (bounded wait). */
@@ -196,9 +206,13 @@ export function registerShellPtyIpc(ctx: IpcContext): {
   }) => Promise<{ ptyId: string; cwd?: string }>;
   closePty: (ptyId: string) => Promise<{ ok: boolean }>;
   onPtyExit: (cb: (ptyId: string) => void) => () => void;
+  tracker: TerminalRuntimeTracker;
+  isPtyAlive: (ptyId: string) => boolean;
 } {
   const authorize = mainWindowSenderPolicy(() => ctx.liveWindow()?.webContents.id ?? null);
   const authorizeError = 'Sender is not the main window';
+  const tracker = ctx.terminalTracker ?? new TerminalRuntimeTracker();
+  ctx.terminalTracker = tracker;
   const exitListeners = new Set<(ptyId: string) => void>();
   const notifyExitListeners = (ptyId: string) => {
     for (const listener of exitListeners) {
@@ -215,16 +229,29 @@ export function registerShellPtyIpc(ctx: IpcContext): {
     const started = Date.now();
     while (Date.now() - started < maxMs) {
       if (exitedPtys.has(ptyId)) return;
+      const status = ctx.agentStatusStore?.get(ptyId);
+      if (status?.state === 'waiting') {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
       const last = lastOutputAt.get(ptyId);
-      if (last !== undefined && Date.now() - last >= quietMs) return;
+      const activity = ctx.agentStatusStore?.getActivitySnapshot(ptyId);
+      const hasExplicitReadySignal = Boolean(
+        activity &&
+          activity.state === 'idle' &&
+          (activity.lastHookAt > 0 || activity.source === 'osc7501' || activity.source === 'title'),
+      );
+      const requiredQuietMs = hasExplicitReadySignal ? Math.min(quietMs, 300) : quietMs;
+      if (last !== undefined && Date.now() - last >= requiredQuietMs) return;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   };
   const events = {
     data: (event: { ptyId: string; data: string; sequence: number }) => {
       if (lastOutputAt.has(event.ptyId)) lastOutputAt.set(event.ptyId, Date.now());
+      const utf8 = Buffer.from(event.data, 'base64').toString('utf8');
+      tracker.ingestUtf8Data(event.ptyId, utf8);
       if (ctx.agentStatusStore) {
-        const utf8 = Buffer.from(event.data, 'base64').toString('utf8');
         const res = ctx.agentStatusStore.ingestPtyData(event.ptyId, utf8);
         if (res.replyToWrite) {
           void service.input(event.ptyId, res.replyToWrite);
@@ -234,9 +261,15 @@ export function registerShellPtyIpc(ctx: IpcContext): {
     },
     exit: (event: { ptyId: string; exitCode: number | null }) => {
       if (lastOutputAt.has(event.ptyId)) exitedPtys.add(event.ptyId);
+      tracker.markExited(event.ptyId, event.exitCode);
       ctx.agentStatusStore?.handlePtyExit(event.ptyId, event.exitCode);
       notifyExitListeners(event.ptyId);
       ctx.liveWindow()?.webContents.send('shell-pty:exit', event);
+    },
+    restore: (snapshot: Snapshot) => {
+      const screen = tracker.restoreScreen(snapshot.ptyId, snapshot.screenSnapshot);
+      if (screen && !snapshot.exited) ctx.agentStatusStore?.seedStartupScreen(snapshot.ptyId, screen);
+      ctx.liveWindow()?.webContents.send('shell-pty:restore', snapshot);
     },
   };
   const shellIntegrationDir = ctx.userDataDir
@@ -298,30 +331,54 @@ export function registerShellPtyIpc(ctx: IpcContext): {
         'ptyId' in snapshot &&
         typeof snapshot.ptyId === 'string'
       ) {
+        const snapObj = snapshot as Record<string, unknown>;
+        tracker.registerPty({
+          ptyId: snapshot.ptyId,
+          cwd: typeof snapObj.cwd === 'string' ? snapObj.cwd : payload.cwd,
+          cliId: payload.cliId,
+          shellId: payload.shellId,
+          cols: payload.cols,
+          rows: payload.rows,
+          replayBase64: typeof snapObj.replay === 'string' ? snapObj.replay : undefined,
+          exited: snapObj.exited === true,
+          exitCode: typeof snapObj.exitCode === 'number' ? snapObj.exitCode : null,
+        });
         // Re-attaching a pane without a cliId must not erase what the orchestrator registered.
         ctx.agentStatusStore?.registerPane(
           snapshot.ptyId,
           payload.cliId ? { agentId: payload.cliId } : undefined,
         );
+        if ('screenSnapshot' in snapshot) {
+          const restored = (snapshot as Snapshot).screenSnapshot;
+          const screen = tracker.restoreScreen(snapshot.ptyId, restored);
+          if (screen && !snapObj.exited) ctx.agentStatusStore?.seedStartupScreen(snapshot.ptyId, screen);
+          if (snapObj.exited) ctx.agentStatusStore?.handlePtyExit(snapshot.ptyId, (snapshot as Snapshot).exitCode ?? null);
+        }
       }
       return snapshot;
     },
   });
   handleSecure('shell-pty:input', {
     schema: shellPtyInputSchema, authorize, authorizeError,
-    handler: ({ ptyId, data }) => service.input(ptyId, data),
+    handler: ({ ptyId, data }) => {
+      ctx.agentStatusStore?.notifyUserInput(ptyId, data);
+      return service.input(ptyId, data);
+    },
   });
   handleSecure('shell-pty:resize', {
     schema: shellPtyResizeSchema, authorize, authorizeError,
-    handler: ({ ptyId, rows, cols }) => service.resize(ptyId, rows, cols),
+    handler: ({ ptyId, rows, cols }) => {
+      tracker.resizePty(ptyId, rows, cols);
+      return service.resize(ptyId, rows, cols);
+    },
   });
   handleSecure('shell-pty:kill', {
     schema: shellPtyIdSchema, authorize, authorizeError,
     handler: async ({ ptyId }) => {
       const result = await service.close(ptyId);
-      // A killed pane is gone for good; leaving its record would keep stale badges and slots.
-      ctx.agentStatusStore?.removePane(ptyId);
       if (result && typeof result === 'object' && 'ok' in result && result.ok !== false) {
+        ctx.agentStatusStore?.removePane(ptyId);
+        tracker.markExited(ptyId, null);
         notifyExitListeners(ptyId);
       }
       return result;
@@ -422,18 +479,21 @@ export function registerShellPtyIpc(ctx: IpcContext): {
   });
 
   return {
-    sendInput: (ptyId: string, data: string) => service.input(ptyId, data),
+    sendInput: (ptyId: string, data: string) => {
+      ctx.agentStatusStore?.notifyUserInput(ptyId, data);
+      return service.input(ptyId, data);
+    },
     createPty: async (payload) => {
       const terminalId =
         payload.terminalId ??
         `orch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const cwd = payload.cwd ?? ctx.getCurrentCwd() ?? process.cwd();
       const rawCliId = payload.cliId?.trim();
-      let target: { cliId?: (typeof LOCAL_CLI_IDS)[number]; shellId?: (typeof LOCAL_SHELL_IDS)[number] };
+      let target: { cliId?: OrchestrationCliId; shellId?: (typeof LOCAL_SHELL_IDS)[number] };
       if (!rawCliId) {
         target = { shellId: 'default' };
-      } else if ((LOCAL_CLI_IDS as readonly string[]).includes(rawCliId)) {
-        target = { cliId: rawCliId as (typeof LOCAL_CLI_IDS)[number] };
+      } else if (isOrchestrationCliId(rawCliId)) {
+        target = { cliId: rawCliId };
       } else if ((LOCAL_SHELL_IDS as readonly string[]).includes(rawCliId)) {
         target = { shellId: rawCliId as (typeof LOCAL_SHELL_IDS)[number] };
       } else {
@@ -444,14 +504,25 @@ export function registerShellPtyIpc(ctx: IpcContext): {
         terminalId,
         cwd,
         ...target,
+        ...(payload.extraArgs && payload.extraArgs.length > 0 ? { extraArgs: payload.extraArgs } : {}),
         cols: payload.cols ?? 120,
         rows: payload.rows ?? 32,
       };
       const expectedPtyId = `local-${terminalId}`;
       if (payload.waitForReady) lastOutputAt.set(expectedPtyId, Number.NaN);
       try {
-        const snapshot = (await service.create(createPayload)) as { ptyId?: unknown; cwd?: unknown };
+        const snapshot = (await service.create(createPayload)) as { ptyId?: unknown; cwd?: unknown; replay?: unknown };
         const ptyId = typeof snapshot?.ptyId === 'string' ? snapshot.ptyId : expectedPtyId;
+        const resolvedCwd = typeof snapshot?.cwd === 'string' ? snapshot.cwd : cwd;
+        tracker.registerPty({
+          ptyId,
+          cwd: resolvedCwd,
+          cliId: target.cliId ?? null,
+          shellId: target.shellId ?? null,
+          cols: createPayload.cols,
+          rows: createPayload.rows,
+          replayBase64: typeof snapshot?.replay === 'string' ? snapshot.replay : undefined,
+        });
         ctx.agentStatusStore?.registerPane(ptyId, { agentId: target.cliId ?? null });
         if (payload.waitForReady) {
           await waitForOutputSettled(
@@ -460,23 +531,30 @@ export function registerShellPtyIpc(ctx: IpcContext): {
             payload.waitForReady.maxMs ?? 20_000,
           );
         }
-        return { ptyId, cwd: typeof snapshot?.cwd === 'string' ? snapshot.cwd : cwd };
+        return { ptyId, cwd: resolvedCwd };
       } finally {
         lastOutputAt.delete(expectedPtyId);
         exitedPtys.delete(expectedPtyId);
       }
     },
     closePty: async (ptyId: string) => {
-      const result = (await service.close(ptyId)) as { ok?: boolean } | undefined;
-      ctx.agentStatusStore?.removePane(ptyId);
+      const result = (await service.close(ptyId)) as { ok?: boolean; error?: string } | undefined;
       if (result?.ok !== false) {
+        ctx.agentStatusStore?.removePane(ptyId);
+        tracker.markExited(ptyId, null);
         notifyExitListeners(ptyId);
       }
-      return { ok: result?.ok !== false };
+      return { ok: result?.ok !== false, ...(result?.error ? { error: result.error } : {}) };
     },
     onPtyExit: (cb: (ptyId: string) => void) => {
       exitListeners.add(cb);
       return () => exitListeners.delete(cb);
+    },
+    tracker,
+    isPtyAlive: (ptyId: string) => {
+      const tracked = tracker.getTerminal(ptyId);
+      if (tracked) return tracked.alive;
+      return Boolean(ctx.agentStatusStore?.get(ptyId));
     },
   };
 }

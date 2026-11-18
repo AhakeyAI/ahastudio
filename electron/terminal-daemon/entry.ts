@@ -22,6 +22,7 @@ export async function startTerminalDaemon(dataDir: string, secureEndpoint = rest
   let generation = 0;
   const requests = new Map<string, { digest: string; terminalId: string; operation: Promise<unknown> }>();
   const stopping = new Map<string, Promise<unknown>>();
+  const closedTerminalIds = new Set<string>();
   let metadata = Promise.resolve();
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let ready = false;
@@ -64,7 +65,21 @@ export async function startTerminalDaemon(dataDir: string, secureEndpoint = rest
           await previous.operation;
           return sessions.get(previous.terminalId);
         }
-        if (requests.size >= 4096 || sessions.list().length >= 128) throw new Error('Daemon session/request capacity reached');
+        const records = sessions.list();
+        if (records.length >= 128) {
+          const expired = [...closedTerminalIds].find(id => !stopping.has(id))
+            ?? records.find(record => record.exited && !record.terminationError && !stopping.has(record.terminalId))?.terminalId;
+          if (!expired || !sessions.forgetExited(expired)) {
+            throw new Error('Daemon session capacity reached');
+          }
+          closedTerminalIds.delete(expired);
+          controllers.delete(expired);
+          for (const p of peers) p.attached.delete(expired);
+          for (const [id, request] of requests) {
+            if (request.terminalId === expired) requests.delete(id);
+          }
+        }
+        if (requests.size >= 4096) throw new Error('Daemon request capacity reached');
         if (sessions.get(request.launch.terminalId)) throw new Error('terminalId already exists; attach instead');
         if (!isAbsolute(request.launch.file) || !isAbsolute(request.launch.cwd)) throw new Error('Absolute executable and cwd required');
         const { terminalId, label, ...options } = request.launch;
@@ -105,7 +120,12 @@ export async function startTerminalDaemon(dataDir: string, secureEndpoint = rest
         }
         let operation = stopping.get(request.terminalId);
         if (!operation) {
-          operation = sessions.terminate(request.terminalId).finally(() => stopping.delete(request.terminalId));
+          operation = sessions.terminate(request.terminalId)
+            .then(snapshot => {
+              closedTerminalIds.add(request.terminalId);
+              return snapshot;
+            })
+            .finally(() => stopping.delete(request.terminalId));
           stopping.set(request.terminalId, operation);
         }
         try { return await operation; }

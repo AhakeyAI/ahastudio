@@ -106,6 +106,12 @@ export class TerminalSessions {
   }
   list(): TerminalRecord[] { return [...this.sessions.values()].map(s => ({ ...s.record })); }
 
+  forgetExited(ptyId: string): boolean {
+    const session = this.sessions.get(ptyId);
+    if (!session?.record.exited || session.record.terminationError) return false;
+    return this.sessions.delete(ptyId);
+  }
+
   private snapshot(ptyId: string, session: Session) {
     let screenSnapshot = session.exitScreenSnapshot;
     if (!screenSnapshot && session.emulator) {

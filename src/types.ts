@@ -193,6 +193,7 @@ export interface VibeMeetApi {
       | { ok: false; error?: string }
     >;
     onData: (cb: (e: { ptyId: string; data: string; sequence: number }) => void) => () => void;
+    onRestore: (cb: (snapshot: TerminalRestoreEvent) => void) => () => void;
     onExit: (cb: (e: { ptyId: string; exitCode: number | null }) => void) => () => void;
   };
 
@@ -420,7 +421,7 @@ export interface AgentPaneStatus {
   updatedAt: number;
 }
 
-export type AgentHookCliId = 'claude' | 'antigravity' | 'codex' | 'qwen' | 'grok';
+export type AgentHookCliId = 'claude' | 'antigravity' | 'codex' | 'gemini' | 'qwen' | 'grok';
 export type AgentHookInstallState = 'not-installed' | 'installed' | 'outdated' | 'conflict' | 'error';
 
 export interface AgentHookCliStatus {
@@ -507,6 +508,38 @@ export type OrchestrationStartObservation =
   | 'unobserved'
   | 'unsupported';
 
+export type OrchestrationDispatchStage =
+  | 'starting'
+  | 'working'
+  | 'waiting_permission'
+  | 'waiting_input'
+  | 'awaiting_review'
+  | 'done'
+  | 'failed'
+  | 'released'
+  | 'stopped';
+
+export type WorkerApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired';
+
+export interface WorkerApprovalPayload {
+  approvalId: string;
+  dispatchId: string;
+  taskId: string;
+  runId: string;
+  workerHandle: string;
+  ptyId: string;
+  provider: string;
+  eventName: string;
+  toolName: string;
+  toolInput?: string;
+  message?: string;
+  status: WorkerApprovalStatus;
+  createdAt: string;
+  resolvedAt?: string | null;
+  resolvedBy?: string | null;
+  reason?: string | null;
+}
+
 export type OrchestrationWorkerReportOutcome =
   | 'completed'
   | 'failed'
@@ -543,10 +576,26 @@ export interface OrchestrationDispatchRecord {
   runId: string;
   creator: string;
   creatorRunId: string | null;
+  creatorDispatchId?: string | null;
+  parentPaneId?: string | null;
   depth: number;
   assigneeHandle: string;
   assigneePaneId: string | null;
   processIncarnation: string | null;
+  worktreePath?: string | null;
+  branch?: string | null;
+  ownsWorktree?: boolean;
+  ownsPane?: boolean;
+  cliId?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  processGeneration?: number;
+  stage?: OrchestrationDispatchStage;
+  turnStopReportedGeneration?: number | null;
+  followUpOfDispatchId?: string | null;
+  retained?: boolean;
+  releasedAt?: string | null;
+  archivedOutput?: string | null;
   status: OrchestrationDispatchStatus;
   failureCount: number;
   lastFailureReason: string | null;
@@ -673,6 +722,7 @@ export interface OrchestrationSnapshot {
   gates: OrchestrationGateRecord[];
   messages: OrchestrationMessageRecord[];
   questions: OrchestrationQuestionRecord[];
+  openApprovals?: WorkerApprovalPayload[];
   coordinatorRuns: OrchestrationCoordinatorRunRecord[];
   activeCoordinatorRun: OrchestrationCoordinatorRunRecord | null;
   currentRunByConsumer: Record<string, string>;
@@ -689,8 +739,21 @@ export interface OrchestrationPaneSpawnedEvent {
   ptyId: string;
   runId: string;
   taskId: string;
+  dispatchId?: string;
+  parentPaneId?: string | null;
   cwd?: string;
+  worktreePath?: string | null;
+  branch?: string | null;
   cliId?: string;
+  ownsWorktree?: boolean;
+  ownsPane?: boolean;
+}
+
+export interface OrchestrationPaneClosedEvent {
+  ptyId: string;
+  runId?: string;
+  taskId?: string;
+  dispatchId?: string;
 }
 
 export type OrchestrationTaskShowResult = {
@@ -841,8 +904,8 @@ export interface OrchestrationApi {
   >;
   workerDone: (opts: {
     from?: string;
-    taskId: string;
-    dispatchId: string;
+    taskId?: string;
+    dispatchId?: string;
     outcome?: OrchestrationWorkerReportOutcome;
     summary?: string;
   }) => Promise<
@@ -852,6 +915,134 @@ export interface OrchestrationApi {
       dispatch: OrchestrationDispatchRecord;
     }>
   >;
+  workerStart?: (opts: {
+    from?: string;
+    runId?: string;
+    taskId?: string;
+    spec?: string;
+    taskTitle?: string;
+    deps?: string[];
+    priority?: OrchestrationMessagePriority;
+    cliId?: string;
+    agent?: string;
+    model?: string;
+    effort?: string;
+    terminal?: string;
+    worktree?: string | boolean;
+    noWorktree?: boolean;
+    branch?: string;
+    baseBranch?: string;
+    name?: string;
+    cwd?: string;
+    callerCwd?: string;
+    keepOpen?: boolean;
+  }) => Promise<
+    OrchestrationResult<{
+      dispatch: OrchestrationDispatchRecord;
+      task: OrchestrationTaskRecord;
+      run: OrchestrationRunRecord;
+      ptyId: string;
+      worktreePath: string | null;
+      branch: string | null;
+      ownsWorktree: boolean;
+      ownsPane: boolean;
+    }>
+  >;
+  workerRead?: (opts: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+    cursor?: number;
+    limit?: number;
+    screen?: boolean;
+  }) => Promise<
+    OrchestrationResult<{
+      ptyId: string;
+      dispatchId: string;
+      screen: boolean;
+      text: string;
+      cursor: number;
+      nextCursor: number;
+      hasMore: boolean;
+      alive: boolean;
+      archived: boolean;
+    }>
+  >;
+  workerKeepOpen?: (opts: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+    keepOpen?: boolean;
+  }) => Promise<OrchestrationResult<{ dispatch: OrchestrationDispatchRecord; retained: boolean }>>;
+  workerRelease?: (opts: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+    keepPane?: boolean;
+    keepWorktree?: boolean;
+    force?: boolean;
+  }) => Promise<
+    OrchestrationResult<{
+      dispatch: OrchestrationDispatchRecord;
+      closedPane: boolean;
+      removedWorktree: boolean;
+    }>
+  >;
+  workerStop?: (opts: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+    reason?: string;
+    removeWorktree?: boolean;
+    force?: boolean;
+  }) => Promise<
+    OrchestrationResult<{
+      dispatch: OrchestrationDispatchRecord;
+      closedPane: boolean;
+      removedWorktree: boolean;
+    }>
+  >;
+  workerAbandon?: (opts: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+    reason?: string;
+  }) => Promise<
+    OrchestrationResult<{
+      dispatch: OrchestrationDispatchRecord;
+      task: OrchestrationTaskRecord;
+      warning: string;
+    }>
+  >;
+  reset?: (opts: {
+    all?: boolean;
+    tasks?: boolean;
+    messages?: boolean;
+  }) => Promise<
+    OrchestrationResult<{
+      reset: 'all' | 'tasks' | 'messages';
+      removed: {
+        runs: number;
+        tasks: number;
+        dispatches: number;
+        gates: number;
+        messages: number;
+      };
+    }>
+  >;
+  approve?: (opts: {
+    id: string;
+    dispatchId?: string;
+    from?: string;
+    reason?: string;
+    updatedInput?: Record<string, unknown>;
+  }) => Promise<OrchestrationResult<{ approval: WorkerApprovalPayload }>>;
+  deny?: (opts: {
+    id: string;
+    dispatchId?: string;
+    from?: string;
+    reason?: string;
+  }) => Promise<OrchestrationResult<{ approval: WorkerApprovalPayload }>>;
   check: (opts?: {
     from?: string;
     runId?: string;
@@ -864,6 +1055,7 @@ export interface OrchestrationApi {
     ack?: string;
     holdAck?: boolean;
     format?: boolean;
+    requestId?: string;
   }) => Promise<
     OrchestrationResult<{
       mailbox: string;
@@ -903,6 +1095,7 @@ export interface OrchestrationApi {
     resume?: string;
     dispatchId?: string;
     runId?: string;
+    requestId?: string;
   }) => Promise<
     OrchestrationResult<{
       messageId: string;
@@ -915,6 +1108,7 @@ export interface OrchestrationApi {
       connectionLost: boolean;
     }>
   >;
+  cancelWait: (opts: { requestId: string }) => Promise<OrchestrationResult<{ cancelled: boolean }>>;
   reply: (opts: {
     id: string;
     body: string;
@@ -943,6 +1137,16 @@ export interface OrchestrationApi {
   }) => Promise<OrchestrationResult<{ gates: OrchestrationGateRecord[]; count: number }>>;
   onEvent: (cb: (event: OrchestrationEvent) => void) => () => void;
   onPaneSpawned: (cb: (event: OrchestrationPaneSpawnedEvent) => void) => () => void;
+  onPaneClosed: (cb: (event: OrchestrationPaneClosedEvent) => void) => () => void;
+}
+
+export interface TerminalRestoreEvent {
+  ptyId: string;
+  sequence?: number;
+  exitCode?: number | null;
+  exited?: boolean;
+  replay: string;
+  screenSnapshot?: TerminalScreenSnapshot;
 }
 
 export interface TerminalScreenSnapshot {

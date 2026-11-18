@@ -226,9 +226,10 @@ test('DaemonTerminalSessions re-attaches every terminal after a dropped connecti
 
   const events = [];
   const exits = [];
+  const restores = [];
   const svc = new DaemonTerminalSessions(
     { dataDir, runtimePath },
-    { data: (ev) => events.push(ev), exit: (ev) => exits.push(ev) },
+    { data: (ev) => events.push(ev), exit: (ev) => exits.push(ev), restore: (s) => restores.push(s) },
     () => dataDir,
   );
   const base = { cols: 80, rows: 24, cwd: dataDir };
@@ -237,9 +238,10 @@ test('DaemonTerminalSessions re-attaches every terminal after a dropped connecti
   const text = (id) => events.filter((e) => e.ptyId === id)
     .map((e) => Buffer.from(e.data, 'base64').toString('utf8')).join('');
 
-  // Drop the socket; the next call on terminal A reconnects.
+  // A dropped socket restores both attached terminals without needing application input.
   svc.activeClient.disconnect();
-  await delay(200);
+  for (let i = 0; i < 50 && restores.length < 2; i++) await delay(100);
+  assert.deepEqual(restores.map((s) => s.ptyId).sort(), ['local-rc-a', 'local-rc-b']);
   assert.equal((await svc.input('local-rc-a', 'echo A_AFTER_DROP\r')).ok, true);
 
   // Terminal B was never touched through svc after the drop, so it only streams if re-attached.
@@ -253,6 +255,21 @@ test('DaemonTerminalSessions re-attaches every terminal after a dropped connecti
 
   await svc.close('local-rc-a');
   assert(exits.some((e) => e.ptyId === 'local-rc-a'), 'exit must be reported under the original ptyId');
+  // Pause the client while a separate controller produces the final screen and exit.
+  svc.resetClientConnection();
+  const gapClient = await ensureTerminalDaemon({ dataDir, runtimePath });
+  await gapClient.attach(bId, true);
+  await gapClient.input(bId, 'echo B_DURING_GAP\r');
+  for (let i = 0; i < 50; i++) {
+    const snapshot = await gapClient.attach(bId, false);
+    if (JSON.stringify(snapshot.screenSnapshot).includes('B_DURING_GAP')) break;
+    await delay(100);
+  }
+  await gapClient.terminate(bId);
+  gapClient.disconnect();
   await svc.close('local-rc-b');
+  const restoredExit = restores.find((s) => s.ptyId === 'local-rc-b' && s.exited);
+  assert.match(restoredExit?.screenSnapshot?.snapshotAnsi ?? '', /B_DURING_GAP/);
+  assert(exits.some((e) => e.ptyId === 'local-rc-b'), 'exit during the gap must reach the original pane');
   svc.detachAll();
 });

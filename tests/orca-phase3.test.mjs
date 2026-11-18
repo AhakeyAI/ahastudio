@@ -18,6 +18,26 @@ import {
 } from '../dist-electron/git/porcelain-parser.js';
 import { registerGitIpc } from '../dist-electron/ipc/git.js';
 import { registerWorkspaceFsIpc } from '../dist-electron/ipc/workspace-fs.js';
+import { discardGitPaths } from '../dist-electron/git/git-service.js';
+
+test('discard uses the selected path literally even when Git glob characters appear in its name', async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), 'aha-literal-path-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const git = (...args) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+  git('init');
+  git('config', 'user.name', 'Fixture');
+  git('config', 'user.email', 'fixture@example.test');
+  const selected = 'report[1].txt';
+  const other = 'report1.txt';
+  for (const name of [selected, other]) writeFileSync(join(cwd, name), 'original');
+  git('add', '--', selected, other);
+  git('-c', 'commit.gpgsign=false', 'commit', '-m', 'fixture');
+  for (const name of [selected, other]) writeFileSync(join(cwd, name), 'edited');
+  const result = await discardGitPaths({ cwd, paths: [selected] });
+  assert.deepEqual(result, { ok: true, restored: [selected], removed: [] });
+  assert.equal(readFileSync(join(cwd, selected), 'utf8'), 'original');
+  assert.equal(readFileSync(join(cwd, other), 'utf8'), 'edited');
+});
 
 function createIpcHarness(t, registerFn) {
   const handlers = new Map();

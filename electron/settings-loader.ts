@@ -99,7 +99,7 @@ const ENV_ALLOWLIST: ReadonlySet<string> = new Set([
 const ENV_PREFIX_ALLOWLIST: readonly string[] = ['ANTHROPIC_', 'CLAUDE_', 'XDG_'];
 
 function isEnvAllowed(name: string): boolean {
-  if (ENV_ALLOWLIST.has(name)) return true;
+  if (ENV_ALLOWLIST.has(name) || name.toUpperCase() === 'PATH') return true;
   for (const pfx of ENV_PREFIX_ALLOWLIST) {
     if (name.startsWith(pfx)) return true;
   }

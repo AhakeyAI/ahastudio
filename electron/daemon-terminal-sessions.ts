@@ -3,9 +3,9 @@ import { accessSync, constants } from 'node:fs';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 import { ensureTerminalDaemon, type DaemonLaunchOptions } from './terminal-daemon/launcher.js';
 import type { TerminalClient } from './terminal-daemon/client.js';
-import type { Snapshot } from './terminal-daemon/protocol.js';
+import type { DaemonEvent, Snapshot } from './terminal-daemon/protocol.js';
 import { resolveDefaultShell } from './pty-host.js';
-import { resolveLocalTerminal, type LocalCliId } from './local-cli.js';
+import { mergeTerminalProcessEnv, resolveLocalTerminal, type OrchestrationCliId } from './local-cli.js';
 import { mergedSubprocessEnv } from './settings-loader.js';
 import { applyShellIntegration } from './shell-integration/index.js';
 import { clampTerminalDim } from './terminal-size.js';
@@ -85,6 +85,8 @@ export class DaemonTerminalSessions {
   private clientPromise: Promise<TerminalClient> | null = null;
   private activeClient: TerminalClient | null = null;
   private unsubEvents: (() => void) | null = null;
+  private unsubDisconnect: (() => void) | null = null;
+  private connectionGeneration = 0;
   private readonly ptyToDaemonId = new Map<string, string>();
   private readonly daemonToPtyId = new Map<string, string>();
   // The daemon tracks attachments per connection, so a new connection must re-attach every live terminal.
@@ -95,9 +97,10 @@ export class DaemonTerminalSessions {
     private readonly events: {
       data: (event: LocalTerminalData) => void;
       exit: (event: LocalTerminalExit) => void;
+      restore?: (snapshot: Snapshot) => void;
     },
     private readonly currentCwd: () => string | undefined,
-    private readonly extraEnv?: (ptyId: string, cliId?: LocalCliId) => Record<string, string>,
+    private readonly extraEnv?: (ptyId: string, cliId?: OrchestrationCliId) => Record<string, string>,
   ) {}
 
   private async getClient(): Promise<TerminalClient> {
@@ -108,18 +111,36 @@ export class DaemonTerminalSessions {
         runtimePath: this.config.runtimePath ?? process.execPath,
         entryPath: this.config.entryPath,
       };
+      const generation = this.connectionGeneration;
       this.clientPromise = ensureTerminalDaemon(launchOpts)
-        .then((client) => {
+        .then(async (client) => {
+          if (generation !== this.connectionGeneration) {
+            client.disconnect();
+            throw new Error('Terminal client detached');
+          }
+          const restoreBuffers = new Map<string, DaemonEvent[]>();
+          this.unsubEvents = client.onEvent((event) => {
+            const pending = restoreBuffers.get(event.terminalId);
+            if (pending) pending.push(event);
+            else this.forwardEvent(event);
+          });
+          try {
+            await this.reattachAll(client, restoreBuffers);
+          } catch (error) {
+            this.unsubEvents?.();
+            this.unsubEvents = null;
+            client.disconnect();
+            throw error;
+          }
+          if (generation !== this.connectionGeneration) {
+            client.disconnect();
+            throw new Error('Terminal client detached');
+          }
           this.activeClient = client;
-          this.unsubEvents?.();
-          this.unsubEvents = client.onEvent((ev) => {
-            const ptyId = this.daemonToPtyId.get(ev.terminalId) ?? ev.terminalId;
-            if (ev.event === 'output') {
-              this.events.data({ ptyId, data: ev.data, sequence: ev.sequence });
-            } else if (ev.event === 'exit') {
-              this.attachedDaemonIds.delete(ev.terminalId);
-              this.daemonToPtyId.delete(ev.terminalId);
-              this.events.exit({ ptyId, exitCode: ev.exitCode });
+          this.unsubDisconnect = client.onDisconnect(() => {
+            this.resetClientConnection(client);
+            if (generation === this.connectionGeneration && this.attachedDaemonIds.size) {
+              void this.getClient().catch(error => console.warn('[shell-pty] reconnect failed:', error));
             }
           });
           return client;
@@ -136,20 +157,47 @@ export class DaemonTerminalSessions {
     if (only && this.activeClient !== only) return;
     this.unsubEvents?.();
     this.unsubEvents = null;
+    this.unsubDisconnect?.();
+    this.unsubDisconnect = null;
     if (this.activeClient) {
       this.activeClient.disconnect();
       this.activeClient = null;
     }
   }
 
-  private async reattachAll(client: TerminalClient): Promise<void> {
+  private forwardEvent(event: DaemonEvent): void {
+    const ptyId = this.daemonToPtyId.get(event.terminalId) ?? event.terminalId;
+    if (event.event === 'output') {
+      this.events.data({ ptyId, data: event.data, sequence: event.sequence });
+    } else {
+      this.attachedDaemonIds.delete(event.terminalId);
+      this.daemonToPtyId.delete(event.terminalId);
+      this.events.exit({ ptyId, exitCode: event.exitCode });
+    }
+  }
+
+  private async reattachAll(client: TerminalClient, buffers: Map<string, DaemonEvent[]>): Promise<void> {
     for (const daemonId of [...this.attachedDaemonIds]) {
+      const events: DaemonEvent[] = [];
+      buffers.set(daemonId, events);
       try {
-        await client.attach(daemonId, true);
+        const snapshot = await client.attach(daemonId, true);
+        const ptyId = this.daemonToPtyId.get(daemonId) ?? daemonId;
+        this.events.restore?.({ ...snapshot, ptyId });
+        if (snapshot.exited) {
+          this.forwardEvent({ event: 'exit', terminalId: daemonId, exitCode: snapshot.exitCode ?? null });
+        } else {
+          for (const event of events) {
+            if (event.event === 'exit' || event.sequence > snapshot.sequence) this.forwardEvent(event);
+          }
+        }
       } catch (error) {
         const msg = error instanceof Error ? error.message : '';
-        if (msg.includes('Unknown terminal')) this.attachedDaemonIds.delete(daemonId);
-        else if (msg.includes('Terminal disconnected')) throw error;
+        if (msg === 'Unknown terminal') {
+          this.forwardEvent({ event: 'exit', terminalId: daemonId, exitCode: null });
+        } else throw error;
+      } finally {
+        buffers.delete(daemonId);
       }
     }
   }
@@ -163,17 +211,19 @@ export class DaemonTerminalSessions {
       return await fn(client);
     } catch (error) {
       const msg = error instanceof Error ? error.message : '';
-      const lostLease = msg.includes('Terminal has no controller lease');
+      const lostLease = msg.includes('Terminal has no controller lease') ||
+        msg === 'Stale terminal controller';
       const disconnected = msg.includes('Terminal disconnected');
       if (!lostLease && !disconnected) throw error;
       this.resetClientConnection(client);
       // After a drop mid-request the daemon may or may not have applied it; replaying could duplicate input.
       if (msg.includes('outcome may be unknown')) throw error;
       const fresh = await this.getClient();
-      await this.reattachAll(fresh);
       if (reattachDaemonId && !this.attachedDaemonIds.has(reattachDaemonId)) {
-        await fresh.attach(reattachDaemonId, true);
-        this.attachedDaemonIds.add(reattachDaemonId);
+        const attached = await fresh.attach(reattachDaemonId, true);
+        if (!attached.exited) {
+          this.attachedDaemonIds.add(reattachDaemonId);
+        }
       }
       return fn(fresh);
     }
@@ -207,16 +257,18 @@ export class DaemonTerminalSessions {
 
       const target =
         payload.terminalId || payload.cliId || payload.shellId
-          ? resolveLocalTerminal(payload.cliId, payload.shellId)
+          ? resolveLocalTerminal(payload.cliId, payload.shellId, payload.extraArgs)
           : null;
       const cwd = resolve(payload.cwd ?? target?.cwd ?? this.currentCwd() ?? process.cwd());
       const rawFile = target?.file ?? resolveDefaultShell();
-      const baseEnv: NodeJS.ProcessEnv = {
-        ...(target?.env ?? mergedSubprocessEnv()),
-        AHA_TERMINAL_ID: ptyId,
-        PI_PROGRAM_STATUS: '1',
-        ...(this.extraEnv?.(ptyId, payload.cliId) ?? {}),
-      };
+      const baseEnv = mergeTerminalProcessEnv(
+        target?.env ?? mergedSubprocessEnv(),
+        {
+          AHA_TERMINAL_ID: ptyId,
+          PI_PROGRAM_STATUS: '1',
+          ...(this.extraEnv?.(ptyId, payload.cliId) ?? {}),
+        },
+      );
       const integration = applyShellIntegration({
         file: rawFile,
         args: target?.args ?? [],
@@ -248,14 +300,10 @@ export class DaemonTerminalSessions {
   async input(ptyId: string, data: string): Promise<{ ok: boolean; error?: string }> {
     const daemonId = this.ptyToDaemonId.get(ptyId) ?? toDaemonUuid(ptyId);
     try {
-      await this.withClient(async (client) => {
-        for (let offset = 0; offset < data.length; offset += MAX_INPUT_CHUNK) {
-          const chunk = data.slice(offset, offset + MAX_INPUT_CHUNK);
-          if (chunk.length > 0) {
-            await client.input(daemonId, chunk);
-          }
-        }
-      }, daemonId);
+      for (let offset = 0; offset < data.length; offset += MAX_INPUT_CHUNK) {
+        const chunk = data.slice(offset, offset + MAX_INPUT_CHUNK);
+        await this.withClient(client => client.input(daemonId, chunk), daemonId);
+      }
       return { ok: true };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : 'Terminal input failed' };
@@ -274,21 +322,23 @@ export class DaemonTerminalSessions {
     }
   }
 
-  async close(ptyId: string): Promise<{ ok: boolean }> {
+  async close(ptyId: string): Promise<{ ok: boolean; error?: string }> {
     const daemonId = this.ptyToDaemonId.get(ptyId) ?? toDaemonUuid(ptyId);
-    this.ptyToDaemonId.delete(ptyId);
     // daemonToPtyId stays until the exit event, so the renderer still receives it under the original ptyId.
     try {
       await this.withClient((client) => client.terminate(daemonId), daemonId);
-    } catch {
-      /* Already exited or daemon absent */
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message !== 'Unknown terminal') return { ok: false, error: message };
     }
+    this.ptyToDaemonId.delete(ptyId);
     this.attachedDaemonIds.delete(daemonId);
     return { ok: true };
   }
 
   /** Disconnect client socket on window close without terminating daemon-hosted PTYs. */
   detachAll(): void {
+    this.connectionGeneration += 1;
     this.attachedDaemonIds.clear();
     this.resetClientConnection();
   }

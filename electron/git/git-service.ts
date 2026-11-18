@@ -175,7 +175,7 @@ async function runChunkedGitArgs(
 ): Promise<{ ok: true } | GitErrorResult> {
   for (let i = 0; i < paths.length; i += PATHSPEC_CHUNK_SIZE) {
     const chunk = paths.slice(i, i + PATHSPEC_CHUNK_SIZE);
-    const res = await runGitCommand([...prefixArgs, ...chunk], { cwd });
+    const res = await runGitCommand(['--literal-pathspecs', ...prefixArgs, ...chunk], { cwd });
     if (res.exitCode !== 0) {
       return {
         ok: false,
@@ -338,7 +338,7 @@ export async function getGitDiff(opts: {
   }
 
   const contextLines = opts.contextLines ?? 3;
-  const args = ['diff', '--no-ext-diff', '--no-color', `-U${contextLines}`];
+  const args = ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-color', `-U${contextLines}`];
   if (opts.staged) {
     args.push('--cached');
   }
@@ -358,7 +358,7 @@ export async function getGitDiff(opts: {
 
   if (!opts.staged && relPath && !res.stdout && !res.truncated) {
     const untrackedCheck = await runGitCommand(
-      ['ls-files', '--others', '--exclude-standard', '--', relPath],
+      ['--literal-pathspecs', 'ls-files', '--others', '--exclude-standard', '--', relPath],
       { cwd: rootPath, readOnly: true },
     );
     if (untrackedCheck.exitCode === 0 && untrackedCheck.stdout.trim().length > 0) {
@@ -487,7 +487,7 @@ export async function discardGitPaths(opts: {
   const trackedSet = new Set<string>();
   for (let i = 0; i < validated.length; i += PATHSPEC_CHUNK_SIZE) {
     const chunk = validated.slice(i, i + PATHSPEC_CHUNK_SIZE);
-    const lsRes = await runGitCommand(['ls-files', '-z', '--', ...chunk], {
+    const lsRes = await runGitCommand(['--literal-pathspecs', 'ls-files', '-z', '--', ...chunk], {
       cwd: rootPath,
       readOnly: true,
     });
@@ -514,12 +514,16 @@ export async function discardGitPaths(opts: {
   if (trackedPaths.length > 0) {
     for (let i = 0; i < trackedPaths.length; i += PATHSPEC_CHUNK_SIZE) {
       const chunk = trackedPaths.slice(i, i + PATHSPEC_CHUNK_SIZE);
-      let res = await runGitCommand(['restore', '--worktree', '--', ...chunk], { cwd: rootPath });
+      let res = await runGitCommand(['--literal-pathspecs', 'restore', '--worktree', '--', ...chunk], {
+        cwd: rootPath,
+      });
       if (
         res.exitCode !== 0 &&
         res.stderr.toLowerCase().includes('not a git command')
       ) {
-        res = await runGitCommand(['checkout', '--', ...chunk], { cwd: rootPath });
+        res = await runGitCommand(['--literal-pathspecs', 'checkout', '--', ...chunk], {
+          cwd: rootPath,
+        });
       }
       if (res.exitCode !== 0) {
         return { ok: false, error: res.stderr.trim() || '恢复已跟踪文件失败' };
@@ -820,6 +824,10 @@ export async function removeGitWorktree(opts: {
   const args = ['worktree', 'remove'];
   if (opts.force) {
     args.push('--force');
+    if (matched.locked) {
+      // Git requires `-f -f` (`--force --force`) to override a locked worktree.
+      args.push('--force');
+    }
   }
   args.push('--', matched.path);
 

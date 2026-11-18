@@ -111,7 +111,7 @@ test('shell integration wraps pwsh/bash/zsh interactively without altering AI CL
     assert.deepEqual(pwsh.args.slice(0, 3), ['-NoLogo', '-NoExit', '-EncodedCommand']);
     const decoded = decodeUtf16LeBase64(pwsh.args[3]);
     assert.match(decoded, /FullLanguage/);
-    assert.match(decoded, /133;D;\$fakeExitCode/);
+    assert.match(decoded, /133;D;\$exitCode/);
     assert.match(decoded, /\]7;\$uri/);
     assert.match(decoded, /133;C/);
 
@@ -731,4 +731,38 @@ test('StageWindowStore splitPane inherits live OSC 7 CWD and closePane closes on
   await stageWindowStore.closeWindow(win.id);
   assert.deepEqual(disposedIds, [`local-${paneB}`, `local-${win.id}`, `local-${paneC}`]);
   assert.equal(stageWindowStore.getSnapshot().windows.some((w) => w.id === win.id), false);
+});
+
+test('PowerShell shell integration emits native exit code 23 in OSC 133;D without clobbering on clean prompts', async (t) => {
+  if (process.platform !== 'win32') return;
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+  const pwshBin = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32\\WindowsPowerShell\\v1.0\\powershell.exe');
+  if (!existsSync(pwshBin)) return;
+
+  const dir = mkdtempSync(join(tmpdir(), 'aha-ps-exit23-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const wrapped = applyShellIntegration({
+    file: pwshBin,
+    args: [],
+    env: { ...process.env },
+    wrapperBaseDir: dir,
+  });
+  const bootstrap = decodeUtf16LeBase64(wrapped.args[3]);
+  const probeScript = [
+    bootstrap,
+    '$null = prompt',
+    'cmd /c "exit /b 23"',
+    '$afterNative = prompt',
+    'Write-Output ("AFTER_NATIVE=" + $afterNative)',
+  ].join('\r\n');
+  const encoded = Buffer.from(probeScript, 'utf16le').toString('base64');
+  const { stdout } = await execFileAsync(
+    pwshBin,
+    ['-NoLogo', '-NonInteractive', '-NoProfile', '-EncodedCommand', encoded],
+    { windowsHide: true, timeout: 10_000 },
+  );
+  assert.ok(stdout.includes('\x1b]133;D;23\x07'), `Expected OSC 133;D;23 in output, got: ${JSON.stringify(stdout)}`);
 });

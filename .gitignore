@@ -29,3 +29,8 @@ build/*
 
 # Downloaded by scripts/fetch-speaker-model.mjs at dev/build time
 public/voice-id/
+
+# Local reference repos & orchestration worktree sandboxes
+dsh-superagent-prototype/
+.aha-worktrees/
+*.aha-worktrees/
