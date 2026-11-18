@@ -223,6 +223,39 @@ export function classifyAgentTitleStatus(
   return null;
 }
 
+const TRUST_PROMPT_MESSAGE = 'Waiting for directory trust confirmation';
+// eslint-disable-next-line no-control-regex
+const OSC_SEQUENCE_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+// eslint-disable-next-line no-control-regex
+const CSI_CURSOR_FORWARD_RE = /\x1b\[\d*C/g;
+// eslint-disable-next-line no-control-regex
+const CSI_SEQUENCE_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+// eslint-disable-next-line no-control-regex
+const OTHER_ESCAPE_OR_CTRL_RE = /\x1b[@-Z\\-_]|[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
+
+export function detectCliStartupConfirmationPrompt(rawText: string): string | null {
+  if (!rawText) return null;
+  const plain = rawText
+    .replace(OSC_SEQUENCE_RE, ' ')
+    .replace(CSI_CURSOR_FORWARD_RE, ' ')
+    .replace(CSI_SEQUENCE_RE, '')
+    .replace(OTHER_ESCAPE_OR_CTRL_RE, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!plain) return null;
+
+  if (
+    /do you trust the files in this folder/i.test(plain) ||
+    /is this a project you created or one you trust/i.test(plain) ||
+    /trust (?:this|the) (?:folder|directory|workspace)/i.test(plain) ||
+    (/safety check/i.test(plain) && /\btrust\b/i.test(plain))
+  ) {
+    return TRUST_PROMPT_MESSAGE;
+  }
+
+  return null;
+}
+
 const OSC_TITLE_0_PREFIX = '\x1b]0;';
 const OSC_TITLE_2_PREFIX = '\x1b]2;';
 const PROMPT_START_MARKER = '\x1b]133;A';

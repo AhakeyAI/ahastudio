@@ -52,3 +52,14 @@ export function PiIcon({ size = 14 }: { size?: number }): React.JSX.Element {
     </svg>
   );
 }
+
+export function GeminiIcon({ size = 14 }: { size?: number }): React.JSX.Element {
+  return (
+    <svg className="gemini-icon" height={size} width={size} viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <path
+        d="M12 1.5C12.55 7.1 16.9 11.45 22.5 12C16.9 12.55 12.55 16.9 12 22.5C11.45 16.9 7.1 12.55 1.5 12C7.1 11.45 11.45 7.1 12 1.5Z"
+        fill="#4E86F8"
+      />
+    </svg>
+  );
+}

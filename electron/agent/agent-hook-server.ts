@@ -1,5 +1,5 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -34,6 +34,10 @@ function canonicalHookEventName(name: string): string {
     case 'userpromptsubmit': return 'UserPromptSubmit';
     case 'preinvocation': return 'PreInvocation';
     case 'postinvocation': return 'PostInvocation';
+    case 'beforeagent': return 'BeforeAgent';
+    case 'afteragent': return 'AfterAgent';
+    case 'beforetool': return 'BeforeTool';
+    case 'aftertool': return 'AfterTool';
     case 'pretooluse': return 'PreToolUse';
     case 'posttooluse': return 'PostToolUse';
     case 'posttoolusefailure': return 'PostToolUseFailure';
@@ -72,9 +76,9 @@ function optStr(value: unknown, maxChars = MAX_MESSAGE_CHARS): string | undefine
   return compact.length > maxChars ? `${compact.slice(0, maxChars - 1)}…` : compact;
 }
 
-function extractToolInputPreview(toolInput: unknown): string | undefined {
+function extractToolInputPreview(toolInput: unknown, maxChars = MAX_TOOL_INPUT_CHARS): string | undefined {
   if (typeof toolInput === 'string') {
-    return optStr(toolInput, MAX_TOOL_INPUT_CHARS);
+    return optStr(toolInput, maxChars);
   }
   if (!toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) {
     return undefined;
@@ -105,21 +109,24 @@ function extractToolInputPreview(toolInput: unknown): string | undefined {
     'Role',
     'name',
   ]) {
-    const val = optStr(record[key], MAX_TOOL_INPUT_CHARS);
+    const val = optStr(record[key], maxChars);
     if (val) return val;
   }
   if (Array.isArray(record.questions) && record.questions[0] && typeof record.questions[0] === 'object') {
-    const firstQuestion = optStr((record.questions[0] as Record<string, unknown>).question, MAX_TOOL_INPUT_CHARS);
+    const firstQuestion = optStr((record.questions[0] as Record<string, unknown>).question, maxChars);
     if (firstQuestion) return firstQuestion;
   }
   try {
-    return optStr(JSON.stringify(record), MAX_TOOL_INPUT_CHARS);
+    return optStr(JSON.stringify(record), maxChars);
   } catch {
     return undefined;
   }
 }
 
-function extractToolInfo(raw: Record<string, unknown>): { toolName?: string; toolInput?: string } {
+function extractToolInfo(
+  raw: Record<string, unknown>,
+  maxInputChars = MAX_TOOL_INPUT_CHARS,
+): { toolName?: string; toolInput?: string } {
   const toolCall =
     raw.toolCall && typeof raw.toolCall === 'object' && !Array.isArray(raw.toolCall)
       ? (raw.toolCall as Record<string, unknown>)
@@ -136,6 +143,7 @@ function extractToolInfo(raw: Record<string, unknown>): { toolName?: string; too
   );
   const toolInput = extractToolInputPreview(
     raw.tool_input ?? raw.toolInput ?? raw.input ?? raw.arguments ?? toolCall?.args ?? toolCall?.input,
+    maxInputChars,
   );
   return { toolName, toolInput };
 }
@@ -201,6 +209,59 @@ export function normalizeAgentHookPayload(
           agentId: hintedAgent ?? 'antigravity',
           state: 'working',
           clearTool: true,
+        };
+
+      case 'BeforeAgent':
+        return {
+          ptyId,
+          agentId: hintedAgent ?? 'gemini',
+          state: 'working',
+          clearTool: true,
+          message: optStr(raw.prompt ?? raw.message),
+        };
+
+      case 'BeforeTool': {
+        const { toolName, toolInput } = extractToolInfo(raw);
+        if (
+          raw.requiresApproval === true ||
+          raw.requires_approval === true ||
+          raw.askPermission === true ||
+          raw.ask_permission === true ||
+          raw.confirmationDetails != null
+        ) {
+          return {
+            ptyId,
+            agentId: hintedAgent ?? 'gemini',
+            state: 'waiting',
+            waitKind: 'permission',
+            toolName,
+            toolInput,
+          };
+        }
+        return {
+          ptyId,
+          agentId: hintedAgent ?? 'gemini',
+          state: 'working',
+          toolName,
+          toolInput,
+        };
+      }
+
+      case 'AfterTool':
+        return {
+          ptyId,
+          agentId: hintedAgent ?? 'gemini',
+          state: 'working',
+          clearTool: true,
+        };
+
+      case 'AfterAgent':
+        return {
+          ptyId,
+          agentId: hintedAgent ?? 'gemini',
+          state: 'done',
+          clearTool: true,
+          message: optStr(raw.lastAssistantMessage ?? raw.last_assistant_message ?? raw.message),
         };
 
       case 'PreToolUse': {
@@ -506,8 +567,26 @@ function extractBearerOrHookToken(req: IncomingMessage): string | null {
 export type OrchestrationHttpHandler = (
   action: string,
   payload: unknown,
-  context: { signal: AbortSignal }
+  context: { signal: AbortSignal; callerPaneId: string | null }
 ) => Promise<{ status: number; body: Record<string, unknown> }>;
+
+export type CompanionHttpHandler = (
+  namespace: 'terminal' | 'worktree' | 'skills',
+  action: string,
+  payload: unknown,
+  context: { signal: AbortSignal; callerPaneId: string | null }
+) => Promise<{ status: number; body: Record<string, unknown> }>;
+
+export type PermissionHookInterceptor = (input: {
+  ptyId: string;
+  providerHint?: string;
+  eventName: string;
+  rawPayload: Record<string, unknown>;
+  toolName?: string;
+  toolInput?: string;
+  message?: string;
+  signal: AbortSignal;
+}) => Promise<{ held: false } | { held: true; hookStdout?: string }>;
 
 export interface AgentHookBinShim {
   applyToEnv: (env: Record<string, string>) => Record<string, string>;
@@ -557,13 +636,39 @@ function readBoundedJsonBody(req: IncomingMessage, maxBytes: number): Promise<un
 
 export class AgentHookServer {
   private readonly token = randomBytes(32).toString('hex');
+  private paneKey = randomBytes(32);
   private server: Server | null = null;
   private boundPort: number | null = null;
   private orchestrationHandler: OrchestrationHttpHandler | null = null;
+  private companionHandler: CompanionHttpHandler | null = null;
+  private permissionHookInterceptor: PermissionHookInterceptor | null = null;
   private orchestrationBinShim: AgentHookBinShim | null = null;
   private endpointFile: string | null = null;
 
   constructor(private readonly store: AgentStatusStore) {}
+
+  setPaneKeyFile(path: string): void {
+    try {
+      writeFileSync(path, this.paneKey, { flag: 'wx', mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const saved = readFileSync(path);
+      if (saved.length !== 32) throw new Error('Invalid orchestration pane key');
+      this.paneKey = saved;
+    }
+  }
+
+  private paneToken(ptyId: string): string {
+    return createHmac('sha256', this.paneKey).update(ptyId).digest('hex');
+  }
+
+  private authenticatedPane(req: IncomingMessage): string | null {
+    const ptyId = req.headers['x-aha-pty-id'];
+    const credential = req.headers['x-aha-pane-token'];
+    return typeof ptyId === 'string' && PTY_ID_RE.test(ptyId) &&
+      typeof credential === 'string' && tokensEqual(this.paneToken(ptyId), credential)
+      ? ptyId : null;
+  }
 
   /**
    * Terminals outlive the app (detached daemon), but port and token change on every start.
@@ -595,6 +700,14 @@ export class AgentHookServer {
     this.orchestrationHandler = handler;
   }
 
+  setCompanionHandler(handler: CompanionHttpHandler | null): void {
+    this.companionHandler = handler;
+  }
+
+  setPermissionHookInterceptor(interceptor: PermissionHookInterceptor | null): void {
+    this.permissionHookInterceptor = interceptor;
+  }
+
   setOrchestrationBinShim(shim: AgentHookBinShim | null): void {
     this.orchestrationBinShim = shim;
   }
@@ -611,6 +724,7 @@ export class AgentHookServer {
     if (this.boundPort === null) {
       const base: Record<string, string> = {
         AHA_TERMINAL_ID: ptyId,
+        AHA_ORCHESTRATION_PANE_TOKEN: this.paneToken(ptyId),
         PI_PROGRAM_STATUS: '1',
         ...(this.endpointFile ? { AHA_AGENT_HOOK_ENDPOINT_FILE: this.endpointFile } : {}),
       };
@@ -618,6 +732,7 @@ export class AgentHookServer {
     }
     const base: Record<string, string> = {
       AHA_TERMINAL_ID: ptyId,
+      AHA_ORCHESTRATION_PANE_TOKEN: this.paneToken(ptyId),
       PI_PROGRAM_STATUS: '1',
       AHA_AGENT_HOOK_PORT: String(this.boundPort),
       AHA_AGENT_HOOK_TOKEN: this.token,
@@ -699,6 +814,55 @@ export class AgentHookServer {
     }
 
     const rawUrl = (req.url ?? '/').split('?')[0] ?? '/';
+    const companionMatch = /^\/(terminal|worktree|skills)\/([^/]+)$/.exec(rawUrl);
+    if (companionMatch) {
+      const namespace = companionMatch[1] as 'terminal' | 'worktree' | 'skills';
+      const action = companionMatch[2]!;
+      if (!this.companionHandler) {
+        sendJson(res, 404, { ok: false, error: 'Companion CLI service unavailable' }, true);
+        req.resume();
+        return;
+      }
+      req.setTimeout(0);
+      res.setTimeout(0);
+      let payload: unknown;
+      try {
+        payload = await readBoundedJsonBody(req, MAX_ORCHESTRATION_BODY_BYTES);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Invalid request body';
+        sendJson(res, msg.includes('large') ? 413 : 400, { ok: false, error: msg }, true);
+        return;
+      }
+      const abortController = new AbortController();
+      const onSocketClose = () => {
+        if (!res.writableFinished) abortController.abort();
+      };
+      req.once('aborted', onSocketClose);
+      res.once('close', onSocketClose);
+      try {
+        const result = await this.companionHandler(namespace, action, payload, {
+          signal: abortController.signal,
+          callerPaneId: this.authenticatedPane(req),
+        });
+        if (!res.writableEnded) {
+          sendJson(res, result.status, result.body, true);
+        }
+      } catch (err) {
+        if (!res.writableEnded) {
+          sendJson(
+            res,
+            500,
+            { ok: false, error: err instanceof Error ? err.message : 'Internal error' },
+            true
+          );
+        }
+      } finally {
+        req.removeListener('aborted', onSocketClose);
+        res.removeListener('close', onSocketClose);
+      }
+      return;
+    }
+
     if (rawUrl.startsWith('/orchestration/')) {
       const action = rawUrl.slice('/orchestration/'.length);
       if (!action || action.includes('/') || !this.orchestrationHandler) {
@@ -712,10 +876,8 @@ export class AgentHookServer {
         return;
       }
 
-      if (action === 'check' || action === 'ask') {
-        req.setTimeout(0);
-        res.setTimeout(0);
-      }
+      req.setTimeout(0);
+      res.setTimeout(0);
 
       let payload: unknown;
       try {
@@ -738,6 +900,7 @@ export class AgentHookServer {
       try {
         const result = await this.orchestrationHandler(action, payload, {
           signal: abortController.signal,
+          callerPaneId: this.authenticatedPane(req),
         });
         if (!res.writableEnded) {
           sendJson(res, result.status, result.body, true);
@@ -819,6 +982,55 @@ export class AgentHookServer {
     }
 
     this.store.ingestHookEvent(normalized);
+
+    if (this.permissionHookInterceptor) {
+      const rawRecord = parsed as Record<string, unknown>;
+      const rawEv = optStr(
+        rawRecord.hook_event_name ?? rawRecord.hookEventName ?? rawRecord.event ?? rawRecord.type,
+        64,
+      );
+      const eventName = rawEv ? canonicalHookEventName(rawEv) : '';
+      if (
+        eventName === 'PermissionRequest' ||
+        eventName === 'BeforeTool' ||
+        eventName === 'PreToolUse'
+      ) {
+        req.setTimeout(0);
+        res.setTimeout(0);
+        const abortController = new AbortController();
+        const onSocketClose = () => {
+          if (!res.writableFinished) abortController.abort();
+        };
+        req.once('aborted', onSocketClose);
+        res.once('close', onSocketClose);
+        try {
+          const { toolName, toolInput } = extractToolInfo(rawRecord, 2_000);
+          const intercept = await this.permissionHookInterceptor({
+            ptyId: normalized.ptyId,
+            providerHint,
+            eventName,
+            rawPayload: rawRecord,
+            toolName: toolName ?? normalized.toolName,
+            toolInput: toolInput ?? normalized.toolInput,
+            message: normalized.message,
+            signal: abortController.signal,
+          });
+          if (!res.writableEnded) {
+            sendJson(
+              res,
+              200,
+              intercept.held && intercept.hookStdout ? { hookStdout: intercept.hookStdout } : {},
+              true
+            );
+          }
+          return;
+        } finally {
+          req.removeListener('aborted', onSocketClose);
+          res.removeListener('close', onSocketClose);
+        }
+      }
+    }
+
     sendJson(res, 200, {});
   }
 }

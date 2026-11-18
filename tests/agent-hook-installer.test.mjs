@@ -8,6 +8,8 @@ import test from 'node:test';
 import { AgentHookInstaller, RELAY_FILE_NAME } from '../dist-electron/agent/agent-hook-installer.js';
 import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
 import { AgentHookServer } from '../dist-electron/agent/agent-hook-server.js';
+import { registerAgentHooksIpc } from '../dist-electron/ipc/agent-hooks.js';
+import { ipcMain } from 'electron';
 
 const RELAY_SOURCE = join(process.cwd(), 'dist-electron', 'agent', 'agent-hook-relay.cjs');
 
@@ -335,4 +337,43 @@ test('Installed hook commands reach the loopback server end to end (Claude stdin
   });
   assert.equal(dead.code, 0);
   assert.ok(Date.now() - started < 4000, 'dead server does not stall the CLI');
+});
+
+test('Relay content drift marks status outdated and refreshRelayIfInstalled/IPC syncs automatically', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'aha-hooks-sync-'));
+  const srcDir = mkdtempSync(join(tmpdir(), 'aha-hooks-src-'));
+  t.after(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(srcDir, { recursive: true, force: true });
+  });
+
+  const srcRelay = join(srcDir, 'agent-hook-relay.cjs');
+  writeFileSync(srcRelay, '// relay v1\n', 'utf8');
+  const installer = new AgentHookInstaller({ homeDir: home, env: {}, relaySourcePath: srcRelay });
+
+  assert.equal(installer.install('claude').state, 'installed');
+  assert.equal(installer.isRelayUpToDate(), true);
+
+  // Updating the relay source marks status outdated until refreshed.
+  writeFileSync(srcRelay, '// relay v2\n', 'utf8');
+  assert.equal(installer.isRelayUpToDate(), false);
+  const outdated = installer.status('claude');
+  assert.equal(outdated.state, 'outdated');
+  assert.match(outdated.detail, /重新安装/);
+
+  // Registering IPC refreshes immediately and on agent-hooks:status even if relay file was deleted.
+  rmSync(installer.relayPath, { force: true });
+  const handlers = new Map();
+  t.mock.method(ipcMain, 'handle', (channel, fn) => handlers.set(channel, fn));
+  const hooksIpc = registerAgentHooksIpc(installer);
+  t.after(() => hooksIpc.dispose());
+
+  assert.equal(installer.isRelayUpToDate(), true);
+  assert.equal(readFileSync(installer.relayPath, 'utf8'), '// relay v2\n');
+
+  writeFileSync(srcRelay, '// relay v3\n', 'utf8');
+  const statusRes = await handlers.get('agent-hooks:status')();
+  assert.equal(statusRes.ok, true);
+  assert.equal(statusRes.statuses.find((s) => s.cliId === 'claude')?.state, 'installed');
+  assert.equal(readFileSync(installer.relayPath, 'utf8'), '// relay v3\n');
 });

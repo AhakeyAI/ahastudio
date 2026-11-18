@@ -1,10 +1,11 @@
 import { Terminal, GitBranch } from 'lucide-react';
 import { BackendAvatar } from './BackendAvatar';
-import { ClaudeIcon, OpenAIIcon, OpenCodeIcon, PiIcon, QwenIcon } from './TerminalBrandIcons';
+import { ClaudeIcon, GeminiIcon, OpenAIIcon, OpenCodeIcon, PiIcon, QwenIcon } from './TerminalBrandIcons';
 
 const BRAND_ICONS: Record<string, typeof OpenAIIcon> = {
   claude: ClaudeIcon,
   codex: OpenAIIcon,
+  gemini: GeminiIcon,
   opencode: OpenCodeIcon,
   pi: PiIcon,
   qwen: QwenIcon,

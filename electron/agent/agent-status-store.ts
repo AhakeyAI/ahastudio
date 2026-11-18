@@ -1,6 +1,7 @@
 import {
   classifyAgentTitleStatus,
   createAgentPtyOscScanner,
+  detectCliStartupConfirmationPrompt,
   normalizeAgentId,
   PROGRAM_STATUS_QUERY_REPLY,
   type AgentPtyOscEvent,
@@ -68,6 +69,8 @@ export interface NormalizedAgentHookEvent {
 
 const HOOK_PRECEDENCE_MS = 120_000;
 const MAX_TRACKED_PANES = 256;
+const MAX_STARTUP_BUFFER_CHARS = 2048;
+const TRUST_WAIT_MESSAGE = 'Waiting for directory trust confirmation';
 
 interface InternalPaneRecord {
   status: AgentPaneStatus;
@@ -79,6 +82,8 @@ interface InternalPaneRecord {
   workingSequence: number;
   permissionSequence: number;
   outputSequence: number;
+  startupBuffer: string;
+  startupTrustBlocked: boolean;
   lastDigest: string;
 }
 
@@ -113,6 +118,7 @@ function isAttentionTransition(prev: AgentLifecycleState, next: AgentLifecycleSt
 
 export class AgentStatusStore {
   private readonly panes = new Map<string, InternalPaneRecord>();
+  private readonly exitedPanes = new Set<string>();
   private readonly changeListeners = new Set<(status: AgentPaneStatus) => void>();
   private readonly attentionListeners = new Set<(status: AgentPaneStatus) => void>();
   private readonly activityListeners = new Set<(snapshot: AgentPaneActivitySnapshot) => void>();
@@ -144,6 +150,7 @@ export class AgentStatusStore {
   }
 
   registerPane(ptyId: string, opts?: { agentId?: string | null }): AgentPaneStatus {
+    this.exitedPanes.delete(ptyId);
     const existing = this.panes.get(ptyId);
     const normalizedAgent = opts?.agentId !== undefined ? normalizeAgentId(opts.agentId) : undefined;
     if (existing) {
@@ -183,6 +190,8 @@ export class AgentStatusStore {
       workingSequence: 0,
       permissionSequence: 0,
       outputSequence: 0,
+      startupBuffer: '',
+      startupTrustBlocked: false,
       lastDigest: statusDigest(initial),
     };
     this.panes.set(ptyId, record);
@@ -190,6 +199,7 @@ export class AgentStatusStore {
   }
 
   removePane(ptyId: string): void {
+    this.rememberPtyExit(ptyId);
     const existing = this.panes.get(ptyId);
     this.panes.delete(ptyId);
     if (existing) {
@@ -235,6 +245,7 @@ export class AgentStatusStore {
   }
 
   ingestPtyData(ptyId: string, utf8Chunk: string): { replyToWrite?: string } {
+    if (this.exitedPanes.has(ptyId)) return {};
     const record = this.ensureRecord(ptyId);
     const hasOutput = utf8Chunk.length > 0;
     if (hasOutput) {
@@ -270,17 +281,95 @@ export class AgentStatusStore {
     }
 
     if (hasOutput && !emittedActivity) {
-      this.emitActivitySnapshot(this.toActivitySnapshot(record));
+      if (
+        record.workingSequence === 0 &&
+        !this.hasFreshHook(record) &&
+        !record.osc7501ActiveInInvocation
+      ) {
+        const lastClear2J = utf8Chunk.lastIndexOf('\x1b[2J');
+        const lastReset = utf8Chunk.lastIndexOf('\x1bc');
+        const clearIndex = Math.max(lastClear2J, lastReset);
+        const hasScreenClear = clearIndex !== -1;
+        if (hasScreenClear) {
+          record.startupBuffer = utf8Chunk.slice(clearIndex);
+        } else {
+          record.startupBuffer += utf8Chunk;
+        }
+        if (record.startupBuffer.length > MAX_STARTUP_BUFFER_CHARS) {
+          record.startupBuffer = record.startupBuffer.slice(-MAX_STARTUP_BUFFER_CHARS);
+        }
+
+        const trustPrompt = detectCliStartupConfirmationPrompt(record.startupBuffer);
+        if (trustPrompt) {
+          if (record.status.state !== 'waiting') {
+            const prevState = record.status.state;
+            const ts = this.now();
+            record.startupTrustBlocked = true;
+            record.status.state = 'waiting';
+            record.status.waitKind = 'permission';
+            record.status.source = 'process';
+            record.status.message = trustPrompt;
+            record.status.stateStartedAt = ts;
+            record.status.updatedAt = ts;
+            record.permissionSequence += 1;
+            this.commitIfChanged(record, prevState);
+            this.emitActivitySnapshot(this.toActivitySnapshot(record));
+            emittedActivity = true;
+          }
+        } else if (record.startupTrustBlocked && hasScreenClear) {
+          if (this.resolveStartupTrustToIdle(record)) {
+            emittedActivity = true;
+          }
+        }
+      }
+      if (!emittedActivity) {
+        this.emitActivitySnapshot(this.toActivitySnapshot(record));
+      }
     }
 
     return replyToWrite ? { replyToWrite } : {};
   }
 
-  ingestHookEvent(event: NormalizedAgentHookEvent): AgentPaneStatus {
+  notifyUserInput(ptyId: string, data: string): void {
+    const record = this.panes.get(ptyId);
+    if (!record || !record.startupTrustBlocked) return;
+    if (!data.includes('\r') && !data.includes('\n')) return;
+    this.resolveStartupTrustToIdle(record);
+  }
+
+  private resolveStartupTrustToIdle(record: InternalPaneRecord): boolean {
+    const prevState = record.status.state;
+    this.clearStartupTrustState(record);
+    if (prevState !== 'waiting') return false;
+    const ts = this.now();
+    record.status.state = 'idle';
+    record.status.source = 'process';
+    record.status.unread = false;
+    delete record.status.waitKind;
+    if (record.status.message === TRUST_WAIT_MESSAGE) {
+      delete record.status.message;
+    }
+    record.status.stateStartedAt = ts;
+    record.status.updatedAt = ts;
+    this.commitIfChanged(record, prevState);
+    this.emitActivitySnapshot(this.toActivitySnapshot(record));
+    return true;
+  }
+
+  seedStartupScreen(ptyId: string, screen: string): void {
+    if (detectCliStartupConfirmationPrompt(screen)) this.ingestPtyData(ptyId, screen);
+  }
+
+  ingestHookEvent(event: NormalizedAgentHookEvent): AgentPaneStatus | null {
+    if (this.exitedPanes.has(event.ptyId)) return this.get(event.ptyId);
     const record = this.ensureRecord(event.ptyId);
     const prevState = record.status.state;
     const ts = this.now();
 
+    this.clearStartupTrustState(record);
+    if (record.status.message === TRUST_WAIT_MESSAGE && event.message === undefined) {
+      delete record.status.message;
+    }
     record.lastHookAt = ts;
     record.status.source = 'hook';
 
@@ -361,6 +450,7 @@ export class AgentStatusStore {
   }
 
   handlePtyExit(ptyId: string, exitCode: number | null): void {
+    this.rememberPtyExit(ptyId);
     const record = this.panes.get(ptyId);
     if (!record) return;
     const prevState = record.status.state;
@@ -368,6 +458,10 @@ export class AgentStatusStore {
 
     record.osc7501ActiveInInvocation = false;
     record.lastHookAt = 0;
+    this.clearStartupTrustState(record);
+    if (record.status.message === TRUST_WAIT_MESSAGE) {
+      delete record.status.message;
+    }
     record.subagents.clear();
     record.status.subagents = [];
     delete record.status.toolName;
@@ -386,6 +480,19 @@ export class AgentStatusStore {
     if (changed || prevState !== record.status.state) {
       this.emitActivitySnapshot(this.toActivitySnapshot(record));
     }
+  }
+
+  private rememberPtyExit(ptyId: string): void {
+    this.exitedPanes.add(ptyId);
+    if (this.exitedPanes.size > MAX_TRACKED_PANES * 2) {
+      const oldest = this.exitedPanes.values().next().value;
+      if (oldest) this.exitedPanes.delete(oldest);
+    }
+  }
+
+  private clearStartupTrustState(record: InternalPaneRecord): void {
+    record.startupBuffer = '';
+    record.startupTrustBlocked = false;
   }
 
   private ensureRecord(ptyId: string): InternalPaneRecord {
@@ -428,6 +535,10 @@ export class AgentStatusStore {
 
   private applyOsc7501Report(record: InternalPaneRecord, report: ProgramStatusReport): boolean {
     record.osc7501ActiveInInvocation = true;
+    this.clearStartupTrustState(record);
+    if (record.status.message === TRUST_WAIT_MESSAGE && report.msg === undefined && report.title === undefined) {
+      delete record.status.message;
+    }
     // Let recent managed hooks remain authoritative unless silent for > 120s.
     if (this.hasFreshHook(record)) {
       return false;
@@ -555,6 +666,11 @@ export class AgentStatusStore {
     const classified = classifyAgentTitleStatus(title);
     if (!classified) return false;
 
+    this.clearStartupTrustState(record);
+    if (record.status.message === TRUST_WAIT_MESSAGE && !classified.cleanTitle) {
+      delete record.status.message;
+    }
+
     const prevState = record.status.state;
     const ts = this.now();
 
@@ -605,6 +721,10 @@ export class AgentStatusStore {
 
     record.osc7501ActiveInInvocation = false;
     record.lastHookAt = 0;
+    this.clearStartupTrustState(record);
+    if (record.status.message === TRUST_WAIT_MESSAGE) {
+      delete record.status.message;
+    }
     record.subagents.clear();
     record.status.subagents = [];
     delete record.status.toolName;

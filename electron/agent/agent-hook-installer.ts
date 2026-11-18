@@ -1,9 +1,9 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const AGENT_HOOK_CLI_IDS = ['claude', 'antigravity', 'codex', 'qwen', 'grok'] as const;
+export const AGENT_HOOK_CLI_IDS = ['claude', 'antigravity', 'codex', 'gemini', 'qwen', 'grok'] as const;
 export type AgentHookCliId = typeof AGENT_HOOK_CLI_IDS[number];
 
 export const RELAY_FILE_NAME = 'aha-agent-hook.cjs';
@@ -34,15 +34,27 @@ const LABELS: Record<AgentHookCliId, string> = {
   claude: 'Claude Code',
   antigravity: 'Antigravity',
   codex: 'Codex',
+  gemini: 'Gemini CLI',
   qwen: 'Qwen Code',
   grok: 'Grok',
 };
 
-// Only lifecycle events the hook server understands. Claude rejects a settings
-// file containing unknown hook events on older versions, so newer events such
-// as PermissionRequest are left out there; Notification already covers prompts.
+const CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS = 130;
+const GEMINI_PERMISSION_HOOK_TIMEOUT_MS = 130_000;
+const GEMINI_LIFECYCLE_HOOK_TIMEOUT_MS = 5_000;
+
 const JSON_HOOK_EVENTS: Record<Exclude<AgentHookCliId, 'codex' | 'antigravity' | 'grok'>, readonly string[]> = {
-  claude: ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Notification', 'Stop', 'SubagentStop'],
+  claude: [
+    'SessionStart',
+    'UserPromptSubmit',
+    'PreToolUse',
+    'PostToolUse',
+    'Notification',
+    'PermissionRequest',
+    'Stop',
+    'SubagentStop',
+  ],
+  gemini: ['BeforeAgent', 'AfterAgent', 'BeforeTool', 'AfterTool'],
   qwen: [
     'SessionStart',
     'UserPromptSubmit',
@@ -78,7 +90,24 @@ const GROK_ALL_EVENTS = [...GROK_DIRECT_EVENTS, ...GROK_TOOL_EVENTS] as const;
 const HOOK_NAME = 'ahastation-agent-status';
 
 function defaultRelaySource(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), 'agent-hook-relay.cjs');
+  const here = dirname(fileURLToPath(import.meta.url));
+  const bundled = join(here, 'agent-hook-relay.cjs');
+  const unpacked = bundled.replace(/\.asar([\\/])/, '.asar.unpacked$1');
+  const source = resolve(here, '..', '..', 'electron', 'agent', 'agent-hook-relay.cjs');
+  if (existsSync(source)) {
+    if (existsSync(bundled)) {
+      try {
+        const content = readFileSync(source, 'utf8');
+        if (readFileSync(bundled, 'utf8') !== content) {
+          writeAtomic(bundled, content);
+        }
+      } catch {
+        /* non-fatal; callers still read from source */
+      }
+    }
+    return source;
+  }
+  return existsSync(unpacked) ? unpacked : bundled;
 }
 
 export class AgentHookInstaller {
@@ -98,6 +127,19 @@ export class AgentHookInstaller {
 
   get relayPath(): string {
     return join(this.relayDir, RELAY_FILE_NAME);
+  }
+
+  get sourcePath(): string {
+    return this.relaySourcePath;
+  }
+
+  isRelayUpToDate(): boolean {
+    if (!existsSync(this.relayPath)) return false;
+    try {
+      return readFileSync(this.relayPath, 'utf8') === readFileSync(this.relaySourcePath, 'utf8');
+    } catch {
+      return false;
+    }
   }
 
   /** Forward slashes keep the path valid in bash, cmd and PowerShell alike. */
@@ -126,6 +168,8 @@ export class AgentHookInstaller {
         return join(this.home, '.gemini', 'config', 'hooks.json');
       case 'codex':
         return join(this.env.CODEX_HOME || join(this.home, '.codex'), 'config.toml');
+      case 'gemini':
+        return join(this.env.GEMINI_CLI_HOME || join(this.home, '.gemini'), 'settings.json');
       case 'qwen':
         return join(this.home, '.qwen', 'settings.json');
       case 'grok':
@@ -135,7 +179,13 @@ export class AgentHookInstaller {
 
   /** Refresh the relay script when hooks already reference it (e.g. after an app update). */
   refreshRelayIfInstalled(): void {
-    if (!existsSync(this.relayPath)) return;
+    const anyInstalled =
+      existsSync(this.relayPath) ||
+      AGENT_HOOK_CLI_IDS.some((cliId) => {
+        const state = this.status(cliId).state;
+        return state === 'installed' || state === 'outdated';
+      });
+    if (!anyInstalled) return;
     try {
       this.writeRelay();
     } catch {
@@ -159,8 +209,13 @@ export class AgentHookInstaller {
             : cliId === 'grok'
               ? this.grokState(configPath)
               : this.jsonState(cliId, configPath);
-      if (state.state === 'installed' && !existsSync(this.relayPath)) {
-        return { ...base, state: 'outdated', detail: '转发脚本缺失，重新安装即可修复' };
+      if (state.state === 'installed') {
+        if (!existsSync(this.relayPath)) {
+          return { ...base, state: 'outdated', detail: '转发脚本缺失，重新安装即可修复' };
+        }
+        if (!this.isRelayUpToDate()) {
+          return { ...base, state: 'outdated', detail: '转发脚本已更新，重新安装即可生效' };
+        }
       }
       return { ...base, ...state };
     } catch (error) {
@@ -196,10 +251,23 @@ export class AgentHookInstaller {
     writeAtomic(this.relayPath, content);
   }
 
-  // ---- JSON settings (Claude / Qwen) ----
+  // ---- JSON settings (Claude / Gemini / Qwen) ----
 
   private isOurCommand(command: unknown): boolean {
     return typeof command === 'string' && command.includes(RELAY_FILE_NAME);
+  }
+
+  private expectedJsonTimeout(
+    cliId: Exclude<AgentHookCliId, 'codex' | 'antigravity' | 'grok'>,
+    event: string,
+  ): number {
+    if (cliId === 'claude') {
+      return event === 'PermissionRequest' ? CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS : 5;
+    }
+    if (cliId === 'gemini') {
+      return event === 'BeforeTool' ? GEMINI_PERMISSION_HOOK_TIMEOUT_MS : GEMINI_LIFECYCLE_HOOK_TIMEOUT_MS;
+    }
+    return 5;
   }
 
   private jsonState(
@@ -213,9 +281,24 @@ export class AgentHookInstaller {
     let found = 0;
     let exact = 0;
     for (const event of JSON_HOOK_EVENTS[cliId]) {
-      const commands = collectCommands(hooks[event]).filter((c) => this.isOurCommand(c));
+      const expectedTimeout = this.expectedJsonTimeout(cliId, event);
+      const groups = hooks[event];
+      const commands = collectCommands(groups).filter((c) => this.isOurCommand(c));
       if (commands.length > 0) found += 1;
-      if (commands.includes(expected)) exact += 1;
+      const hasExactHook =
+        Array.isArray(groups) &&
+        groups.some(
+          (g) =>
+            isRecord(g) &&
+            Array.isArray(g.hooks) &&
+            g.hooks.some(
+              (h) =>
+                isRecord(h) &&
+                h.command === expected &&
+                h.timeout === expectedTimeout,
+            ),
+        );
+      if (commands.length === 1 && hasExactHook) exact += 1;
     }
     const anyOurs = Object.values(hooks).some((groups) =>
       collectCommands(groups).some((c) => this.isOurCommand(c)),
@@ -234,13 +317,18 @@ export class AgentHookInstaller {
     const hooks: Record<string, unknown> = { ...(isRecord(settings.hooks) ? settings.hooks : {}) };
     stripOurHooks(hooks, (c) => this.isOurCommand(c));
     const command = this.commandFor(cliId);
-    const entry: Record<string, unknown> =
-      cliId === 'claude'
-        ? { type: 'command', command, timeout: 5 }
-        : { type: 'command', command, name: HOOK_NAME, timeout: 5 };
     for (const event of JSON_HOOK_EVENTS[cliId]) {
+      const timeout = this.expectedJsonTimeout(cliId, event);
+      const entry: Record<string, unknown> =
+        cliId === 'qwen'
+          ? { type: 'command', command, name: HOOK_NAME, timeout }
+          : { type: 'command', command, timeout };
+      const group: Record<string, unknown> =
+        cliId === 'claude' && event === 'PermissionRequest'
+          ? { matcher: '*', hooks: [entry] }
+          : { hooks: [entry] };
       const groups = Array.isArray(hooks[event]) ? [...(hooks[event] as unknown[])] : [];
-      groups.push({ hooks: [{ ...entry }] });
+      groups.push(group);
       hooks[event] = groups;
     }
     const next = { ...settings, hooks };

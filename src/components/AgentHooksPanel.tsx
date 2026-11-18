@@ -90,14 +90,20 @@ export function AgentHooksPanel() {
               </div>
             </div>
             <div style={{ display: 'flex', gap: 6 }}>
-              {(s.state !== 'installed') && canInstall && (
+              {canInstall && (
                 <button
                   type="button"
                   style={buttonStyle}
                   disabled={busy !== null}
                   onClick={() => void run(s.cliId, 'install')}
                 >
-                  {busy === s.cliId ? '处理中…' : s.state === 'outdated' ? '更新' : '启用'}
+                  {busy === s.cliId
+                    ? '处理中…'
+                    : s.state === 'outdated'
+                      ? '更新'
+                      : s.state === 'installed'
+                        ? '重新安装'
+                        : '启用'}
                 </button>
               )}
               {enabled && (

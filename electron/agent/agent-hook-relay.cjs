@@ -35,6 +35,37 @@ let stdinHandled = false;
 let resolvedEventName = eventArg;
 let idleTimer = null;
 let fallbackTimer = null;
+let safetyTimer = null;
+
+function isHoldablePermissionEvent(evName, payload) {
+  const norm = String(evName || '').replace(/[-_\s]+/g, '').toLowerCase();
+  if (norm === 'permissionrequest') return true;
+  if (norm === 'beforetool') {
+    return payload.requiresApproval === true || payload.requires_approval === true ||
+      payload.askPermission === true || payload.ask_permission === true || payload.confirmationDetails != null;
+  }
+  return norm === 'pretooluse' && (
+    (payload.tool_name || payload.toolName) === 'ask_permission' ||
+    payload.requiresApproval === true || payload.requires_approval === true ||
+    payload.permissionPrompt === true || payload.holdForApproval === true
+  );
+}
+
+function unavailableDecision(eventName) {
+  const reason = 'AhaStation could not confirm this permission request.';
+  const norm = String(eventName || '').replace(/[-_\s]+/g, '').toLowerCase();
+  if (provider === 'claude' && norm === 'pretooluse') {
+    return JSON.stringify({ hookSpecificOutput: {
+      hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason,
+    } }) + '\n';
+  }
+  if (provider === 'claude' || provider === 'qwen') {
+    return JSON.stringify({ hookSpecificOutput: {
+      hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: reason },
+    } }) + '\n';
+  }
+  return JSON.stringify({ decision: 'deny', reason }) + '\n';
+}
 
 function antigravityReplyFor(eventName) {
   const ev = eventName || eventArg;
@@ -44,19 +75,25 @@ function antigravityReplyFor(eventName) {
   return '{}\n';
 }
 
-function finish(eventName) {
+function finish(eventName, customStdout) {
   if (finished) return;
   finished = true;
   clearTimeout(idleTimer);
   clearTimeout(fallbackTimer);
+  clearTimeout(safetyTimer);
   try { process.stdin.pause(); } catch {}
-  if (provider === 'antigravity') {
+  if (typeof customStdout === 'string' && customStdout.length > 0) {
+    process.stdout.write(customStdout, () => process.exit(0));
+  } else if (provider === 'antigravity') {
     process.stdout.write(antigravityReplyFor(eventName || resolvedEventName), () => process.exit(0));
+  } else if (provider === 'gemini') {
+    process.stdout.write('{}\n', () => process.exit(0));
   } else {
     process.exit(0);
   }
 }
-setTimeout(() => finish(), 3000).unref();
+safetyTimer = setTimeout(() => finish(), 3000);
+safetyTimer.unref();
 
 function hasCompleteJsonObject(str) {
   let depth = 0;
@@ -111,6 +148,17 @@ function send(raw) {
   }
   const ev = payload.hook_event_name || payload.hookEventName || payload.event || payload.type;
   if (typeof ev === 'string' && ev.trim()) resolvedEventName = ev.trim();
+  const gated = isHoldablePermissionEvent(resolvedEventName, payload);
+  const managedWorker = Boolean(process.env.AHA_DISPATCH_CAPABILITY);
+  let connected = false;
+  // Once connected to AhaStation (or inside an automated worker), fail closed on drop/timeout.
+  // If AhaStation was closed (`ECONNREFUSED` before connect) in an interactive user terminal,
+  // exit silently so the CLI falls back to its own terminal permission prompt.
+  const transportFailed = () =>
+    finish(
+      resolvedEventName,
+      gated && (connected || managedWorker) ? unavailableDecision(resolvedEventName) : undefined
+    );
 
   let body = JSON.stringify(shrink(payload, 0));
   if (Buffer.byteLength(body) > MAX_BODY_BYTES) {
@@ -122,7 +170,7 @@ function send(raw) {
     body = JSON.stringify(flat);
   }
   let target;
-  try { target = new URL(hookUrl.replace(/\/+$/, '') + (provider ? '/' + provider : '')); } catch { finish(); return; }
+  try { target = new URL(hookUrl.replace(/\/+$/, '') + (provider ? '/' + provider : '')); } catch { transportFailed(); return; }
   const req = http.request(target, {
     method: 'POST',
     headers: {
@@ -132,9 +180,47 @@ function send(raw) {
       'x-aha-pty-id': ptyId,
     },
     timeout: 1500,
-  }, (res) => { res.resume(); res.on('end', () => finish()); res.on('error', () => finish()); });
-  req.on('timeout', () => { req.destroy(); finish(); });
-  req.on('error', () => finish());
+  }, (res) => {
+    const chunks = [];
+    let total = 0;
+    res.on('data', (chunk) => {
+      if (total < 65536) {
+        chunks.push(chunk);
+        total += chunk.length;
+      }
+    });
+    res.on('end', () => {
+      if (res.statusCode !== 200) {
+        transportFailed();
+        return;
+      }
+      let hookStdout = '';
+      if (chunks.length > 0) {
+        try {
+          const parsedRes = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          if (parsedRes && typeof parsedRes.hookStdout === 'string') {
+            hookStdout = parsedRes.hookStdout;
+          }
+        } catch {}
+      }
+      finish(resolvedEventName, hookStdout);
+    });
+    res.on('error', transportFailed);
+  });
+  req.on('socket', (socket) => {
+    socket.once('connect', () => {
+      connected = true;
+      if (gated) {
+        // Only extend wait window after confirming the local hook server is reachable.
+        req.setTimeout(125000);
+        clearTimeout(safetyTimer);
+        safetyTimer = setTimeout(transportFailed, 125000);
+        safetyTimer.unref();
+      }
+    });
+  });
+  req.on('timeout', () => { req.destroy(); transportFailed(); });
+  req.on('error', transportFailed);
   req.end(body);
 }
 
