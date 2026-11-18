@@ -297,7 +297,18 @@ export function leafIdForSpawnedPty(ptyId: string): string | null {
   return /^[a-zA-Z0-9._-]{1,128}$/.test(leafId) ? leafId : null;
 }
 
-const KNOWN_CLI_IDS = new Set(['codex', 'claude', 'opencode', 'qoder', 'kimi', 'qwen', 'pi', 'antigravity', 'grok']);
+const KNOWN_CLI_IDS = new Set([
+  'codex',
+  'claude',
+  'gemini',
+  'opencode',
+  'qoder',
+  'kimi',
+  'qwen',
+  'pi',
+  'antigravity',
+  'grok',
+]);
 const KNOWN_SHELL_IDS = new Set(['default', 'pwsh', 'powershell', 'cmd', 'git-bash']);
 
 /** Stage-window launch fields that re-attach to a worker PTY created by the main process. */
@@ -321,4 +332,76 @@ export function formatRelativeTime(iso: string | null | undefined, now = Date.no
   if (diff < 3_600_000) return `${Math.round(diff / 60_000)} 分钟前`;
   if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)} 小时前`;
   return `${Math.round(diff / 86_400_000)} 天前`;
+}
+
+function mergeScopedRecords<T extends { runId: string }>(
+  prevItems: readonly T[],
+  incomingItems: readonly T[],
+  runId: string,
+  validRunIds: ReadonlySet<string>,
+  getKey: (item: T) => string,
+  compare: (a: T, b: T) => number,
+  includeUnbound = false,
+): T[] {
+  const byKey = new Map<string, T>();
+  for (const item of prevItems) {
+    if (item.runId !== runId && (validRunIds.has(item.runId) || (includeUnbound && item.runId === 'run_unbound'))) {
+      byKey.set(getKey(item), item);
+    }
+  }
+  for (const item of incomingItems) {
+    byKey.set(getKey(item), item);
+  }
+  return [...byKey.values()].sort(compare);
+}
+
+/** Merges a run-scoped snapshot pushed by `orchestration:event` into the previously loaded global snapshot. */
+export function mergeRunSnapshot(
+  prev: OrchestrationSnapshot,
+  runId: string,
+  incoming: OrchestrationSnapshot,
+): OrchestrationSnapshot {
+  const validRunIds = new Set(incoming.runs.map((run) => run.id));
+  validRunIds.add(runId);
+  const byCreatedAt = (a: { createdAt: string }, b: { createdAt: string }) =>
+    a.createdAt.localeCompare(b.createdAt);
+
+  return {
+    runs: incoming.runs,
+    tasks: mergeScopedRecords(prev.tasks, incoming.tasks, runId, validRunIds, (t) => t.id, byCreatedAt),
+    dispatches: mergeScopedRecords(prev.dispatches, incoming.dispatches, runId, validRunIds, (d) => d.id, byCreatedAt),
+    gates: mergeScopedRecords(prev.gates, incoming.gates, runId, validRunIds, (g) => g.id, byCreatedAt),
+    messages: mergeScopedRecords(
+      prev.messages,
+      incoming.messages,
+      runId,
+      validRunIds,
+      (m) => m.id,
+      (a, b) => a.seq - b.seq || a.createdAt.localeCompare(b.createdAt),
+      true,
+    ),
+    questions: mergeScopedRecords(prev.questions, incoming.questions, runId, validRunIds, (q) => q.messageId, byCreatedAt),
+    ...(incoming.openApprovals !== undefined || prev.openApprovals !== undefined
+      ? {
+          openApprovals: mergeScopedRecords(
+            prev.openApprovals ?? [],
+            incoming.openApprovals ?? [],
+            runId,
+            validRunIds,
+            (a) => a.approvalId,
+            byCreatedAt,
+          ),
+        }
+      : {}),
+    coordinatorRuns: mergeScopedRecords(
+      prev.coordinatorRuns,
+      incoming.coordinatorRuns,
+      runId,
+      validRunIds,
+      (c) => c.id,
+      (a, b) => a.startedAt.localeCompare(b.startedAt),
+    ),
+    activeCoordinatorRun: incoming.activeCoordinatorRun,
+    currentRunByConsumer: incoming.currentRunByConsumer,
+  };
 }

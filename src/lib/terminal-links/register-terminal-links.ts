@@ -15,6 +15,12 @@ import {
   isSafeTerminalLinkCandidate,
   resolveSafeOscLinkTarget,
 } from './terminal-link-safety';
+import { orchestrationClient } from '../orchestration-client';
+import {
+  dispatchFocusOrchestrationTarget,
+  extractOrchestrationTerminalLinks,
+  resolveOrchestrationLinkTarget,
+} from './orchestration-terminal-links';
 
 export interface RegisterTerminalLinksOptions {
   getCwd: () => string | undefined;
@@ -300,13 +306,72 @@ export function registerTerminalLinks(
     allowNonHttpProtocols: true,
   };
 
+  // 4. Orchestration #task_xxx / ctx_xxx / @handle link provider
+  const orchestrationProvider: ILinkProvider = {
+    provideLinks(bufferLineNumber, callback) {
+      const buffer = terminal.buffer.active as unknown as TerminalLinkBuffer;
+      const logicalLines = buildCandidateLogicalLinesForBufferPosition(buffer, bufferLineNumber);
+      const snapshot = orchestrationClient.getSnapshot();
+      const links: ILink[] = [];
+      const seen = new Set<string>();
+
+      for (const logicalLine of logicalLines) {
+        const tokens = extractOrchestrationTerminalLinks(logicalLine.text);
+        for (const token of tokens) {
+          const resolved = resolveOrchestrationLinkTarget(token, snapshot, session.getPtyId());
+          if (!resolved) continue;
+          const rowRange = rangeForParsedLinkOnRow(
+            logicalLine,
+            token.startIndex,
+            token.endIndex,
+            bufferLineNumber,
+          );
+          if (
+            !rowRange ||
+            terminalLogicalLinkHasOscLink(buffer, logicalLine, token.startIndex, token.endIndex)
+          ) {
+            continue;
+          }
+          const range = toXtermRange(rowRange);
+          const key = rangeKey(range, token.rawText);
+          if (seen.has(key)) continue;
+          seen.add(key);
+
+          links.push({
+            range,
+            text: token.rawText,
+            decorations: { pointerCursor: true, underline: true },
+            hover: (ev) => showTooltip(ev, resolved.label),
+            leave: hideTooltip,
+            activate: (event) => {
+              if (!isIntentionalLinkClick(event)) return;
+              event.preventDefault();
+              hideTooltip();
+              const latestResolved =
+                resolveOrchestrationLinkTarget(token, orchestrationClient.getSnapshot(), session.getPtyId());
+              if (!latestResolved) return;
+              if (latestResolved.ptyId) {
+                dispatchFocusOrchestrationTarget(latestResolved);
+              } else {
+                options.onNotify?.(`${latestResolved.label} 当前没有活跃终端`);
+              }
+            },
+          });
+        }
+      }
+      callback(links.length > 0 ? links : undefined);
+    },
+  };
+
   const disposeHttp = session.registerLinkProvider(httpProvider);
   const disposeFile = session.registerLinkProvider(fileProvider);
+  const disposeOrchestration = session.registerLinkProvider(orchestrationProvider);
 
   return () => {
     hideTooltip();
     disposeHttp.dispose();
     disposeFile.dispose();
+    disposeOrchestration.dispose();
     if (terminal.options.linkHandler) {
       terminal.options.linkHandler = previousLinkHandler ?? undefined;
     }

@@ -37,13 +37,21 @@ import {
 import { isPathInside, isSamePath } from '../lib/git-panel-model';
 import { orchestrationClient } from '../lib/orchestration-client';
 import {
-  attentionCount,
+  buildSidebarWindowLineage,
+  filterLineageForFolder,
+  isAutoManagedWorktreeFolder,
+} from '../lib/orchestration-crew-model';
+import {
   leafIdForSpawnedPty,
   newAttention,
   newUrgentMessages,
   taskTitle,
   workerWindowTarget,
 } from '../lib/orchestration-view';
+import {
+  ORCHESTRATION_FOCUS_EVENT,
+  type ResolvedOrchestrationLinkTarget,
+} from '../lib/terminal-links/orchestration-terminal-links';
 import { stageWindowStore } from '../lib/stage-window-store';
 import {
   getTerminalSearchShortcutLabel,
@@ -59,7 +67,6 @@ import { TerminalProfileIcon } from './TerminalProfileIcon';
 import { AgentStatusBadge, useAgentStatuses } from './AgentStatusBadge';
 import type { WorktreeHostActions } from './GitWorktreesPanel';
 import type { AgentPromptTarget } from './PanelPreview';
-import type { OrchestrationHostActions, OrchestrationPaneTarget } from './OrchestrationPanel';
 import { clampRightPanelWidth, WorkspaceRightPanel, type RightPanelTab } from './WorkspaceRightPanel';
 import './local-terminal-workspace.css';
 
@@ -76,7 +83,7 @@ function readDirectories(): string[] {
 
 function readRightPanelTab(): RightPanelTab {
   const value = localStorage.getItem('aha.rightPanel.tab');
-  return value === 'files' || value === 'worktrees' || value === 'orchestration' ? value : 'changes';
+  return value === 'files' || value === 'worktrees' ? value : 'changes';
 }
 
 function paneCwd(win: { cwd?: string; panes?: Record<string, { cwd?: string }> }, leafId: string) {
@@ -132,19 +139,32 @@ export function LocalTerminalWorkspace({
   );
 
   useSyncExternalStore(terminalSessionStore.subscribe, terminalSessionStore.getSnapshot);
+  const orchestration = useSyncExternalStore(
+    orchestrationClient.subscribe,
+    orchestrationClient.getSnapshot,
+  );
   const agents = useAgentStatuses();
   const fontSize = terminalSessionStore.getFontSize();
   const appearance = terminalSessionStore.getAppearance();
   const appearancePreference = terminalSessionStore.getAppearancePreference();
   const windows = stage.windows.filter((win) => win.localCliId);
-  const windowFolder = (win: { cwd?: string }) => win.cwd ?? defaultCwd;
+  const windowLineage = buildSidebarWindowLineage(
+    windows,
+    orchestration,
+    stage.getWindowLeafIds,
+    defaultCwd,
+  );
+  const effectiveFolderByWinId = new Map(
+    windowLineage.map((item) => [item.win.id, item.effectiveFolder]),
+  );
+  const windowFolder = (win: { id: string; cwd?: string }) =>
+    effectiveFolderByWinId.get(win.id) ?? win.cwd ?? defaultCwd;
+  const activeGlobalWin = windows.find((win) => win.id === stage.activeWindowId);
   const selectedCwd =
-    cwd ?? windows.find((win) => win.id === stage.activeWindowId)?.cwd ?? defaultCwd;
-  // Each project folder owns the CLIs opened in it; only those are shown.
-  const folderWindows = windows.filter((win) => {
-    const folder = windowFolder(win);
-    return Boolean(folder && selectedCwd && isSamePath(folder, selectedCwd));
-  });
+    cwd ?? (activeGlobalWin ? windowFolder(activeGlobalWin) : undefined) ?? defaultCwd;
+  // Each project folder owns the CLIs opened in it plus child workers spawned beneath them.
+  const folderLineage = filterLineageForFolder(windowLineage, selectedCwd);
+  const folderWindows = folderLineage.map((item) => item.win);
   const lastActiveByFolder = useRef(new Map<string, string>());
   const rememberedId = selectedCwd ? lastActiveByFolder.current.get(selectedCwd.toLowerCase()) : undefined;
   const active =
@@ -165,11 +185,15 @@ export function LocalTerminalWorkspace({
   const displayCwd = activePaneCwd ?? selectedCwd ?? '用户目录';
   const folders = [
     ...directories,
-    ...windows.flatMap((win) => {
-      const folder = windowFolder(win);
-      return folder ? [folder] : [];
+    ...windowLineage.flatMap((item) => {
+      const folder = item.effectiveFolder;
+      if (!folder || (item.depth > 0 && isAutoManagedWorktreeFolder(folder))) return [];
+      if (isAutoManagedWorktreeFolder(folder) && !directories.some((d) => isSamePath(d, folder))) {
+        return [];
+      }
+      return [folder];
     }),
-    ...(selectedCwd ? [selectedCwd] : []),
+    ...(selectedCwd && !isAutoManagedWorktreeFolder(selectedCwd) ? [selectedCwd] : []),
   ].reduce<string[]>(
     (list, path) => (list.some((item) => isSamePath(item, path)) ? list : [...list, path]),
     [],
@@ -193,22 +217,6 @@ export function LocalTerminalWorkspace({
         cwd: terminalSessionStore.getState(leafId).cwd ?? pane?.cwd ?? win.cwd,
         isAgent: Boolean(cliId && cliId !== 'shell'),
         isActive: leafId === activeLeafId && win.id === active?.id,
-        status,
-      };
-    });
-  });
-
-  const orchestrationPanes: OrchestrationPaneTarget[] = windows.flatMap((win) => {
-    const leafIds = stage.getWindowLeafIds(win.id);
-    const folder = windowFolder(win);
-    return leafIds.map((leafId, index) => {
-      const pane = win.panes?.[leafId];
-      const cliId = pane?.localCliId ?? win.localCliId;
-      const status = agents.get(ptyIdForLeaf(leafId));
-      return {
-        ptyId: ptyIdForLeaf(leafId),
-        label: `${folder ? `${folderName(folder)} / ` : ''}${pane?.title ?? win.title}${leafIds.length > 1 ? ` · 窗格 ${index + 1}` : ''}`,
-        isAgent: Boolean((cliId && cliId !== 'shell') || status?.agentId),
         status,
       };
     });
@@ -351,8 +359,17 @@ export function LocalTerminalWorkspace({
     return true;
   };
 
+  const closeWorkerPane = (ptyId: string) => {
+    seenWorkerPanes.current?.delete(ptyId);
+    const hit = findLeafByPtyId(ptyId);
+    if (hit) {
+      void stageWindowStore.closePane(hit.win.id, hit.leafId);
+    }
+  };
+
   const orchestrationEventsRef = useRef<{
     spawned: (event: { ptyId: string; taskId: string; cwd?: string; cliId?: string }) => void;
+    closed: (event: { ptyId: string }) => void;
     changed: Parameters<typeof orchestrationClient.onChange>[0];
   }>();
   orchestrationEventsRef.current = {
@@ -363,6 +380,9 @@ export function LocalTerminalWorkspace({
         setToast(`编排：已为「${name}」启动 Worker`);
       }
     },
+    closed: (event) => {
+      closeWorkerPane(event.ptyId);
+    },
     changed: (prev, next) => {
       // Workers spawned while this window was not listening (e.g. after a reload) still get a tab, once.
       for (const dispatch of next.dispatches) {
@@ -372,15 +392,36 @@ export function LocalTerminalWorkspace({
         if (!agentStatusClient.get(ptyId)) continue;
         const task = next.tasks.find((item) => item.id === dispatch.taskId);
         openWorkerPane(
-          { ptyId, cwd: task?.worktreePath ?? undefined, title: `Worker · ${task ? taskTitle(task) : dispatch.taskId}` },
+          {
+            ptyId,
+            cliId: dispatch.cliId ?? undefined,
+            cwd: dispatch.worktreePath ?? task?.worktreePath ?? undefined,
+            title: `Worker · ${task ? taskTitle(task) : dispatch.taskId}`,
+          },
           false,
         );
       }
-      const viewing = rightPanel && rightTab === 'orchestration' && document.hasFocus();
-      if (viewing) return;
+      if (prev) {
+        for (const dispatch of next.dispatches) {
+          if (!dispatch.releasedAt) continue;
+          const prevDispatch = prev.dispatches.find((d) => d.id === dispatch.id);
+          if (prevDispatch?.releasedAt) continue;
+          const ptyId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
+          if (!leafIdForSpawnedPty(ptyId)?.startsWith('orch-')) continue;
+          if (!agentStatusClient.get(ptyId)) {
+            closeWorkerPane(ptyId);
+          }
+        }
+      }
       const fresh = newAttention(prev, next);
       const urgent = newUrgentMessages(prev, next);
-      if (fresh.gates.length) {
+      const prevApprovalIds = new Set((prev?.openApprovals ?? []).map((a) => a.approvalId));
+      const newApprovals = (next.openApprovals ?? []).filter(
+        (a) => a.status === 'pending' && !prevApprovalIds.has(a.approvalId),
+      );
+      if (newApprovals.length) {
+        setToast(`编排：Worker 请求权限「${newApprovals[0]!.toolName}」`);
+      } else if (fresh.gates.length) {
         setToast(`编排：需要你决策「${fresh.gates[0]!.question.slice(0, 60)}」`);
       } else if (fresh.questions.length) {
         setToast(`编排：Worker 提问「${fresh.questions[0]!.question.slice(0, 60)}」`);
@@ -392,15 +433,51 @@ export function LocalTerminalWorkspace({
 
   useEffect(() => {
     const offSpawned = orchestrationClient.onPaneSpawned((event) => orchestrationEventsRef.current?.spawned(event));
+    const offClosed = orchestrationClient.onPaneClosed((event) => orchestrationEventsRef.current?.closed(event));
     const offChange = orchestrationClient.onChange((prev, next) => orchestrationEventsRef.current?.changed(prev, next));
     return () => {
       offSpawned();
+      offClosed();
       offChange();
     };
   }, []);
 
-  const orchestration = useSyncExternalStore(orchestrationClient.subscribe, orchestrationClient.getSnapshot);
-  const orchestrationAttention = attentionCount(orchestration);
+  const focusOrchestrationTargetRef = useRef<(target: ResolvedOrchestrationLinkTarget) => void>();
+  focusOrchestrationTargetRef.current = (target) => {
+    if (!target.ptyId) {
+      setToast(`${target.label} 没有活跃终端`);
+      return;
+    }
+    const existing = findLeafByPtyId(target.ptyId);
+    if (existing) {
+      agentEventsRef.current?.focus(target.ptyId);
+      return;
+    }
+    if (!agentStatusClient.get(target.ptyId)) {
+      setToast(`${target.label} 终端已关闭`);
+      return;
+    }
+    openWorkerPane(
+      {
+        ptyId: target.ptyId,
+        cliId: target.cliId ?? undefined,
+        cwd: target.cwd ?? undefined,
+        title: `Worker · ${target.label}`,
+      },
+      true,
+    );
+  };
+
+  useEffect(() => {
+    const onFocusTarget = (ev: Event) => {
+      const custom = ev as CustomEvent<ResolvedOrchestrationLinkTarget>;
+      if (custom.detail) {
+        focusOrchestrationTargetRef.current?.(custom.detail);
+      }
+    };
+    window.addEventListener(ORCHESTRATION_FOCUS_EVENT, onFocusTarget);
+    return () => window.removeEventListener(ORCHESTRATION_FOCUS_EVENT, onFocusTarget);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -437,22 +514,6 @@ export function LocalTerminalWorkspace({
     }
     return null;
   }
-
-  const orchestrationActions: OrchestrationHostActions = {
-    focusPane: (ptyId) => {
-      if (!findLeafByPtyId(ptyId)) return false;
-      agentEventsRef.current?.focus(ptyId);
-      return true;
-    },
-    openWorkerPane: (target) => {
-      if (!agentStatusClient.get(target.ptyId)) {
-        setToast('该 Worker 终端已退出');
-        return;
-      }
-      if (target.cwd) selectFolder(target.cwd);
-      openWorkerPane(target, true);
-    },
-  };
 
   const focusAgentTarget = (target: AgentPromptTarget) => {
     stage.setActiveWindow(target.windowId);
@@ -562,23 +623,6 @@ export function LocalTerminalWorkspace({
       }
       return;
     }
-    if (
-      event.ctrlKey &&
-      event.shiftKey &&
-      !event.altKey &&
-      !event.metaKey &&
-      event.key.toLowerCase() === 'o'
-    ) {
-      event.preventDefault();
-      event.stopPropagation();
-      if (rightPanel && rightTab === 'orchestration') {
-        toggleRightPanel(false);
-      } else {
-        changeRightTab('orchestration');
-        toggleRightPanel(true);
-      }
-      return;
-    }
     if (!active || !activeLeafId) return;
 
     if (pendingClosePane) {
@@ -683,13 +727,14 @@ export function LocalTerminalWorkspace({
         <span className="terminal-workspace-brand">AhaStation</span>
         <button
           type="button"
+          className="terminal-sidebar-toggle"
           onClick={() => setSidebar((value) => !value)}
           aria-label="切换目录侧栏"
           aria-expanded={sidebar}
+          title={sidebar ? '收起目录侧栏' : '展开目录侧栏'}
         >
           <PanelLeft size={16} />
         </button>
-        {toolbarExtra}
       </header>
 
       {sidebar && (
@@ -716,17 +761,15 @@ export function LocalTerminalWorkspace({
           </div>
           <div className="terminal-directory-list">
             {folders.map((path) => {
-              const tabs = windows.filter((win) => {
-                const folder = windowFolder(win);
-                return Boolean(folder && isSamePath(folder, path));
-              });
-              const matchingTabs = tabs.filter((win) =>
-                win.title.toLowerCase().includes(query.toLowerCase()),
+              const lineageItems = filterLineageForFolder(windowLineage, path);
+              const tabs = lineageItems.map((item) => item.win);
+              const matchingLineage = lineageItems.filter((item) =>
+                item.win.title.toLowerCase().includes(query.toLowerCase()),
               );
               if (
                 query &&
                 !path.toLowerCase().includes(query.toLowerCase()) &&
-                !matchingTabs.length
+                !matchingLineage.length
               ) {
                 return null;
               }
@@ -772,9 +815,9 @@ export function LocalTerminalWorkspace({
                     </button>
                   </div>
                   {(query && !path.toLowerCase().includes(query.toLowerCase())
-                    ? matchingTabs
-                    : tabs
-                  ).map((win) => {
+                    ? matchingLineage
+                    : lineageItems
+                  ).map(({ win, depth, dispatch }) => {
                     const winLeafId = stage.getActiveLeafId(win);
                     const winLeafCount = stage.getWindowLeafIds(win.id).length;
                     const state = terminalSessionStore.getState(winLeafId);
@@ -782,10 +825,26 @@ export function LocalTerminalWorkspace({
                       <button
                         type="button"
                         key={win.id}
-                        className={`terminal-directory-session ${active?.id === win.id ? 'is-active' : ''}`}
+                        data-lineage-depth={depth > 0 ? depth : undefined}
+                        className={`terminal-directory-session ${depth > 0 ? 'is-child-worker' : ''} ${active?.id === win.id ? 'is-active' : ''}`}
+                        style={
+                          depth > 0
+                            ? ({ paddingLeft: `${12 + depth * 14}px` } as CSSProperties)
+                            : undefined
+                        }
                         onClick={() => selectTab(win.id)}
-                        title={state.error ?? win.title}
+                        title={
+                          state.error ??
+                          (dispatch?.branch
+                            ? `${win.title} (${dispatch.branch})`
+                            : win.title)
+                        }
                       >
+                        {depth > 0 && (
+                          <span className="terminal-lineage-connector" aria-hidden="true">
+                            └
+                          </span>
+                        )}
                         <TerminalProfileIcon
                           id={win.localCliId === 'shell' ? win.shellId : win.localCliId}
                           size={14}
@@ -886,17 +945,19 @@ export function LocalTerminalWorkspace({
           <button
             type="button"
             className={rightPanel ? 'is-active' : ''}
-            title={`Git、文件与编排面板 (Ctrl+Shift+G / Ctrl+Shift+O)${orchestrationAttention ? ` · 编排有 ${orchestrationAttention} 项待处理` : ''}`}
-            aria-label="切换 Git、文件与编排面板"
+            title="Git、文件与工作树面板 (Ctrl+Shift+G)"
+            aria-label="切换 Git、文件与工作树面板"
             aria-expanded={rightPanel}
             onClick={() => toggleRightPanel()}
           >
             <PanelRight size={14} />
-            {orchestrationAttention > 0 && !(rightPanel && rightTab === 'orchestration') && (
-              <span className="terminal-tab-attention-dot" aria-hidden />
-            )}
           </button>
         </div>
+        {toolbarExtra && (
+          <div className="terminal-workspace-toolbar-extra">
+            {toolbarExtra}
+          </div>
+        )}
       </div>
 
       {rightPanel && (
@@ -912,8 +973,6 @@ export function LocalTerminalWorkspace({
           worktreeActions={worktreeActions}
           agentTargets={agentTargets}
           onAgentPromptSent={focusAgentTarget}
-          orchestrationPanes={orchestrationPanes}
-          orchestrationActions={orchestrationActions}
         />
       )}
 

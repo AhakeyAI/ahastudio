@@ -1,20 +1,29 @@
-import type { OrchestrationPaneSpawnedEvent, OrchestrationSnapshot } from '../types';
-import { EMPTY_SNAPSHOT } from './orchestration-view';
+import type {
+  OrchestrationPaneClosedEvent,
+  OrchestrationPaneSpawnedEvent,
+  OrchestrationSnapshot,
+} from '../types';
+import { EMPTY_SNAPSHOT, mergeRunSnapshot } from './orchestration-view';
 
 type Listener = () => void;
 type ChangeListener = (prev: OrchestrationSnapshot | null, next: OrchestrationSnapshot) => void;
 type SpawnListener = (event: OrchestrationPaneSpawnedEvent) => void;
+type ClosedListener = (event: OrchestrationPaneClosedEvent) => void;
 
 let snapshot: OrchestrationSnapshot = EMPTY_SNAPSHOT;
 let loaded = false;
+let hasGlobalSnapshot = false;
 let error: string | null = null;
 let started = false;
-// Events carry a full snapshot; a slow initial fetch must not overwrite a newer pushed one.
+// Events may be global or run-scoped; preserve other runs if a run-scoped event beats the initial fetch.
 let lastPushAt = '';
+const pendingPreGlobalRunEvents: Array<{ runId: string; snapshot: OrchestrationSnapshot }> = [];
 const listeners = new Set<Listener>();
 const changeListeners = new Set<ChangeListener>();
 const spawnListeners = new Set<SpawnListener>();
+const closedListeners = new Set<ClosedListener>();
 const pendingSpawns: OrchestrationPaneSpawnedEvent[] = [];
+const pendingCloses: OrchestrationPaneClosedEvent[] = [];
 
 function emit() {
   for (const listener of listeners) {
@@ -56,6 +65,15 @@ async function refresh(): Promise<void> {
       emit();
       return;
     }
+    if (!hasGlobalSnapshot) {
+      let merged = res.snapshot;
+      for (const ev of pendingPreGlobalRunEvents.splice(0)) {
+        merged = mergeRunSnapshot(merged, ev.runId, ev.snapshot);
+      }
+      hasGlobalSnapshot = true;
+      apply(merged);
+      return;
+    }
     if (lastPushAt !== requestedAfter) return;
     apply(res.snapshot);
   } catch (err) {
@@ -72,7 +90,16 @@ function start() {
   api.onEvent((event) => {
     if (!event?.snapshot) return;
     lastPushAt = event.updatedAt || String(Date.now());
-    apply(event.snapshot);
+    if (!event.runId) {
+      hasGlobalSnapshot = true;
+      pendingPreGlobalRunEvents.length = 0;
+      apply(event.snapshot);
+      return;
+    }
+    if (!hasGlobalSnapshot) {
+      pendingPreGlobalRunEvents.push({ runId: event.runId, snapshot: event.snapshot });
+    }
+    apply(loaded ? mergeRunSnapshot(snapshot, event.runId, event.snapshot) : event.snapshot);
   });
   api.onPaneSpawned((event) => {
     if (spawnListeners.size === 0) {
@@ -80,6 +107,18 @@ function start() {
       return;
     }
     for (const listener of spawnListeners) listener(event);
+  });
+  api.onPaneClosed?.((event) => {
+    for (let i = pendingSpawns.length - 1; i >= 0; i -= 1) {
+      if (pendingSpawns[i]!.ptyId === event.ptyId) {
+        pendingSpawns.splice(i, 1);
+      }
+    }
+    if (closedListeners.size === 0) {
+      pendingCloses.push(event);
+      return;
+    }
+    for (const listener of closedListeners) listener(event);
   });
   void refresh();
 }
@@ -110,6 +149,14 @@ export const orchestrationClient = {
     for (const event of pendingSpawns.splice(0)) listener(event);
     return () => {
       spawnListeners.delete(listener);
+    };
+  },
+  onPaneClosed(listener: ClosedListener) {
+    start();
+    closedListeners.add(listener);
+    for (const event of pendingCloses.splice(0)) listener(event);
+    return () => {
+      closedListeners.delete(listener);
     };
   },
 };

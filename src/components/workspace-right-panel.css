@@ -130,8 +130,9 @@
 .wrp-resize-handle:hover, .wrp-resize-handle:active { background: linear-gradient(90deg, transparent 2px, var(--wrp-accent) 2px, var(--wrp-accent) 4px, transparent 4px); }
 
 .wrp-header { display: flex; align-items: center; gap: 2px; height: 40px; padding: 0 6px 0 4px; border-bottom: 1px solid var(--wrp-line); flex-shrink: 0; }
-.wrp-tabs { display: flex; align-items: stretch; height: 100%; flex: 1; min-width: 0; overflow: hidden; }
-.wrp-tabs button { display: flex; align-items: center; gap: 5px; padding: 0 10px; border: 0; background: transparent; color: var(--wrp-muted); cursor: pointer; white-space: nowrap; box-shadow: none; }
+.wrp-tabs { display: flex; align-items: stretch; height: 100%; flex: 1; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.wrp-tabs::-webkit-scrollbar { display: none; }
+.wrp-tabs button { display: flex; align-items: center; gap: 5px; padding: 0 10px; border: 0; background: transparent; color: var(--wrp-muted); cursor: pointer; white-space: nowrap; box-shadow: none; flex-shrink: 0; }
 .wrp-tabs button:hover:not(:disabled) { color: var(--wrp-ink); background: var(--wrp-hover-soft); }
 .wrp-tabs button.is-active { color: var(--wrp-ink-strong); box-shadow: inset 0 -2px var(--wrp-tab-indicator); }
 .wrp-tabs button:disabled { opacity: 0.45; cursor: default; }
@@ -328,3 +329,15 @@
 .wrp-ok { color: var(--wrp-ok-ink); }
 .wrp-link { border: 0; background: transparent; color: var(--wrp-accent); cursor: pointer; padding: 0; font-size: 11px; white-space: nowrap; }
 .wrp-hint.is-inline { margin: 0; flex: 1; }
+html.handheld .workspace-right-panel .wrp-header { height: 52px; }
+html.handheld .workspace-right-panel .wrp-subbar,
+html.handheld .workspace-right-panel .wrp-group-header,
+html.handheld .workspace-right-panel .wrp-file-row,
+html.handheld .workspace-right-panel .wrp-tree-row,
+html.handheld .workspace-right-panel .wrp-preview-header { height: auto; min-height: 44px; }
+html.handheld .workspace-right-panel .wrp-file-main > span,
+html.handheld .workspace-right-panel .wrp-file-main > small { line-height: 1.4; }
+html.handheld .workspace-right-panel .wrp-wt-actions .wrp-btn,
+html.handheld .workspace-right-panel .wrp-field input,
+html.handheld .workspace-right-panel .wrp-field select,
+html.handheld .workspace-right-panel .wrp-composer-row select { height: auto; min-height: 44px; }

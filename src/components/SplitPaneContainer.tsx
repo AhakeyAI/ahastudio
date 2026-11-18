@@ -10,6 +10,7 @@ import {
 import { agentStatusDetail, isAgentStatusVisible, ptyIdForLeaf } from '../lib/agent-status-view';
 import { terminalSessionStore } from '../lib/terminal-session-store';
 import { AgentStatusBadge, useAgentStatuses } from './AgentStatusBadge';
+import { OrchestrationCrewPanel } from './OrchestrationCrewPanel';
 import { ShellTerminal } from './ShellTerminal';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
 
@@ -160,6 +161,12 @@ export function SplitPaneContainer({
           </div>
         )}
         <div className="split-pane-terminal-host">
+          <OrchestrationCrewPanel
+            leafId={node.id}
+            agentStatuses={agents}
+            searchOpen={searchOpen && isActive}
+            onNotify={onNotify}
+          />
           <ShellTerminal
             key={node.id}
             terminalId={node.id}
