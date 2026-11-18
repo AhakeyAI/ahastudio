@@ -16,8 +16,10 @@ import {
 import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
 import { AgentHookServer } from '../dist-electron/agent/agent-hook-server.js';
 import {
+  computePromptSubmitDelayMs,
   deliverPromptToPty,
   formatAgentPromptPayload,
+  isHeldAgentPromptDraft,
   sanitizeBracketedPasteText,
 } from '../dist-electron/agent/agent-prompt-delivery.js';
 import { registerShellPtyIpc } from '../dist-electron/ipc/shell-pty.js';
@@ -443,6 +445,53 @@ test('Agent prompt delivery sanitizes ESC/CSI/NUL and enforces bracketed paste +
     () => ({ ok: true }),
   );
   assert.equal(tooBig.ok, false);
+
+  // Orca paste-settle timing & held-draft `[Pasted Content N chars]` automatic Enter resubmit.
+  const codexWinDelay = computePromptSubmitDelayMs({
+    prompt: 'x'.repeat(1_000),
+    byteLength: 1_012,
+    agentId: 'codex',
+    platform: 'win32',
+  });
+  assert.ok(codexWinDelay >= 3_500, `Expected Win32 Codex input-record burst settle >= 3500ms, got ${codexWinDelay}`);
+
+  const multiPrompt = 'Line 1 of dispatch specification\nLine 2 of dispatch specification';
+  assert.equal(
+    isHeldAgentPromptDraft(`› [Pasted Content ${multiPrompt.length + 2} chars]`, multiPrompt, 1),
+    true,
+  );
+  assert.equal(
+    isHeldAgentPromptDraft('• Working (3s • esc to interrupt)', multiPrompt, 1),
+    false,
+  );
+
+  const retryWrites = [];
+  let simulatedScreen = `› [Pasted Content ${multiPrompt.length + 2} chars]`;
+  const retryRes = await deliverPromptToPty(
+    {
+      ptyId: 'local-codex',
+      prompt: multiPrompt,
+      submit: true,
+      settleDelayMs: 5,
+      submitRetryDelayMs: 10,
+      maxSubmitRetries: 3,
+      readScreen: () => simulatedScreen,
+    },
+    (ptyId, data) => {
+      retryWrites.push(data);
+      // Simulate first Enter absorbed into paste burst, second Enter submitting the turn!
+      if (data === '\r' && retryWrites.filter((w) => w === '\r').length >= 2) {
+        simulatedScreen = '• Working (1s • esc to interrupt)';
+      }
+      return { ok: true };
+    },
+  );
+  assert.equal(retryRes.ok, true);
+  assert.equal(
+    retryWrites.filter((w) => w === '\r').length,
+    2,
+    'Should resend Enter once while [Pasted Content] remains held, then stop once submitted',
+  );
 });
 
 test('PTY IPC auto-answers OSC 7501 queries, pushes agent:status-changed, and safely delivers prompts', async (t) => {

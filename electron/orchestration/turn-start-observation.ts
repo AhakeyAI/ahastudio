@@ -15,6 +15,8 @@ export interface DeliverAndObserveAgentTurnOptions {
   writePty: PtyWriteFn;
   agentStatusStore: AgentStatusStore;
   isPaneAlive?: (ptyId: string) => boolean;
+  readScreen?: (ptyId: string) => string;
+  getLastOutputAtMs?: (ptyId: string) => number;
   observeTimeoutMs?: number;
 }
 
@@ -209,12 +211,22 @@ export async function deliverAndObserveAgentTurn(
 
   let writeRes: { ok: true; bytesWritten: number } | { ok: false; error: string };
   try {
+    const agentId = opts.agentStatusStore.get(opts.ptyId)?.agentId ?? null;
     writeRes = await deliverPromptToPty(
       {
         ptyId: opts.ptyId,
         prompt: opts.prompt,
         submit: opts.submit,
         settleDelayMs: opts.settleDelayMs,
+        agentId,
+        isPaneAlive: opts.isPaneAlive ? () => opts.isPaneAlive!(opts.ptyId) : undefined,
+        readScreen: opts.readScreen ? () => opts.readScreen!(opts.ptyId) : undefined,
+        getLastOutputAtMs: opts.getLastOutputAtMs ? () => opts.getLastOutputAtMs!(opts.ptyId) : undefined,
+        hasTurnStartedOrBlocked: () =>
+          evaluateTurnStartTransition(
+            baseline,
+            captureTurnActivityBaseline(opts.agentStatusStore, opts.ptyId),
+          ) !== null,
       },
       opts.writePty,
     );

@@ -412,6 +412,10 @@ export class TerminalRuntimeTracker {
     return base.slice(-maxChars);
   }
 
+  getLastOutputAtMs(ptyId: string): number {
+    return this.entries.get(ptyId)?.lastOutputAtMs ?? 0;
+  }
+
   async waitForTerminal(
     ptyId: string,
     opts: {

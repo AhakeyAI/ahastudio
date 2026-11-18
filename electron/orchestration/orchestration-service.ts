@@ -4170,6 +4170,7 @@ export class OrchestrationService {
       this.inFlightObservationDispatches.add(dispatchId);
     }
     try {
+      const trackedTerm = this.terminalTracker?.getTerminal(opts.ptyId);
       const res = await deliverAndObserveAgentTurn({
         ptyId: opts.ptyId,
         prompt: opts.prompt,
@@ -4178,6 +4179,12 @@ export class OrchestrationService {
         writePty: this.writePty,
         agentStatusStore: this.agentStatusStore,
         isPaneAlive: (ptyId) => this.isPaneAlive(ptyId),
+        readScreen: trackedTerm
+          ? (ptyId) => this.terminalTracker!.captureTail(ptyId, 4_000)
+          : undefined,
+        getLastOutputAtMs: trackedTerm
+          ? (ptyId) => this.terminalTracker!.getLastOutputAtMs(ptyId)
+          : undefined,
         observeTimeoutMs: this.turnStartObserveTimeoutMs,
       });
       if (dispatchId && res.ok) {

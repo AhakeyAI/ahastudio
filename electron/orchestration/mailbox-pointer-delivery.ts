@@ -341,6 +341,8 @@ export class MailboxPointerDelivery {
           prompt: pointerText.trim(),
           submit: true,
           settleDelayMs: this.settleDelayMs,
+          agentId: this.deps.agentStatusStore.get(ptyId)?.agentId ?? null,
+          isPaneAlive: this.deps.isPaneAlive ? () => this.deps.isPaneAlive!(ptyId) : undefined,
         },
         this.deps.writePty
       );

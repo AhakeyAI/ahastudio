@@ -149,7 +149,21 @@ export class AgentHookInstaller {
 
   commandFor(cliId: AgentHookCliId, eventName?: string): string {
     const suffix = eventName ? ` ${eventName}` : '';
-    return `${this.nodeCommand} "${this.relayArgPath()}" ${cliId}${suffix}`;
+    const relayArg = this.relayArgPath();
+    if (cliId === 'antigravity') {
+      // Antigravity tokenizes `hooks.json` command strings on whitespace without shell quote
+      // stripping, so wrapping `relayArg` in `"` passes literal quotes to `node` on Windows.
+      if (!/[\s"'&|<>()^;]/.test(relayArg)) {
+        return `${this.nodeCommand} ${relayArg} antigravity${suffix}`;
+      }
+      if (process.platform === 'win32') {
+        const psLiteral = `'${this.relayPath.replace(/'/g, "''")}'`;
+        const psScript = `& '${this.nodeCommand.replace(/'/g, "''")}' ${psLiteral} antigravity${suffix}; exit $LASTEXITCODE # ${RELAY_FILE_NAME}`;
+        const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+        return `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${encoded}`;
+      }
+    }
+    return `${this.nodeCommand} "${relayArg}" ${cliId}${suffix}`;
   }
 
   private grokHomeDir(): string {
@@ -254,7 +268,17 @@ export class AgentHookInstaller {
   // ---- JSON settings (Claude / Gemini / Qwen) ----
 
   private isOurCommand(command: unknown): boolean {
-    return typeof command === 'string' && command.includes(RELAY_FILE_NAME);
+    if (typeof command !== 'string') return false;
+    if (command.includes(RELAY_FILE_NAME)) return true;
+    const encMatch = /-EncodedCommand\s+([A-Za-z0-9+/=]+)\s*$/.exec(command);
+    if (encMatch) {
+      try {
+        return Buffer.from(encMatch[1]!, 'base64').toString('utf16le').includes(RELAY_FILE_NAME);
+      } catch {
+        return false;
+      }
+    }
+    return false;
   }
 
   private expectedJsonTimeout(

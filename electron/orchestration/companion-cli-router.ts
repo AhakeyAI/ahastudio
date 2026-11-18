@@ -250,6 +250,13 @@ export async function dispatchCompanionHttpAction(
               ptyId: parsed.id,
               prompt: parsed.text,
               submit: parsed.submit ?? true,
+              agentId:
+                deps.agentStatusStore.get(parsed.id)?.agentId ??
+                deps.terminalTracker.getTerminal(parsed.id)?.cliId ??
+                null,
+              isPaneAlive: () => deps.terminalTracker.isAlive(parsed.id),
+              readScreen: () => deps.terminalTracker.captureTail(parsed.id, 4_000),
+              getLastOutputAtMs: () => deps.terminalTracker.getLastOutputAtMs(parsed.id),
             },
             deps.writePty
           );
@@ -453,7 +460,15 @@ export async function dispatchCompanionHttpAction(
             });
             if (parsed.prompt) {
               const delivered = await deliverPromptToPty(
-                { ptyId, prompt: parsed.prompt, submit: true },
+                {
+                  ptyId,
+                  prompt: parsed.prompt,
+                  submit: true,
+                  agentId: launch.cliId,
+                  isPaneAlive: () => deps.terminalTracker.isAlive(ptyId!),
+                  readScreen: () => deps.terminalTracker.captureTail(ptyId!, 4_000),
+                  getLastOutputAtMs: () => deps.terminalTracker.getLastOutputAtMs(ptyId!),
+                },
                 deps.writePty
               );
               if (!delivered.ok) {

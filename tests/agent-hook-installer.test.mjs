@@ -277,18 +277,29 @@ test('Installed hook commands reach the loopback server end to end (Claude stdin
   assert.equal(status.toolName, 'Write');
   assert.equal(status.toolInput, 'a.txt');
 
-  // Simulate agy keeping stdin open after sending JSON containing braces in strings.
+  // Simulate agy's real non-shell whitespace argv tokenizer (with cwd = ~/.gemini/config)
+  // AND keeping stdin open after sending JSON containing braces in strings.
   const agyPty = 'local-agy-e2e';
   store.registerPane(agyPty);
   const agyEnv = server.envForPane(agyPty);
-  const agyPre = await runRelay([], {
-    env: agyEnv,
-    shellCommand: installer.commandFor('antigravity', 'PreToolUse'),
-    stdin: JSON.stringify({
-      hookEventName: 'PreToolUse',
-      toolCall: { id: 'tc1', name: 'run_command', args: { CommandLine: 'echo }' } },
-    }),
-    keepStdinOpen: true,
+  const agyConfigDir = join(installer.configPath('antigravity'), '..');
+  mkdirSync(agyConfigDir, { recursive: true });
+  const agyTokens = installer.commandFor('antigravity', 'PreToolUse').trim().split(/\s+/);
+  const agyPre = await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(agyTokens[0], agyTokens.slice(1), {
+      cwd: agyConfigDir,
+      env: { ...process.env, ...agyEnv },
+    });
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.on('error', rejectPromise);
+    child.on('close', (code) => resolvePromise({ code, stdout }));
+    child.stdin.write(
+      JSON.stringify({
+        hookEventName: 'PreToolUse',
+        toolCall: { id: 'tc1', name: 'run_command', args: { CommandLine: 'echo }' } },
+      }),
+    );
   });
   assert.deepEqual(agyPre, { code: 0, stdout: '{"decision":"ask"}\n' });
   const agyStatus = store.get(agyPty);

@@ -166,7 +166,22 @@ export function registerAgentIpc(
         return { ok: false, error: 'Terminal input channel unavailable' };
       }
       return deliverPromptToPty(
-        { ptyId, prompt, filePath, startLine, endLine, diffSnippet, submit },
+        {
+          ptyId,
+          prompt,
+          filePath,
+          startLine,
+          endLine,
+          diffSnippet,
+          submit,
+          agentId: store.get(ptyId)?.agentId ?? null,
+          readScreen: ctx.terminalTracker
+            ? () => ctx.terminalTracker!.captureTail(ptyId, 4_000)
+            : undefined,
+          getLastOutputAtMs: ctx.terminalTracker
+            ? () => ctx.terminalTracker!.getLastOutputAtMs(ptyId)
+            : undefined,
+        },
         sendInput,
       );
     },
