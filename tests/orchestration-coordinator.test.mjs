@@ -1,8 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { ipcMain } from 'electron';
 
 import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
+import { registerOrchestrationIpc } from '../dist-electron/ipc/orchestration.js';
 import { registerShellPtyIpc } from '../dist-electron/ipc/shell-pty.js';
 import { getPtyHost } from '../dist-electron/pty-host.js';
 import { OrchestrationError } from '../dist-electron/orchestration/orchestration-types.js';
@@ -429,6 +434,304 @@ test('registerShellPtyIpc createPty defaults cleanly to shellId=default, validat
     assert.equal(service.store.getDispatchContext(activeDispatch.id)?.status, 'failed');
   } finally {
     offExit();
+    service.dispose();
+  }
+});
+
+test('emitChanged scopes snapshots to runId, auto-closes finished spawned workers, and dispose/resume preserves run continuity', async () => {
+  const agentStatusStore = new AgentStatusStore();
+  const store = new OrchestrationStore();
+  const closedPtys = [];
+  const closedEvents = [];
+  const events = [];
+  let spawnCounter = 0;
+  let confirmClosed;
+  const closeConfirmation = new Promise((resolve) => { confirmClosed = resolve; });
+
+  const service = new OrchestrationService({
+    store,
+    agentStatusStore,
+    writePty: async () => ({ ok: true }),
+    spawnWorkerPty: async ({ cliId, cwd }) => {
+      const ptyId = `local-orch-auto-${++spawnCounter}`;
+      agentStatusStore.registerPane(ptyId, { agentId: cliId ?? 'codex' });
+      return { ptyId, cwd };
+    },
+    closeWorkerPty: (ptyId) => {
+      closedPtys.push(ptyId);
+      return closeConfirmation;
+    },
+  });
+
+  const offEvents = service.onEvent((event) => events.push(event));
+  const offClosed = service.onPaneClosed((event) => closedEvents.push(event));
+
+  try {
+    agentStatusStore.registerPane('coord', { agentId: 'claude' });
+    agentStatusStore.registerPane('manual-worker', { agentId: 'codex' });
+
+    const { run: runA } = service.runCreate({ id: 'run_a', objective: 'Run A', from: 'coord' });
+    const { run: runB } = service.runCreate({ id: 'run_b', objective: 'Run B', from: 'coord-b' });
+    service.taskCreate({ id: 'tA', runId: runA.id, spec: 'Task A' });
+    service.taskCreate({ id: 'tB', runId: runB.id, spec: 'Task B' });
+
+    const taskBEvent = events.filter((e) => e.reason === 'task:created' && e.runId === runB.id).at(-1);
+    assert.ok(taskBEvent);
+    assert.deepEqual(taskBEvent.snapshot.tasks.map((t) => t.id), ['tB']);
+    assert.equal(taskBEvent.snapshot.runs.length, 2);
+
+    // Manual worker completion must NOT close manual-worker.
+    await service.dispatchTask({ taskId: 'tA', to: 'manual-worker', from: 'coord' });
+    const dManual = service.store.getLatestDispatchForTask('tA');
+    service.workerDone({
+      capability: service.store.getDispatchCapability(dManual.id),
+      from: 'manual-worker',
+      taskId: 'tA',
+      dispatchId: dManual.id,
+      outcome: 'completed',
+    });
+    assert.deepEqual(closedPtys, []);
+
+    // Auto-spawned worker closes automatically when settled, and dispose stops active runs.
+    const { run: runAuto } = service.runCreate({ id: 'run_auto', objective: 'Auto close', from: 'coord-auto' });
+    service.taskCreate({ id: 'tAuto1', runId: runAuto.id, spec: 'Auto 1' });
+    service.taskCreate({ id: 'tAuto2', runId: runAuto.id, spec: 'Auto 2', deps: ['tAuto1'] });
+    service.coordinatorStart({
+      runId: runAuto.id,
+      from: 'coord-auto',
+      pollIntervalMs: 40,
+      autoSpawnWorkers: true,
+      workerCliId: 'codex',
+      workerPaneIds: [],
+    });
+
+    for (let i = 0; i < 40 && !service.store.getLatestDispatchForTask('tAuto1'); i += 1) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const dAuto1 = service.store.getLatestDispatchForTask('tAuto1');
+    assert.ok(dAuto1);
+    assert.equal(dAuto1.assigneePaneId, 'local-orch-auto-1');
+
+    service.workerDone({
+      capability: service.store.getDispatchCapability(dAuto1.id),
+      from: 'local-orch-auto-1',
+      taskId: 'tAuto1',
+      dispatchId: dAuto1.id,
+      outcome: 'completed',
+    });
+    assert.deepEqual(closedPtys, ['local-orch-auto-1']);
+    assert.equal(closedEvents.length, 0, 'closure is published after the PTY confirms termination');
+    confirmClosed({ ok: true });
+    for (let i = 0; i < 40 && !closedEvents.length; i += 1) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(closedEvents.length, 1);
+    assert.equal(closedEvents[0].ptyId, 'local-orch-auto-1');
+    assert.equal(closedEvents[0].runId, runAuto.id);
+    assert.equal(closedEvents[0].taskId, 'tAuto1');
+
+    // Stop active coordinator before checking dispose + resume of a bound stopped run.
+    service.coordinatorStop();
+    const { run: runResume } = service.runCreate({ id: 'run_resume', objective: 'Resume me', from: 'coord-res' });
+    service.taskCreate({ id: 'tRes', runId: runResume.id, spec: 'Pending task' });
+    service.coordinatorStart({ runId: runResume.id, from: 'coord-res', pollIntervalMs: 500 });
+    service.dispose();
+    assert.equal(store.getRun(runResume.id)?.status, 'stopped');
+
+    // New service on same store resumes the stopped bound run without spec/runId.
+    const resumedService = new OrchestrationService({
+      store,
+      agentStatusStore,
+      writePty: async () => ({ ok: true }),
+    });
+    const restarted = resumedService.coordinatorStart({ from: 'coord-res', pollIntervalMs: 500 });
+    assert.equal(restarted.runId, runResume.id);
+    assert.equal(store.getRun(runResume.id)?.status, 'active');
+    resumedService.dispose();
+  } finally {
+    offEvents();
+    offClosed();
+    service.dispose();
+  }
+});
+
+test('IPC check/ask with wait can be cancelled via orchestration:cancel-wait and sender destroy', async (t) => {
+  const handlers = new Map();
+  t.mock.method(ipcMain, 'handle', (channel, fn) => handlers.set(channel, fn));
+  const sender = Object.assign(new EventEmitter(), { id: 77, send: () => {} });
+  const agentStatusStore = new AgentStatusStore();
+  const store = new OrchestrationStore();
+  const service = new OrchestrationService({
+    store,
+    agentStatusStore,
+    writePty: async () => ({ ok: true }),
+  });
+
+  const ipc = registerOrchestrationIpc({
+    liveWindow: () => ({ webContents: sender }),
+    getCurrentCwd: () => process.cwd(),
+    orchestrationService: service,
+  });
+
+  try {
+    agentStatusStore.registerPane('coord', { agentId: 'claude' });
+    agentStatusStore.registerPane('w1', { agentId: 'codex' });
+    const { run } = service.runCreate({ id: 'run_ipc_cancel', objective: 'IPC Cancel', from: 'coord', paneId: 'coord' });
+    const { task } = service.taskCreate({ id: 't_cancel', runId: run.id, spec: 'Work' });
+    await service.dispatchTask({ taskId: task.id, to: 'w1', from: 'coord', inject: false });
+
+    const call = (channel, payload) => handlers.get(channel)({ sender }, payload);
+
+    const waitingCheck = call('orchestration:check', {
+      from: 'coord',
+      runId: run.id,
+      wait: true,
+      timeoutMs: 30_000,
+      requestId: 'req-check-1',
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    const cancelCheck = await call('orchestration:cancel-wait', { requestId: 'req-check-1' });
+    assert.deepEqual(cancelCheck, { ok: true, cancelled: true });
+    const checkRes = await waitingCheck;
+    assert.equal(checkRes.ok, true);
+    assert.equal(checkRes.cancelled, true);
+    assert.equal(checkRes.count, 0);
+
+    const waitingAsk = call('orchestration:ask', {
+      from: 'w1',
+      question: 'Proceed?',
+      wait: true,
+      timeoutMs: 30_000,
+      requestId: 'req-ask-1',
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    const cancelAsk = await call('orchestration:cancel-wait', { requestId: 'req-ask-1' });
+    assert.deepEqual(cancelAsk, { ok: true, cancelled: true });
+    const askRes = await waitingAsk;
+    assert.equal(askRes.ok, true);
+    assert.equal(askRes.cancelled, true);
+    assert.equal(askRes.pending, true);
+
+    const missingCancel = await call('orchestration:cancel-wait', { requestId: 'nonexistent' });
+    assert.deepEqual(missingCancel, { ok: true, cancelled: false });
+
+    // Drain the unread question posted by waitingAsk so destroyCheck actually blocks on wait.
+    await call('orchestration:check', { from: 'coord', runId: run.id });
+
+    const destroyCheck = call('orchestration:check', {
+      from: 'coord',
+      runId: run.id,
+      wait: true,
+      timeoutMs: 30_000,
+      requestId: 'req-destroy',
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    sender.emit('destroyed');
+    const destroyRes = await destroyCheck;
+    assert.equal(destroyRes.ok, true);
+    assert.equal(destroyRes.cancelled, true);
+  } finally {
+    ipc.dispose();
+    service.dispose();
+  }
+});
+
+test('startup trust confirmation blocks quiet-ready return and defers dispatch prompt until user confirms', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aha-trust-guard-'));
+  const prevPath = process.env.PATH;
+  const binName = process.platform === 'win32' ? 'codex.cmd' : 'codex';
+  writeFileSync(
+    join(dir, binName),
+    process.platform === 'win32' ? '@echo off\r\n' : '#!/bin/sh\n',
+    { mode: 0o755 },
+  );
+  process.env.PATH = `${dir}${process.platform === 'win32' ? ';' : ':'}${prevPath ?? ''}`;
+  t.after(() => {
+    process.env.PATH = prevPath;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  t.mock.method(ipcMain, 'handle', () => {});
+  const host = getPtyHost();
+  const ptys = new Map();
+  t.mock.method(host, 'spawn', (id) => {
+    ptys.set(id, { onData: () => {}, onExit: () => {} });
+    return 1001;
+  });
+  t.mock.method(host, 'onData', (id, cb) => {
+    ptys.get(id).onData = cb;
+    return () => {};
+  });
+  t.mock.method(host, 'onExit', (id, cb) => {
+    ptys.get(id).onExit = cb;
+    return () => {};
+  });
+  t.mock.method(host, 'kill', (id) => ptys.delete(id));
+
+  const agentStatusStore = new AgentStatusStore();
+  const shellPtyCtrl = registerShellPtyIpc({
+    liveWindow: () => null,
+    getCurrentCwd: () => dir,
+    agentStatusStore,
+  });
+
+  // 1. waitForReady must NOT return early on 150ms silence while trust confirmation puts pane in 'waiting'.
+  const createPromise = shellPtyCtrl.createPty({
+    terminalId: 'orch-trust-ready',
+    cliId: 'codex',
+    cwd: dir,
+    waitForReady: { quietMs: 120, maxMs: 2_000 },
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  const expectedPtyId = 'local-orch-trust-ready';
+  ptys.get(expectedPtyId).onData('Do you trust the files in this folder?\r\n1. Yes, proceed');
+  assert.equal(agentStatusStore.get(expectedPtyId)?.state, 'waiting');
+
+  let settledEarly = false;
+  void createPromise.then(() => {
+    settledEarly = true;
+  });
+  await new Promise((r) => setTimeout(r, 250));
+  assert.equal(settledEarly, false, 'must stay blocked past quietMs while trust prompt is waiting');
+
+  // Confirming trust via user Enter unblocks waitForReady promptly.
+  agentStatusStore.notifyUserInput(expectedPtyId, '\r');
+  assert.equal(agentStatusStore.get(expectedPtyId)?.state, 'idle');
+  await createPromise;
+  await shellPtyCtrl.closePty(expectedPtyId);
+
+  // 2. Dispatching to a pane already stuck on directory trust defers the prompt until confirmed.
+  const store = new OrchestrationStore();
+  const writes = [];
+  const service = new OrchestrationService({
+    store,
+    agentStatusStore,
+    writePty: async (ptyId, data) => {
+      writes.push({ ptyId, data });
+      return { ok: true };
+    },
+  });
+  try {
+    agentStatusStore.registerPane('coord', { agentId: 'claude' });
+    agentStatusStore.registerPane('w_trust', { agentId: 'claude' });
+    agentStatusStore.ingestPtyData('w_trust', 'Do you trust the files in this folder?\nYes, proceed');
+    assert.equal(agentStatusStore.get('w_trust')?.state, 'waiting');
+
+    const { run } = service.runCreate({ id: 'run_trust', objective: 'Trust guard', from: 'coord', paneId: 'coord' });
+    const { task } = service.taskCreate({ id: 't_trust', runId: run.id, spec: 'Safe task' });
+    const res = await service.dispatchTask({ taskId: task.id, to: 'w_trust', from: 'coord' });
+
+    assert.equal(res.dispatch?.startObservation, 'permission');
+    assert.equal(res.dispatch?.promptSentAt, null);
+    assert.equal(writes.length, 0, 'must not write task text + Enter into trust dialog');
+
+    // User presses Enter on trust dialog -> pane returns to idle -> deferred prompt is delivered once.
+    agentStatusStore.notifyUserInput('w_trust', '\r');
+    await new Promise((r) => setTimeout(r, 150));
+    assert.ok(writes.some((w) => w.ptyId === 'w_trust' && w.data.includes('\x1b[200~')));
+    assert.ok(writes.some((w) => w.ptyId === 'w_trust' && w.data === '\r'));
+    assert.ok(service.store.getLatestDispatchForTask(task.id)?.promptSentAt);
+  } finally {
     service.dispose();
   }
 });

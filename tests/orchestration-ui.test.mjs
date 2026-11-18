@@ -171,3 +171,144 @@ test('orchestration client keeps pushed snapshots over a slower initial fetch an
     delete globalThis.window;
   }
 });
+
+test('mergeRunSnapshot merges run-scoped events without dropping other runs and removes pruned runs', () => {
+  const runA = { id: 'rA', objective: 'A', status: 'active', createdAt: iso(1) };
+  const runB = { id: 'rB', objective: 'B', status: 'active', createdAt: iso(2) };
+  const runGone = { id: 'rGone', objective: 'G', status: 'completed', createdAt: iso(0) };
+
+  const prev = snapshot({
+    runs: [runA, runB, runGone],
+    tasks: [
+      task('tA1', { runId: 'rA', createdAt: iso(1) }),
+      task('tB1', { runId: 'rB', createdAt: iso(2) }),
+      task('tG1', { runId: 'rGone', createdAt: iso(0) }),
+    ],
+    messages: [
+      { id: 'mA1', runId: 'rA', seq: 1, type: 'status', createdAt: iso(1) },
+      { id: 'mB1', runId: 'rB', seq: 2, type: 'status', createdAt: iso(2) },
+      { id: 'mG1', runId: 'rGone', seq: 0, type: 'status', createdAt: iso(0) },
+    ],
+  });
+
+  const incomingForB = snapshot({
+    runs: [runA, runB],
+    tasks: [task('tB1', { runId: 'rB', status: 'completed', createdAt: iso(2) }), task('tB2', { runId: 'rB', createdAt: iso(3) })],
+    messages: [{ id: 'mB1', runId: 'rB', seq: 2, type: 'status', createdAt: iso(2) }, { id: 'mB2', runId: 'rB', seq: 3, type: 'status', createdAt: iso(3) }],
+  });
+
+  const merged = view.mergeRunSnapshot(prev, 'rB', incomingForB);
+  assert.deepEqual(merged.runs.map((r) => r.id), ['rA', 'rB']);
+  assert.deepEqual(merged.tasks.map((t) => `${t.id}:${t.status}`), ['tA1:ready', 'tB1:completed', 'tB2:ready']);
+  assert.deepEqual(merged.messages.map((m) => m.id), ['mA1', 'mB1', 'mB2']);
+});
+
+test('orchestrationClient merges run-scoped events after initial load and cancels buffered spawns on close', async () => {
+  let pushEvent;
+  let pushSpawn;
+  let pushClose;
+  globalThis.window = {
+    vibeMeet: {
+      orchestration: {
+        getSnapshot: async () => ({
+          ok: true,
+          snapshot: snapshot({
+            runs: [{ id: 'r1', status: 'active', createdAt: iso(1) }, { id: 'r2', status: 'active', createdAt: iso(2) }],
+            tasks: [task('t1', { runId: 'r1', createdAt: iso(1) })],
+          }),
+        }),
+        onEvent: (cb) => ((pushEvent = cb), () => {}),
+        onPaneSpawned: (cb) => ((pushSpawn = cb), () => {}),
+        onPaneClosed: (cb) => ((pushClose = cb), () => {}),
+      },
+    },
+  };
+  try {
+    const freshClientUrl = `${clientUrl}?t=${Date.now()}`;
+    const { orchestrationClient } = await import(freshClientUrl);
+    orchestrationClient.subscribe(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(orchestrationClient.isLoaded(), true);
+
+    pushEvent({
+      reason: 'task:created',
+      runId: 'r2',
+      updatedAt: iso(5),
+      snapshot: snapshot({
+        runs: [{ id: 'r1', status: 'active', createdAt: iso(1) }, { id: 'r2', status: 'active', createdAt: iso(2) }],
+        tasks: [task('t2', { runId: 'r2', createdAt: iso(2) })],
+      }),
+    });
+    assert.deepEqual(
+      orchestrationClient.getSnapshot().tasks.map((t) => t.id),
+      ['t1', 't2'],
+    );
+
+    pushSpawn({ ptyId: 'local-orch-drop', runId: 'r2', taskId: 't2' });
+    pushClose({ ptyId: 'local-orch-drop', runId: 'r2', taskId: 't2' });
+    const spawnedAfterClose = [];
+    const closedSeen = [];
+    orchestrationClient.onPaneSpawned((e) => spawnedAfterClose.push(e.ptyId));
+    orchestrationClient.onPaneClosed((e) => closedSeen.push(e.ptyId));
+    assert.deepEqual(spawnedAfterClose, []);
+    assert.deepEqual(closedSeen, ['local-orch-drop']);
+  } finally {
+    delete globalThis.window;
+  }
+});
+
+test('orchestrationClient preserves other runs when a run-scoped event arrives before initial getSnapshot resolves', async () => {
+  let resolveFetch;
+  let pushEvent;
+  globalThis.window = {
+    vibeMeet: {
+      orchestration: {
+        getSnapshot: () => new Promise((resolve) => (resolveFetch = resolve)),
+        onEvent: (cb) => ((pushEvent = cb), () => {}),
+        onPaneSpawned: () => () => {},
+        onPaneClosed: () => () => {},
+      },
+    },
+  };
+  try {
+    const freshClientUrl = `${clientUrl}?race=${Date.now()}`;
+    const { orchestrationClient } = await import(freshClientUrl);
+    orchestrationClient.subscribe(() => {});
+    assert.equal(orchestrationClient.isLoaded(), false);
+
+    const run1 = { id: 'r1', status: 'active', createdAt: iso(1) };
+    const run2 = { id: 'r2', status: 'active', createdAt: iso(2) };
+
+    // A run-scoped event for r2 arrives BEFORE initial getSnapshot() resolves.
+    pushEvent({
+      reason: 'task:updated',
+      runId: 'r2',
+      updatedAt: iso(10),
+      snapshot: snapshot({
+        runs: [run1, run2],
+        tasks: [task('t2', { runId: 'r2', status: 'completed', createdAt: iso(2) })],
+      }),
+    });
+
+    // Initial global getSnapshot() resolves with r1's task plus r2's older pre-event state.
+    resolveFetch({
+      ok: true,
+      snapshot: snapshot({
+        runs: [run1, run2],
+        tasks: [
+          task('t1', { runId: 'r1', status: 'dispatched', createdAt: iso(1) }),
+          task('t2', { runId: 'r2', status: 'ready', createdAt: iso(2) }),
+        ],
+      }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const finalSnap = orchestrationClient.getSnapshot();
+    assert.deepEqual(
+      finalSnap.tasks.map((t) => `${t.id}:${t.status}`),
+      ['t1:dispatched', 't2:completed'],
+    );
+  } finally {
+    delete globalThis.window;
+  }
+});

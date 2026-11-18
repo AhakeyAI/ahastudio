@@ -595,12 +595,27 @@ test('MessageWake sharing, forwarded dispatch mail, ask --resume & close wakeup,
     }
     assert.ok(qId);
 
-    const token = hookServer.envForPane('coord').AHA_AGENT_HOOK_TOKEN;
+    const token = coordEnv.AHA_AGENT_HOOK_TOKEN;
+    // Worker cannot spoof a reply to its own blocking question.
+    const spoofResp = await fetch(`http://127.0.0.1:${port}/orchestration/reply`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-aha-agent-hook-token': token,
+        'x-aha-pty-id': workerEnv.AHA_TERMINAL_ID,
+        'x-aha-pane-token': workerEnv.AHA_ORCHESTRATION_PANE_TOKEN,
+      },
+      body: JSON.stringify({ id: qId, body: '9999', from: 'coord' }),
+    });
+    assert.equal(spoofResp.status, 400);
+
     const replyResp = await fetch(`http://127.0.0.1:${port}/orchestration/reply`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-aha-agent-hook-token': token,
+        'x-aha-pty-id': coordEnv.AHA_TERMINAL_ID,
+        'x-aha-pane-token': coordEnv.AHA_ORCHESTRATION_PANE_TOKEN,
       },
       body: JSON.stringify({ id: qId, body: '8080', from: 'coord' }),
     });

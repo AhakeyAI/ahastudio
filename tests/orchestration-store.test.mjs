@@ -393,3 +393,121 @@ test('runUse fences old consumerGeneration deliveries and lets new coordinator t
   assert.equal(gen2Batch.messages.length, 1);
   assert.equal(gen2Batch.messages[0].id, msg.id);
 });
+
+test('OrchestrationStore prunes duplicate heartbeats, excess read messages, settled deliveries, and old finished runs while protecting unread/pending items', () => {
+  let seq = 0;
+  const iso = () => new Date(Date.UTC(2026, 0, 1, 0, 0, seq++)).toISOString();
+  const store = new OrchestrationStore({
+    now: iso,
+    maxMessagesPerRun: 2,
+    maxMessages: 4,
+    maxDeliveries: 2,
+    maxRuns: 2,
+  });
+
+  const r1 = store.createRun({ id: 'r_old_1', objective: 'Old 1', coordinatorHandle: 'c1' });
+  const r2 = store.createRun({ id: 'r_old_2', objective: 'Old 2', coordinatorHandle: 'c2' });
+  const r3 = store.createRun({ id: 'r_cur', objective: 'Current', coordinatorHandle: 'c3' });
+
+  // Duplicate heartbeats from same sender in a run collapse to the newest one.
+  const hb1 = store.insertMessage({
+    runId: r3.id,
+    from: 'w1',
+    to: `run:${r3.id}`,
+    type: 'heartbeat',
+    subject: 'hb1',
+  });
+  const hb2 = store.insertMessage({
+    runId: r3.id,
+    from: 'w1',
+    to: `run:${r3.id}`,
+    type: 'heartbeat',
+    subject: 'hb2',
+  });
+  assert.equal(store.getMessageById(hb1.id), undefined);
+  assert.ok(store.getMessageById(hb2.id));
+
+  // Unread messages and pending questions are protected even past maxMessagesPerRun.
+  const unread1 = store.insertMessage({ runId: r3.id, from: 'w1', to: `run:${r3.id}`, subject: 'u1' });
+  const unread2 = store.insertMessage({ runId: r3.id, from: 'w1', to: `run:${r3.id}`, subject: 'u2' });
+  const unread3 = store.insertMessage({ runId: r3.id, from: 'w1', to: `run:${r3.id}`, subject: 'u3' });
+  assert.ok(store.getMessageById(unread1.id));
+  assert.ok(store.getMessageById(unread2.id));
+  assert.ok(store.getMessageById(unread3.id));
+
+  // Marking unread messages read triggers pruning down to maxMessagesPerRun (2) for r3.
+  store.markAsRead([unread1.id, unread2.id, unread3.id]);
+  const r3Msgs = store.listMessages({ runId: r3.id });
+  assert.equal(r3Msgs.length, 2);
+  assert.equal(store.getMessageById(hb2.id), undefined);
+  assert.equal(store.getMessageById(unread1.id), undefined);
+  assert.ok(store.getMessageById(unread2.id));
+  assert.ok(store.getMessageById(unread3.id));
+
+  // Settled deliveries beyond maxDeliveries (2) are pruned, while pending deliveries remain protected.
+  const dMsg1 = store.insertMessage({ runId: r2.id, from: 'w2', to: `run:${r2.id}`, subject: 'd1' });
+  const dlv1 = store.takeMailboxDelivery({ runId: r2.id, mailboxHandle: `run:${r2.id}`, consumerGeneration: 1 });
+  const dMsg2 = store.insertMessage({ runId: r2.id, from: 'w2', to: `run:${r2.id}`, subject: 'd2' });
+  const dlv2 = store.takeMailboxDelivery({ runId: r2.id, mailboxHandle: `run:${r2.id}`, consumerGeneration: 1 });
+  const dMsg3 = store.insertMessage({ runId: r2.id, from: 'w2', to: `run:${r2.id}`, subject: 'd3' });
+  const dlv3 = store.takeMailboxDelivery({
+    runId: r2.id,
+    mailboxHandle: `run:${r2.id}`,
+    consumerGeneration: 1,
+    holdAck: true,
+  });
+  assert.ok(dlv1 && dlv2 && dlv3);
+  assert.ok(store.getMessageById(dMsg3.id));
+  assert.equal(store.getDelivery(dlv1.delivery.id), undefined);
+  assert.ok(store.getDelivery(dlv2.delivery.id));
+  assert.ok(store.getDelivery(dlv3.delivery.id));
+  store.acknowledgeDelivery(dlv3.delivery.id);
+  void dMsg1;
+  void dMsg2;
+
+  // Finishing bound/old runs beyond maxRuns (2) prunes oldest finished unbound run and cascades.
+  store.createTask({ id: 't_old_1', runId: r1.id, spec: 'Old task' });
+  store.insertMessage({ runId: r1.id, from: 'c1', to: `run:${r1.id}`, subject: 'old msg' });
+  store.bindRun({ runId: r3.id, coordinatorHandle: 'c1', coordinatorPaneId: null });
+  store.updateRunStatus(r1.id, 'completed');
+  store.updateRunStatus(r2.id, 'stopped');
+  assert.equal(store.getRun(r1.id), undefined);
+  assert.equal(store.getTask('t_old_1'), undefined);
+  assert.equal(store.listMessages({ runId: r1.id }).length, 0);
+  assert.ok(store.getRun(r2.id));
+  assert.ok(store.getRun(r3.id));
+});
+
+test('hydrate settles active runs on restart and coordinatorStart can resume stopped bound runs', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aha-orch-restart-'));
+  try {
+    const file = join(dir, 'orchestration-state.json');
+    const store1 = new OrchestrationStore({ resolveFile: () => file });
+    const unfinished = store1.createRun({
+      id: 'run_unfinished',
+      objective: 'Unfinished on restart',
+      coordinatorHandle: 'coord',
+    });
+    store1.createTask({ id: 't_pending', runId: unfinished.id, spec: 'Still pending' });
+    const allDone = store1.createRun({
+      id: 'run_all_done',
+      objective: 'Finished tasks',
+      coordinatorHandle: 'coord_done',
+    });
+    const td = store1.createTask({ id: 't_done', runId: allDone.id, spec: 'Done' });
+    store1.updateTaskStatus(td.id, 'completed');
+    store1.close();
+
+    const store2 = new OrchestrationStore({ resolveFile: () => file });
+    store2.load();
+    const loadedUnfinished = store2.getRun(unfinished.id);
+    const loadedAllDone = store2.getRun(allDone.id);
+    assert.equal(loadedUnfinished?.status, 'stopped');
+    assert.ok(loadedUnfinished?.endedAt);
+    assert.equal(loadedAllDone?.status, 'completed');
+    assert.ok(loadedAllDone?.endedAt);
+    store2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
