@@ -8,6 +8,7 @@ const files = [
   ['electron/preload.cjs', 'dist-electron/preload.cjs'],
   ['electron/agent/agent-hook-relay.cjs', 'dist-electron/agent/agent-hook-relay.cjs'],
   ['electron/orchestration/aha-orchestration-cli.cjs', 'dist-electron/orchestration/aha-orchestration-cli.cjs'],
+  ['electron/orchestration/aha-mcp-server.cjs', 'dist-electron/orchestration/aha-mcp-server.cjs'],
   ['electron/terminal-daemon/windows-pipe-acl.ps1', 'dist-electron/terminal-daemon/windows-pipe-acl.ps1'],
 ];
 

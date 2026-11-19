@@ -168,7 +168,7 @@ export function resolveWorkerLaunchConfig(input: {
     return { cliId, model: null, effort: null, extraArgs: [] };
   }
 
-  if (/[\r\n\0]/.test(model)) {
+  if (model.startsWith('-') || model.length > 128 || /[\r\n\0\s]/.test(model)) {
     throw new OrchestrationError('invalid_argument', 'Invalid --model value.');
   }
 

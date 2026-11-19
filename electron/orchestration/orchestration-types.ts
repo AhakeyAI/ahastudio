@@ -102,6 +102,64 @@ export interface WorkerApprovalPayload {
   reason?: string | null;
 }
 
+export type OrchestrationConfirmMode = 'chat-and-guard' | 'always-ui' | 'auto';
+
+export const ORCHESTRATION_TASK_KINDS = [
+  'architecture',
+  'implementation',
+  'debug',
+  'tests',
+  'review',
+  'research',
+  'docs',
+] as const;
+
+export type OrchestrationTaskKind = (typeof ORCHESTRATION_TASK_KINDS)[number];
+
+export interface OrchestrationIdlePaneInfo {
+  ptyId: string;
+  cliId: string;
+  cwd: string | null;
+}
+
+export interface OrchestrationAgentRosterEntry {
+  cliId: string;
+  label: string;
+  command: string;
+  installed: boolean;
+  enabled: boolean;
+  available: boolean;
+  specialty: string;
+  defaultModel: string | null;
+  defaultEffort: string | null;
+  hooksInstalled: boolean;
+  mcpMode: 'launch-arg' | 'config' | 'cli-fallback';
+  mcpReady: boolean;
+  idlePanes: OrchestrationIdlePaneInfo[];
+}
+
+export type OrchestrationDispatchProposalStatus = 'pending' | 'approved' | 'rejected' | 'expired';
+
+export interface OrchestrationDispatchProposal {
+  id: string;
+  coordinatorPaneId: string;
+  runId: string | null;
+  role: string;
+  task: string;
+  planSummary: string;
+  requestedAgent: string;
+  resolvedAgent: string;
+  taskKind: OrchestrationTaskKind | null;
+  worktree: boolean;
+  model: string | null;
+  effort: string | null;
+  terminal: string | null;
+  status: OrchestrationDispatchProposalStatus;
+  createdAt: string;
+  resolvedAt: string | null;
+  reason?: string | null;
+}
+
 export type OrchestrationErrorCode =
   | 'invalid_argument'
   | 'not_found'
@@ -125,6 +183,8 @@ export type OrchestrationErrorCode =
   | 'gate_already_resolved'
   | 'approval_not_found'
   | 'approval_already_resolved'
+  | 'proposal_not_found'
+  | 'proposal_already_resolved'
   | 'worktree_failed'
   | 'coordinator_already_running'
   | 'no_agent_detected'
@@ -372,6 +432,8 @@ export interface OrchestrationSnapshot {
   messages: OrchestrationMessageRecord[];
   questions: OrchestrationQuestionRecord[];
   openApprovals?: WorkerApprovalPayload[];
+  pendingProposals?: OrchestrationDispatchProposal[];
+  orchestrationModePanes?: string[];
   coordinatorRuns: OrchestrationCoordinatorRunRecord[];
   activeCoordinatorRun: OrchestrationCoordinatorRunRecord | null;
   currentRunByConsumer: Record<string, string>;

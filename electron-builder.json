@@ -14,6 +14,7 @@
     "dist/vad/**/*",
     "dist/voice-id/**/*",
     "dist-electron/orchestration/aha-orchestration-cli.cjs",
+    "dist-electron/orchestration/aha-mcp-server.cjs",
     "dist-electron/terminal-daemon/windows-pipe-acl.ps1",
     "dist-electron/agent/agent-hook-relay.cjs"
   ],

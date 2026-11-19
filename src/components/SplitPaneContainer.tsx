@@ -163,7 +163,9 @@ export function SplitPaneContainer({
         <div className="split-pane-terminal-host">
           <OrchestrationCrewPanel
             leafId={node.id}
+            cwd={effectiveCwd}
             agentStatuses={agents}
+            isAgentPane={Boolean(effectiveCliId && effectiveCliId !== 'shell')}
             searchOpen={searchOpen && isActive}
             onNotify={onNotify}
           />

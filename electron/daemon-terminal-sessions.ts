@@ -9,10 +9,11 @@ import { mergeTerminalProcessEnv, resolveLocalTerminal, type OrchestrationCliId 
 import { mergedSubprocessEnv } from './settings-loader.js';
 import { applyShellIntegration } from './shell-integration/index.js';
 import { clampTerminalDim } from './terminal-size.js';
-import type {
-  LocalTerminalData,
-  LocalTerminalExit,
-  LocalTerminalLaunch,
+import {
+  mergeCliLaunchArgs,
+  type LocalTerminalData,
+  type LocalTerminalExit,
+  type LocalTerminalLaunch,
 } from './local-terminal-sessions.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -101,6 +102,7 @@ export class DaemonTerminalSessions {
     },
     private readonly currentCwd: () => string | undefined,
     private readonly extraEnv?: (ptyId: string, cliId?: OrchestrationCliId) => Record<string, string>,
+    private readonly mcpLaunchArgsForCli?: (cliId: OrchestrationCliId) => string[],
   ) {}
 
   private async getClient(): Promise<TerminalClient> {
@@ -255,9 +257,12 @@ export class DaemonTerminalSessions {
         if (!message.includes('Unknown terminal')) throw err;
       }
 
+      const mergedArgs = payload.cliId
+        ? mergeCliLaunchArgs(this.mcpLaunchArgsForCli?.(payload.cliId) ?? [], payload.extraArgs)
+        : payload.extraArgs;
       const target =
         payload.terminalId || payload.cliId || payload.shellId
-          ? resolveLocalTerminal(payload.cliId, payload.shellId, payload.extraArgs)
+          ? resolveLocalTerminal(payload.cliId, payload.shellId, mergedArgs)
           : null;
       const cwd = resolve(payload.cwd ?? target?.cwd ?? this.currentCwd() ?? process.cwd());
       const rawFile = target?.file ?? resolveDefaultShell();

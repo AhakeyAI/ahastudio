@@ -35,6 +35,7 @@ export function migrateSettings(raw: LegacySettings): { settings: Settings; chan
   if (raw.handheldMode !== undefined) settings.handheldMode = raw.handheldMode;
   if (raw.xfyunAsr !== undefined) settings.xfyunAsr = raw.xfyunAsr;
   if (raw.xfyunAsrEncrypted !== undefined) settings.xfyunAsrEncrypted = raw.xfyunAsrEncrypted;
+  if (raw.orchestration !== undefined) settings.orchestration = raw.orchestration;
 
   const polishKey = raw.voicePolishApiKey ?? raw.anthropicApiKey;
   const polishKeyEncrypted = raw.voicePolishApiKeyEncrypted ?? raw.anthropicApiKeyEncrypted;

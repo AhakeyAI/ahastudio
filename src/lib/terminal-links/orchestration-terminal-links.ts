@@ -192,6 +192,39 @@ export function resolveOrchestrationLinkTarget(
     };
   }
 
+  const normalizedRole = token.id.trim().replace(/^@+/, '').toLowerCase();
+  if (normalizedRole) {
+    const taskById = new Map(snapshot.tasks.map((t) => [t.id, t]));
+    const roleDispatches = snapshot.dispatches.filter((d) => {
+      if (d.releasedAt) return false;
+      const task = taskById.get(d.taskId);
+      const role = task?.displayName?.trim().replace(/^@+/, '').toLowerCase();
+      return Boolean(role && role === normalizedRole);
+    });
+    const seed =
+      roleDispatches.filter((d) => d.status === 'pending' || d.status === 'dispatched').at(-1) ??
+      roleDispatches.at(-1) ??
+      null;
+    if (seed) {
+      const dispatch =
+        resolveClientDispatchLineage(snapshot.dispatches, seed.id) ?? seed;
+      const task = taskById.get(dispatch.taskId) ?? taskById.get(seed.taskId);
+      const canonicalRole =
+        task?.displayName?.trim().replace(/^@+/, '') || token.id.trim().replace(/^@+/, '');
+      return {
+        kind: 'dispatch',
+        label: `@${canonicalRole}`,
+        ptyId:
+          dispatch.assigneePaneId ??
+          (dispatch.assigneeHandle.startsWith('local-') ? dispatch.assigneeHandle : null),
+        dispatchId: dispatch.id,
+        taskId: task?.id ?? dispatch.taskId,
+        cwd: dispatch.worktreePath ?? task?.worktreePath ?? null,
+        cliId: dispatch.cliId ?? null,
+      };
+    }
+  }
+
   return null;
 }
 

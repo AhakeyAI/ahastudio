@@ -1,5 +1,6 @@
 import type {
   AgentPaneStatus,
+  OrchestrationDispatchProposal,
   OrchestrationDispatchRecord,
   OrchestrationDispatchStage,
   OrchestrationGateRecord,
@@ -15,6 +16,7 @@ import { shortId, taskTitle, type StatusTone } from './orchestration-view';
 export interface CrewMemberEntry {
   key: string;
   role: 'coordinator' | 'worker';
+  roleName: string | null;
   ptyId: string | null;
   handle: string;
   mentionToken: string;
@@ -52,6 +54,8 @@ export interface CrewPeerEntry {
 export interface PaneCrewViewModel {
   ptyId: string;
   isVisible: boolean;
+  isOrchestrationMode: boolean;
+  pendingProposals: OrchestrationDispatchProposal[];
   ownDispatch: OrchestrationDispatchRecord | null;
   ownRun: OrchestrationRunRecord | null;
   managedBy: CrewMemberEntry | null;
@@ -66,6 +70,39 @@ export interface PaneCrewViewModel {
   pillLabel: string;
   pillTone: StatusTone;
   mentionAllText: string;
+}
+
+export interface BuildCrewViewOptions {
+  isAgentPane?: boolean;
+}
+
+export interface QuickDispatchTarget {
+  agent: string;
+  role?: string;
+  task: string;
+}
+
+const QUICK_DISPATCH_AGENT_ALIASES: Record<string, string> = {
+  agy: 'antigravity',
+  'claude-code': 'claude',
+  'gemini-cli': 'gemini',
+};
+
+export function parseQuickDispatchInput(raw: string): QuickDispatchTarget | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const mentionMatch = /^@([a-zA-Z0-9_-]+)(?::([^\s]*))?(?:\s+([\s\S]*))?$/.exec(trimmed);
+  if (mentionMatch) {
+    const rawAgent = (mentionMatch[1] ?? '').toLowerCase();
+    const agent = QUICK_DISPATCH_AGENT_ALIASES[rawAgent] ?? rawAgent;
+    const rawRole = (mentionMatch[2] ?? '').trim().replace(/^@+/, '');
+    const task = (mentionMatch[3] ?? '').trim();
+    if (!task) return null;
+    return rawRole ? { agent, role: rawRole, task } : { agent, task };
+  }
+
+  return { agent: 'auto', task: trimmed };
 }
 
 export const STAGE_LABELS: Record<OrchestrationDispatchStage | 'active' | 'idle', string> = {
@@ -171,6 +208,27 @@ export interface AgentStatusLookup {
   get(ptyId: string): AgentPaneStatus | null | undefined;
 }
 
+function workerRoleSubtitle(
+  task: OrchestrationTaskRecord | null,
+  roleName: string,
+  cliId: string | null,
+): string {
+  let desc = task?.taskTitle?.trim() || '';
+  if (desc) {
+    const escaped = roleName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const stripped = desc.replace(new RegExp(`^@?${escaped}\\s*[:：-]\\s*`, 'i'), '').trim();
+    if (stripped) desc = stripped;
+  }
+  if (!desc && task?.spec) {
+    const firstLine = task.spec.split(/\r?\n/).find((line) => line.trim())?.trim() ?? '';
+    if (firstLine) {
+      desc = firstLine.length > 60 ? `${firstLine.slice(0, 59)}…` : firstLine;
+    }
+  }
+  const parts = [cliId, desc].filter((part): part is string => Boolean(part));
+  return parts.length > 0 ? parts.join(' · ') : roleName;
+}
+
 function toWorkerCrewEntry(
   dispatch: OrchestrationDispatchRecord,
   snapshot: OrchestrationSnapshot,
@@ -187,6 +245,7 @@ function toWorkerCrewEntry(
   );
   const stage = deriveClientDispatchStage(dispatch, agentStatus, hasOpenApproval, hasOpenQuestion);
   const isSettled = !isActiveStatus(dispatch.status);
+  const roleName = task?.displayName?.trim().replace(/^@+/, '') || null;
   const title = task ? taskTitle(task) : shortId(dispatch.taskId);
   const cliId = dispatch.cliId ?? agentStatus?.agentId ?? null;
   const needsAttention =
@@ -198,11 +257,14 @@ function toWorkerCrewEntry(
   return {
     key: dispatch.id,
     role: 'worker',
+    roleName,
     ptyId,
     handle: `dispatch:${dispatch.id}`,
-    mentionToken: `@dispatch:${dispatch.id}`,
-    label: title,
-    subtitle: `#${dispatch.taskId} · ${shortId(dispatch.id)}`,
+    mentionToken: roleName ? `@${roleName}` : `@dispatch:${dispatch.id}`,
+    label: roleName ? `@${roleName}` : title,
+    subtitle: roleName
+      ? workerRoleSubtitle(task, roleName, cliId)
+      : `#${dispatch.taskId} · ${shortId(dispatch.id)}`,
     cliId,
     dispatch,
     task,
@@ -225,6 +287,7 @@ export function buildCrewViewForPane(
   snapshot: OrchestrationSnapshot,
   ptyId: string,
   agentStatuses?: AgentStatusLookup,
+  opts?: BuildCrewViewOptions,
 ): PaneCrewViewModel {
   const collapsedDispatches = collapseFollowUpLineages(snapshot.dispatches).filter(
     (d) => !d.releasedAt,
@@ -271,6 +334,7 @@ export function buildCrewViewForPane(
       managedBy = {
         key: `coord:${ownDispatch.runId}`,
         role: 'coordinator',
+        roleName: null,
         ptyId: parentPtyId,
         handle: parentRun ? `run:${parentRun.id}` : ownDispatch.creator,
         mentionToken: '@coordinator',
@@ -433,20 +497,45 @@ export function buildCrewViewForPane(
     b.lastMessageAt.localeCompare(a.lastMessageAt),
   );
 
+  const isOrchestrationMode = Boolean(snapshot.orchestrationModePanes?.includes(ptyId));
+  const pendingProposals = (snapshot.pendingProposals ?? []).filter(
+    (p) =>
+      p.status === 'pending' &&
+      (p.coordinatorPaneId === ptyId ||
+        (!ownDispatch && ownRun !== null && p.runId === ownRun.id) ||
+        (p.runId !== null && coordinatedRunIds.has(p.runId))),
+  );
+
   const workingCount = managing.filter(
     (m) => m.stage === 'working' || m.stage === 'starting',
   ).length;
   const memberAttention = managing.filter((m) => m.needsAttention).length;
   const attentionCount =
-    openApprovals.length + openQuestions.length + openGates.length + memberAttention;
+    pendingProposals.length +
+    openApprovals.length +
+    openQuestions.length +
+    openGates.length +
+    memberAttention;
   const totalCount = (managedBy ? 1 : 0) + managing.length + talkingWith.length;
   const isVisible =
-    totalCount > 0 || openApprovals.length > 0 || openQuestions.length > 0 || openGates.length > 0;
+    Boolean(opts?.isAgentPane) ||
+    isOrchestrationMode ||
+    pendingProposals.length > 0 ||
+    totalCount > 0 ||
+    openApprovals.length > 0 ||
+    openQuestions.length > 0 ||
+    openGates.length > 0;
 
-  let pillLabel = `${totalCount} Crew`;
-  let pillTone: StatusTone = 'neutral';
+  let pillLabel = isOrchestrationMode ? '编排中' : '编排';
+  let pillTone: StatusTone = isOrchestrationMode ? 'accent' : 'neutral';
 
-  if (openApprovals.length > 0) {
+  if (pendingProposals.length > 0) {
+    pillLabel =
+      workingCount > 0
+        ? `待确认 (${pendingProposals.length}) · ${workingCount} 执行中`
+        : `待确认 (${pendingProposals.length})`;
+    pillTone = 'warn';
+  } else if (openApprovals.length > 0) {
     pillLabel = `${openApprovals.length} 待授权`;
     pillTone = 'warn';
   } else if (openQuestions.length + openGates.length > 0) {
@@ -462,8 +551,21 @@ export function buildCrewViewForPane(
     pillLabel = `${managing.length} Workers`;
     pillTone = 'ok';
   } else if (managedBy) {
-    pillLabel = ownDispatch ? `#${shortId(ownDispatch.taskId)}` : 'Worker';
-    pillTone = ownDispatch ? stageTone(deriveClientDispatchStage(ownDispatch, agentStatuses?.get(ptyId))) : 'accent';
+    const ownTask = ownDispatch
+      ? snapshot.tasks.find((t) => t.id === ownDispatch.taskId) ?? null
+      : null;
+    const ownRole = ownTask?.displayName?.trim().replace(/^@+/, '') || null;
+    pillLabel = ownRole
+      ? `@${ownRole}`
+      : ownDispatch
+        ? `#${shortId(ownDispatch.taskId)}`
+        : 'Worker';
+    pillTone = ownDispatch
+      ? stageTone(deriveClientDispatchStage(ownDispatch, agentStatuses?.get(ptyId)))
+      : 'accent';
+  } else if (talkingWith.length > 0) {
+    pillLabel = `${totalCount} Crew`;
+    pillTone = isOrchestrationMode ? 'accent' : 'neutral';
   }
 
   const activeWorkerMentions = managing
@@ -479,6 +581,8 @@ export function buildCrewViewForPane(
   return {
     ptyId,
     isVisible,
+    isOrchestrationMode,
+    pendingProposals,
     ownDispatch,
     ownRun,
     managedBy,

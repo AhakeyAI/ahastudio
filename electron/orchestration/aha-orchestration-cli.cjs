@@ -65,6 +65,9 @@ function parseCliArgs(argv) {
   let args = argv.slice();
   let namespace = 'orchestration';
 
+  if (args[0] === 'mcp') {
+    return { help: false, namespace: 'mcp', verb: 'serve', flags: {}, positional: args.slice(1) };
+  }
   if (args[0] === 'orchestration' || args[0] === 'orch') {
     args = args.slice(1);
   } else if (COMPANION_NAMESPACES.has(args[0])) {
@@ -994,6 +997,15 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
           ...(flags.status ? { status: String(flags.status) } : {}),
         },
       };
+    case 'agents':
+      return {
+        action: 'agents',
+        payload: {
+          ...(defaultFrom ? { callerPaneId: defaultFrom } : {}),
+          receiptText: !wantJson,
+          full,
+        },
+      };
     default:
       throw new Error(`Unknown orchestration command: ${verb}`);
   }
@@ -1001,17 +1013,24 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
 
 async function main() {
   const parsed = parseCliArgs(process.argv.slice(2));
+  if (parsed.namespace === 'mcp') {
+    const { runMcpServer } = require('./aha-mcp-server.cjs');
+    await runMcpServer();
+    return;
+  }
   if (parsed.help) {
     console.log(
       [
         'AhaStation Multi-Agent Orchestration & Companion CLI',
         'Usage:',
+        '  aha mcp',
         '  aha orchestration <command> [options]',
         '  aha terminal <list|show|read|send|wait> [options]',
         '  aha worktree <list|create|remove> [options]',
         '  aha skills <list|get|sync> [options]',
         '',
         'Orchestration Commands:',
+        '  agents',
         '  worker-start | worker-list | worker-show | worker-read | worker-keep-open | worker-release | worker-stop | worker-abandon',
         '  approve | deny | reset',
         '  run-create | run-use | run-current | run-list | run-show',

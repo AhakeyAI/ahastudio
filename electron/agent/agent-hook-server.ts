@@ -588,6 +588,68 @@ export type PermissionHookInterceptor = (input: {
   signal: AbortSignal;
 }) => Promise<{ held: false } | { held: true; hookStdout?: string }>;
 
+export interface UserPromptInterceptRequest {
+  ptyId: string;
+  provider: string;
+  eventName: string;
+  promptText?: string;
+}
+
+export type UserPromptInterceptor = (
+  req: UserPromptInterceptRequest
+) =>
+  | { hookStdout?: string }
+  | null
+  | void
+  | Promise<{ hookStdout?: string } | null | void>;
+
+export function formatAdditionalContextHookStdout(
+  provider: string,
+  eventName: string,
+  text: string
+): string {
+  const trimmed = text.trim();
+  if (!trimmed) return '';
+  const normProvider = provider.trim().toLowerCase();
+  const cleanEvent = eventName.trim() || 'UserPromptSubmit';
+
+  if (normProvider === 'claude' || normProvider === 'claude-code') {
+    return `${JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: cleanEvent,
+        additionalContext: trimmed,
+      },
+    })}\n`;
+  }
+
+  if (normProvider === 'gemini' || normProvider === 'gemini-cli') {
+    return `${JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: eventName.trim() || 'BeforeAgent',
+        additionalContext: trimmed,
+      },
+    })}\n`;
+  }
+
+  if (normProvider === 'antigravity' || normProvider === 'agy') {
+    return `${JSON.stringify({
+      additionalContext: trimmed,
+      hookSpecificOutput: {
+        hookEventName: eventName.trim() || 'PreInvocation',
+        additionalContext: trimmed,
+      },
+    })}\n`;
+  }
+
+  return `${JSON.stringify({
+    additionalContext: trimmed,
+    hookSpecificOutput: {
+      hookEventName: cleanEvent,
+      additionalContext: trimmed,
+    },
+  })}\n`;
+}
+
 export interface AgentHookBinShim {
   applyToEnv: (env: Record<string, string>) => Record<string, string>;
 }
@@ -642,6 +704,7 @@ export class AgentHookServer {
   private orchestrationHandler: OrchestrationHttpHandler | null = null;
   private companionHandler: CompanionHttpHandler | null = null;
   private permissionHookInterceptor: PermissionHookInterceptor | null = null;
+  private userPromptInterceptor: UserPromptInterceptor | null = null;
   private orchestrationBinShim: AgentHookBinShim | null = null;
   private endpointFile: string | null = null;
 
@@ -706,6 +769,10 @@ export class AgentHookServer {
 
   setPermissionHookInterceptor(interceptor: PermissionHookInterceptor | null): void {
     this.permissionHookInterceptor = interceptor;
+  }
+
+  setUserPromptInterceptor(interceptor: UserPromptInterceptor | null): void {
+    this.userPromptInterceptor = interceptor;
   }
 
   setOrchestrationBinShim(shim: AgentHookBinShim | null): void {
@@ -983,13 +1050,50 @@ export class AgentHookServer {
 
     this.store.ingestHookEvent(normalized);
 
+    const rawRecord = parsed as Record<string, unknown>;
+    const rawEv = optStr(
+      rawRecord.hook_event_name ?? rawRecord.hookEventName ?? rawRecord.event ?? rawRecord.type,
+      64,
+    );
+    const eventName = rawEv ? canonicalHookEventName(rawEv) : '';
+
+    if (
+      this.userPromptInterceptor &&
+      (eventName === 'UserPromptSubmit' ||
+        eventName === 'BeforeAgent' ||
+        eventName === 'PreInvocation')
+    ) {
+      const provider = providerHint ?? normalized.agentId ?? 'unknown';
+      const promptText =
+        optStr(rawRecord.prompt ?? rawRecord.lastUserInput ?? rawRecord.message, 4_000) ??
+        normalized.message;
+      try {
+        const promptReply = await this.userPromptInterceptor({
+          ptyId: normalized.ptyId,
+          provider,
+          eventName,
+          promptText,
+        });
+        if (!res.writableEnded) {
+          sendJson(
+            res,
+            200,
+            promptReply && typeof promptReply.hookStdout === 'string' && promptReply.hookStdout.length > 0
+              ? { hookStdout: promptReply.hookStdout }
+              : {},
+          );
+        }
+        return;
+      } catch (err) {
+        console.warn('[agent-hooks] userPromptInterceptor failed:', err);
+        if (!res.writableEnded) {
+          sendJson(res, 200, {});
+        }
+        return;
+      }
+    }
+
     if (this.permissionHookInterceptor) {
-      const rawRecord = parsed as Record<string, unknown>;
-      const rawEv = optStr(
-        rawRecord.hook_event_name ?? rawRecord.hookEventName ?? rawRecord.event ?? rawRecord.type,
-        64,
-      );
-      const eventName = rawEv ? canonicalHookEventName(rawEv) : '';
       if (
         eventName === 'PermissionRequest' ||
         eventName === 'BeforeTool' ||

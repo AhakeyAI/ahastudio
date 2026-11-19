@@ -2,10 +2,20 @@ import { app, BrowserWindow, nativeTheme, protocol, screen, session } from 'elec
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AgentHookServer } from './agent/agent-hook-server.js';
+import {
+  AgentHookServer,
+  formatAdditionalContextHookStdout,
+} from './agent/agent-hook-server.js';
+import { AgentHookInstaller } from './agent/agent-hook-installer.js';
+import {
+  AGENT_MCP_CLI_IDS,
+  AgentMcpInstaller,
+  type AgentMcpCliId,
+} from './agent/agent-mcp-installer.js';
 import { AgentStatusStore } from './agent/agent-status-store.js';
 import { registerAgentIpc } from './ipc/agent.js';
 import { registerAgentHooksIpc } from './ipc/agent-hooks.js';
+import { registerAgentMcpIpc } from './ipc/agent-mcp.js';
 import { registerAsrIpc } from './ipc/asr.js';
 import type { IpcContext } from './ipc/context.js';
 import { registerDesktopIpc } from './ipc/desktop.js';
@@ -14,7 +24,7 @@ import { registerGitIpc } from './ipc/git.js';
 import { registerSettingsIpc } from './ipc/settings.js';
 import { registerSettingsWindowIpc } from './ipc/settings-window.js';
 import { registerShellPtyIpc } from './ipc/shell-pty.js';
-import { isOrchestrationCliId } from './local-cli.js';
+import { isOrchestrationCliId, resolveMcpLaunchArgs } from './local-cli.js';
 import { registerWorkspaceFsIpc } from './ipc/workspace-fs.js';
 import { getPtyHost } from './pty-host.js';
 import {
@@ -22,7 +32,11 @@ import {
   resolveAppAssetPath,
   themeBackgroundColor,
 } from './renderer-security.js';
-import { flushSettingsWrites } from './store.js';
+import {
+  flushSettingsWrites,
+  getSettings,
+  normalizeOrchestrationSettings,
+} from './store.js';
 import { getDefaultWorkspaceStateStore } from './persistence/workspace-state-store.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -68,6 +82,7 @@ let currentCwd: string | undefined;
 let agentHookServer: AgentHookServer | null = null;
 let disposeAgentIpc: (() => void) | null = null;
 let disposeAgentHooks: (() => void) | null = null;
+let disposeAgentMcp: (() => void) | null = null;
 let disposeOrchestration: (() => void) | null = null;
 
 const MIME_TYPES: Record<string, string> = {
@@ -222,10 +237,13 @@ app.whenReady().then(async () => {
     console.warn('[orchestration] could not retain pane identities across restarts:', error);
   }
   agentHookServer.setEndpointFile(join(app.getPath('userData'), 'agent-hook-endpoint.json'));
+  let defaultMcpServerSourcePath: string | undefined;
   try {
-    const { createOrchestrationBinShim } = await import(
-      './orchestration/orchestration-bin-shim.js'
-    );
+    const {
+      createOrchestrationBinShim,
+      resolveDefaultOrchestrationMcpServerPath,
+    } = await import('./orchestration/orchestration-bin-shim.js');
+    defaultMcpServerSourcePath = resolveDefaultOrchestrationMcpServerPath();
     const binShim = createOrchestrationBinShim({
       binDir: join(app.getPath('userData'), 'orchestration-bin'),
     });
@@ -233,6 +251,25 @@ app.whenReady().then(async () => {
   } catch (error) {
     console.warn('[orchestration] failed to initialize CLI bin shim:', error);
   }
+
+  const mcpInstaller = new AgentMcpInstaller(
+    defaultMcpServerSourcePath ? { serverSourcePath: defaultMcpServerSourcePath } : undefined,
+  );
+  let claudeMcpConfigPath: string | undefined;
+  try {
+    mcpInstaller.refreshServerIfInstalled();
+    claudeMcpConfigPath = mcpInstaller.ensureClaudeMcpConfigFile();
+  } catch (error) {
+    console.warn('[agent-mcp] failed to prepare MCP launch config:', error);
+  }
+  const resolveActiveMcpServerPath = (): string | undefined => {
+    if (existsSync(mcpInstaller.serverPath)) return mcpInstaller.serverPath;
+    if (defaultMcpServerSourcePath && existsSync(defaultMcpServerSourcePath)) {
+      return defaultMcpServerSourcePath;
+    }
+    return existsSync(mcpInstaller.sourcePath) ? mcpInstaller.sourcePath : undefined;
+  };
+
   try {
     await agentHookServer.start();
   } catch (error) {
@@ -249,6 +286,24 @@ app.whenReady().then(async () => {
     userDataDir: () => app.getPath('userData'),
     agentStatusStore,
     agentHookEnv: (ptyId) => agentHookServer?.envForPane(ptyId) ?? { AHA_TERMINAL_ID: ptyId },
+    mcpLaunchArgsForCli: (cliId) => {
+      const serverPath = resolveActiveMcpServerPath();
+      if (!serverPath) return [];
+      if (cliId === 'claude') {
+        try {
+          claudeMcpConfigPath = mcpInstaller.ensureClaudeMcpConfigFile();
+        } catch {
+          /* fall back to previously written config if present */
+        }
+        return claudeMcpConfigPath && existsSync(claudeMcpConfigPath)
+          ? resolveMcpLaunchArgs(cliId, { claudeMcpConfigPath })
+          : [];
+      }
+      if (cliId === 'codex') {
+        return resolveMcpLaunchArgs(cliId, { mcpServerPath: serverPath });
+      }
+      return [];
+    },
   };
 
   const shellPtyCtrl = registerShellPtyIpc(ipcCtx);
@@ -260,6 +315,12 @@ app.whenReady().then(async () => {
 
   const { OrchestrationStore } = await import('./orchestration/orchestration-store.js');
   const { OrchestrationService } = await import('./orchestration/orchestration-service.js');
+  const { ACTIVE_DISPATCH_STATUSES } = await import(
+    './orchestration/orchestration-lifecycle-graph.js'
+  );
+  const { buildAgentRoster, selectAgentForTask } = await import(
+    './orchestration/agent-roster.js'
+  );
   const { dispatchOrchestrationHttpAction } = await import(
     './orchestration/orchestration-http-router.js'
   );
@@ -280,6 +341,8 @@ app.whenReady().then(async () => {
   const resolveFallbackCwd = (): string | undefined =>
     currentCwd ?? shellPtyCtrl.tracker.listTerminals()[0]?.cwd;
 
+  const hookInstaller = new AgentHookInstaller();
+  const mcpCliIdSet = new Set<string>(AGENT_MCP_CLI_IDS);
   const orchestrationStore = OrchestrationStore.forUserDataDir(() => app.getPath('userData'));
   const orchestrationService = new OrchestrationService({
     store: orchestrationStore,
@@ -302,6 +365,66 @@ app.whenReady().then(async () => {
     isAgentCliId: isOrchestrationCliId,
     terminalTracker: shellPtyCtrl.tracker,
     getDefaultCwd: resolveFallbackCwd,
+    getConfirmMode: () =>
+      normalizeOrchestrationSettings(getSettings().orchestration).confirmBeforeDispatch,
+    getDefaultWorktree: () =>
+      normalizeOrchestrationSettings(getSettings().orchestration).defaultWorktree,
+    isMcpEnabledForCli: (cliId) => {
+      if (!mcpCliIdSet.has(cliId)) return false;
+      try {
+        const state = mcpInstaller.status(cliId as AgentMcpCliId).state;
+        return state === 'launch-managed' || state === 'installed';
+      } catch {
+        return false;
+      }
+    },
+    listCodingAgents: (opts) => {
+      const settings = normalizeOrchestrationSettings(getSettings().orchestration);
+      let hookStatuses: ReturnType<AgentHookInstaller['listStatus']> = [];
+      try {
+        hookStatuses = hookInstaller.listStatus();
+      } catch {
+        /* ignore unreadable hook config */
+      }
+      let mcpStatuses: ReturnType<AgentMcpInstaller['listStatus']> = [];
+      try {
+        mcpStatuses = mcpInstaller.listStatus();
+      } catch {
+        /* ignore unreadable MCP config */
+      }
+
+      const idlePanes: Array<{ ptyId: string; cliId: string; cwd: string | null }> = [];
+      if (opts?.includeIdlePanes !== false) {
+        const busyPanes = new Set<string>();
+        for (const dispatch of orchestrationStore.listDispatches()) {
+          if (!ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) continue;
+          if (dispatch.assigneePaneId) busyPanes.add(dispatch.assigneePaneId);
+          if (dispatch.assigneeHandle) busyPanes.add(dispatch.assigneeHandle);
+        }
+        for (const pane of agentStatusStore.list()) {
+          if (opts?.callerPaneId && pane.ptyId === opts.callerPaneId) continue;
+          if (!shellPtyCtrl.isPtyAlive(pane.ptyId)) continue;
+          if (!pane.agentId || !isOrchestrationCliId(pane.agentId)) continue;
+          if (pane.state !== 'idle' && pane.state !== 'done') continue;
+          if (busyPanes.has(pane.ptyId)) continue;
+          const boundRun = orchestrationStore.getCurrentRunForConsumer(pane.ptyId);
+          if (boundRun && boundRun.coordinatorPaneId === pane.ptyId) continue;
+          idlePanes.push({
+            ptyId: pane.ptyId,
+            cliId: pane.agentId,
+            cwd: shellPtyCtrl.tracker.getTerminal(pane.ptyId)?.cwd ?? null,
+          });
+        }
+      }
+
+      return buildAgentRoster({
+        settings,
+        hookStatuses,
+        mcpStatuses,
+        idlePanes,
+      });
+    },
+    selectAgentForTask: (opts) => selectAgentForTask(opts),
     turnStartObserveTimeoutMs: 2_000,
     startConfirmationTimeoutMs: 60_000,
     heartbeatTimeoutMs: 300_000,
@@ -315,6 +438,43 @@ app.whenReady().then(async () => {
   agentHookServer.setPermissionHookInterceptor((req) =>
     orchestrationService.handlePermissionHookRequest(req)
   );
+  agentHookServer.setUserPromptInterceptor((req) => {
+    orchestrationService.recordUserPromptTurn(req.ptyId, 'hook');
+    if (!orchestrationService.isPaneOrchestrationMode(req.ptyId)) {
+      return null;
+    }
+    const mcpCtx = orchestrationService.getMcpContextForPane(req.ptyId);
+    if (mcpCtx.role === 'worker' && !mcpCtx.canDelegate) {
+      return null;
+    }
+    const availableAgents = mcpCtx.roster.filter((entry) => entry.available);
+    const agentListText =
+      availableAgents.length > 0
+        ? availableAgents
+            .map((a) => {
+              const idleNote = a.idlePanes.length > 0 ? ` (${a.idlePanes.length} idle)` : '';
+              return `${a.cliId}${idleNote}: ${a.specialty}`;
+            })
+            .join('; ')
+        : '(no available coding agents detected)';
+    const lines = [
+      '[AhaStation Orchestration Mode Active — Coordinator]',
+      'Prefer AhaStation MCP tools (`delegate_task`, `team_wait`, `team_status`, `message_worker`, `manage_worker`) over built-in subagents so tasks run in visible AhaStation Coding Agent terminals with optional isolated Git worktrees.',
+      `Available Coding Agents: ${agentListText}.`,
+      'Pick the Coding Agent best suited to each subtask (prefer a heterogeneous CLI for independent review/tests).',
+      ...(mcpCtx.confirmMode === 'chat-and-guard'
+        ? [
+            'Confirmation rule (2-step): before spawning new workers on a request, first call `delegate_task` with `confirmed=false` to register the dispatch plan without spawning, then give ONE short natural sentence confirming role, Coding Agent, task, and whether to use an isolated worktree; after the user replies to confirm, call `delegate_task` with `confirmed=true` (parallel batch calls in that confirmed turn all pass without re-confirming).',
+          ]
+        : []),
+    ];
+    const hookStdout = formatAdditionalContextHookStdout(
+      req.provider,
+      req.eventName,
+      lines.join('\n'),
+    );
+    return hookStdout ? { hookStdout } : null;
+  });
   agentHookServer.setCompanionHandler((namespace, action, payload, context) =>
     dispatchCompanionHttpAction(
       {
@@ -353,6 +513,7 @@ app.whenReady().then(async () => {
     orchestrationService.dispose();
   };
   disposeAgentHooks = registerAgentHooksIpc().dispose;
+  disposeAgentMcp = registerAgentMcpIpc(mcpInstaller).dispose;
   registerGitIpc(ipcCtx);
   registerWorkspaceFsIpc(ipcCtx);
   registerDialogIpc(ipcCtx);
@@ -389,6 +550,10 @@ app.on('before-quit', () => {
   try {
     disposeAgentHooks?.();
     disposeAgentHooks = null;
+  } catch { /* ignore */ }
+  try {
+    disposeAgentMcp?.();
+    disposeAgentMcp = null;
   } catch { /* ignore */ }
   try {
     disposeAgentIpc?.();

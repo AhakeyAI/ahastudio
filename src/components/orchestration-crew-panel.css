@@ -16,8 +16,91 @@
 }
 
 .aha-crew-pill,
+.aha-crew-split-pill,
 .aha-crew-drawer {
   pointer-events: auto;
+}
+
+.aha-crew-split-pill {
+  display: inline-flex;
+  align-items: stretch;
+  height: 26px;
+  border-radius: 999px;
+  border: 1px solid var(--workspace-line);
+  background: var(--workspace-surface);
+  color: var(--workspace-ink);
+  font-size: 11px;
+  font-weight: 500;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+  overflow: hidden;
+  transition: border-color 0.14s ease, background-color 0.14s ease;
+}
+
+.aha-crew-split-pill:hover,
+.aha-crew-split-pill.is-open,
+.aha-crew-split-pill.is-mode-on {
+  border-color: var(--workspace-accent);
+}
+
+.aha-crew-split-pill.tone-warn {
+  border-color: #f59e0b;
+}
+
+.aha-crew-split-pill.tone-error {
+  border-color: #ef4444;
+}
+
+.aha-crew-mode-btn,
+.aha-crew-drawer-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.aha-crew-mode-btn {
+  padding: 0 8px 0 9px;
+}
+
+.aha-crew-drawer-btn {
+  padding: 0 8px 0 6px;
+}
+
+.aha-crew-mode-btn:hover,
+.aha-crew-drawer-btn:hover {
+  background: var(--workspace-hover);
+}
+
+.aha-crew-mode-btn.is-active {
+  background: rgba(59, 130, 246, 0.14);
+  color: #1d4ed8;
+}
+
+.aha-crew-mode-btn.is-active:hover {
+  background: rgba(59, 130, 246, 0.22);
+}
+
+.local-terminal-workspace[data-appearance="dark"] .aha-crew-mode-btn.is-active {
+  background: rgba(90, 150, 221, 0.22);
+  color: #93c5fd;
+}
+
+.local-terminal-workspace[data-appearance="dark"] .aha-crew-mode-btn.is-active:hover {
+  background: rgba(90, 150, 221, 0.3);
+}
+
+.aha-crew-pill-divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--workspace-line);
 }
 
 .aha-crew-pill {
@@ -444,4 +527,127 @@
 .aha-crew-ext {
   opacity: 0.6;
   flex-shrink: 0;
+}
+
+.aha-crew-proposal-role {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.aha-crew-proposal-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.aha-crew-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 1px solid var(--workspace-line);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 11px;
+  background: var(--workspace-input-bg, var(--workspace-surface));
+  color: var(--workspace-ink);
+}
+
+.aha-crew-wt-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--workspace-ink-soft);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.aha-crew-wt-check input {
+  margin: 0;
+  accent-color: var(--workspace-accent);
+}
+
+.aha-crew-empty-hint {
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--workspace-muted);
+}
+
+.aha-crew-quick-dispatch {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-top: 6px;
+  margin-top: 2px;
+  border-top: 1px solid var(--workspace-line);
+}
+
+.aha-crew-quick-dispatch input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 26px;
+  box-sizing: border-box;
+  border: 1px solid var(--workspace-line);
+  border-radius: 5px;
+  padding: 0 7px;
+  font-size: 11px;
+  background: var(--workspace-input-bg, var(--workspace-surface));
+  color: var(--workspace-ink);
+}
+
+.aha-crew-quick-dispatch input:focus {
+  border-color: var(--workspace-accent);
+  outline: none;
+}
+
+.aha-crew-wt-toggle {
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--workspace-line);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--workspace-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.aha-crew-wt-toggle:hover {
+  background: var(--workspace-hover);
+  color: var(--workspace-ink);
+}
+
+.aha-crew-wt-toggle.is-active {
+  border-color: var(--workspace-accent);
+  background: rgba(59, 130, 246, 0.14);
+  color: #1d4ed8;
+}
+
+.local-terminal-workspace[data-appearance="dark"] .aha-crew-wt-toggle.is-active {
+  background: rgba(90, 150, 221, 0.22);
+  color: #93c5fd;
+}
+
+.aha-crew-quick-send {
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--workspace-accent);
+  border-radius: 5px;
+  background: var(--workspace-accent);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 0;
+}
+
+.aha-crew-quick-send:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }

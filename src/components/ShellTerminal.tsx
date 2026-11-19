@@ -7,7 +7,7 @@ import { SearchAddon } from '@xterm/addon-search';
 import { usePtyTerminal } from '../hooks/usePtyTerminal';
 import { stageWindowStore } from '../lib/stage-window-store';
 import { registerTerminalLinks } from '../lib/terminal-links/register-terminal-links';
-import { isTerminalSearchShortcut } from '../lib/terminal-search-options';
+import { isMacSearchPlatform, isTerminalSearchShortcut } from '../lib/terminal-search-options';
 import type { TerminalSession } from '../lib/terminal-session';
 import { terminalSessionStore } from '../lib/terminal-session-store';
 import { TerminalSearch } from './TerminalSearch';
@@ -37,6 +37,13 @@ export function ShellTerminal(props: ShellTerminalProps) {
 function isWorkspaceChord(event: KeyboardEvent): boolean {
   if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return false;
   return ['d', 'e', 'w', '[', ']', '{', '}', 'pageup', 'pagedown'].includes(event.key.toLowerCase());
+}
+
+function isOrchestrationModeChord(event: KeyboardEvent): boolean {
+  if (event.altKey || !event.shiftKey || event.key.toLowerCase() !== 'o') return false;
+  return isMacSearchPlatform()
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey;
 }
 
 function PersistentShellTerminal({
@@ -121,7 +128,7 @@ function PersistentShellTerminal({
           return false;
         }
       }
-      if (isWorkspaceChord(event)) {
+      if (isWorkspaceChord(event) || (Boolean(cliId) && isOrchestrationModeChord(event))) {
         return false;
       }
       return true;

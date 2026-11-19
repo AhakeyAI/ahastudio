@@ -11,11 +11,22 @@ name: orchestration
 description: Coordinate autonomous multi-agent workers, isolated Git worktrees, mailboxes, permission approvals, and terminals via the aha CLI. Use when decomposing work across parallel coding agents (claude, codex, gemini, opencode, antigravity, grok), inspecting or steering workers, or reporting worker completion.
 ---
 
-# Multi-Agent Orchestration Guide (\`aha orchestration\`)
+# Multi-Agent Orchestration Guide (\`aha orchestration\` & Native MCP Tools)
 
-Use \`aha orchestration\`, \`aha terminal\`, and \`aha worktree\` to coordinate parallel AI coding workers inside AhaStation.
+Use native AhaStation MCP tools when available, or fall back to \`aha orchestration\`, \`aha terminal\`, and \`aha worktree\` to coordinate parallel AI coding workers inside AhaStation.
 
-## Core Coordinator Loop
+## Native MCP Tools (Preferred When Mounted)
+
+- Coordinator tools: \`list_coding_agents\`, \`delegate_task\`, \`team_status\`, \`team_wait\`, \`message_worker\`, \`manage_worker\`.
+- Worker tools: \`ask_coordinator\`, \`report_done\` (plus \`delegate_task\` / \`team_wait\` when sub-workers are permitted).
+- In \`chat-and-guard\` mode, use the 2-step confirmation flow: first call \`delegate_task\` with \`confirmed: false\` to register the dispatch plan without spawning, confirm role, Coding Agent, task, and worktree isolation with the user in one short sentence, then after the user replies call \`delegate_task\` with \`confirmed: true\` (parallel batch calls in that confirmed turn all pass).
+
+## Core Coordinator Loop (CLI)
+
+0. **Inspect available Coding Agents, specialties, and idle panes**:
+   \`\`\`bash
+   aha orchestration agents
+   \`\`\`
 
 1. **Launch autonomous workers** (creates a task, optional isolated Git worktree, background agent terminal, and injects the task preamble):
    \`\`\`bash

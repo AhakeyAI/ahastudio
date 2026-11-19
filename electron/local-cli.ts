@@ -6,12 +6,27 @@ import { basename, delimiter, dirname, join } from 'node:path';
 import { augmentedPath, resolveBinaryFromPath } from './bin-resolve.js';
 import { resolveDefaultShell } from './pty-host.js';
 
-export const LOCAL_CLI_IDS = ['codex', 'claude', 'opencode', 'qoder', 'kimi', 'qwen', 'pi', 'antigravity', 'grok'] as const;
+export const LOCAL_CLI_IDS = ['codex', 'claude', 'opencode', 'qoder', 'kimi', 'qwen', 'pi', 'antigravity', 'grok', 'gemini'] as const;
 export type LocalCliId = typeof LOCAL_CLI_IDS[number];
-export const ORCHESTRATION_CLI_IDS = [...LOCAL_CLI_IDS, 'gemini'] as const;
+export const ORCHESTRATION_CLI_IDS = LOCAL_CLI_IDS;
 export type OrchestrationCliId = typeof ORCHESTRATION_CLI_IDS[number];
 export const LOCAL_SHELL_IDS = ['default', 'pwsh', 'powershell', 'cmd', 'git-bash'] as const;
 export type LocalShellId = typeof LOCAL_SHELL_IDS[number];
+
+export interface LocalCliInventoryEntry {
+  id: LocalCliId;
+  label: string;
+  command: string;
+  binaryPath: string | null;
+  installed: boolean;
+}
+
+export interface ResolveMcpLaunchArgsOptions {
+  mcpServerPath?: string;
+  claudeMcpConfigPath?: string;
+  nodeCommand?: string;
+  enabled?: boolean;
+}
 
 const ALL_COMMANDS: Record<OrchestrationCliId, { label: string; command: string }> = {
   codex: { label: 'Codex', command: 'codex' },
@@ -30,12 +45,36 @@ export function isOrchestrationCliId(value: string): value is OrchestrationCliId
   return (ORCHESTRATION_CLI_IDS as readonly string[]).includes(value);
 }
 
-export function listLocalCliInventory() {
+export function listLocalCliInventory(): LocalCliInventoryEntry[] {
   return LOCAL_CLI_IDS.map((id) => {
     const entry = ALL_COMMANDS[id];
     const binaryPath = resolveBinaryFromPath(entry.command);
     return { id, ...entry, binaryPath, installed: binaryPath !== null };
   });
+}
+
+export function resolveMcpLaunchArgs(
+  cliId: OrchestrationCliId,
+  opts?: ResolveMcpLaunchArgsOptions,
+): string[] {
+  if (opts?.enabled === false) return [];
+  if (cliId === 'claude') {
+    const configPath = opts?.claudeMcpConfigPath?.trim();
+    return configPath ? ['--mcp-config', configPath] : [];
+  }
+  if (cliId === 'codex') {
+    const serverPath = opts?.mcpServerPath?.trim();
+    if (!serverPath) return [];
+    const nodeCommand = opts?.nodeCommand?.trim() || 'node';
+    const normalizedServerPath = serverPath.replace(/\\/g, '/');
+    return [
+      '-c',
+      `mcp_servers.aha.command=${JSON.stringify(nodeCommand)}`,
+      '-c',
+      `mcp_servers.aha.args=${JSON.stringify([normalizedServerPath])}`,
+    ];
+  }
+  return [];
 }
 
 export function listLocalClis() {

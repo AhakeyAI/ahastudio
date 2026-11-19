@@ -13,6 +13,8 @@ export interface BuildDispatchPreambleInput {
   dispatchCapability?: string | null;
   isFollowUp?: boolean;
   previousDispatchId?: string | null;
+  mcpEnabled?: boolean;
+  role?: string | null;
 }
 
 /**
@@ -49,10 +51,44 @@ export function redactDispatchCapability(text: string, capability?: string | nul
 
 export function buildDispatchPreamble(input: BuildDispatchPreambleInput): string {
   const cli = input.cliCommand?.trim() || 'aha';
-  const fromFlag = `--from ${input.workerHandle}`;
-  const capabilityFlag = input.dispatchCapability ? ` --capability ${input.dispatchCapability}` : '';
   const spec = input.taskSpec.trim();
   const clipped = clipUtf8(spec, INLINE_SPEC_MAX_BYTES);
+
+  if (input.mcpEnabled) {
+    const cleanRole = input.role?.trim().replace(/^@+/, '') || '';
+    const header = cleanRole
+      ? input.isFollowUp
+        ? `[Worker @${cleanRole} · Follow-Up]`
+        : `[Worker @${cleanRole}]`
+      : input.isFollowUp
+        ? `[Worker ${input.dispatchId} · Follow-Up]`
+        : `[Worker ${input.dispatchId}]`;
+    const mcpSpecLines =
+      clipped === spec
+        ? [spec]
+        : [
+            clipped.trimEnd(),
+            '…',
+            `[Specification truncated (${input.taskId}); ask coordinator if details are missing.]`,
+          ];
+    const lines: string[] = [
+      header,
+      ...(input.worktreePath ? [`Workspace: ${input.worktreePath}`] : []),
+      ...(input.branch ? [`Branch: ${input.branch}`] : []),
+      '',
+      ...mcpSpecLines,
+      '',
+      `- Need clarification or blocked? Call MCP tool \`ask_coordinator\` (wait=true).`,
+      `- When finished or blocked, call MCP tool \`report_done\` with outcome & brief summary.`,
+      ...(input.canDispatchSubWorkers
+        ? [`- Sub-tasks permitted: use MCP tools \`delegate_task\` and \`team_wait\` if needed.`]
+        : []),
+    ];
+    return lines.join('\n');
+  }
+
+  const fromFlag = `--from ${input.workerHandle}`;
+  const capabilityFlag = input.dispatchCapability ? ` --capability ${input.dispatchCapability}` : '';
   const specLines =
     clipped === spec
       ? [spec]

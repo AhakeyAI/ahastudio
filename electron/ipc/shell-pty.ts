@@ -291,6 +291,7 @@ export function registerShellPtyIpc(ctx: IpcContext): {
         events,
         () => ctx.getCurrentCwd() ?? undefined,
         ctx.agentHookEnv,
+        ctx.mcpLaunchArgsForCli,
       )
     : null;
   const localService = daemonService
@@ -301,6 +302,7 @@ export function registerShellPtyIpc(ctx: IpcContext): {
         () => ctx.getCurrentCwd() ?? undefined,
         shellIntegrationDir,
         ctx.agentHookEnv,
+        ctx.mcpLaunchArgsForCli,
       );
   let cleanupBound = false;
 
@@ -362,6 +364,9 @@ export function registerShellPtyIpc(ctx: IpcContext): {
     schema: shellPtyInputSchema, authorize, authorizeError,
     handler: ({ ptyId, data }) => {
       ctx.agentStatusStore?.notifyUserInput(ptyId, data);
+      if (data.includes('\r') || data.includes('\n')) {
+        ctx.orchestrationService?.recordUserPromptTurn(ptyId, 'pty');
+      }
       return service.input(ptyId, data);
     },
   });

@@ -14,6 +14,14 @@ export function resolveDefaultOrchestrationCliPath(moduleUrlOrPath: string = imp
   return join(here, 'aha-orchestration-cli.cjs').replace(/\.asar([\\/])/, '.asar.unpacked$1');
 }
 
+export function resolveDefaultOrchestrationMcpServerPath(
+  moduleUrlOrPath: string = import.meta.url
+): string {
+  const filePath = moduleUrlOrPath.startsWith('file://') ? fileURLToPath(moduleUrlOrPath) : moduleUrlOrPath;
+  const here = dirname(filePath);
+  return join(here, 'aha-mcp-server.cjs').replace(/\.asar([\\/])/, '.asar.unpacked$1');
+}
+
 export function findPathEnvKey(env: Record<string, string | undefined>): string {
   return Object.keys(env).find((key) => key.toUpperCase() === 'PATH') ?? 'PATH';
 }

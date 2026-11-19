@@ -52,6 +52,16 @@ const api = {
     list: () => ipcRenderer.invoke('settings:list-cli-inventory'),
   },
 
+  orchestrationSettings: {
+    get: () => ipcRenderer.invoke('settings:get-orchestration'),
+    set: (patch) => ipcRenderer.invoke('settings:set-orchestration', patch),
+    onChanged: (cb) => {
+      const listener = () => cb();
+      ipcRenderer.on('settings:orchestration-changed', listener);
+      return () => ipcRenderer.removeListener('settings:orchestration-changed', listener);
+    },
+  },
+
   asrAvailable: () => ipcRenderer.invoke('asr:available'),
   startAsrStream: (lang, includePreRoll) =>
     ipcRenderer.invoke('asr:stream-start', { lang, includePreRoll }),
@@ -140,6 +150,12 @@ const api = {
     uninstall: (opts) => ipcRenderer.invoke('agent-hooks:uninstall', opts),
   },
 
+  agentMcp: {
+    status: () => ipcRenderer.invoke('agent-mcp:status'),
+    install: (opts) => ipcRenderer.invoke('agent-mcp:install', opts),
+    uninstall: (opts) => ipcRenderer.invoke('agent-mcp:uninstall', opts),
+  },
+
   agent: {
     listStatuses: () => ipcRenderer.invoke('agent:list-statuses'),
     getStatus: (opts) => ipcRenderer.invoke('agent:get-status', opts),
@@ -195,6 +211,11 @@ const api = {
     gateCreate: (opts) => ipcRenderer.invoke('orchestration:gate-create', opts),
     gateResolve: (opts) => ipcRenderer.invoke('orchestration:gate-resolve', opts),
     gateList: (opts) => ipcRenderer.invoke('orchestration:gate-list', opts),
+    setPaneMode: (opts) => ipcRenderer.invoke('orchestration:set-pane-mode', opts),
+    listAgents: (opts) => ipcRenderer.invoke('orchestration:list-agents', opts),
+    delegateTask: (opts) => ipcRenderer.invoke('orchestration:delegate-task', opts),
+    proposalApprove: (opts) => ipcRenderer.invoke('orchestration:proposal-approve', opts),
+    proposalReject: (opts) => ipcRenderer.invoke('orchestration:proposal-reject', opts),
     onEvent: (cb) => {
       const listener = (_, event) => cb(event);
       ipcRenderer.on('orchestration:event', listener);

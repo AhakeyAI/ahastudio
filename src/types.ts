@@ -206,6 +206,22 @@ export interface VibeMeetApi {
   workspaceFs?: WorkspaceFsApi;
   agent?: AgentApi;
   agentHooks?: AgentHooksApi;
+  agentMcp?: {
+    status: () => Promise<{ ok: true; statuses: AgentMcpCliStatus[] } | { ok: false; error: string }>;
+    install: (opts: {
+      cliId: AgentMcpCliId;
+    }) => Promise<{ ok: true; status?: AgentMcpCliStatus } | { ok: false; error: string; status?: AgentMcpCliStatus }>;
+    uninstall: (opts: {
+      cliId: AgentMcpCliId;
+    }) => Promise<{ ok: true; status?: AgentMcpCliStatus } | { ok: false; error: string; status?: AgentMcpCliStatus }>;
+  };
+  orchestrationSettings?: {
+    get: () => Promise<OrchestrationSettings>;
+    set: (
+      patch: OrchestrationSettingsPatch,
+    ) => Promise<{ ok: true; settings: OrchestrationSettings } | { ok: false; error: string }>;
+    onChanged: (cb: () => void) => () => void;
+  };
   orchestration?: OrchestrationApi;
 
   browser?: BrowserApi;
@@ -715,6 +731,96 @@ export interface OrchestrationCoordinatorRunRecord {
   error: string | null;
 }
 
+export type OrchestrationConfirmMode = 'chat-and-guard' | 'always-ui' | 'auto';
+export type OrchestrationTaskKind =
+  | 'architecture'
+  | 'implementation'
+  | 'debug'
+  | 'tests'
+  | 'review'
+  | 'research'
+  | 'docs';
+
+export interface OrchestrationAgentProfile {
+  enabled?: boolean;
+  specialty?: string;
+  defaultModel?: string;
+  defaultEffort?: string;
+}
+
+export interface OrchestrationSettings {
+  confirmBeforeDispatch: OrchestrationConfirmMode;
+  defaultWorktree: boolean;
+  agentProfiles: Record<string, OrchestrationAgentProfile>;
+}
+
+export interface OrchestrationSettingsPatch {
+  confirmBeforeDispatch?: OrchestrationConfirmMode;
+  defaultWorktree?: boolean;
+  agentProfiles?: Record<string, OrchestrationAgentProfile | null>;
+}
+
+export type AgentMcpCliId = 'claude' | 'codex' | 'antigravity' | 'grok' | 'gemini' | 'qwen' | 'opencode';
+export type AgentMcpInstallMode = 'launch-arg' | 'config';
+export type AgentMcpInstallState =
+  | 'launch-managed'
+  | 'not-installed'
+  | 'installed'
+  | 'outdated'
+  | 'conflict'
+  | 'error';
+
+export interface AgentMcpCliStatus {
+  cliId: AgentMcpCliId;
+  label: string;
+  mode: AgentMcpInstallMode;
+  configPath: string;
+  state: AgentMcpInstallState;
+  detail?: string;
+}
+
+export interface OrchestrationIdlePaneInfo {
+  ptyId: string;
+  cliId: string;
+  cwd: string | null;
+}
+
+export interface OrchestrationAgentRosterEntry {
+  cliId: string;
+  label: string;
+  command: string;
+  installed: boolean;
+  enabled: boolean;
+  available: boolean;
+  specialty: string;
+  defaultModel: string | null;
+  defaultEffort: string | null;
+  hooksInstalled: boolean;
+  mcpMode: 'launch-arg' | 'config' | 'cli-fallback';
+  mcpReady: boolean;
+  idlePanes: OrchestrationIdlePaneInfo[];
+}
+
+export interface OrchestrationDispatchProposal {
+  id: string;
+  coordinatorPaneId: string;
+  runId: string | null;
+  role: string;
+  task: string;
+  planSummary: string;
+  requestedAgent: string;
+  resolvedAgent: string;
+  taskKind: OrchestrationTaskKind | null;
+  worktree: boolean;
+  model: string | null;
+  effort: string | null;
+  terminal: string | null;
+  status: 'pending' | 'approved' | 'rejected' | 'expired';
+  createdAt: string;
+  resolvedAt: string | null;
+  reason?: string | null;
+}
+
 export interface OrchestrationSnapshot {
   runs: OrchestrationRunRecord[];
   tasks: OrchestrationTaskWithDispatch[];
@@ -723,6 +829,8 @@ export interface OrchestrationSnapshot {
   messages: OrchestrationMessageRecord[];
   questions: OrchestrationQuestionRecord[];
   openApprovals?: WorkerApprovalPayload[];
+  pendingProposals?: OrchestrationDispatchProposal[];
+  orchestrationModePanes?: string[];
   coordinatorRuns: OrchestrationCoordinatorRunRecord[];
   activeCoordinatorRun: OrchestrationCoordinatorRunRecord | null;
   currentRunByConsumer: Record<string, string>;
@@ -739,6 +847,8 @@ export interface OrchestrationPaneSpawnedEvent {
   ptyId: string;
   runId: string;
   taskId: string;
+  displayName?: string | null;
+  taskTitle?: string;
   dispatchId?: string;
   parentPaneId?: string | null;
   cwd?: string;
@@ -948,6 +1058,25 @@ export interface OrchestrationApi {
       ownsPane: boolean;
     }>
   >;
+  workerList?: (opts?: {
+    runId?: string;
+    from?: string;
+    parent?: string;
+    status?: OrchestrationDispatchStatus;
+    stage?: OrchestrationDispatchStage;
+    includeReleased?: boolean;
+  }) => Promise<OrchestrationResult<{ dispatches: OrchestrationDispatchRecord[]; count: number }>>;
+  workerShow?: (opts: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+  }) => Promise<
+    OrchestrationResult<{
+      dispatch: OrchestrationDispatchRecord;
+      task: OrchestrationTaskRecord | null;
+      openApprovals: WorkerApprovalPayload[];
+    }>
+  >;
   workerRead?: (opts: {
     dispatchId?: string;
     worker?: string;
@@ -1135,6 +1264,67 @@ export interface OrchestrationApi {
     taskId?: string;
     status?: OrchestrationGateStatus;
   }) => Promise<OrchestrationResult<{ gates: OrchestrationGateRecord[]; count: number }>>;
+  setPaneMode?: (opts: {
+    ptyId: string;
+    enabled: boolean;
+  }) => Promise<OrchestrationResult<{ ptyId: string; enabled: boolean }>>;
+  listAgents?: (opts?: {
+    callerPaneId?: string;
+  }) => Promise<OrchestrationResult<{ agents: OrchestrationAgentRosterEntry[] }>>;
+  delegateTask?: (opts: {
+    from?: string;
+    runId?: string;
+    role?: string;
+    task: string;
+    agent?: string;
+    taskKind?: OrchestrationTaskKind;
+    worktree?: boolean;
+    model?: string;
+    effort?: string;
+    terminal?: string;
+    callerCwd?: string;
+    userInitiated?: boolean;
+    confirmed?: boolean;
+    planSummary?: string;
+    requestId?: string;
+  }) => Promise<
+    OrchestrationResult<{
+      status: 'started' | 'confirmation_required' | 'rejected';
+      role?: string;
+      agent?: string;
+      selectionReason?: string;
+      fallbackFrom?: string | null;
+      message?: string;
+      dispatch?: OrchestrationDispatchRecord;
+      task?: OrchestrationTaskRecord;
+      run?: OrchestrationRunRecord;
+      ptyId?: string;
+      worktreePath?: string | null;
+      branch?: string | null;
+      proposal?: OrchestrationDispatchProposal;
+    }>
+  >;
+  proposalApprove?: (opts: {
+    id: string;
+    agent?: string;
+    worktree?: boolean;
+    model?: string | null;
+    effort?: string | null;
+  }) => Promise<
+    OrchestrationResult<{
+      proposal: OrchestrationDispatchProposal;
+      dispatch?: OrchestrationDispatchRecord;
+      task?: OrchestrationTaskRecord;
+      run?: OrchestrationRunRecord;
+      ptyId?: string;
+      worktreePath?: string | null;
+      branch?: string | null;
+    }>
+  >;
+  proposalReject?: (opts: {
+    id: string;
+    reason?: string;
+  }) => Promise<OrchestrationResult<{ proposal: OrchestrationDispatchProposal }>>;
   onEvent: (cb: (event: OrchestrationEvent) => void) => () => void;
   onPaneSpawned: (cb: (event: OrchestrationPaneSpawnedEvent) => void) => () => void;
   onPaneClosed: (cb: (event: OrchestrationPaneClosedEvent) => void) => () => void;

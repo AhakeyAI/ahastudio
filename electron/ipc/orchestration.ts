@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
   ORCHESTRATION_MESSAGE_TYPES,
+  ORCHESTRATION_TASK_KINDS,
   OrchestrationError,
 } from '../orchestration/orchestration-types.js';
 import type { IpcContext } from './context.js';
@@ -11,6 +12,7 @@ const optionalSchema = <T extends z.ZodTypeAny>(schema: T): z.ZodType<z.output<T
 
 const nonEmptyId = z.string().trim().min(1).max(200);
 const messageTypeEnum = z.enum(ORCHESTRATION_MESSAGE_TYPES);
+const taskKindEnum = z.enum(ORCHESTRATION_TASK_KINDS);
 const priorityEnum = z.enum(['low', 'normal', 'high', 'urgent']);
 const taskStatusEnum = z.enum(['pending', 'ready', 'dispatched', 'completed', 'failed', 'blocked']);
 const gateStatusEnum = z.enum(['pending', 'resolved', 'timeout']);
@@ -368,6 +370,57 @@ const gateListSchema = optionalSchema(
     .strict()
 );
 
+const setPaneModeSchema = z
+  .object({
+    ptyId: nonEmptyId,
+    enabled: z.boolean(),
+  })
+  .strict();
+
+const listAgentsSchema = optionalSchema(
+  z
+    .object({
+      callerPaneId: nonEmptyId.optional(),
+    })
+    .strict()
+);
+
+const delegateTaskSchema = z
+  .object({
+    from: nonEmptyId.optional(),
+    role: z.string().trim().max(120).optional(),
+    task: z.string().trim().min(1).max(64_000),
+    agent: nonEmptyId.optional(),
+    taskKind: taskKindEnum.optional(),
+    worktree: z.boolean().optional(),
+    model: nonEmptyId.optional(),
+    effort: nonEmptyId.optional(),
+    terminal: nonEmptyId.optional(),
+    userInitiated: z.boolean().optional(),
+    confirmed: z.boolean().optional(),
+    planSummary: z.string().trim().max(1_000).optional(),
+    runId: nonEmptyId.optional(),
+    requestId: nonEmptyId.optional(),
+  })
+  .strict();
+
+const proposalApproveSchema = z
+  .object({
+    id: nonEmptyId,
+    agent: nonEmptyId.optional(),
+    worktree: z.boolean().optional(),
+    model: z.union([nonEmptyId, z.null()]).optional(),
+    effort: z.union([nonEmptyId, z.null()]).optional(),
+  })
+  .strict();
+
+const proposalRejectSchema = z
+  .object({
+    id: nonEmptyId,
+    reason: z.string().max(4_000).optional(),
+  })
+  .strict();
+
 function formatIpcFailure(error: unknown): {
   ok: false;
   code: string;
@@ -716,6 +769,50 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     authorize,
     authorizeError,
     handler: (payload) => act(() => requireService().gateList(payload)),
+  });
+
+  handleSecure('orchestration:set-pane-mode', {
+    schema: setPaneModeSchema,
+    authorize,
+    authorizeError,
+    handler: ({ ptyId, enabled }) =>
+      runAction(() => requireService().setPaneOrchestrationMode(ptyId, enabled)),
+  });
+
+  handleSecure('orchestration:list-agents', {
+    schema: listAgentsSchema,
+    authorize,
+    authorizeError,
+    handler: ({ callerPaneId }) =>
+      runAction(() => ({ agents: requireService().listCodingAgents(callerPaneId ?? null) })),
+  });
+
+  handleSecure('orchestration:delegate-task', {
+    schema: delegateTaskSchema,
+    authorize,
+    authorizeError,
+    handler: ({ requestId, ...payload }, event) =>
+      runCancellableWait(requestId, event.sender, (signal) =>
+        requireService().delegateTask(payload, signal)
+      ),
+  });
+
+  handleSecure('orchestration:proposal-approve', {
+    schema: proposalApproveSchema,
+    authorize,
+    authorizeError,
+    handler: ({ id, agent, worktree, model, effort }) =>
+      runAction(() =>
+        requireService().approveDispatchProposal(id, { agent, worktree, model, effort })
+      ),
+  });
+
+  handleSecure('orchestration:proposal-reject', {
+    schema: proposalRejectSchema,
+    authorize,
+    authorizeError,
+    handler: ({ id, reason }) =>
+      runAction(() => requireService().rejectDispatchProposal(id, reason)),
   });
 
   if (!service) {

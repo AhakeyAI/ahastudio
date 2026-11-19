@@ -1,5 +1,6 @@
 import type {
   OrchestrationCoordinatorStatus,
+  OrchestrationDispatchProposal,
   OrchestrationDispatchRecord,
   OrchestrationDispatchStatus,
   OrchestrationGateRecord,
@@ -25,6 +26,8 @@ export const EMPTY_SNAPSHOT: OrchestrationSnapshot = {
   gates: [],
   messages: [],
   questions: [],
+  pendingProposals: [],
+  orchestrationModePanes: [],
   coordinatorRuns: [],
   activeCoordinatorRun: null,
   currentRunByConsumer: {},
@@ -225,11 +228,50 @@ export function countTasks(tasks: OrchestrationTaskWithDispatch[]): TaskCounts {
   return counts;
 }
 
-export function taskTitle(task: { taskTitle: string; displayName: string; spec: string; id: string }): string {
+export function taskTitle(task: {
+  taskTitle?: string | null;
+  displayName?: string | null;
+  spec?: string | null;
+  id?: string;
+}): string {
   const title = task.displayName?.trim() || task.taskTitle?.trim();
   if (title) return title;
-  const firstLine = task.spec.split(/\r?\n/).find((line) => line.trim())?.trim();
-  return firstLine ? (firstLine.length > 60 ? `${firstLine.slice(0, 59)}…` : firstLine) : task.id;
+  const firstLine = (task.spec ?? '').split(/\r?\n/).find((line) => line.trim())?.trim();
+  return firstLine ? (firstLine.length > 60 ? `${firstLine.slice(0, 59)}…` : firstLine) : (task.id ?? '');
+}
+
+export function workerTabTitle(
+  task:
+    | {
+        taskTitle?: string | null;
+        displayName?: string | null;
+        spec?: string | null;
+        id?: string;
+      }
+    | null
+    | undefined,
+  fallbackId?: string,
+): string {
+  const role = task?.displayName?.trim().replace(/^@+/, '');
+  if (role) return `Worker · @${role}`;
+  if (task) {
+    const title = taskTitle(task);
+    if (title) return `Worker · ${title}`;
+  }
+  return fallbackId ? `Worker · ${fallbackId}` : 'Worker';
+}
+
+export function newPendingProposals(
+  prev: OrchestrationSnapshot | null,
+  next: OrchestrationSnapshot,
+): OrchestrationDispatchProposal[] {
+  if (!prev) return [];
+  const prevPendingIds = new Set(
+    (prev.pendingProposals ?? []).filter((p) => p.status === 'pending').map((p) => p.id),
+  );
+  return (next.pendingProposals ?? []).filter(
+    (p) => p.status === 'pending' && !prevPendingIds.has(p.id),
+  );
 }
 
 export interface AttentionItems {
@@ -393,6 +435,27 @@ export function mergeRunSnapshot(
           ),
         }
       : {}),
+    ...(incoming.pendingProposals !== undefined || prev.pendingProposals !== undefined
+      ? {
+          pendingProposals: (() => {
+            const byId = new Map<string, OrchestrationDispatchProposal>();
+            for (const p of prev.pendingProposals ?? []) {
+              if (p.runId === null || (p.runId !== runId && validRunIds.has(p.runId))) {
+                byId.set(p.id, p);
+              }
+            }
+            for (const p of incoming.pendingProposals ?? []) {
+              byId.set(p.id, p);
+            }
+            return [...byId.values()].sort(byCreatedAt);
+          })(),
+        }
+      : {}),
+    ...(incoming.orchestrationModePanes !== undefined
+      ? { orchestrationModePanes: incoming.orchestrationModePanes }
+      : prev.orchestrationModePanes !== undefined
+        ? { orchestrationModePanes: prev.orchestrationModePanes }
+        : {}),
     coordinatorRuns: mergeScopedRecords(
       prev.coordinatorRuns,
       incoming.coordinatorRuns,

@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as desktopIpc from '../dist-electron/ipc/desktop.js';
+import * as settingsIpc from '../dist-electron/ipc/settings.js';
 import * as settingsWindow from '../dist-electron/ipc/settings-window.js';
+import * as settingsMigration from '../dist-electron/settings-migration.js';
 import * as localCli from '../dist-electron/local-cli.js';
 
 test('UI preference validation keeps handheld mode out of voice preferences', () => {
@@ -29,7 +31,7 @@ test('CLI inventory includes unsupported or uninstalled entries with detection s
   const inventory = localCli.listLocalCliInventory();
   assert.deepEqual(
     inventory.map(entry => entry.id),
-    ['codex', 'claude', 'opencode', 'qoder', 'kimi', 'qwen', 'pi', 'antigravity', 'grok'],
+    ['codex', 'claude', 'opencode', 'qoder', 'kimi', 'qwen', 'pi', 'antigravity', 'grok', 'gemini'],
   );
   for (const entry of inventory) {
     assert.equal(typeof entry.label, 'string');
@@ -37,4 +39,28 @@ test('CLI inventory includes unsupported or uninstalled entries with detection s
     assert.equal(entry.installed, entry.binaryPath !== null);
     if (!entry.installed) assert.equal(entry.binaryPath, null);
   }
+});
+
+test('orchestration settings validation and v2 migration preserve valid preferences', () => {
+  assert.equal(typeof settingsIpc.buildOrchestrationSettingsUpdate, 'function');
+  const updated = settingsIpc.buildOrchestrationSettingsUpdate({
+    confirmBeforeDispatch: 'always-ui',
+    defaultWorktree: false,
+    agentProfiles: { gemini: { enabled: true, specialty: '调研与文档' } },
+  });
+  assert.equal(updated.ok, true);
+  assert.deepEqual(updated.settings, {
+    confirmBeforeDispatch: 'always-ui',
+    defaultWorktree: false,
+    agentProfiles: { gemini: { enabled: true, specialty: '调研与文档' } },
+  });
+  assert.equal(settingsIpc.buildOrchestrationSettingsUpdate({ confirmBeforeDispatch: 'invalid' }).ok, false);
+  assert.equal(settingsIpc.buildOrchestrationSettingsUpdate({ unknownField: 1 }).ok, false);
+
+  const migrated = settingsMigration.migrateSettings({
+    schemaVersion: 2,
+    orchestration: updated.settings,
+  });
+  assert.equal(migrated.changed, false);
+  assert.deepEqual(migrated.settings.orchestration, updated.settings);
 });

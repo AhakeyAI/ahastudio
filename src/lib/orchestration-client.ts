@@ -7,10 +7,15 @@ import { EMPTY_SNAPSHOT, mergeRunSnapshot } from './orchestration-view';
 
 type Listener = () => void;
 type ChangeListener = (prev: OrchestrationSnapshot | null, next: OrchestrationSnapshot) => void;
+export type { OrchestrationPaneClosedEvent, OrchestrationPaneSpawnedEvent };
 type SpawnListener = (event: OrchestrationPaneSpawnedEvent) => void;
 type ClosedListener = (event: OrchestrationPaneClosedEvent) => void;
 
-let snapshot: OrchestrationSnapshot = EMPTY_SNAPSHOT;
+let snapshot: OrchestrationSnapshot = {
+  ...EMPTY_SNAPSHOT,
+  pendingProposals: [],
+  orchestrationModePanes: [],
+};
 let loaded = false;
 let hasGlobalSnapshot = false;
 let error: string | null = null;

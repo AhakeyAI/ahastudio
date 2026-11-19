@@ -18,6 +18,33 @@ export interface LocalTerminalLaunch {
 export interface LocalTerminalData { ptyId: string; data: string; sequence: number }
 export interface LocalTerminalExit { ptyId: string; exitCode: number | null }
 
+export function mergeCliLaunchArgs(
+  mcpArgs: readonly string[],
+  extraArgs?: readonly string[],
+): string[] | undefined {
+  const userArgs = extraArgs ?? [];
+  if (mcpArgs.length === 0) return userArgs.length > 0 ? [...userArgs] : undefined;
+  const hasMcpConfig = userArgs.some(
+    (arg) => arg === '--mcp-config' || arg.startsWith('--mcp-config='),
+  );
+  const hasCodexAhaMcp = userArgs.some((arg) => arg.includes('mcp_servers.aha.'));
+  const filtered: string[] = [];
+  for (let i = 0; i < mcpArgs.length; i += 1) {
+    const arg = mcpArgs[i]!;
+    if (arg === '--mcp-config' && hasMcpConfig) {
+      i += 1;
+      continue;
+    }
+    if (arg === '-c' && mcpArgs[i + 1]?.includes('mcp_servers.aha.') && hasCodexAhaMcp) {
+      i += 1;
+      continue;
+    }
+    filtered.push(arg);
+  }
+  const combined = [...filtered, ...userArgs];
+  return combined.length > 0 ? combined : undefined;
+}
+
 /** App launch configuration stays outside the pure process service. */
 export class LocalTerminalSessions {
   private core: TerminalSessions;
@@ -27,14 +54,18 @@ export class LocalTerminalSessions {
     private currentCwd: () => string | undefined,
     private wrapperBaseDir?: () => string | undefined,
     private extraEnv?: (ptyId: string, cliId?: OrchestrationCliId) => Record<string, string>,
+    private mcpLaunchArgsForCli?: (cliId: OrchestrationCliId) => string[],
   ) { this.core = new TerminalSessions(host, events); }
 
   create(payload: LocalTerminalLaunch) {
     const ptyId = payload.terminalId ? `local-${payload.terminalId}` : `shell-${randomUUID()}`;
     const existing = this.core.get(ptyId);
     if (existing) return existing;
+    const mergedArgs = payload.cliId
+      ? mergeCliLaunchArgs(this.mcpLaunchArgsForCli?.(payload.cliId) ?? [], payload.extraArgs)
+      : payload.extraArgs;
     const target = payload.terminalId || payload.cliId || payload.shellId
-      ? resolveLocalTerminal(payload.cliId, payload.shellId, payload.extraArgs) : null;
+      ? resolveLocalTerminal(payload.cliId, payload.shellId, mergedArgs) : null;
     const cwd = payload.cwd ?? target?.cwd ?? this.currentCwd() ?? process.cwd();
     const rawFile = target?.file ?? resolveDefaultShell();
     const baseEnv = mergeTerminalProcessEnv(

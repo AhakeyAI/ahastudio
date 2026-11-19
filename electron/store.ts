@@ -24,6 +24,106 @@ export interface XfyunAsrCredentials {
   apiSecret?: string;
 }
 
+export const ORCHESTRATION_CONFIRM_MODES = ['chat-and-guard', 'always-ui', 'auto'] as const;
+export type OrchestrationConfirmMode = (typeof ORCHESTRATION_CONFIRM_MODES)[number];
+
+export const ORCHESTRATION_TASK_KINDS = [
+  'architecture',
+  'implementation',
+  'debug',
+  'tests',
+  'review',
+  'research',
+  'docs',
+] as const;
+export type OrchestrationTaskKind = (typeof ORCHESTRATION_TASK_KINDS)[number];
+
+export interface OrchestrationAgentProfile {
+  enabled?: boolean;
+  specialty?: string;
+  defaultModel?: string;
+  defaultEffort?: string;
+}
+
+export interface OrchestrationSettings {
+  confirmBeforeDispatch: OrchestrationConfirmMode;
+  defaultWorktree: boolean;
+  agentProfiles: Record<string, OrchestrationAgentProfile>;
+}
+
+export const DEFAULT_ORCHESTRATION_SETTINGS: OrchestrationSettings = {
+  confirmBeforeDispatch: 'chat-and-guard',
+  defaultWorktree: true,
+  agentProfiles: {},
+};
+
+const FORBIDDEN_RECORD_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+export function normalizeOrchestrationSettings(
+  raw?: Partial<OrchestrationSettings> | null,
+): OrchestrationSettings {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {
+      confirmBeforeDispatch: DEFAULT_ORCHESTRATION_SETTINGS.confirmBeforeDispatch,
+      defaultWorktree: DEFAULT_ORCHESTRATION_SETTINGS.defaultWorktree,
+      agentProfiles: {},
+    };
+  }
+
+  const confirmBeforeDispatch: OrchestrationConfirmMode =
+    raw.confirmBeforeDispatch === 'chat-and-guard' ||
+    raw.confirmBeforeDispatch === 'always-ui' ||
+    raw.confirmBeforeDispatch === 'auto'
+      ? raw.confirmBeforeDispatch
+      : DEFAULT_ORCHESTRATION_SETTINGS.confirmBeforeDispatch;
+
+  const defaultWorktree =
+    typeof raw.defaultWorktree === 'boolean'
+      ? raw.defaultWorktree
+      : DEFAULT_ORCHESTRATION_SETTINGS.defaultWorktree;
+
+  const agentProfiles: Record<string, OrchestrationAgentProfile> = {};
+  if (raw.agentProfiles && typeof raw.agentProfiles === 'object' && !Array.isArray(raw.agentProfiles)) {
+    for (const [rawKey, rawProfile] of Object.entries(raw.agentProfiles)) {
+      const cliId = rawKey.trim();
+      if (!cliId || FORBIDDEN_RECORD_KEYS.has(cliId)) continue;
+      if (!rawProfile || typeof rawProfile !== 'object' || Array.isArray(rawProfile)) continue;
+      const cleaned: OrchestrationAgentProfile = {};
+      if (typeof rawProfile.enabled === 'boolean') cleaned.enabled = rawProfile.enabled;
+      if (typeof rawProfile.specialty === 'string') {
+        const sanitizedSpecialty = rawProfile.specialty.replace(/[\r\n]+/g, ' ').trim().slice(0, 300);
+        if (sanitizedSpecialty) cleaned.specialty = sanitizedSpecialty;
+      }
+      if (typeof rawProfile.defaultModel === 'string') {
+        const trimmedModel = rawProfile.defaultModel.trim();
+        if (
+          trimmedModel &&
+          trimmedModel.length <= 128 &&
+          !trimmedModel.startsWith('-') &&
+          !/[\s\r\n\0]/.test(trimmedModel)
+        ) {
+          cleaned.defaultModel = trimmedModel;
+        }
+      }
+      if (typeof rawProfile.defaultEffort === 'string') {
+        const trimmedEffort = rawProfile.defaultEffort.trim();
+        if (trimmedEffort && trimmedEffort.length <= 32 && !/[\s\r\n\0]/.test(trimmedEffort)) {
+          cleaned.defaultEffort = trimmedEffort;
+        }
+      }
+      if (Object.keys(cleaned).length > 0) {
+        agentProfiles[cliId] = cleaned;
+      }
+    }
+  }
+
+  return {
+    confirmBeforeDispatch,
+    defaultWorktree,
+    agentProfiles,
+  };
+}
+
 export interface Settings {
   schemaVersion?: 2;
   voiceLockEnabled?: boolean;
@@ -36,6 +136,7 @@ export interface Settings {
   handheldMode?: 'auto' | 'desktop' | 'handheld';
   xfyunAsr?: XfyunAsrCredentials;
   xfyunAsrEncrypted?: string;
+  orchestration?: OrchestrationSettings;
 }
 
 let cachedSettings: Settings | null = null;
@@ -126,6 +227,9 @@ export function getSettings(): Settings {
 
   const raw = JSON.parse(readFileSync(file, 'utf8')) as LegacySettings;
   const migration = migrateSettings(raw ?? {});
+  if (migration.settings.orchestration !== undefined) {
+    migration.settings.orchestration = normalizeOrchestrationSettings(migration.settings.orchestration);
+  }
   if (migration.changed) {
     backupV1Settings();
     writeSettingsNow(migration.settings);

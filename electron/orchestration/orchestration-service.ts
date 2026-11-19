@@ -25,8 +25,11 @@ import {
   DEFAULT_NESTED_WORKER_MAX_DEPTH,
   ORCHESTRATION_MESSAGE_WAIT_DEFAULT_TIMEOUT_MS,
   OrchestrationError,
+  type OrchestrationAgentRosterEntry,
+  type OrchestrationConfirmMode,
   type OrchestrationCoordinatorRunRecord,
   type OrchestrationCoordinatorStatusResult,
+  type OrchestrationDispatchProposal,
   type OrchestrationDispatchRecord,
   type OrchestrationDispatchStage,
   type OrchestrationExposedMessage,
@@ -38,6 +41,7 @@ import {
   type OrchestrationQuestionRecord,
   type OrchestrationRunRecord,
   type OrchestrationSnapshot,
+  type OrchestrationTaskKind,
   type OrchestrationTaskRecord,
   type OrchestrationTaskShowResult,
   type OrchestrationTaskStatus,
@@ -45,6 +49,11 @@ import {
   type OrchestrationWorkerReportOutcome,
   type WorkerApprovalPayload,
 } from './orchestration-types.js';
+import {
+  DispatchProposalManager,
+  type DispatchProposalOverrides,
+  type UserTurnSource,
+} from './dispatch-proposals.js';
 import {
   PermissionApprovalManager,
   type PermissionHookInterceptInput,
@@ -81,6 +90,8 @@ export interface OrchestrationPaneSpawnedEvent {
   cliId?: string;
   ownsWorktree?: boolean;
   ownsPane?: boolean;
+  displayName?: string | null;
+  taskTitle?: string;
 }
 
 export interface OrchestrationPaneClosedEvent {
@@ -116,6 +127,67 @@ export interface OrchestrationWorkerSummary {
   terminal: TerminalSummary | null;
 }
 
+export interface OrchestrationAgentSelectionResult {
+  cliId: string;
+  reason: string;
+  model: string | null;
+  effort: string | null;
+  idlePaneId: string | null;
+  fallbacks: string[];
+}
+
+export type OrchestrationDelegateTaskResult =
+  | {
+      status: 'confirmation_required';
+      proposal: OrchestrationDispatchProposal;
+      message: string;
+    }
+  | {
+      status: 'rejected';
+      proposal: OrchestrationDispatchProposal;
+      message: string;
+    }
+  | {
+      status: 'started';
+      role: string;
+      agent: string;
+      selectionReason: string;
+      fallbackFrom: string | null;
+      dispatch: OrchestrationDispatchRecord;
+      task: OrchestrationTaskRecord;
+      run: OrchestrationRunRecord;
+      ptyId: string;
+      worktreePath: string | null;
+      branch: string | null;
+    };
+
+export interface OrchestrationMcpWorkerBrief {
+  dispatchId: string;
+  taskId: string;
+  role: string;
+  cliId: string | null;
+  stage: OrchestrationDispatchStage;
+  status: OrchestrationDispatchRecord['status'];
+  ptyId: string | null;
+  paneAlive: boolean;
+  worktreePath: string | null;
+  branch: string | null;
+  openApprovalCount: number;
+  openQuestionCount: number;
+}
+
+export interface OrchestrationMcpContext {
+  ptyId: string;
+  role: 'worker' | 'coordinator';
+  orchestrationMode: boolean;
+  confirmMode: OrchestrationConfirmMode;
+  activeDispatch: OrchestrationDispatchRecord | null;
+  canDelegate: boolean;
+  roster: OrchestrationAgentRosterEntry[];
+  workers: OrchestrationMcpWorkerBrief[];
+  pendingProposals: OrchestrationDispatchProposal[];
+}
+
 export interface OrchestrationServiceDependencies {
   store: OrchestrationStore;
   agentStatusStore: AgentStatusStore;
@@ -133,6 +205,23 @@ export interface OrchestrationServiceDependencies {
   isAgentCliId?: (cliId: string) => boolean;
   terminalTracker?: TerminalRuntimeTracker;
   getDefaultCwd?: () => string | undefined;
+  listCodingAgents?: (opts?: {
+    callerPaneId?: string | null;
+    includeIdlePanes?: boolean;
+  }) => OrchestrationAgentRosterEntry[];
+  selectAgentForTask?: (opts: {
+    roster: readonly OrchestrationAgentRosterEntry[];
+    requestedAgent?: string | null;
+    taskKind?: OrchestrationTaskKind | null;
+    coordinatorCliId?: string | null;
+    excludeCliIds?: readonly string[];
+    preferIdle?: boolean;
+  }) => OrchestrationAgentSelectionResult;
+  getConfirmMode?: () => OrchestrationConfirmMode;
+  getDefaultWorktree?: () => boolean;
+  isMcpEnabledForCli?: (cliId: string) => boolean;
+  proposalHoldTimeoutMs?: number;
+  proposalTtlMs?: number;
   cliCommand?: string;
   maxDepth?: number;
   turnStartObserveTimeoutMs?: number;
@@ -153,6 +242,7 @@ export class OrchestrationService {
   readonly waiters: RuntimeMessageWaiters;
   readonly pointerDelivery: MailboxPointerDelivery;
   readonly approvals: PermissionApprovalManager;
+  readonly proposals: DispatchProposalManager;
   private readonly turnStopMonitor: WorkerTurnStopMonitor;
 
   private readonly agentStatusStore: AgentStatusStore;
@@ -163,6 +253,12 @@ export class OrchestrationService {
   private readonly isAgentCliId?: (cliId: string) => boolean;
   private readonly terminalTracker?: TerminalRuntimeTracker;
   private readonly getDefaultCwd?: () => string | undefined;
+  private readonly listCodingAgentsDep?: OrchestrationServiceDependencies['listCodingAgents'];
+  private readonly selectAgentForTaskDep?: OrchestrationServiceDependencies['selectAgentForTask'];
+  private readonly getConfirmModeDep?: () => OrchestrationConfirmMode;
+  private readonly getDefaultWorktreeDep?: () => boolean;
+  private readonly isMcpEnabledForCliDep?: (cliId: string) => boolean;
+  private readonly orchestrationModePanes = new Set<string>();
   /** Worker panes auto-spawned by the Coordinator loop; retired on loop task completion unless retained. */
   private readonly spawnedWorkerPanes = new Set<string>();
   private readonly spawnedWorkerMeta = new Map<string, { runId: string; taskId: string }>();
@@ -207,6 +303,11 @@ export class OrchestrationService {
     this.isAgentCliId = deps.isAgentCliId;
     this.terminalTracker = deps.terminalTracker;
     this.getDefaultCwd = deps.getDefaultCwd;
+    this.listCodingAgentsDep = deps.listCodingAgents;
+    this.selectAgentForTaskDep = deps.selectAgentForTask;
+    this.getConfirmModeDep = deps.getConfirmMode;
+    this.getDefaultWorktreeDep = deps.getDefaultWorktree;
+    this.isMcpEnabledForCliDep = deps.isMcpEnabledForCli;
     this.cliCommand = deps.cliCommand ?? 'aha';
     this.maxDepth = deps.maxDepth ?? DEFAULT_NESTED_WORKER_MAX_DEPTH;
     this.turnStartObserveTimeoutMs = deps.turnStartObserveTimeoutMs ?? 0;
@@ -240,6 +341,13 @@ export class OrchestrationService {
       onChanged: (reason, runId) => this.emitChanged(reason, runId),
       cliCommand: this.cliCommand,
       holdTimeoutMs: deps.approvalHoldTimeoutMs,
+      now: this.clock,
+    });
+
+    this.proposals = new DispatchProposalManager({
+      onChanged: (reason, runId) => this.emitChanged(reason, runId),
+      holdTimeoutMs: deps.proposalHoldTimeoutMs,
+      proposalTtlMs: deps.proposalTtlMs,
       now: this.clock,
     });
 
@@ -323,6 +431,8 @@ export class OrchestrationService {
   markPtyExited(ptyId: string): void {
     this.exitedPanes.add(ptyId);
     this.approvals.cancelForPane(ptyId);
+    this.proposals.cancelForPane(ptyId);
+    const removedMode = this.orchestrationModePanes.delete(ptyId);
     this.turnStopMonitor.notifyPaneExited(ptyId);
     this.pointerDelivery.retirePane(ptyId);
     this.waiters.cancel(ptyId);
@@ -348,6 +458,9 @@ export class OrchestrationService {
         this.waiters.cancel(`dispatch:${dispatch.id}`);
         this.waiters.notifyPrefix(`question:${dispatch.id}:`, 'status');
       }
+    }
+    if (removedMode) {
+      this.emitChanged('pane-mode:changed');
     }
   }
 
@@ -1034,6 +1147,8 @@ export class OrchestrationService {
                 taskId: spawnInput.task.id,
                 cwd: spawned.cwd,
                 cliId: spawnInput.cliId ?? options.workerCliId,
+                displayName: spawnInput.task.displayName ?? null,
+                taskTitle: spawnInput.task.taskTitle,
               });
             }
             return spawned;
@@ -2704,6 +2819,8 @@ export class OrchestrationService {
     cwd?: string;
     callerCwd?: string;
     keepOpen?: boolean;
+    mcpEnabled?: boolean;
+    role?: string;
   }): Promise<{
     dispatch: OrchestrationDispatchRecord;
     task: OrchestrationTaskRecord;
@@ -2886,7 +3003,8 @@ export class OrchestrationService {
         if (!spawned) {
           throw new OrchestrationError(
             'terminal_unavailable',
-            `Failed to spawn worker terminal for CLI "${launchConfig.cliId}".`
+            `Failed to spawn worker terminal for CLI "${launchConfig.cliId}".`,
+            { taskId: task.id, cliId: launchConfig.cliId }
           );
         }
         ptyId = spawned.ptyId;
@@ -2896,12 +3014,21 @@ export class OrchestrationService {
         if (placement.ownsWorktree && placement.worktreePath) {
           await this.rollbackWorkerResources(undefined, placement.worktreePath);
         }
-        throw err instanceof OrchestrationError
-          ? err
-          : new OrchestrationError(
-              'terminal_unavailable',
-              err instanceof Error ? err.message : String(err)
-            );
+        if (err instanceof OrchestrationError) {
+          if (err.code === 'terminal_unavailable' && !err.data?.taskId) {
+            throw new OrchestrationError(err.code, err.message, {
+              ...(err.data ?? {}),
+              taskId: task.id,
+              cliId: launchConfig.cliId,
+            });
+          }
+          throw err;
+        }
+        throw new OrchestrationError(
+          'terminal_unavailable',
+          err instanceof Error ? err.message : String(err),
+          { taskId: task.id, cliId: launchConfig.cliId }
+        );
       }
     }
 
@@ -2947,10 +3074,16 @@ export class OrchestrationService {
         cliId: launchConfig.cliId,
         ownsWorktree: placement.ownsWorktree,
         ownsPane: true,
+        displayName: task.displayName ?? null,
+        taskTitle: task.taskTitle,
       });
     }
 
     const coordinatorHandle = callerDispatch ? `dispatch:${callerDispatch.id}` : `run:${run.id}`;
+    const effectiveMcpEnabled =
+      input.mcpEnabled ?? this.isMcpEnabledForCliDep?.(launchConfig.cliId) ?? false;
+    const preambleRole =
+      (input.role ?? input.displayName)?.trim().replace(/^@+/, '') || null;
     const preamble = buildDispatchPreamble({
       taskId: task.id,
       dispatchId: ctx.id,
@@ -2963,6 +3096,8 @@ export class OrchestrationService {
       canDispatchSubWorkers: ctx.depth < this.maxDepth,
       cliCommand: this.cliCommand,
       dispatchCapability: this.store.getDispatchCapability(ctx.id),
+      mcpEnabled: effectiveMcpEnabled,
+      role: preambleRole,
     });
 
     const delivery = await this.deliverAndObserveDispatchTurn(ctx.id, {
@@ -3164,6 +3299,8 @@ export class OrchestrationService {
         cliId: settledDispatch.cliId ?? undefined,
         ownsWorktree: Boolean(nextCtx.ownsWorktree),
         ownsPane: true,
+        displayName: followUpTask.displayName ?? null,
+        taskTitle: followUpTask.taskTitle,
       });
     }
 
@@ -3188,6 +3325,10 @@ export class OrchestrationService {
     this.store.markAsReadAndDelivered([msg.id]);
 
     const coordinatorHandle = this.resolveActiveParentMailbox(nextCtx);
+    const followUpMcpEnabled = nextCtx.cliId
+      ? (this.isMcpEnabledForCliDep?.(nextCtx.cliId) ?? false)
+      : false;
+    const followUpRole = this.resolveRoleNameForDispatch(settledDispatch) || null;
     const preamble = buildDispatchPreamble({
       taskId: followUpTask.id,
       dispatchId: nextCtx.id,
@@ -3202,6 +3343,8 @@ export class OrchestrationService {
       dispatchCapability: this.store.getDispatchCapability(nextCtx.id),
       isFollowUp: true,
       previousDispatchId: settledDispatch.id,
+      mcpEnabled: followUpMcpEnabled,
+      role: followUpRole,
     });
 
     const delivery = await this.deliverAndObserveDispatchTurn(nextCtx.id, {
@@ -3723,6 +3866,7 @@ export class OrchestrationService {
         const pty = d.assigneePaneId ?? d.assigneeHandle;
         if (pty) this.turnStopMonitor.cancelForPane(pty);
       }
+      this.proposals.cancelAllPendingProposals('Orchestration state reset');
       this.inFlightObservationDispatches.clear();
     }
     if (scope === 'all' || scope === 'messages') {
@@ -3758,6 +3902,672 @@ export class OrchestrationService {
     return this.approvals.maybeHoldHookRequest(input);
   }
 
+  // ==================== Pane Mode, Roster, Proposals & Semantic MCP Delegation ====================
+
+  setPaneOrchestrationMode(ptyId: string, enabled: boolean): { ptyId: string; enabled: boolean } {
+    const cleanId = ptyId.trim();
+    if (!cleanId) {
+      throw new OrchestrationError('invalid_argument', 'Missing ptyId.');
+    }
+    if (enabled) {
+      this.orchestrationModePanes.add(cleanId);
+    } else {
+      this.orchestrationModePanes.delete(cleanId);
+    }
+    this.emitChanged('pane-mode:changed');
+    return { ptyId: cleanId, enabled };
+  }
+
+  isPaneOrchestrationMode(ptyId: string): boolean {
+    return this.orchestrationModePanes.has(ptyId.trim());
+  }
+
+  recordUserPromptTurn(ptyId: string, source: UserTurnSource = 'hook'): number {
+    const cleanId = ptyId.trim();
+    if (
+      source === 'pty' &&
+      this.agentStatusStore.get(cleanId)?.state === 'working' &&
+      this.proposals.hasPendingChatProposalForCurrentTurn?.(cleanId)
+    ) {
+      return this.proposals.getUserTurn(cleanId);
+    }
+    return this.proposals.recordUserTurn(ptyId, source);
+  }
+
+  listCodingAgents(callerPaneId?: string | null): OrchestrationAgentRosterEntry[] {
+    if (!this.listCodingAgentsDep) {
+      return [];
+    }
+    return this.listCodingAgentsDep({
+      callerPaneId: callerPaneId ?? null,
+      includeIdlePanes: true,
+    });
+  }
+
+  approveDispatchProposal(
+    id: string,
+    overrides?: DispatchProposalOverrides
+  ): { proposal: OrchestrationDispatchProposal } {
+    return this.proposals.approveProposal(id, overrides);
+  }
+
+  rejectDispatchProposal(
+    id: string,
+    reason?: string
+  ): { proposal: OrchestrationDispatchProposal } {
+    return this.proposals.rejectProposal(id, reason);
+  }
+
+  private resolveRoleNameForDispatch(dispatch: OrchestrationDispatchRecord): string {
+    const visited = new Set<string>();
+    let current: OrchestrationDispatchRecord | undefined = dispatch;
+    let fallbackName = '';
+    while (current && !visited.has(current.id)) {
+      visited.add(current.id);
+      const task = this.store.getTask(current.taskId);
+      const rawDisplay = task?.displayName?.trim().replace(/^@+/, '') ?? '';
+      if (rawDisplay) {
+        if (!current.followUpOfDispatchId) {
+          return rawDisplay;
+        }
+        if (!fallbackName && !rawDisplay.startsWith('Follow-up:')) {
+          fallbackName = rawDisplay;
+        }
+      }
+      current = current.followUpOfDispatchId
+        ? this.store.getDispatchContext(current.followUpOfDispatchId)
+        : undefined;
+    }
+    return fallbackName;
+  }
+
+  private listManagedDispatchesForCaller(callerPaneId: string): OrchestrationDispatchRecord[] {
+    const cleanCaller = callerPaneId.trim();
+    const callerActive = this.store.getActiveDispatchForIdentity(cleanCaller, cleanCaller);
+    const callerBoundRun = this.store.getCurrentRunForConsumer(cleanCaller);
+    const all = this.store.listDispatches();
+    const byHeadId = new Map<string, OrchestrationDispatchRecord>();
+
+    const ownDispatchIds = new Set<string>();
+    if (callerActive) {
+      let cur: OrchestrationDispatchRecord | undefined = callerActive;
+      while (cur && !ownDispatchIds.has(cur.id)) {
+        ownDispatchIds.add(cur.id);
+        cur = cur.followUpOfDispatchId
+          ? this.store.getDispatchContext(cur.followUpOfDispatchId)
+          : undefined;
+      }
+    }
+
+    for (const d of all) {
+      const isManaged = callerActive
+        ? Boolean(d.creatorDispatchId && ownDispatchIds.has(d.creatorDispatchId))
+        : d.parentPaneId === cleanCaller ||
+          d.creator === cleanCaller ||
+          Boolean(
+            callerBoundRun &&
+              d.runId === callerBoundRun.id &&
+              (callerBoundRun.coordinatorPaneId === cleanCaller ||
+                callerBoundRun.coordinatorHandle === cleanCaller)
+          );
+      if (!isManaged) continue;
+      const head = this.store.resolveDispatchLineage(d.id) ?? d;
+      if (head.assigneePaneId === cleanCaller || head.assigneeHandle === cleanCaller) continue;
+      byHeadId.set(head.id, head);
+    }
+
+    return [...byHeadId.values()];
+  }
+
+  async delegateTask(
+    input: {
+      from?: string;
+      role?: string;
+      task: string;
+      agent?: string;
+      taskKind?: OrchestrationTaskKind;
+      worktree?: boolean;
+      model?: string;
+      effort?: string;
+      terminal?: string;
+      userInitiated?: boolean;
+      confirmed?: boolean;
+      planSummary?: string;
+      runId?: string;
+      callerCwd?: string;
+    },
+    signal?: AbortSignal
+  ): Promise<OrchestrationDelegateTaskResult> {
+    const taskText = input.task?.trim() ?? '';
+    if (!taskText) {
+      throw new OrchestrationError('invalid_argument', 'Missing task specification.');
+    }
+
+    const from = input.from?.trim() || 'coordinator';
+    const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
+    const nextDepth = this.store.resolveChildDispatchDepth(callerDispatch?.id ?? null);
+    if (nextDepth > this.maxDepth) {
+      throw new OrchestrationError(
+        'operation_rejected',
+        `Nested worker dispatch depth ${nextDepth} exceeds max depth ${this.maxDepth}.`,
+        { depth: nextDepth, maxDepth: this.maxDepth }
+      );
+    }
+    const role = (input.role ?? '').trim().replace(/^@+/, '');
+    const firstLine =
+      taskText
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean) ?? taskText;
+    const displayName = role || undefined;
+    const taskTitle = role ? `@${role}: ${firstLine}` : firstLine;
+
+    let worktree = input.worktree ?? this.getDefaultWorktreeDep?.() ?? true;
+    const requestedAgent = input.agent?.trim() || 'auto';
+    const roster = this.listCodingAgents(from);
+    const coordinatorCliId =
+      this.agentStatusStore.get(from)?.agentId ??
+      this.terminalTracker?.getTerminal(from)?.cliId ??
+      null;
+
+    let resolvedAgent: string;
+    let selectionReason: string;
+    let resolvedModel: string | undefined = input.model?.trim() || undefined;
+    let resolvedEffort: string | undefined = input.effort?.trim() || undefined;
+    let fallbacks: string[] = [];
+
+    if (this.selectAgentForTaskDep && roster.length > 0) {
+      let selection: OrchestrationAgentSelectionResult;
+      try {
+        selection = this.selectAgentForTaskDep({
+          roster,
+          requestedAgent,
+          taskKind: input.taskKind ?? null,
+          coordinatorCliId,
+          preferIdle: Boolean(input.terminal),
+        });
+      } catch (err) {
+        if (err instanceof OrchestrationError) throw err;
+        throw new OrchestrationError(
+          'invalid_argument',
+          err instanceof Error ? err.message : String(err)
+        );
+      }
+      resolvedAgent = selection.cliId;
+      selectionReason = selection.reason;
+      if (!resolvedModel && selection.model) {
+        resolvedModel = selection.model;
+      }
+      if (!resolvedEffort && resolvedModel && selection.effort) {
+        resolvedEffort = selection.effort;
+      }
+      fallbacks = selection.fallbacks;
+    } else if (requestedAgent && requestedAgent.toLowerCase() !== 'auto') {
+      resolvedAgent = normalizeWorkerCliId(requestedAgent);
+      selectionReason = 'explicit';
+    } else {
+      const firstAvailable = roster.find((entry) => entry.available);
+      resolvedAgent = firstAvailable?.cliId ?? coordinatorCliId ?? 'claude';
+      selectionReason = firstAvailable ? 'roster-default' : 'default';
+      if (!resolvedModel && firstAvailable?.defaultModel) {
+        resolvedModel = firstAvailable.defaultModel;
+      }
+      if (!resolvedEffort && resolvedModel && firstAvailable?.defaultEffort) {
+        resolvedEffort = firstAvailable.defaultEffort;
+      }
+      fallbacks = roster
+        .filter((entry) => entry.available && entry.cliId !== resolvedAgent)
+        .map((entry) => entry.cliId);
+    }
+
+    if (!resolvedModel) {
+      resolvedEffort = undefined;
+    }
+
+    const planSummary =
+      input.planSummary?.trim() ||
+      (role ? `@${role} (${resolvedAgent}): ${firstLine}` : `${resolvedAgent}: ${firstLine}`);
+    const inferredRunId = input.runId?.trim() || this.inferRunIdOptional(from) || null;
+    const confirmMode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
+    const bypassGate = input.userInitiated === true || confirmMode === 'auto';
+
+    if (!bypassGate) {
+      if (confirmMode === 'chat-and-guard') {
+        const guard = this.proposals.evaluateChatGuard(from, Boolean(input.confirmed));
+        if (!guard.allowed) {
+          const proposal: OrchestrationDispatchProposal = {
+            id: guard.proposalId,
+            coordinatorPaneId: from,
+            runId: inferredRunId,
+            role,
+            task: taskText,
+            planSummary,
+            requestedAgent,
+            resolvedAgent,
+            taskKind: input.taskKind ?? null,
+            worktree,
+            model: resolvedModel ?? null,
+            effort: resolvedEffort ?? null,
+            terminal: input.terminal?.trim() || null,
+            status: 'pending',
+            createdAt: new Date(this.clock()).toISOString(),
+            resolvedAt: null,
+            reason: null,
+          };
+          return {
+            status: 'confirmation_required',
+            proposal,
+            message:
+              '尚未经用户确认派发。请先用一句简短人话向用户确认拟派角色、Coding Agent、任务与是否使用独立 worktree，待用户回复后再带 confirmed=true 调用 delegate_task。',
+          };
+        }
+      } else if (confirmMode === 'always-ui') {
+        const held = await this.proposals.createHeldProposal(
+          {
+            coordinatorPaneId: from,
+            runId: inferredRunId,
+            role,
+            task: taskText,
+            planSummary,
+            requestedAgent,
+            resolvedAgent,
+            taskKind: input.taskKind ?? null,
+            worktree,
+            model: resolvedModel ?? null,
+            effort: resolvedEffort ?? null,
+            terminal: input.terminal?.trim() || null,
+          },
+          signal
+        );
+        if (held.decision !== 'approved') {
+          return {
+            status: 'rejected',
+            proposal: held.proposal,
+            message:
+              held.reason ||
+              (held.decision === 'expired' ? '派发确认已超时。' : '用户已取消本次派发。'),
+          };
+        }
+        if (held.overrides) {
+          const prevAgent = resolvedAgent;
+          if (held.overrides.agent?.trim()) {
+            resolvedAgent = normalizeWorkerCliId(held.overrides.agent);
+            selectionReason = 'user-override';
+            fallbacks = [];
+          }
+          if (typeof held.overrides.worktree === 'boolean') {
+            worktree = held.overrides.worktree;
+          }
+          if (held.overrides.model !== undefined) {
+            resolvedModel = held.overrides.model?.trim() || undefined;
+          } else if (resolvedAgent !== prevAgent) {
+            const newProfile = roster.find((entry) => entry.cliId === resolvedAgent);
+            resolvedModel = newProfile?.defaultModel ?? undefined;
+          }
+          if (held.overrides.effort !== undefined) {
+            resolvedEffort = held.overrides.effort?.trim() || undefined;
+          } else if (resolvedAgent !== prevAgent) {
+            const newProfile = roster.find((entry) => entry.cliId === resolvedAgent);
+            resolvedEffort = resolvedModel ? (newProfile?.defaultEffort ?? undefined) : undefined;
+          }
+          if (!resolvedModel) {
+            resolvedEffort = undefined;
+          }
+        }
+      }
+    }
+
+    const candidates = input.terminal?.trim()
+      ? [resolvedAgent]
+      : [resolvedAgent, ...fallbacks.filter((cli) => cli !== resolvedAgent)];
+    let fallbackFrom: string | null = null;
+    let reusableTaskId: string | undefined;
+
+    for (let i = 0; i < candidates.length; i += 1) {
+      const candidateCli = candidates[i]!;
+      const isFallback = i > 0;
+      const candidateProfile = isFallback
+        ? roster.find((entry) => entry.cliId === candidateCli)
+        : undefined;
+      const candidateModel = isFallback
+        ? (candidateProfile?.defaultModel ?? undefined)
+        : resolvedModel;
+      const candidateEffort = isFallback
+        ? candidateModel
+          ? (candidateProfile?.defaultEffort ?? undefined)
+          : undefined
+        : resolvedEffort;
+      const mcpEnabled = this.isMcpEnabledForCliDep?.(candidateCli) ?? false;
+
+      const existingTask = reusableTaskId ? this.store.getTask(reusableTaskId) : null;
+      if (existingTask && existingTask.status !== 'ready') {
+        this.store.requeueTaskForRetry(reusableTaskId!);
+      }
+
+      try {
+        const started = await this.workerStart({
+          from,
+          runId: input.runId,
+          ...(reusableTaskId ? { taskId: reusableTaskId } : { spec: taskText }),
+          taskTitle,
+          displayName,
+          name: role || undefined,
+          agent: candidateCli,
+          model: candidateModel,
+          effort: candidateEffort,
+          terminal: input.terminal?.trim() || undefined,
+          noWorktree: !worktree,
+          callerCwd: input.callerCwd,
+          mcpEnabled,
+          role: role || undefined,
+        });
+        return {
+          status: 'started',
+          role,
+          agent: started.cliId,
+          selectionReason,
+          fallbackFrom,
+          dispatch: started.dispatch,
+          task: started.task,
+          run: started.run,
+          ptyId: started.ptyId,
+          worktreePath: started.worktreePath,
+          branch: started.branch,
+        };
+      } catch (err) {
+        const canRetryFallback =
+          err instanceof OrchestrationError &&
+          err.code === 'terminal_unavailable' &&
+          !input.terminal?.trim() &&
+          i + 1 < candidates.length;
+        if (!canRetryFallback) {
+          throw err;
+        }
+        if (fallbackFrom === null) {
+          fallbackFrom = resolvedAgent;
+        }
+        if (typeof err.data?.taskId === 'string' && err.data.taskId) {
+          reusableTaskId = err.data.taskId;
+        }
+      }
+    }
+
+    throw new OrchestrationError(
+      'terminal_unavailable',
+      `Failed to start worker with any candidate CLI (${candidates.join(', ')}).`
+    );
+  }
+
+  workerDoneByPane(
+    callerPaneId: string,
+    input: { outcome?: OrchestrationWorkerReportOutcome | 'succeeded'; summary: string }
+  ): ReturnType<OrchestrationService['workerDone']> {
+    const cleanCaller = callerPaneId.trim();
+    if (!cleanCaller) {
+      throw new OrchestrationError('invalid_argument', 'Missing caller pane id.');
+    }
+    const active = this.store.getActiveDispatchForIdentity(cleanCaller, cleanCaller);
+    if (!active) {
+      throw new OrchestrationError(
+        'dispatch_not_found',
+        `No active worker dispatch found for pane ${cleanCaller}.`
+      );
+    }
+    const capability = this.store.getDispatchCapability(active.id);
+    return this.workerDone({
+      from: cleanCaller,
+      dispatchId: active.id,
+      taskId: active.taskId,
+      outcome: input.outcome ?? 'completed',
+      summary: input.summary,
+      capability,
+    });
+  }
+
+  askCoordinatorByPane(
+    callerPaneId: string,
+    input: { question: string; options?: string[]; wait?: boolean; timeoutMs?: number },
+    signal?: AbortSignal
+  ): ReturnType<OrchestrationService['ask']> {
+    const cleanCaller = callerPaneId.trim();
+    if (!cleanCaller) {
+      throw new OrchestrationError('invalid_argument', 'Missing caller pane id.');
+    }
+    const active = this.store.getActiveDispatchForIdentity(cleanCaller, cleanCaller);
+    if (!active) {
+      throw new OrchestrationError(
+        'dispatch_inactive',
+        `No active worker dispatch found for pane ${cleanCaller}.`
+      );
+    }
+    const capability = this.store.getDispatchCapability(active.id);
+    return this.ask(
+      {
+        from: cleanCaller,
+        dispatchId: active.id,
+        question: input.question,
+        options: input.options,
+        wait: input.wait ?? true,
+        timeoutMs: input.timeoutMs,
+        capability,
+      },
+      signal
+    );
+  }
+
+  resolveWorkerByRoleOrId(callerPaneId: string, target: string): OrchestrationDispatchRecord {
+    const cleanCaller = callerPaneId.trim();
+    const rawTarget = target.trim();
+    if (!rawTarget) {
+      throw new OrchestrationError('invalid_argument', 'Missing target worker role or dispatch id.');
+    }
+
+    if (rawTarget.startsWith('dispatch:')) {
+      const id = rawTarget.slice('dispatch:'.length).trim();
+      const ctx = this.store.resolveDispatchLineage(id) ?? this.store.getDispatchContext(id);
+      if (ctx) {
+        this.assertWorkerController({ dispatchId: ctx.id }, cleanCaller);
+        return ctx;
+      }
+    }
+
+    const direct = this.store.getDispatchContext(rawTarget);
+    if (direct) {
+      const resolved = this.store.resolveDispatchLineage(direct.id) ?? direct;
+      this.assertWorkerController({ dispatchId: resolved.id }, cleanCaller);
+      return resolved;
+    }
+
+    const cleanRole = rawTarget.replace(/^@+/, '').trim().toLowerCase();
+    const managed = this.listManagedDispatchesForCaller(callerPaneId);
+    const matching = managed.filter((d) => {
+      const roleName = this.resolveRoleNameForDispatch(d).toLowerCase();
+      if (roleName && roleName === cleanRole) return true;
+      const task = this.store.getTask(d.taskId);
+      const taskDisplay = task?.displayName?.trim().replace(/^@+/, '').toLowerCase() ?? '';
+      if (taskDisplay && taskDisplay === cleanRole) return true;
+      return d.assigneePaneId === rawTarget || d.assigneeHandle === rawTarget;
+    });
+
+    if (matching.length > 0) {
+      matching.sort((a, b) => {
+        const aActive = ACTIVE_DISPATCH_STATUSES.has(a.status) ? 1 : 0;
+        const bActive = ACTIVE_DISPATCH_STATUSES.has(b.status) ? 1 : 0;
+        if (aActive !== bActive) return bActive - aActive;
+        return b.createdAt.localeCompare(a.createdAt);
+      });
+      return matching[0]!;
+    }
+
+    throw new OrchestrationError('dispatch_not_found', `Worker not found: ${rawTarget}`);
+  }
+
+  async messageWorkerByRole(
+    callerPaneId: string,
+    input: { role: string; message: string; subject?: string }
+  ): Promise<
+    | ({ mode: 'replied'; dispatch: OrchestrationDispatchRecord } & ReturnType<
+        OrchestrationService['reply']
+      >)
+    | ({ mode: 'sent' | 'reactivated'; dispatch: OrchestrationDispatchRecord } & OrchestrationSendResult)
+  > {
+    const cleanMessage = input.message?.trim() ?? '';
+    if (!cleanMessage) {
+      throw new OrchestrationError('invalid_argument', 'Missing message body.');
+    }
+    const dispatch = this.resolveWorkerByRoleOrId(callerPaneId, input.role);
+    this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
+    const pendingQuestions = this.store.listQuestions({
+      dispatchId: dispatch.id,
+      status: 'pending',
+    });
+    if (pendingQuestions.length > 0) {
+      const targetQuestion = pendingQuestions[0]!;
+      this.assertCanReply(targetQuestion.messageId, callerPaneId);
+      const replied = this.reply({
+        id: targetQuestion.messageId,
+        body: cleanMessage,
+        from: callerPaneId,
+      });
+      return { mode: 'replied', dispatch, ...replied };
+    }
+    const sent = await this.send({
+      from: callerPaneId,
+      to: `dispatch:${dispatch.id}`,
+      subject: input.subject?.trim() || 'Coordinator message',
+      body: cleanMessage,
+    });
+    return {
+      mode: sent.followUp ? 'reactivated' : 'sent',
+      dispatch: sent.followUp?.dispatch ?? dispatch,
+      ...sent,
+    };
+  }
+
+  async manageWorkerByRole(
+    callerPaneId: string,
+    input: {
+      role: string;
+      action: 'read' | 'approve' | 'deny' | 'release' | 'stop';
+      reason?: string;
+      force?: boolean;
+      screen?: boolean;
+    }
+  ): Promise<Record<string, unknown>> {
+    const dispatch = this.resolveWorkerByRoleOrId(callerPaneId, input.role);
+    this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
+    switch (input.action) {
+      case 'read': {
+        const output = this.workerRead({
+          dispatchId: dispatch.id,
+          screen: input.screen ?? true,
+        });
+        return { action: 'read', dispatch, output };
+      }
+      case 'approve': {
+        const open = this.approvals.listOpenApprovals({ dispatchId: dispatch.id });
+        if (open.length === 0) {
+          throw new OrchestrationError(
+            'approval_not_found',
+            `No pending permission approval for worker "${input.role}".`
+          );
+        }
+        const res = this.approve(
+          {
+            id: open[0]!.approvalId,
+            dispatchId: dispatch.id,
+            from: callerPaneId,
+            reason: input.reason,
+          },
+          callerPaneId
+        );
+        return { action: 'approve', dispatch, ...res };
+      }
+      case 'deny': {
+        const open = this.approvals.listOpenApprovals({ dispatchId: dispatch.id });
+        if (open.length === 0) {
+          throw new OrchestrationError(
+            'approval_not_found',
+            `No pending permission approval for worker "${input.role}".`
+          );
+        }
+        const res = this.deny(
+          {
+            id: open[0]!.approvalId,
+            dispatchId: dispatch.id,
+            from: callerPaneId,
+            reason: input.reason,
+          },
+          callerPaneId
+        );
+        return { action: 'deny', dispatch, ...res };
+      }
+      case 'release': {
+        this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
+        const res = await this.workerRelease({
+          dispatchId: dispatch.id,
+          force: input.force,
+        });
+        return { action: 'release', ...res };
+      }
+      case 'stop': {
+        this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
+        const res = await this.workerStop({
+          dispatchId: dispatch.id,
+          reason: input.reason,
+          force: input.force,
+        });
+        return { action: 'stop', ...res };
+      }
+    }
+  }
+
+  getMcpContextForPane(callerPaneId: string): OrchestrationMcpContext {
+    const cleanCaller = callerPaneId.trim();
+    const activeDispatch = this.store.getActiveDispatchForIdentity(cleanCaller, cleanCaller) ?? null;
+    const role: 'worker' | 'coordinator' = activeDispatch ? 'worker' : 'coordinator';
+    const orchestrationMode = this.isPaneOrchestrationMode(cleanCaller);
+    const confirmMode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
+    const canDelegate = activeDispatch ? activeDispatch.depth < this.maxDepth : true;
+    const roster = this.listCodingAgents(cleanCaller);
+    const managed = this.listManagedDispatchesForCaller(cleanCaller);
+    const workers: OrchestrationMcpWorkerBrief[] = managed.map((d) => {
+      const summary = this.toWorkerSummary(d);
+      const roleName =
+        this.resolveRoleNameForDispatch(d) ||
+        summary.task?.displayName?.trim().replace(/^@+/, '') ||
+        d.id;
+      return {
+        dispatchId: d.id,
+        taskId: d.taskId,
+        role: roleName,
+        cliId: d.cliId ?? null,
+        stage: summary.stage,
+        status: d.status,
+        ptyId: d.assigneePaneId ?? null,
+        paneAlive: summary.paneAlive,
+        worktreePath: d.worktreePath ?? null,
+        branch: d.branch ?? null,
+        openApprovalCount: summary.openApprovals.length,
+        openQuestionCount: summary.openQuestions.length,
+      };
+    });
+    const pendingProposals = this.proposals.listPendingProposals({
+      coordinatorPaneId: cleanCaller,
+    });
+    return {
+      ptyId: cleanCaller,
+      role,
+      orchestrationMode,
+      confirmMode,
+      activeDispatch,
+      canDelegate,
+      roster,
+      workers,
+      pendingProposals,
+    };
+  }
+
   // ==================== Snapshot & Agent Text Views ====================
 
   getSnapshot(runId?: string): OrchestrationSnapshot {
@@ -3765,6 +4575,8 @@ export class OrchestrationService {
     return {
       ...base,
       openApprovals: this.approvals.listOpenApprovals(runId ? { runId } : undefined),
+      pendingProposals: this.proposals.listPendingProposals(runId ? { runId } : undefined),
+      orchestrationModePanes: [...this.orchestrationModePanes],
     };
   }
 
@@ -4054,6 +4866,47 @@ export class OrchestrationService {
       );
     }
 
+    if (action === 'agents') {
+      const agents = Array.isArray(record.agents)
+        ? (record.agents as OrchestrationAgentRosterEntry[])
+        : [];
+      if (agents.length === 0) {
+        return 'No coding agents discovered.';
+      }
+      return agents
+        .map((a) => {
+          const state = a.available
+            ? 'available'
+            : !a.installed
+              ? 'not-installed'
+              : 'disabled';
+          const idle = a.idlePanes.length > 0 ? `, ${a.idlePanes.length} idle pane(s)` : '';
+          const model = a.defaultModel ? `, model=${a.defaultModel}` : '';
+          const mcp = a.mcpReady ? `mcp=${a.mcpMode}` : 'mcp=fallback';
+          return `- ${a.cliId} (${a.label}) [${state}; ${mcp}${model}${idle}]: ${a.specialty}`;
+        })
+        .join('\n');
+    }
+
+    if (action === 'delegate-task') {
+      if (record.status === 'confirmation_required' || record.status === 'rejected') {
+        return typeof record.message === 'string' ? record.message : JSON.stringify(data, null, 2);
+      }
+      const dispatch = record.dispatch as OrchestrationDispatchRecord | undefined;
+      return formatAgentFieldsText(
+        [
+          ['Role', typeof record.role === 'string' && record.role ? `@${record.role}` : null],
+          ['Agent', typeof record.agent === 'string' ? record.agent : dispatch?.cliId],
+          ['Dispatch', dispatch?.id],
+          ['Worker', typeof record.ptyId === 'string' ? record.ptyId : dispatch?.assigneePaneId],
+          ['FallbackFrom', typeof record.fallbackFrom === 'string' ? record.fallbackFrom : null],
+          ['Worktree', typeof record.worktreePath === 'string' ? record.worktreePath : null],
+          ['Branch', typeof record.branch === 'string' ? record.branch : null],
+        ],
+        'Task delegated.'
+      );
+    }
+
     return JSON.stringify(data, null, 2);
   }
 
@@ -4084,6 +4937,8 @@ export class OrchestrationService {
     this.activeCoordinator = null;
     this.turnStopMonitor.dispose();
     this.approvals.dispose();
+    this.proposals.dispose();
+    this.orchestrationModePanes.clear();
     this.pointerDelivery.stop();
     this.waiters.dispose();
     this.disposeStatusListener();

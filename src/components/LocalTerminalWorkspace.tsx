@@ -44,8 +44,10 @@ import {
 import {
   leafIdForSpawnedPty,
   newAttention,
+  newPendingProposals,
   newUrgentMessages,
   taskTitle,
+  workerTabTitle,
   workerWindowTarget,
 } from '../lib/orchestration-view';
 import {
@@ -55,6 +57,7 @@ import {
 import { stageWindowStore } from '../lib/stage-window-store';
 import {
   getTerminalSearchShortcutLabel,
+  isMacSearchPlatform,
   isTerminalSearchShortcut,
   shouldConfirmPaneClose,
 } from '../lib/terminal-search-options';
@@ -368,15 +371,34 @@ export function LocalTerminalWorkspace({
   };
 
   const orchestrationEventsRef = useRef<{
-    spawned: (event: { ptyId: string; taskId: string; cwd?: string; cliId?: string }) => void;
+    spawned: (event: {
+      ptyId: string;
+      taskId: string;
+      displayName?: string | null;
+      taskTitle?: string;
+      cwd?: string;
+      cliId?: string;
+    }) => void;
     closed: (event: { ptyId: string }) => void;
     changed: Parameters<typeof orchestrationClient.onChange>[0];
   }>();
   orchestrationEventsRef.current = {
     spawned: (event) => {
       const task = orchestrationClient.getSnapshot().tasks.find((item) => item.id === event.taskId);
-      const name = task ? taskTitle(task) : event.taskId;
-      if (openWorkerPane({ ...event, title: `Worker · ${name}` }, false)) {
+      const fallbackTask =
+        event.displayName || event.taskTitle
+          ? {
+              id: event.taskId,
+              displayName: event.displayName ?? '',
+              taskTitle: event.taskTitle ?? '',
+              spec: event.taskTitle ?? '',
+            }
+          : null;
+      const effectiveTask = task ?? fallbackTask;
+      const title = workerTabTitle(effectiveTask, event.taskId);
+      const role = effectiveTask?.displayName?.trim().replace(/^@+/, '');
+      const name = role ? `@${role}` : effectiveTask ? taskTitle(effectiveTask) : event.taskId;
+      if (openWorkerPane({ ...event, title }, false)) {
         setToast(`编排：已为「${name}」启动 Worker`);
       }
     },
@@ -387,16 +409,26 @@ export function LocalTerminalWorkspace({
       // Workers spawned while this window was not listening (e.g. after a reload) still get a tab, once.
       for (const dispatch of next.dispatches) {
         const ptyId = dispatch.assigneePaneId;
-        if (!ptyId || (dispatch.status !== 'pending' && dispatch.status !== 'dispatched')) continue;
-        if (!leafIdForSpawnedPty(ptyId)?.startsWith('orch-') || seenWorkerPanes.current!.has(ptyId)) continue;
-        if (!agentStatusClient.get(ptyId)) continue;
+        if (!ptyId) continue;
+        if (!leafIdForSpawnedPty(ptyId)?.startsWith('orch-')) continue;
         const task = next.tasks.find((item) => item.id === dispatch.taskId);
+        const hit = findLeafByPtyId(ptyId);
+        if (hit && task) {
+          const nextTitle = workerTabTitle(task, dispatch.taskId);
+          if (hit.win.title !== nextTitle) {
+            stageWindowStore.renameWindow(hit.win.id, nextTitle);
+            stageWindowStore.updatePaneMeta(hit.win.id, hit.leafId, { title: nextTitle });
+          }
+        }
+        if (dispatch.status !== 'pending' && dispatch.status !== 'dispatched') continue;
+        if (seenWorkerPanes.current!.has(ptyId)) continue;
+        if (!agentStatusClient.get(ptyId)) continue;
         openWorkerPane(
           {
             ptyId,
             cliId: dispatch.cliId ?? undefined,
             cwd: dispatch.worktreePath ?? task?.worktreePath ?? undefined,
-            title: `Worker · ${task ? taskTitle(task) : dispatch.taskId}`,
+            title: workerTabTitle(task, dispatch.taskId),
           },
           false,
         );
@@ -413,13 +445,19 @@ export function LocalTerminalWorkspace({
           }
         }
       }
+      const freshProposals = newPendingProposals(prev, next);
       const fresh = newAttention(prev, next);
       const urgent = newUrgentMessages(prev, next);
       const prevApprovalIds = new Set((prev?.openApprovals ?? []).map((a) => a.approvalId));
       const newApprovals = (next.openApprovals ?? []).filter(
         (a) => a.status === 'pending' && !prevApprovalIds.has(a.approvalId),
       );
-      if (newApprovals.length) {
+      if (freshProposals.length) {
+        const proposal = freshProposals[0]!;
+        const role = proposal.role?.trim().replace(/^@+/, '') || 'worker';
+        const agent = proposal.resolvedAgent || proposal.requestedAgent || 'auto';
+        setToast(`编排：待确认拉起 @${role} (${agent})`);
+      } else if (newApprovals.length) {
         setToast(`编排：Worker 请求权限「${newApprovals[0]!.toolName}」`);
       } else if (fresh.gates.length) {
         setToast(`编排：需要你决策「${fresh.gates[0]!.question.slice(0, 60)}」`);
@@ -624,6 +662,36 @@ export function LocalTerminalWorkspace({
       return;
     }
     if (!active || !activeLeafId) return;
+
+    const isNonTerminalInput =
+      event.target instanceof Element &&
+      !event.target.classList.contains('xterm-helper-textarea') &&
+      Boolean(event.target.closest('input, select, textarea, [role="dialog"]'));
+
+    const isMac = isMacSearchPlatform();
+    const isOrchestrationModeShortcut =
+      !event.altKey &&
+      event.shiftKey &&
+      event.key.toLowerCase() === 'o' &&
+      (isMac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey);
+
+    if (isOrchestrationModeShortcut && !isNonTerminalInput && activePtyId) {
+      const paneCliId = active.panes?.[activeLeafId]?.localCliId ?? active.localCliId;
+      if (paneCliId && paneCliId !== 'shell') {
+        event.preventDefault();
+        event.stopPropagation();
+        event.nativeEvent.stopPropagation();
+        const api = window.vibeMeet.orchestration?.setPaneMode;
+        if (api) {
+          const enabled = !Boolean(orchestration.orchestrationModePanes?.includes(activePtyId));
+          void api({ ptyId: activePtyId, enabled }).then((res) => {
+            if (!res.ok) setToast(res.error);
+            else setToast(res.enabled ? '已开启编排模式' : '已关闭编排模式');
+          });
+        }
+        return;
+      }
+    }
 
     if (pendingClosePane) {
       const inConfirmControl =
@@ -1077,7 +1145,7 @@ export function LocalTerminalWorkspace({
         ) : null}
         <span
           className="terminal-shortcut-hint"
-          title={`${searchShortcut} 搜索 · Ctrl+Shift+D/E 分屏 · Ctrl+Shift+[/] 切换窗格 · Ctrl+Shift+W 关闭`}
+          title={`${searchShortcut} 搜索 · ${isMacSearchPlatform() ? 'Cmd+Shift+O' : 'Ctrl+Shift+O'} 编排模式 · Ctrl+Shift+D/E 分屏 · Ctrl+Shift+[/] 切换窗格 · Ctrl+Shift+W 关闭`}
         >
           {folderWindows.length} 个终端
           {activeLeafIds.length > 1 ? ` · ${activeLeafIds.length} 窗格` : ''}

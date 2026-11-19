@@ -4,6 +4,10 @@ import {
   getSettings,
   updateSettings,
   clearVoicePrint,
+  normalizeOrchestrationSettings,
+  type OrchestrationAgentProfile,
+  type OrchestrationConfirmMode,
+  type OrchestrationSettings,
   type Settings,
   type VoicePrint,
   type XfyunAsrCredentials,
@@ -20,6 +24,151 @@ function broadcastVoiceInputChanged(): void {
   for (const wc of webContents.getAllWebContents()) {
     wc.send('settings:voice-input-changed');
   }
+}
+
+function broadcastOrchestrationSettingsChanged(): void {
+  for (const wc of webContents.getAllWebContents()) {
+    wc.send('settings:orchestration-changed');
+  }
+}
+
+export interface OrchestrationSettingsPatch {
+  confirmBeforeDispatch?: OrchestrationConfirmMode;
+  defaultWorktree?: boolean;
+  agentProfiles?: Record<string, OrchestrationAgentProfile | null>;
+}
+
+const ORCHESTRATION_SETTING_KEYS = new Set([
+  'confirmBeforeDispatch',
+  'defaultWorktree',
+  'agentProfiles',
+]);
+
+const ORCHESTRATION_PROFILE_KEYS = new Set([
+  'enabled',
+  'specialty',
+  'defaultModel',
+  'defaultEffort',
+]);
+
+const FORBIDDEN_PROFILE_IDS = new Set(['__proto__', 'constructor', 'prototype']);
+
+export function buildOrchestrationSettingsUpdate(
+  patch: unknown,
+  current?: Partial<OrchestrationSettings>,
+): { ok: true; settings: OrchestrationSettings } | { ok: false; error: string } {
+  if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+    return { ok: false, error: 'orchestration settings patch must be an object' };
+  }
+  const patchObj = patch as Record<string, unknown>;
+  for (const key of Object.keys(patchObj)) {
+    if (!ORCHESTRATION_SETTING_KEYS.has(key)) {
+      return { ok: false, error: `unknown orchestration setting: ${key}` };
+    }
+  }
+
+  const next = normalizeOrchestrationSettings(current);
+
+  if (Object.prototype.hasOwnProperty.call(patchObj, 'confirmBeforeDispatch')) {
+    const mode = patchObj.confirmBeforeDispatch;
+    if (mode !== 'chat-and-guard' && mode !== 'always-ui' && mode !== 'auto') {
+      return { ok: false, error: 'invalid confirmBeforeDispatch' };
+    }
+    next.confirmBeforeDispatch = mode;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patchObj, 'defaultWorktree')) {
+    if (typeof patchObj.defaultWorktree !== 'boolean') {
+      return { ok: false, error: 'defaultWorktree must be a boolean' };
+    }
+    next.defaultWorktree = patchObj.defaultWorktree;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patchObj, 'agentProfiles')) {
+    const rawProfiles = patchObj.agentProfiles;
+    if (typeof rawProfiles !== 'object' || rawProfiles === null || Array.isArray(rawProfiles)) {
+      return { ok: false, error: 'agentProfiles must be an object' };
+    }
+    const nextProfiles: Record<string, OrchestrationAgentProfile> = { ...next.agentProfiles };
+    for (const [rawCliId, rawProfile] of Object.entries(rawProfiles as Record<string, unknown>)) {
+      const cliId = rawCliId.trim();
+      if (
+        !cliId ||
+        cliId.length > 64 ||
+        FORBIDDEN_PROFILE_IDS.has(cliId) ||
+        !/^[a-zA-Z0-9._-]+$/.test(cliId)
+      ) {
+        return { ok: false, error: `invalid agent profile id: ${rawCliId}` };
+      }
+      if (rawProfile === null) {
+        delete nextProfiles[cliId];
+        continue;
+      }
+      if (typeof rawProfile !== 'object' || Array.isArray(rawProfile)) {
+        return { ok: false, error: `agentProfiles.${cliId} must be an object` };
+      }
+      const profileObj = rawProfile as Record<string, unknown>;
+      for (const field of Object.keys(profileObj)) {
+        if (!ORCHESTRATION_PROFILE_KEYS.has(field)) {
+          return { ok: false, error: `unknown agent profile field for ${cliId}: ${field}` };
+        }
+      }
+      const mergedProfile: OrchestrationAgentProfile = { ...(nextProfiles[cliId] ?? {}) };
+      if (Object.prototype.hasOwnProperty.call(profileObj, 'enabled')) {
+        if (profileObj.enabled === undefined) {
+          delete mergedProfile.enabled;
+        } else if (typeof profileObj.enabled !== 'boolean') {
+          return { ok: false, error: `agentProfiles.${cliId}.enabled must be a boolean` };
+        } else {
+          mergedProfile.enabled = profileObj.enabled;
+        }
+      }
+      for (const field of ['specialty', 'defaultModel', 'defaultEffort'] as const) {
+        if (!Object.prototype.hasOwnProperty.call(profileObj, field)) continue;
+        const value = profileObj[field];
+        if (value === undefined || value === null) {
+          delete mergedProfile[field];
+        } else if (typeof value !== 'string') {
+          return { ok: false, error: `agentProfiles.${cliId}.${field} must be a string` };
+        } else if (field === 'specialty') {
+          const collapsed = value.replace(/[\r\n]+/g, ' ').trim();
+          if (collapsed.length > 300) {
+            return { ok: false, error: `agentProfiles.${cliId}.specialty must be at most 300 characters` };
+          }
+          if (collapsed) mergedProfile.specialty = collapsed;
+          else delete mergedProfile.specialty;
+        } else if (field === 'defaultModel') {
+          const trimmed = value.trim();
+          if (trimmed) {
+            if (trimmed.length > 128 || trimmed.startsWith('-') || /[\s\r\n\0]/.test(trimmed)) {
+              return { ok: false, error: `invalid agentProfiles.${cliId}.defaultModel` };
+            }
+            mergedProfile.defaultModel = trimmed;
+          } else {
+            delete mergedProfile.defaultModel;
+          }
+        } else if (field === 'defaultEffort') {
+          const trimmed = value.trim();
+          if (trimmed) {
+            if (trimmed.length > 32 || /[\s\r\n\0]/.test(trimmed)) {
+              return { ok: false, error: `invalid agentProfiles.${cliId}.defaultEffort` };
+            }
+            mergedProfile.defaultEffort = trimmed;
+          } else {
+            delete mergedProfile.defaultEffort;
+          }
+        }
+      }
+      if (Object.keys(mergedProfile).length > 0) {
+        nextProfiles[cliId] = mergedProfile;
+      } else {
+        delete nextProfiles[cliId];
+      }
+    }
+    next.agentProfiles = nextProfiles;
+  }
+
+  return { ok: true, settings: normalizeOrchestrationSettings(next) };
 }
 
 export interface VoicePrefPatch {
@@ -160,4 +309,21 @@ export function registerSettingsIpc(): void {
   });
 
   ipcMain.handle('settings:list-cli-inventory', async () => ({ ok: true, clis: listLocalCliInventory() }));
+
+  ipcMain.handle('settings:get-orchestration', async () => {
+    return normalizeOrchestrationSettings(getSettings().orchestration);
+  });
+
+  ipcMain.handle('settings:set-orchestration', async (_event, patch: OrchestrationSettingsPatch) => {
+    const current = normalizeOrchestrationSettings(getSettings().orchestration);
+    const result = buildOrchestrationSettingsUpdate(patch, current);
+    if (!result.ok) return { ok: false, error: result.error };
+    try {
+      updateSettings({ orchestration: result.settings });
+      broadcastOrchestrationSettingsChanged();
+      return { ok: true, settings: result.settings };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
 }

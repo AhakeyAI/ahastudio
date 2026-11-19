@@ -8,34 +8,49 @@ import {
   Eye,
   GitBranch,
   Pin,
+  Send,
   ShieldAlert,
+  Sparkles,
   Square,
   Trash2,
   Users,
   X,
 } from 'lucide-react';
+import type { OrchestrationAgentRosterEntry, OrchestrationDispatchProposal } from '../types';
 import { ptyIdForLeaf } from '../lib/agent-status-view';
 import { agentStatusClient } from '../lib/agent-status-client';
 import { orchestrationClient } from '../lib/orchestration-client';
 import {
   buildCrewViewForPane,
+  parseQuickDispatchInput,
   type AgentStatusLookup,
   type CrewMemberEntry,
 } from '../lib/orchestration-crew-model';
+import { isMacSearchPlatform } from '../lib/terminal-search-options';
 import { dispatchFocusOrchestrationTarget } from '../lib/terminal-links/orchestration-terminal-links';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
 import './orchestration-crew-panel.css';
 
 export interface OrchestrationCrewPanelProps {
   leafId: string;
+  cwd?: string;
   agentStatuses: AgentStatusLookup;
+  isAgentPane?: boolean;
   searchOpen?: boolean;
   onNotify?: (message: string) => void;
 }
 
+interface ProposalDraft {
+  agent: string;
+  worktree: boolean;
+  reason: string;
+}
+
 export function OrchestrationCrewPanel({
   leafId,
+  cwd,
   agentStatuses,
+  isAgentPane = false,
   searchOpen = false,
   onNotify,
 }: OrchestrationCrewPanelProps) {
@@ -49,13 +64,19 @@ export function OrchestrationCrewPanel({
   );
   const ptyId = ptyIdForLeaf(leafId);
   const crew = useMemo(
-    () => buildCrewViewForPane(snapshot, ptyId, agentStatuses),
-    [snapshot, ptyId, agentStatuses, agentStatusRevision],
+    () => buildCrewViewForPane(snapshot, ptyId, agentStatuses, { isAgentPane }),
+    [snapshot, ptyId, agentStatuses, agentStatusRevision, isAgentPane],
   );
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [agentsRoster, setAgentsRoster] = useState<OrchestrationAgentRosterEntry[]>([]);
+  const [proposalDrafts, setProposalDrafts] = useState<Record<string, ProposalDraft>>({});
+  const [quickInput, setQuickInput] = useState('');
+  const [quickWorktree, setQuickWorktree] = useState(true);
+  const lastDefaultWorktreeRef = useRef<boolean | null>(null);
+  const [quickBusy, setQuickBusy] = useState(false);
   const [questionDrafts, setQuestionDrafts] = useState<Record<string, string>>({});
   const [denyReasonByApproval, setDenyReasonByApproval] = useState<Record<string, string>>({});
   const [previewByDispatch, setPreviewByDispatch] = useState<Record<string, string>>({});
@@ -63,10 +84,58 @@ export function OrchestrationCrewPanel({
     Record<string, string>
   >({});
 
+  const modeShortcutLabel = isMacSearchPlatform() ? 'Cmd+Shift+O' : 'Ctrl+Shift+O';
+
+  useEffect(() => {
+    const settingsApi = window.vibeMeet.orchestrationSettings;
+    if (!settingsApi) return;
+    let cancelled = false;
+    const syncDefaultWorktree = () => {
+      void settingsApi
+        .get()
+        .then((settings) => {
+          if (
+            !cancelled &&
+            typeof settings?.defaultWorktree === 'boolean' &&
+            settings.defaultWorktree !== lastDefaultWorktreeRef.current
+          ) {
+            lastDefaultWorktreeRef.current = settings.defaultWorktree;
+            setQuickWorktree(settings.defaultWorktree);
+          }
+        })
+        .catch(() => {});
+    };
+    syncDefaultWorktree();
+    const offChanged = settingsApi.onChanged?.(syncDefaultWorktree);
+    return () => {
+      cancelled = true;
+      offChanged?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!expanded) return;
+    const listAgents = window.vibeMeet.orchestration?.listAgents;
+    if (!listAgents) return;
+    let cancelled = false;
+    void listAgents({ callerPaneId: ptyId })
+      .then((res) => {
+        if (!cancelled && res.ok) {
+          setAgentsRoster(res.agents);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [expanded, ptyId, crew.pendingProposals.length]);
+
   useEffect(() => {
     if (!expanded) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
         setExpanded(false);
       }
     };
@@ -76,10 +145,10 @@ export function OrchestrationCrewPanel({
         setExpanded(false);
       }
     };
-    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keydown', onKeyDown, true);
     document.addEventListener('mousedown', onPointerDown);
     return () => {
-      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keydown', onKeyDown, true);
       document.removeEventListener('mousedown', onPointerDown);
     };
   }, [expanded]);
@@ -96,7 +165,14 @@ export function OrchestrationCrewPanel({
   );
 
   const focusMemberPane = useCallback(
-    (entry: { ptyId: string | null; label: string; dispatchId?: string | null; taskId?: string | null; cwd?: string | null; cliId?: string | null }) => {
+    (entry: {
+      ptyId: string | null;
+      label: string;
+      dispatchId?: string | null;
+      taskId?: string | null;
+      cwd?: string | null;
+      cliId?: string | null;
+    }) => {
       if (!entry.ptyId) {
         onNotify?.(`${entry.label} 没有关联的活跃终端`);
         return;
@@ -113,6 +189,138 @@ export function OrchestrationCrewPanel({
     },
     [onNotify],
   );
+
+  const handleToggleOrchestrationMode = async () => {
+    const api = window.vibeMeet.orchestration?.setPaneMode;
+    if (!api) {
+      onNotify?.('编排模式接口不可用');
+      return;
+    }
+    setBusyId('pane-mode');
+    try {
+      const res = await api({ ptyId, enabled: !crew.isOrchestrationMode });
+      if (!res.ok) {
+        onNotify?.(res.error);
+      } else {
+        onNotify?.(res.enabled ? '已开启编排模式' : '已关闭编排模式');
+      }
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const getProposalDraft = (proposal: OrchestrationDispatchProposal): ProposalDraft =>
+    proposalDrafts[proposal.id] ?? {
+      agent: proposal.resolvedAgent || proposal.requestedAgent || 'auto',
+      worktree: proposal.worktree,
+      reason: '',
+    };
+
+  const updateProposalDraft = (
+    proposal: OrchestrationDispatchProposal,
+    patch: Partial<ProposalDraft>,
+  ) => {
+    setProposalDrafts((prev) => ({
+      ...prev,
+      [proposal.id]: {
+        ...getProposalDraft(proposal),
+        ...patch,
+      },
+    }));
+  };
+
+  const clearProposalDraft = (proposalId: string) => {
+    setProposalDrafts((prev) => {
+      if (!(proposalId in prev)) return prev;
+      const next = { ...prev };
+      delete next[proposalId];
+      return next;
+    });
+  };
+
+  const handleApproveProposal = async (proposal: OrchestrationDispatchProposal) => {
+    const api = window.vibeMeet.orchestration?.proposalApprove;
+    if (!api) return;
+    const draft = getProposalDraft(proposal);
+    setBusyId(proposal.id);
+    try {
+      const res = await api({
+        id: proposal.id,
+        agent: draft.agent,
+        worktree: draft.worktree,
+      });
+      if (!res.ok) {
+        onNotify?.(res.error);
+      } else {
+        clearProposalDraft(proposal.id);
+        const role = proposal.role?.trim().replace(/^@+/, '');
+        onNotify?.(role ? `已确认拉起 @${role}` : '已确认拉起 Worker');
+      }
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleRejectProposal = async (proposal: OrchestrationDispatchProposal) => {
+    const api = window.vibeMeet.orchestration?.proposalReject;
+    if (!api) return;
+    const draft = getProposalDraft(proposal);
+    setBusyId(proposal.id);
+    try {
+      const reason = draft.reason.trim();
+      const res = await api({
+        id: proposal.id,
+        ...(reason ? { reason } : {}),
+      });
+      if (!res.ok) {
+        onNotify?.(res.error);
+      } else {
+        clearProposalDraft(proposal.id);
+        onNotify?.('已取消派发');
+      }
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleQuickDispatch = async () => {
+    const parsed = parseQuickDispatchInput(quickInput);
+    if (!parsed) {
+      onNotify?.('请输入任务内容（如 @codex 补全单测）');
+      return;
+    }
+    const api = window.vibeMeet.orchestration?.delegateTask;
+    if (!api) {
+      onNotify?.('快捷派发接口不可用');
+      return;
+    }
+    setQuickBusy(true);
+    try {
+      const res = await api({
+        from: ptyId,
+        agent: parsed.agent,
+        ...(parsed.role ? { role: parsed.role } : {}),
+        ...(cwd ? { callerCwd: cwd } : {}),
+        task: parsed.task,
+        worktree: quickWorktree,
+        userInitiated: true,
+      });
+      if (!res.ok) {
+        onNotify?.(res.error);
+      } else if (res.status === 'rejected') {
+        onNotify?.(res.message ?? '派发已取消');
+      } else if (res.status === 'confirmation_required') {
+        setQuickInput('');
+        onNotify?.('已生成待确认派发，请在编排面板中确认');
+      } else {
+        setQuickInput('');
+        const target = res.role ? `@${res.role}` : res.agent ?? parsed.agent;
+        onNotify?.(res.message ?? `已派发给 ${target}`);
+      }
+    } finally {
+      setQuickBusy(false);
+    }
+  };
 
   const handleApprove = async (approvalId: string) => {
     const api = window.vibeMeet.orchestration?.approve;
@@ -289,30 +497,157 @@ export function OrchestrationCrewPanel({
     return null;
   }
 
+  const availableAgents = agentsRoster.filter((agent) => agent.available);
+  const showRightSummary = crew.pillLabel !== '编排' && crew.pillLabel !== '编排中';
+  const hasDrawerContent =
+    crew.pendingProposals.length > 0 ||
+    crew.openApprovals.length > 0 ||
+    crew.openQuestions.length > 0 ||
+    crew.openGates.length > 0 ||
+    Boolean(crew.managedBy) ||
+    crew.managing.length > 0 ||
+    crew.talkingWith.length > 0;
+
   return (
     <div
       ref={rootRef}
       className={`aha-crew-overlay ${searchOpen ? 'is-below-search' : ''}`}
       onMouseDown={(e) => e.stopPropagation()}
     >
-      <button
-        type="button"
-        className={`aha-crew-pill tone-${crew.pillTone} ${expanded ? 'is-open' : ''}`}
-        aria-expanded={expanded}
-        aria-label="Orchestration Crew"
-        onClick={() => setExpanded((prev) => !prev)}
+      <div
+        className={`aha-crew-split-pill tone-${crew.pillTone} ${crew.isOrchestrationMode ? 'is-mode-on' : ''} ${expanded ? 'is-open' : ''}`}
       >
-        <span className={`aha-crew-dot tone-${crew.pillTone}`} aria-hidden="true" />
-        <Users size={12} />
-        <span className="aha-crew-pill-label">{crew.pillLabel}</span>
-        {crew.attentionCount > 0 && (
-          <span className="aha-crew-pill-badge">{crew.attentionCount}</span>
-        )}
-        {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-      </button>
+        <button
+          type="button"
+          className={`aha-crew-mode-btn ${crew.isOrchestrationMode ? 'is-active' : ''}`}
+          aria-pressed={crew.isOrchestrationMode}
+          aria-label={crew.isOrchestrationMode ? '关闭编排模式' : '开启编排模式'}
+          title={`切换编排模式 (${modeShortcutLabel})`}
+          disabled={busyId === 'pane-mode'}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={() => void handleToggleOrchestrationMode()}
+        >
+          <span
+            className={`aha-crew-dot tone-${crew.isOrchestrationMode ? 'accent' : crew.pillTone}`}
+            aria-hidden="true"
+          />
+          <span>{crew.isOrchestrationMode && !showRightSummary ? '编排中' : '编排'}</span>
+        </button>
+        <span className="aha-crew-pill-divider" aria-hidden="true" />
+        <button
+          type="button"
+          className="aha-crew-drawer-btn"
+          aria-expanded={expanded}
+          aria-label="Orchestration Crew"
+          title="展开编排详情与快捷派发"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={() => setExpanded((prev) => !prev)}
+        >
+          {showRightSummary && (
+            <>
+              <Users size={11} />
+              <span className="aha-crew-pill-label">{crew.pillLabel}</span>
+            </>
+          )}
+          {crew.attentionCount > 0 && (
+            <span className="aha-crew-pill-badge">{crew.attentionCount}</span>
+          )}
+          {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+        </button>
+      </div>
 
       {expanded && (
         <div className="aha-crew-drawer" role="region" aria-label="Orchestration Crew 详情">
+          {crew.pendingProposals.length > 0 && (
+            <section className="aha-crew-section is-alert">
+              <header className="aha-crew-section-header">
+                <span>
+                  <Sparkles size={12} /> 待确认派发 ({crew.pendingProposals.length})
+                </span>
+              </header>
+              {crew.pendingProposals.map((proposal) => {
+                const draft = getProposalDraft(proposal);
+                const roleLabel = proposal.role?.trim().replace(/^@+/, '') || 'worker';
+                const hasSelectedInRoster = availableAgents.some((a) => a.cliId === draft.agent);
+                return (
+                  <div key={proposal.id} className="aha-crew-alert-card">
+                    <div className="aha-crew-alert-title">
+                      <span className="aha-crew-proposal-role">
+                        <TerminalProfileIcon id={draft.agent} size={12} />
+                        <strong>@{roleLabel}</strong>
+                      </span>
+                      {proposal.taskKind && <small>{proposal.taskKind}</small>}
+                    </div>
+                    <p className="aha-crew-question-text" title={proposal.task}>
+                      {proposal.planSummary?.trim() || proposal.task}
+                    </p>
+                    <div className="aha-crew-proposal-controls">
+                      <select
+                        className="aha-crew-select"
+                        aria-label={`选择 @${roleLabel} 的 Coding Agent`}
+                        value={draft.agent}
+                        disabled={busyId === proposal.id}
+                        onChange={(e) => updateProposalDraft(proposal, { agent: e.target.value })}
+                      >
+                        {!hasSelectedInRoster && (
+                          <option value={draft.agent}>{draft.agent}</option>
+                        )}
+                        {availableAgents.map((agent) => (
+                          <option key={agent.cliId} value={agent.cliId}>
+                            {agent.label}
+                            {agent.idlePanes.length > 0 ? ' (空闲窗格)' : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <label className="aha-crew-wt-check" title="在独立 Git worktree 中执行">
+                        <input
+                          type="checkbox"
+                          checked={draft.worktree}
+                          disabled={busyId === proposal.id}
+                          onChange={(e) =>
+                            updateProposalDraft(proposal, { worktree: e.target.checked })
+                          }
+                        />
+                        <span>worktree</span>
+                      </label>
+                    </div>
+                    <div className="aha-crew-inline-actions">
+                      <input
+                        type="text"
+                        placeholder="取消原因（可选）"
+                        value={draft.reason}
+                        disabled={busyId === proposal.id}
+                        onChange={(e) => updateProposalDraft(proposal, { reason: e.target.value })}
+                      />
+                      <button
+                        type="button"
+                        className="is-ok"
+                        disabled={busyId === proposal.id}
+                        onClick={() => void handleApproveProposal(proposal)}
+                      >
+                        <Check size={11} /> 确认拉起
+                      </button>
+                      <button
+                        type="button"
+                        className="is-danger"
+                        disabled={busyId === proposal.id}
+                        onClick={() => void handleRejectProposal(proposal)}
+                      >
+                        <X size={11} /> 取消
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </section>
+          )}
+
           {crew.openApprovals.length > 0 && (
             <section className="aha-crew-section is-alert">
               <header className="aha-crew-section-header">
@@ -473,7 +808,9 @@ export function OrchestrationCrewPanel({
                   <button
                     type="button"
                     title={`在终端插入 ${crew.managedBy.mentionToken}`}
-                    onClick={() => void insertTextIntoCurrentTerminal(`${crew.managedBy!.mentionToken} `)}
+                    onClick={() =>
+                      void insertTextIntoCurrentTerminal(`${crew.managedBy!.mentionToken} `)
+                    }
                   >
                     <AtSign size={12} />
                   </button>
@@ -522,11 +859,14 @@ export function OrchestrationCrewPanel({
                           <strong>{entry.label}</strong>
                           <small>
                             {entry.subtitle}
-                            {entry.model ? ` · ${entry.model}${entry.effort ? ` (${entry.effort})` : ''}` : ''}
+                            {entry.model
+                              ? ` · ${entry.model}${entry.effort ? ` (${entry.effort})` : ''}`
+                              : ''}
                             {entry.branch ? (
                               <>
                                 {' · '}
-                                <GitBranch size={10} style={{ verticalAlign: '-1px' }} /> {entry.branch}
+                                <GitBranch size={10} style={{ verticalAlign: '-1px' }} />{' '}
+                                {entry.branch}
                               </>
                             ) : null}
                           </small>
@@ -609,9 +949,7 @@ export function OrchestrationCrewPanel({
                         </div>
                       </div>
                     )}
-                    {preview !== undefined && (
-                      <pre className="aha-crew-preview">{preview}</pre>
-                    )}
+                    {preview !== undefined && <pre className="aha-crew-preview">{preview}</pre>}
                   </div>
                 );
               })}
@@ -659,6 +997,54 @@ export function OrchestrationCrewPanel({
               ))}
             </section>
           )}
+
+          {!hasDrawerContent && (
+            <div className="aha-crew-empty-hint">
+              {crew.isOrchestrationMode
+                ? '编排模式已开启：对话即可让当前 Agent 协作派活，或在下方快捷直派。'
+                : '点击左侧「编排」开启对话协作，或直接在下方快捷派发任务。'}
+            </div>
+          )}
+
+          <form
+            className="aha-crew-quick-dispatch"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void handleQuickDispatch();
+            }}
+          >
+            <input
+              type="text"
+              value={quickInput}
+              disabled={quickBusy}
+              placeholder="@cli 或直接输入任务（回车直派）…"
+              aria-label="快捷派发任务"
+              onChange={(e) => setQuickInput(e.target.value)}
+            />
+            <button
+              type="button"
+              className={`aha-crew-wt-toggle ${quickWorktree ? 'is-active' : ''}`}
+              aria-pressed={quickWorktree}
+              disabled={quickBusy}
+              title={
+                quickWorktree
+                  ? '使用独立 Git worktree（点击切换为当前目录）'
+                  : '使用当前目录（点击切换为独立 Git worktree）'
+              }
+              onClick={() => setQuickWorktree((prev) => !prev)}
+            >
+              WT
+            </button>
+            <button
+              type="submit"
+              className="aha-crew-quick-send"
+              disabled={quickBusy || !quickInput.trim()}
+              title="派发任务"
+              aria-label="派发任务"
+            >
+              <Send size={12} />
+            </button>
+          </form>
         </div>
       )}
     </div>

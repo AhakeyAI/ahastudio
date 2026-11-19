@@ -13,6 +13,7 @@ export interface IpcContext {
   userDataDir?: () => string;
   agentStatusStore?: AgentStatusStore;
   agentHookEnv?: (ptyId: string, cliId?: OrchestrationCliId) => Record<string, string>;
+  mcpLaunchArgsForCli?: (cliId: OrchestrationCliId) => string[];
   sendPtyInput?: PtyWriteFn;
   orchestrationService?: OrchestrationService;
   terminalTracker?: TerminalRuntimeTracker;

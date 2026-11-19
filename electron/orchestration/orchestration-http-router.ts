@@ -2,10 +2,12 @@ import { z } from 'zod';
 import { OrchestrationService } from './orchestration-service.js';
 import {
   ORCHESTRATION_MESSAGE_TYPES,
+  ORCHESTRATION_TASK_KINDS,
   OrchestrationError,
 } from './orchestration-types.js';
 
 const messageTypeEnum = z.enum(ORCHESTRATION_MESSAGE_TYPES);
+const taskKindEnum = z.enum(ORCHESTRATION_TASK_KINDS);
 const priorityEnum = z.enum(['low', 'normal', 'high', 'urgent']);
 const taskStatusEnum = z.enum(['pending', 'ready', 'dispatched', 'completed', 'failed', 'blocked']);
 const gateStatusEnum = z.enum(['pending', 'resolved', 'timeout']);
@@ -269,13 +271,90 @@ const snapshotSchema = z.object({
   runId: z.string().trim().min(1).optional(),
 });
 
+const agentsSchema = z.object({
+  callerPaneId: z.string().trim().min(1).optional(),
+});
+
+const mcpContextSchema = z.object({
+  ptyId: z.string().trim().min(1).optional(),
+});
+
+const delegateTaskSchema = z.object({
+  from: z.string().trim().min(1).optional(),
+  role: z.string().trim().max(120).optional(),
+  task: z.string().trim().min(1),
+  agent: z.string().trim().min(1).optional(),
+  taskKind: taskKindEnum.optional(),
+  worktree: z.boolean().optional(),
+  model: z.string().trim().min(1).optional(),
+  effort: z.string().trim().min(1).optional(),
+  terminal: z.string().trim().min(1).optional(),
+  confirmed: z.boolean().optional(),
+  planSummary: z.string().trim().max(1_000).optional(),
+  runId: z.string().trim().min(1).optional(),
+  callerCwd: z.string().trim().min(1).optional(),
+});
+
+const workerDoneSelfSchema = z.object({
+  from: z.string().trim().min(1).optional(),
+  outcome: workerOutcomeEnum.optional(),
+  summary: z.string().trim().min(1),
+});
+
+const askSelfSchema = z.object({
+  from: z.string().trim().min(1).optional(),
+  question: z.string().trim().min(1),
+  options: z.array(z.string().trim().min(1)).optional(),
+  wait: z.boolean().optional(),
+  timeoutMs: z.number().int().min(0).max(3_600_000).optional(),
+});
+
+const proposalApproveSchema = z.object({
+  id: z.string().trim().min(1),
+  agent: z.string().trim().min(1).optional(),
+  worktree: z.boolean().optional(),
+  model: z.union([z.string().trim().min(1), z.null()]).optional(),
+  effort: z.union([z.string().trim().min(1), z.null()]).optional(),
+});
+
+const proposalRejectSchema = z.object({
+  id: z.string().trim().min(1),
+  reason: z.string().max(4_000).optional(),
+});
+
+const paneModeSetSchema = z.object({
+  ptyId: z.string().trim().min(1).optional(),
+  enabled: z.boolean(),
+});
+
+const roleMessageSchema = z.object({
+  from: z.string().trim().min(1).optional(),
+  role: z.string().trim().min(1),
+  message: z.string().trim().min(1),
+  subject: z.string().trim().min(1).optional(),
+});
+
+const roleManageSchema = z.object({
+  from: z.string().trim().min(1).optional(),
+  role: z.string().trim().min(1),
+  action: z.enum(['read', 'approve', 'deny', 'release', 'stop']),
+  reason: z.string().max(4_000).optional(),
+  force: z.boolean().optional(),
+  screen: z.boolean().optional(),
+});
+
 export interface OrchestrationHttpDispatchResult {
   status: number;
   body: Record<string, unknown>;
 }
 
 export function isLongPollOrchestrationAction(action: string): boolean {
-  return action === 'check' || action === 'ask';
+  return (
+    action === 'check' ||
+    action === 'ask' ||
+    action === 'ask-self' ||
+    action === 'delegate-task'
+  );
 }
 
 /** Reads skip the durability barrier; every mutation is fsynced before its receipt is returned. */
@@ -293,6 +372,8 @@ const READ_ONLY_ORCHESTRATION_ACTIONS = new Set([
   'gate-list',
   'inbox',
   'snapshot',
+  'agents',
+  'mcp-context',
 ]);
 
 export async function dispatchOrchestrationHttpAction(
@@ -367,7 +448,11 @@ export async function dispatchOrchestrationHttpAction(
       case 'dispatch': {
         const parsed = dispatchSchema.parse(payload);
         if (!parsed.dryRun && parsed.inject !== false) assertWorkerTarget(parsed.to);
-        result = await service.dispatchTask(parsed);
+        result = await service.dispatchTask(
+          context.callerPaneId !== undefined && context.callerPaneId !== null
+            ? { ...parsed, from: context.callerPaneId }
+            : parsed
+        );
         break;
       }
       case 'dispatch-show':
@@ -403,7 +488,11 @@ export async function dispatchOrchestrationHttpAction(
       case 'worker-start': {
         const parsed = workerStartSchema.parse(payload);
         assertWorkerTarget(parsed.terminal);
-        result = await service.workerStart(parsed);
+        result = await service.workerStart(
+          context.callerPaneId !== undefined && context.callerPaneId !== null
+            ? { ...parsed, from: context.callerPaneId }
+            : parsed
+        );
         break;
       }
       case 'worker-list':
@@ -500,6 +589,142 @@ export async function dispatchOrchestrationHttpAction(
       case 'snapshot':
         result = service.getSnapshot(snapshotSchema.parse(payload).runId);
         break;
+      case 'agents': {
+        const parsed = agentsSchema.parse(payload);
+        result = {
+          agents: service.listCodingAgents(parsed.callerPaneId ?? context.callerPaneId ?? null),
+        };
+        break;
+      }
+      case 'mcp-context': {
+        const parsed = mcpContextSchema.parse(payload);
+        const caller =
+          context.callerPaneId !== undefined
+            ? requireCallerPane()
+            : parsed.ptyId || 'coordinator';
+        result = service.getMcpContextForPane(caller);
+        break;
+      }
+      case 'delegate-task': {
+        const parsed = delegateTaskSchema.parse(payload);
+        assertWorkerTarget(parsed.terminal);
+        const caller =
+          context.callerPaneId !== undefined
+            ? requireCallerPane()
+            : parsed.from || 'coordinator';
+        result = await service.delegateTask(
+          {
+            ...parsed,
+            from: caller,
+            userInitiated: false,
+          },
+          context.signal
+        );
+        break;
+      }
+      case 'worker-done-self': {
+        const parsed = workerDoneSelfSchema.parse(payload);
+        const caller =
+          context.callerPaneId !== undefined
+            ? requireCallerPane()
+            : parsed.from || '';
+        result = service.workerDoneByPane(caller, {
+          outcome: parsed.outcome,
+          summary: parsed.summary,
+        });
+        break;
+      }
+      case 'ask-self': {
+        const parsed = askSelfSchema.parse(payload);
+        const caller =
+          context.callerPaneId !== undefined
+            ? requireCallerPane()
+            : parsed.from || '';
+        result = await service.askCoordinatorByPane(
+          caller,
+          {
+            question: parsed.question,
+            options: parsed.options,
+            wait: parsed.wait,
+            timeoutMs: parsed.timeoutMs,
+          },
+          context.signal
+        );
+        break;
+      }
+      case 'proposal-approve': {
+        const parsed = proposalApproveSchema.parse(payload);
+        if (context.callerPaneId !== undefined) {
+          throw new OrchestrationError(
+            'operation_rejected',
+            'Dispatch proposals can only be approved or rejected from the AhaStation UI.'
+          );
+        }
+        result = service.approveDispatchProposal(parsed.id, {
+          agent: parsed.agent,
+          worktree: parsed.worktree,
+          model: parsed.model,
+          effort: parsed.effort,
+        });
+        break;
+      }
+      case 'proposal-reject': {
+        const parsed = proposalRejectSchema.parse(payload);
+        if (context.callerPaneId !== undefined) {
+          throw new OrchestrationError(
+            'operation_rejected',
+            'Dispatch proposals can only be approved or rejected from the AhaStation UI.'
+          );
+        }
+        result = service.rejectDispatchProposal(parsed.id, parsed.reason);
+        break;
+      }
+      case 'pane-mode-set': {
+        const parsed = paneModeSetSchema.parse(payload);
+        let targetPtyId: string;
+        if (context.callerPaneId !== undefined) {
+          const caller = requireCallerPane();
+          if (parsed.ptyId && parsed.ptyId !== caller) {
+            throw new OrchestrationError(
+              'operation_rejected',
+              'A terminal pane may only change its own orchestration mode.'
+            );
+          }
+          targetPtyId = caller;
+        } else {
+          targetPtyId = parsed.ptyId ?? requireCallerPane();
+        }
+        result = service.setPaneOrchestrationMode(targetPtyId, parsed.enabled);
+        break;
+      }
+      case 'role-message': {
+        const parsed = roleMessageSchema.parse(payload);
+        const caller =
+          context.callerPaneId !== undefined
+            ? requireCallerPane()
+            : parsed.from || 'coordinator';
+        result = await service.messageWorkerByRole(caller, {
+          role: parsed.role,
+          message: parsed.message,
+          subject: parsed.subject,
+        });
+        break;
+      }
+      case 'role-manage': {
+        const parsed = roleManageSchema.parse(payload);
+        const caller =
+          context.callerPaneId !== undefined
+            ? requireCallerPane()
+            : parsed.from || 'coordinator';
+        result = await service.manageWorkerByRole(caller, {
+          role: parsed.role,
+          action: parsed.action,
+          reason: parsed.reason,
+          force: parsed.force,
+          screen: parsed.screen,
+        });
+        break;
+      }
       default:
         return {
           status: 404,
@@ -543,11 +768,13 @@ export async function dispatchOrchestrationHttpAction(
         error.code === 'dispatch_not_found' ||
         error.code === 'delivery_not_found' ||
         error.code === 'gate_not_found' ||
-        error.code === 'approval_not_found'
+        error.code === 'approval_not_found' ||
+        error.code === 'proposal_not_found'
           ? 404
           : error.code === 'answer_conflict' ||
               error.code === 'gate_already_resolved' ||
               error.code === 'approval_already_resolved' ||
+              error.code === 'proposal_already_resolved' ||
               error.code === 'worker_busy' ||
               error.code === 'duplicate_run' ||
               error.code === 'duplicate_task' ||
