@@ -43,16 +43,16 @@ const loadPureTs = async (relPath, rewrites = {}) => {
   }
   return moduleUrl(src);
 };
-const ownedUtf16Url = await loadPureTs('../src/lib/orca-shared/owned-utf16-suffix.ts');
-const ownRetainedUrl = await loadPureTs('../src/lib/orca-shared/own-retained-string.ts', {
+const ownedUtf16Url = await loadPureTs('../src/lib/shared/owned-utf16-suffix.ts');
+const ownRetainedUrl = await loadPureTs('../src/lib/shared/own-retained-string.ts', {
   './owned-utf16-suffix': ownedUtf16Url,
 });
-const osc133Url = await loadPureTs('../src/lib/orca-shared/terminal/output/terminal-osc133-command-finished.ts', {
+const osc133Url = await loadPureTs('../src/lib/shared/terminal/output/terminal-osc133-command-finished.ts', {
   '../../own-retained-string': ownRetainedUrl,
 });
 const oscTrackerUrl = await loadPureTs('../src/lib/terminal-osc-tracker.ts', {
-  './orca-shared/own-retained-string': ownRetainedUrl,
-  './orca-shared/terminal/output/terminal-osc133-command-finished': osc133Url,
+  './shared/own-retained-string': ownRetainedUrl,
+  './shared/terminal/output/terminal-osc133-command-finished': osc133Url,
 });
 const paneTreeUrl = await loadPureTs('../src/lib/terminal-pane-tree.ts');
 

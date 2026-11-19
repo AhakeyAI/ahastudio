@@ -145,8 +145,8 @@ test('Antigravity installs bundle into hooks.json preserving sibling bundles and
   const { home, installer } = makeHome(t);
   const antigravityPath = join(home, '.gemini', 'config', 'hooks.json');
   const sibling = {
-    'orca-status': {
-      Stop: [{ type: 'command', command: 'orca-stop.cmd', timeout: 10 }],
+    'aha-sibling-status': {
+      Stop: [{ type: 'command', command: 'aha-sibling-stop.cmd', timeout: 10 }],
     },
   };
   writeFile(antigravityPath, JSON.stringify(sibling, null, 2));
@@ -156,7 +156,7 @@ test('Antigravity installs bundle into hooks.json preserving sibling bundles and
   installer.install('qwen');
   const hooksJson = JSON.parse(readFileSync(antigravityPath, 'utf8'));
   const qwen = JSON.parse(readFileSync(join(home, '.qwen', 'settings.json'), 'utf8'));
-  assert.deepEqual(hooksJson['orca-status'], sibling['orca-status'], 'preserves unrelated bundles');
+  assert.deepEqual(hooksJson['aha-sibling-status'], sibling['aha-sibling-status'], 'preserves unrelated bundles');
   const bundle = hooksJson['ahastation-agent-status'];
   assert.deepEqual(Object.keys(bundle).sort(), ['PostInvocation', 'PostToolUse', 'PreInvocation', 'PreToolUse', 'Stop']);
   for (const event of ['PreInvocation', 'PostInvocation', 'Stop']) {

@@ -164,9 +164,9 @@ test('skill sync preserves a user-owned orchestration skill and publishes aha-or
   const directory = join(homeDir, '.agents', 'skills', 'orchestration');
   mkdirSync(directory, { recursive: true });
   const skill = join(directory, 'SKILL.md');
-  writeFileSync(skill, '# Orca Orchestration\nRun orca orchestration...');
+  writeFileSync(skill, '# Aha Custom Orchestration\nRun custom aha orchestration...');
   const result = syncBundledOrchestrationSkills({ homeDir, env: {} });
-  assert.equal(readFileSync(skill, 'utf8'), '# Orca Orchestration\nRun orca orchestration...');
+  assert.equal(readFileSync(skill, 'utf8'), '# Aha Custom Orchestration\nRun custom aha orchestration...');
   assert.ok(result.skippedFiles.includes(skill));
   const fallbackSkill = join(homeDir, '.agents', 'skills', 'aha-orchestration', 'SKILL.md');
   assert.match(readFileSync(fallbackSkill, 'utf8'), /^---\nname: aha-orchestration\n/);

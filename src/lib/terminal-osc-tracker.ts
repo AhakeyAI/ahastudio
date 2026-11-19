@@ -1,5 +1,5 @@
-import { ownRetainedString } from './orca-shared/own-retained-string';
-import { createOsc133CommandFinishedScanner } from './orca-shared/terminal/output/terminal-osc133-command-finished';
+import { ownRetainedString } from './shared/own-retained-string';
+import { createOsc133CommandFinishedScanner } from './shared/terminal/output/terminal-osc133-command-finished';
 
 const OSC_7_PREFIX = '\x1b]7;';
 const MAX_OSC_CARRY_LENGTH = 4096;

@@ -3,7 +3,7 @@ import xtermHeadless, { type ITerminalOptions, type Terminal as HeadlessTerminal
 import { SerializeAddon } from '@xterm/addon-serialize'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 const { Terminal } = xtermHeadless
-import { activateOrcaTerminalUnicodeProvider } from '../../shared/terminal/appearance/terminal-unicode-provider.js'
+import { activateAhaTerminalUnicodeProvider } from '../../shared/terminal/appearance/terminal-unicode-provider.js'
 import {
   readSavedCursorRegister,
   serializeWithAbsoluteCursor
@@ -61,7 +61,7 @@ export class HeadlessEmulator {
 
     // Match renderer cell widths to prevent shifted snapshot rows.
     this.terminal.loadAddon(new Unicode11Addon())
-    activateOrcaTerminalUnicodeProvider(this.terminal)
+    activateAhaTerminalUnicodeProvider(this.terminal)
   }
 
   write(data: string): Promise<void> {

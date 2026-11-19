@@ -1,16 +1,16 @@
 import type { ILink, ILinkProvider, IBufferRange, Terminal } from '@xterm/xterm';
 import type { TerminalSession } from '../terminal-session';
-import type { TerminalLinkBuffer } from '../orca-shared/terminal/links/terminal-link-buffer';
-import { buildTerminalHttpLogicalLines, hasHardWrappedRows } from '../orca-shared/terminal/links/terminal-http-logical-lines';
-import { extractTerminalHttpLinks } from '../orca-shared/terminal/links/terminal-http-url-extraction';
-import { rangeForParsedLinkOnRow } from '../orca-shared/terminal/links/terminal-link-row-range';
-import { terminalLogicalLinkHasOscLink } from '../orca-shared/terminal/links/terminal-osc-link-cells';
+import type { TerminalLinkBuffer } from '../shared/terminal/links/terminal-link-buffer';
+import { buildTerminalHttpLogicalLines, hasHardWrappedRows } from '../shared/terminal/links/terminal-http-logical-lines';
+import { extractTerminalHttpLinks } from '../shared/terminal/links/terminal-http-url-extraction';
+import { rangeForParsedLinkOnRow } from '../shared/terminal/links/terminal-link-row-range';
+import { terminalLogicalLinkHasOscLink } from '../shared/terminal/links/terminal-osc-link-cells';
 import {
   buildCandidateLogicalLinesForBufferPosition,
   findTerminalHttpLinkAtBufferPosition,
-} from '../orca-shared/terminal/links/terminal-link-buffer-hit-testing';
-import { extractTerminalFileLinkReadings } from '../orca-shared/terminal/links/terminal-links';
-import { rangeForParsedFileLink } from '../orca-shared/terminal/links/wrapped-terminal-link-ranges';
+} from '../shared/terminal/links/terminal-link-buffer-hit-testing';
+import { extractTerminalFileLinkReadings } from '../shared/terminal/links/terminal-links';
+import { rangeForParsedFileLink } from '../shared/terminal/links/wrapped-terminal-link-ranges';
 import {
   isSafeTerminalLinkCandidate,
   resolveSafeOscLinkTarget,

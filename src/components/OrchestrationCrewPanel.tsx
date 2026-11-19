@@ -292,42 +292,42 @@ export function OrchestrationCrewPanel({
   return (
     <div
       ref={rootRef}
-      className={`orca-crew-overlay ${searchOpen ? 'is-below-search' : ''}`}
+      className={`aha-crew-overlay ${searchOpen ? 'is-below-search' : ''}`}
       onMouseDown={(e) => e.stopPropagation()}
     >
       <button
         type="button"
-        className={`orca-crew-pill tone-${crew.pillTone} ${expanded ? 'is-open' : ''}`}
+        className={`aha-crew-pill tone-${crew.pillTone} ${expanded ? 'is-open' : ''}`}
         aria-expanded={expanded}
         aria-label="Orchestration Crew"
         onClick={() => setExpanded((prev) => !prev)}
       >
-        <span className={`orca-crew-dot tone-${crew.pillTone}`} aria-hidden="true" />
+        <span className={`aha-crew-dot tone-${crew.pillTone}`} aria-hidden="true" />
         <Users size={12} />
-        <span className="orca-crew-pill-label">{crew.pillLabel}</span>
+        <span className="aha-crew-pill-label">{crew.pillLabel}</span>
         {crew.attentionCount > 0 && (
-          <span className="orca-crew-pill-badge">{crew.attentionCount}</span>
+          <span className="aha-crew-pill-badge">{crew.attentionCount}</span>
         )}
         {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
       </button>
 
       {expanded && (
-        <div className="orca-crew-drawer" role="region" aria-label="Orchestration Crew 详情">
+        <div className="aha-crew-drawer" role="region" aria-label="Orchestration Crew 详情">
           {crew.openApprovals.length > 0 && (
-            <section className="orca-crew-section is-alert">
-              <header className="orca-crew-section-header">
+            <section className="aha-crew-section is-alert">
+              <header className="aha-crew-section-header">
                 <span>
                   <ShieldAlert size={12} /> 权限请求 ({crew.openApprovals.length})
                 </span>
               </header>
               {crew.openApprovals.map((app) => (
-                <div key={app.approvalId} className="orca-crew-alert-card">
-                  <div className="orca-crew-alert-title">
+                <div key={app.approvalId} className="aha-crew-alert-card">
+                  <div className="aha-crew-alert-title">
                     <strong>{app.toolName}</strong>
                     <small>{app.approvalId}</small>
                   </div>
-                  {app.toolInput && <code className="orca-crew-code">{app.toolInput}</code>}
-                  <div className="orca-crew-inline-actions">
+                  {app.toolInput && <code className="aha-crew-code">{app.toolInput}</code>}
+                  <div className="aha-crew-inline-actions">
                     <input
                       type="text"
                       placeholder="拒绝原因（可选）"
@@ -362,15 +362,15 @@ export function OrchestrationCrewPanel({
           )}
 
           {crew.openQuestions.length > 0 && (
-            <section className="orca-crew-section is-alert">
-              <header className="orca-crew-section-header">
+            <section className="aha-crew-section is-alert">
+              <header className="aha-crew-section-header">
                 <span>Worker 提问 ({crew.openQuestions.length})</span>
               </header>
               {crew.openQuestions.map((q) => (
-                <div key={q.messageId} className="orca-crew-alert-card">
-                  <p className="orca-crew-question-text">{q.question}</p>
+                <div key={q.messageId} className="aha-crew-alert-card">
+                  <p className="aha-crew-question-text">{q.question}</p>
                   {q.options.length > 0 && (
-                    <div className="orca-crew-chips">
+                    <div className="aha-crew-chips">
                       {q.options.map((opt) => (
                         <button
                           key={opt}
@@ -383,7 +383,7 @@ export function OrchestrationCrewPanel({
                       ))}
                     </div>
                   )}
-                  <div className="orca-crew-inline-actions">
+                  <div className="aha-crew-inline-actions">
                     <input
                       type="text"
                       placeholder="输入回复…"
@@ -415,14 +415,14 @@ export function OrchestrationCrewPanel({
           )}
 
           {crew.openGates.length > 0 && (
-            <section className="orca-crew-section is-alert">
-              <header className="orca-crew-section-header">
+            <section className="aha-crew-section is-alert">
+              <header className="aha-crew-section-header">
                 <span>决策门禁 ({crew.openGates.length})</span>
               </header>
               {crew.openGates.map((g) => (
-                <div key={g.id} className="orca-crew-alert-card">
-                  <p className="orca-crew-question-text">{g.question}</p>
-                  <div className="orca-crew-chips">
+                <div key={g.id} className="aha-crew-alert-card">
+                  <p className="aha-crew-question-text">{g.question}</p>
+                  <div className="aha-crew-chips">
                     {(g.options.length > 0 ? g.options : ['approve', 'reject']).map((opt) => (
                       <button
                         key={opt}
@@ -440,14 +440,14 @@ export function OrchestrationCrewPanel({
           )}
 
           {crew.managedBy && (
-            <section className="orca-crew-section">
-              <header className="orca-crew-section-header">
+            <section className="aha-crew-section">
+              <header className="aha-crew-section-header">
                 <span>Managed by</span>
               </header>
-              <div className="orca-crew-row">
+              <div className="aha-crew-row">
                 <button
                   type="button"
-                  className="orca-crew-row-main"
+                  className="aha-crew-row-main"
                   title="点击切换到上级终端"
                   onClick={() =>
                     focusMemberPane({
@@ -461,15 +461,15 @@ export function OrchestrationCrewPanel({
                   }
                 >
                   <TerminalProfileIcon id={crew.managedBy.cliId ?? undefined} size={13} />
-                  <span className="orca-crew-row-text">
+                  <span className="aha-crew-row-text">
                     <strong>{crew.managedBy.label}</strong>
                     <small>{crew.managedBy.subtitle}</small>
                   </span>
-                  <span className={`orca-crew-stage tone-${crew.managedBy.tone}`}>
+                  <span className={`aha-crew-stage tone-${crew.managedBy.tone}`}>
                     {crew.managedBy.stageLabel}
                   </span>
                 </button>
-                <div className="orca-crew-row-actions">
+                <div className="aha-crew-row-actions">
                   <button
                     type="button"
                     title={`在终端插入 ${crew.managedBy.mentionToken}`}
@@ -483,12 +483,12 @@ export function OrchestrationCrewPanel({
           )}
 
           {crew.managing.length > 0 && (
-            <section className="orca-crew-section">
-              <header className="orca-crew-section-header">
+            <section className="aha-crew-section">
+              <header className="aha-crew-section-header">
                 <span>Managing ({crew.managing.length})</span>
                 <button
                   type="button"
-                  className="orca-crew-mention-all"
+                  className="aha-crew-mention-all"
                   title="在当前终端插入全部下属 Worker 提及"
                   onClick={() => void insertTextIntoCurrentTerminal(crew.mentionAllText)}
                 >
@@ -500,11 +500,11 @@ export function OrchestrationCrewPanel({
                 const preview = previewByDispatch[dId];
                 const forceReleaseReason = confirmForceReleaseByDispatch[dId];
                 return (
-                  <div key={entry.key} className="orca-crew-item">
-                    <div className="orca-crew-row">
+                  <div key={entry.key} className="aha-crew-item">
+                    <div className="aha-crew-row">
                       <button
                         type="button"
-                        className="orca-crew-row-main"
+                        className="aha-crew-row-main"
                         title="定位到该 Worker 终端"
                         onClick={() =>
                           focusMemberPane({
@@ -518,7 +518,7 @@ export function OrchestrationCrewPanel({
                         }
                       >
                         <TerminalProfileIcon id={entry.cliId ?? undefined} size={13} />
-                        <span className="orca-crew-row-text">
+                        <span className="aha-crew-row-text">
                           <strong>{entry.label}</strong>
                           <small>
                             {entry.subtitle}
@@ -531,11 +531,11 @@ export function OrchestrationCrewPanel({
                             ) : null}
                           </small>
                         </span>
-                        <span className={`orca-crew-stage tone-${entry.tone}`}>
+                        <span className={`aha-crew-stage tone-${entry.tone}`}>
                           {entry.stageLabel}
                         </span>
                       </button>
-                      <div className="orca-crew-row-actions">
+                      <div className="aha-crew-row-actions">
                         <button
                           type="button"
                           title={`在终端插入 ${entry.mentionToken}`}
@@ -582,9 +582,9 @@ export function OrchestrationCrewPanel({
                       </div>
                     </div>
                     {forceReleaseReason && (
-                      <div className="orca-crew-force-confirm" role="alert">
+                      <div className="aha-crew-force-confirm" role="alert">
                         <span>{forceReleaseReason}</span>
-                        <div className="orca-crew-inline-actions">
+                        <div className="aha-crew-inline-actions">
                           <button
                             type="button"
                             className="is-danger"
@@ -610,7 +610,7 @@ export function OrchestrationCrewPanel({
                       </div>
                     )}
                     {preview !== undefined && (
-                      <pre className="orca-crew-preview">{preview}</pre>
+                      <pre className="aha-crew-preview">{preview}</pre>
                     )}
                   </div>
                 );
@@ -619,15 +619,15 @@ export function OrchestrationCrewPanel({
           )}
 
           {crew.talkingWith.length > 0 && (
-            <section className="orca-crew-section">
-              <header className="orca-crew-section-header">
+            <section className="aha-crew-section">
+              <header className="aha-crew-section-header">
                 <span>Talking with ({crew.talkingWith.length})</span>
               </header>
               {crew.talkingWith.map((peer) => (
-                <div key={peer.key} className="orca-crew-row">
+                <div key={peer.key} className="aha-crew-row">
                   <button
                     type="button"
-                    className="orca-crew-row-main"
+                    className="aha-crew-row-main"
                     onClick={() =>
                       focusMemberPane({
                         ptyId: peer.ptyId,
@@ -637,16 +637,16 @@ export function OrchestrationCrewPanel({
                     }
                   >
                     <TerminalProfileIcon id={peer.cliId ?? undefined} size={13} />
-                    <span className="orca-crew-row-text">
+                    <span className="aha-crew-row-text">
                       <strong>{peer.label}</strong>
                       <small>{peer.lastSubject}</small>
                     </span>
                     {peer.unreadCount > 0 && (
-                      <span className="orca-crew-pill-badge">{peer.unreadCount}</span>
+                      <span className="aha-crew-pill-badge">{peer.unreadCount}</span>
                     )}
-                    {peer.ptyId && <ExternalLink size={11} className="orca-crew-ext" />}
+                    {peer.ptyId && <ExternalLink size={11} className="aha-crew-ext" />}
                   </button>
-                  <div className="orca-crew-row-actions">
+                  <div className="aha-crew-row-actions">
                     <button
                       type="button"
                       title={`在终端插入 ${peer.mentionToken}`}

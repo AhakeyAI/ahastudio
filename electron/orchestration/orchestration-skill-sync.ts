@@ -104,7 +104,7 @@ aha orchestration worker-start \\
 - \`grok\`: \`--model <id>\`, \`--effort low|medium|high|xhigh\`
 
 ### Worktree Placement
-- By default in a Git repository, \`worker-start\` creates an isolated Git worktree and branch (\`orca/worker/<slug>\`).
+- By default in a Git repository, \`worker-start\` creates an isolated Git worktree and branch (\`aha/worker/<slug>\`).
 - Pass \`--no-worktree\` (or \`--worktree current\`) to run in the current directory without creating a worktree.
 - Pass \`--branch <name>\` and \`--base-branch <ref>\` to control branch creation.
 - Pass \`--terminal <ptyId>\` to reuse an existing idle agent pane instead of spawning a new terminal.

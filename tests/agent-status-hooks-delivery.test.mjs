@@ -446,7 +446,7 @@ test('Agent prompt delivery sanitizes ESC/CSI/NUL and enforces bracketed paste +
   );
   assert.equal(tooBig.ok, false);
 
-  // Orca paste-settle timing & held-draft `[Pasted Content N chars]` automatic Enter resubmit.
+  // Aha paste-settle timing & held-draft `[Pasted Content N chars]` automatic Enter resubmit.
   const codexWinDelay = computePromptSubmitDelayMs({
     prompt: 'x'.repeat(1_000),
     byteLength: 1_012,

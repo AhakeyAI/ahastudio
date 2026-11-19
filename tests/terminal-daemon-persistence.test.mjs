@@ -52,11 +52,11 @@ test('WorkspaceStateStore persists atomically via AtomicSnapshotWriter and flush
 
 test('HeadlessEmulator and TerminalSessions capture ANSI screen snapshots and keep list() minimal', async () => {
   const emulator = new HeadlessEmulator({ cols: 80, rows: 24 });
-  await emulator.write('\x1b]2;orca-title\x07\x1b[32mGREEN_OK\x1b[0m\r\nline2');
+  await emulator.write('\x1b]2;aha-title\x07\x1b[32mGREEN_OK\x1b[0m\r\nline2');
   const snap = emulator.getSnapshot();
   assert.match(snap.snapshotAnsi, /GREEN_OK/);
   assert.match(snap.snapshotAnsi, /line2/);
-  assert.equal(snap.lastTitle, 'orca-title');
+  assert.equal(snap.lastTitle, 'aha-title');
   assert.equal(snap.cols, 80);
   assert.equal(snap.rows, 24);
   emulator.dispose();

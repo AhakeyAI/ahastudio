@@ -58,7 +58,7 @@ async function notifyAttentionIfBackground(
   status: AgentPaneStatus,
   ctx: IpcContext,
 ): Promise<void> {
-  if (process.env.ORCA_BACKGROUND_LAUNCH === '1') return;
+  if (process.env.AHA_BACKGROUND_LAUNCH === '1') return;
   const win = ctx.liveWindow();
   if (win && win.isFocused() && !win.isMinimized()) return;
 

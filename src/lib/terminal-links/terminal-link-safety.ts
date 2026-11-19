@@ -1,7 +1,7 @@
 import {
   classifyTerminalOscLinkTarget,
   type TerminalOscLinkTarget,
-} from '../orca-shared/terminal/links/terminal-osc-link-target';
+} from '../shared/terminal/links/terminal-osc-link-target';
 
 const UNC_OR_DEVICE_PREFIX_RE = /^(?:[\\/]{2}|[\\/]\?\?(?:[\\/]|$))/;
 const WINDOWS_RESERVED_DEVICE_RE = /^(CON|PRN|AUX|NUL|COM\d|LPT\d)(\.|$)/i;

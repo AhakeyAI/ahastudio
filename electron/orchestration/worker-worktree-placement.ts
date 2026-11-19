@@ -127,7 +127,7 @@ export async function prepareWorkerWorktreePlacement(
       : resolve(mainWorktreeRoot, rawWt)
     : join(dirname(mainWorktreeRoot), `${basename(mainWorktreeRoot)}.aha-worktrees`, slug);
 
-  const desiredBranch = input.branch?.trim() || `orca/worker/${slug}`;
+  const desiredBranch = input.branch?.trim() || `aha/worker/${slug}`;
   const startPoint = input.baseBranch?.trim() ||
     (rawWt === 'new-top-level' ? undefined : inspected.head);
 
@@ -163,10 +163,9 @@ export function inferSiblingMainRepoPath(worktreePath: string): string | null {
   const resolvedWt = resolve(worktreePath);
   const parentDir = dirname(resolvedWt);
   const parentBase = basename(parentDir);
-  for (const suffix of ['.aha-worktrees', '.orca-worktrees']) {
-    if (parentBase.toLowerCase().endsWith(suffix) && parentBase.length > suffix.length) {
-      return join(dirname(parentDir), parentBase.slice(0, -suffix.length));
-    }
+  const suffix = '.aha-worktrees';
+  if (parentBase.toLowerCase().endsWith(suffix) && parentBase.length > suffix.length) {
+    return join(dirname(parentDir), parentBase.slice(0, -suffix.length));
   }
   return null;
 }

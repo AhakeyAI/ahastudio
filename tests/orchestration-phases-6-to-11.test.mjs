@@ -355,7 +355,7 @@ test('Phase 7: 6-CLI launch catalog validation, worker-start isolated Git worktr
   assert.equal(w1.ownsPane, true);
   assert.ok(w1.worktreePath && existsSync(w1.worktreePath));
   assert.notEqual(resolve(w1.worktreePath), resolve(repoDir));
-  assert.match(w1.branch, /^orca\/worker\//);
+  assert.match(w1.branch, /^aha\/worker\//);
   assert.deepEqual(spawnedCalls[0].extraArgs, ['-m', 'gpt-5.4', '-c', 'model_reasoning_effort="high"']);
   assert.equal(spawnedEvents[0].parentPaneId, 'local-coord');
   assert.equal(spawnedEvents[0].dispatchId, w1.dispatch.id);
@@ -896,7 +896,7 @@ test('Phase 11: Crew read-model (managedBy/managing/talkingWith), sidebar lineag
         assigneePaneId: 'local-orch-a',
         processIncarnation: null,
         worktreePath: 'C:/proj.aha-worktrees/wt-a',
-        branch: 'orca/worker/wt-a',
+        branch: 'aha/worker/wt-a',
         ownsWorktree: false,
         ownsPane: false,
         cliId: 'claude',
@@ -923,7 +923,7 @@ test('Phase 11: Crew read-model (managedBy/managing/talkingWith), sidebar lineag
         assigneePaneId: 'local-orch-a',
         processIncarnation: null,
         worktreePath: 'C:/proj.aha-worktrees/wt-a',
-        branch: 'orca/worker/wt-a',
+        branch: 'aha/worker/wt-a',
         ownsWorktree: true,
         ownsPane: true,
         cliId: 'claude',
@@ -1399,7 +1399,7 @@ test('Regression: turn-stop exit after waiting_input settles dispatch before wak
   assert.match(fullContent, /<!-- reference: approvals\.md -->/);
 });
 
-test('Parity & Hardening: Orca structured worker_done CLI, nested child ask/done across parent follow-up, @idle/@cli/@mention routing, multi-approval state, gate authority, worker-abandon/reset, and standalone worktree sidebar folder', async (t) => {
+test('Parity & Hardening: Aha structured worker_done CLI, nested child ask/done across parent follow-up, @idle/@cli/@mention routing, multi-approval state, gate authority, worker-abandon/reset, and standalone worktree sidebar folder', async (t) => {
   const tmpDir = mkdtempSync(join(tmpdir(), 'aha-parity-'));
   t.after(() => rmSync(tmpDir, { recursive: true, force: true }));
 
@@ -1446,8 +1446,8 @@ test('Parity & Hardening: Orca structured worker_done CLI, nested child ask/done
 
   const coordEnv = hookServer.envForPane('local-coord');
 
-  // 1. task-create with Orca's `--task-title` & `--display-name` + gate-create with JSON `--options '["yes","no"]'`.
-  await runNodeScript(CLI_PATH, ['orchestration', 'run-create', '--objective', 'Orca CLI Parity', '--json'], {
+  // 1. task-create with Aha's `--task-title` & `--display-name` + gate-create with JSON `--options '["yes","no"]'`.
+  await runNodeScript(CLI_PATH, ['orchestration', 'run-create', '--objective', 'Aha CLI Parity', '--json'], {
     env: coordEnv,
   });
   const createdTaskCli = await runNodeScript(
@@ -1542,7 +1542,7 @@ test('Parity & Hardening: Orca structured worker_done CLI, nested child ask/done
   );
   assert.equal(coordResolveGate.code, 0, coordResolveGate.stderr);
 
-  // 4. Depth-1 codex worker spawns depth-2 child helper, then codex settles via Orca's documented
+  // 4. Depth-1 codex worker spawns depth-2 child helper, then codex settles via Aha's documented
   //    `send --type worker_done --outcome succeeded` (without `--to`), and Coordinator reactivates codex via `@dispatch:<id>`!
   const childWorker = await service.workerStart({
     from: codexStart.ptyId,
@@ -1578,7 +1578,7 @@ test('Parity & Hardening: Orca structured worker_done CLI, nested child ask/done
   assert.equal(badWorkerDoneCli.code, 1, 'rejected worker_done must exit non-zero');
   assert.match(badWorkerDoneCli.stderr, /lifecycle_rejected/);
 
-  // Valid Orca `send --type worker_done --outcome succeeded --files-modified ...` without `--to`!
+  // Valid Aha `send --type worker_done --outcome succeeded --files-modified ...` without `--to`!
   const okWorkerDoneCli = await runNodeScript(
     CLI_PATH,
     [

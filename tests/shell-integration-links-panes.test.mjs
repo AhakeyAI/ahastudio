@@ -62,16 +62,16 @@ const rootDir = resolve(new URL('..', import.meta.url).pathname.replace(/^\/([a-
 const paneTree = await import(await loadRendererTsModule(join(rootDir, 'src/lib/terminal-pane-tree.ts')));
 const oscTrackerMod = await import(await loadRendererTsModule(join(rootDir, 'src/lib/terminal-osc-tracker.ts')));
 const httpUrlExtract = await import(
-  await loadRendererTsModule(join(rootDir, 'src/lib/orca-shared/terminal/links/terminal-http-url-extraction.ts'))
+  await loadRendererTsModule(join(rootDir, 'src/lib/shared/terminal/links/terminal-http-url-extraction.ts'))
 );
 const terminalLinksMod = await import(
-  await loadRendererTsModule(join(rootDir, 'src/lib/orca-shared/terminal/links/terminal-links.ts'))
+  await loadRendererTsModule(join(rootDir, 'src/lib/shared/terminal/links/terminal-links.ts'))
 );
 const hitTestingMod = await import(
-  await loadRendererTsModule(join(rootDir, 'src/lib/orca-shared/terminal/links/terminal-link-buffer-hit-testing.ts'))
+  await loadRendererTsModule(join(rootDir, 'src/lib/shared/terminal/links/terminal-link-buffer-hit-testing.ts'))
 );
 const oscLinkTargetMod = await import(
-  await loadRendererTsModule(join(rootDir, 'src/lib/orca-shared/terminal/links/terminal-osc-link-target.ts'))
+  await loadRendererTsModule(join(rootDir, 'src/lib/shared/terminal/links/terminal-osc-link-target.ts'))
 );
 const linkSafetyMod = await import(
   await loadRendererTsModule(join(rootDir, 'src/lib/terminal-links/terminal-link-safety.ts'))
