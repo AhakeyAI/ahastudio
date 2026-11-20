@@ -8,6 +8,12 @@
   color: var(--wrp-ink);
 }
 
+.local-terminal-workspace .obp-root button,
+.local-terminal-workspace .obp-root input:not([type='checkbox']):not([type='radio']),
+.local-terminal-workspace .obp-root select {
+  min-height: 0;
+}
+
 .obp-empty {
   gap: 10px;
 }

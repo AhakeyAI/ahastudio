@@ -165,16 +165,21 @@ export async function startTerminalDaemon(dataDir: string, secureEndpoint = rest
     server.once('error', reject);
     server.listen({ path: descriptor.endpoint, readableAll: false, writableAll: false }, resolve);
   });
+  // This process now owns the endpoint; clear any stale discovery record from a prior exited daemon
+  // before running ACL setup so polling clients wait instead of dialing a pre-ready pipe.
+  await unlink(join(dataDir, 'daemon.json')).catch(() => {});
   try {
     if (process.platform !== 'win32') await chmod(descriptor.endpoint, 0o600);
     await secureEndpoint(descriptor.endpoint);
-    await atomicJson(dataDir, 'daemon.json', descriptor);
     await persist();
+    ready = true;
+    await atomicJson(dataDir, 'daemon.json', descriptor);
   } catch (error) {
+    ready = false;
     server.close();
     throw error;
   }
-  ready = true; idle();
+  idle();
   const stopWarmup = warmWindowsConptyOnce();
   server.on('close', () => {
     stopWarmup();
@@ -182,7 +187,10 @@ export async function startTerminalDaemon(dataDir: string, secureEndpoint = rest
     // node-pty's Windows conout workers can outlive a naturally closed socket.
     // No live terminals or clients remain; flush metadata and release the host
     // process (and its native handles/threads) rather than leave an empty daemon.
-    void metadata.then(() => process.exit(0), () => process.exit(1));
+    void Promise.allSettled([
+      metadata,
+      unlink(join(dataDir, 'daemon.json')).catch(() => {}),
+    ]).then(([metaResult]) => process.exit(metaResult.status === 'fulfilled' ? 0 : 1));
   });
   return { descriptor, server };
 }

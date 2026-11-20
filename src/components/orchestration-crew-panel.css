@@ -21,6 +21,12 @@
   pointer-events: auto;
 }
 
+.local-terminal-workspace .aha-crew-overlay button,
+.local-terminal-workspace .aha-crew-overlay input:not([type='checkbox']):not([type='radio']),
+.local-terminal-workspace .aha-crew-overlay select {
+  min-height: 0;
+}
+
 .aha-crew-split-pill {
   display: inline-flex;
   align-items: stretch;
@@ -50,12 +56,15 @@
   border-color: #ef4444;
 }
 
-.aha-crew-mode-btn,
-.aha-crew-drawer-btn {
+.aha-crew-split-pill .aha-crew-mode-btn,
+.aha-crew-split-pill .aha-crew-drawer-btn {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 5px;
   height: 100%;
+  min-height: 0;
+  line-height: 1;
   border: 0;
   background: transparent;
   color: inherit;
@@ -63,15 +72,34 @@
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
+  flex-shrink: 0;
   transition: background-color 0.12s ease, color 0.12s ease;
 }
 
-.aha-crew-mode-btn {
+.aha-crew-split-pill .aha-crew-mode-btn {
   padding: 0 8px 0 9px;
 }
 
-.aha-crew-drawer-btn {
+.aha-crew-split-pill .aha-crew-drawer-btn {
   padding: 0 8px 0 6px;
+}
+
+html.handheld .aha-crew-split-pill {
+  height: 36px;
+}
+
+html.handheld .aha-crew-split-pill .aha-crew-mode-btn,
+html.handheld .aha-crew-split-pill .aha-crew-drawer-btn {
+  min-height: 0;
+  font-size: 12px;
+}
+
+html.handheld .aha-crew-split-pill .aha-crew-mode-btn {
+  padding: 0 10px 0 11px;
+}
+
+html.handheld .aha-crew-split-pill .aha-crew-drawer-btn {
+  padding: 0 10px 0 8px;
 }
 
 .aha-crew-mode-btn:hover,

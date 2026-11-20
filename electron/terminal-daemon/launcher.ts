@@ -5,6 +5,13 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { TerminalClient } from './client.js';
 import { prepareDataDir } from './storage.js';
 
+function isRetryableDaemonConnectError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code ?? '';
+  if (['ENOENT', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE'].includes(code)) return true;
+  const message = error instanceof Error ? error.message : '';
+  return message.startsWith('Terminal disconnected');
+}
+
 export interface DaemonLaunchOptions { dataDir: string; runtimePath: string; entryPath?: string }
 /** runtimePath is the app's process.execPath (Electron), never PATH's node.
  * This module is also usable by isolated test mains without importing Electron. */
@@ -13,7 +20,7 @@ export async function ensureTerminalDaemon(options: DaemonLaunchOptions) {
   await prepareDataDir(dataDir);
   try { return await TerminalClient.connect(dataDir); }
   catch (error) {
-    if (!['ENOENT', 'ECONNREFUSED'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+    if (!isRetryableDaemonConnectError(error)) throw error;
   }
   const child = spawn(options.runtimePath, [options.entryPath ?? fileURLToPath(new URL('./entry.js', import.meta.url)), dataDir], {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
@@ -29,7 +36,7 @@ export async function ensureTerminalDaemon(options: DaemonLaunchOptions) {
     if (launchError) throw launchError;
     try { return await TerminalClient.connect(dataDir); }
     catch (error) {
-      if (!['ENOENT', 'ECONNREFUSED'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+      if (!isRetryableDaemonConnectError(error)) throw error;
     }
     await delay(100);
   }

@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, rename, mkdir, rmdir } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rename, mkdir, rmdir, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createConnection } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ensureTerminalDaemon } from '../dist-electron/terminal-daemon/launcher.js';
+import { atomicJson, endpointFor } from '../dist-electron/terminal-daemon/storage.js';
 import { MAX_FRAME_BYTES, receive, send } from '../dist-electron/terminal-daemon/protocol.js';
 
 const runtimePath = resolve(process.env.AHA_D1_TEST_RUNTIME ?? 'node_modules/electron/dist/electron.exe');
@@ -117,4 +118,33 @@ test('Windows startup failure is session-local and persistence recovers after a 
   const records = JSON.parse(await readFile(target, 'utf8')).records;
   assert.equal(records.find(s => s.terminalId === good.terminalId).cols, 82);
   assert.equal((await client.terminate(good.terminalId)).exited, true);
+});
+
+test('Windows daemon recovers cleanly when a stale daemon.json exists on disk and removes it on idle exit', {
+  skip: process.platform !== 'win32', timeout: 25_000,
+}, async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'aha-d1-stale-'));
+  const staleInstanceId = randomUUID();
+  await atomicJson(dataDir, 'daemon.json', {
+    schemaVersion: 1,
+    protocolVersion: 1,
+    instanceId: staleInstanceId,
+    pid: 999999,
+    startedAt: new Date(Date.now() - 60_000).toISOString(),
+    endpoint: endpointFor(dataDir),
+  });
+  let daemonPid = 0;
+  t.after(async () => {
+    if (daemonPid) {
+      for (let i = 0; i < 50 && alive(daemonPid); i++) await delay(100);
+    }
+  });
+  const client = await ensureTerminalDaemon({ dataDir, runtimePath, entryPath });
+  daemonPid = client.descriptor.pid;
+  assert.notEqual(client.descriptor.instanceId, staleInstanceId);
+  assert.deepEqual(await client.inventory(), []);
+  client.disconnect();
+  for (let i = 0; i < 50 && alive(daemonPid); i++) await delay(100);
+  assert.equal(alive(daemonPid), false);
+  await assert.rejects(access(join(dataDir, 'daemon.json')));
 });
