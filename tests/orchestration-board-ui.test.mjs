@@ -532,3 +532,89 @@ test('EMPTY_SNAPSHOT and mergeRunSnapshot preserve memberCursorsByRun across run
   assert.deepEqual(merged.memberCursorsByRun.run_1, prev.memberCursorsByRun.run_1);
   assert.equal(merged.memberCursorsByRun.run_2.ver.lastReadSeq, 5);
 });
+
+test('buildBoardViewModel prefers active runs over stale stopped runs and reflects live coordinator/worker activity', () => {
+  const stoppedRun = makeRun('run_old', {
+    status: 'stopped',
+    coordinatorHandle: 'local-old-coord',
+    coordinatorPaneId: 'local-old-coord',
+    createdAt: isoAt(0),
+  });
+  const liveRun = makeRun('run_live', {
+    status: 'active',
+    coordinatorHandle: 'local-live-coord',
+    coordinatorPaneId: 'local-live-coord',
+    createdAt: isoAt(60),
+  });
+  const liveTask = makeTask('t_live', {
+    runId: 'run_live',
+    displayName: 'backend',
+    taskTitle: 'Wire sync',
+  });
+  const liveDispatch = makeDispatch('d_live', 't_live', {
+    runId: 'run_live',
+    assigneeHandle: 'local-worker-1',
+    assigneePaneId: 'local-worker-1',
+    cliId: 'codex',
+  });
+
+  const statuses = new Map([
+    [
+      'local-live-coord',
+      {
+        ptyId: 'local-live-coord',
+        agentId: 'claude',
+        state: 'working',
+        toolName: 'Read',
+        toolInput: 'src/app.ts',
+        updatedAt: Date.now(),
+        unread: false,
+      },
+    ],
+    [
+      'local-worker-1',
+      {
+        ptyId: 'local-worker-1',
+        agentId: 'codex',
+        state: 'working',
+        toolName: 'exec_command',
+        toolInput: 'npm test',
+        updatedAt: Date.now(),
+        unread: false,
+      },
+    ],
+  ]);
+
+  const snapshot = {
+    ...view.EMPTY_SNAPSHOT,
+    runs: [stoppedRun, liveRun],
+    tasks: [liveTask],
+    dispatches: [liveDispatch],
+    currentRunByConsumer: { 'local-old-coord': 'run_old', 'local-live-coord': 'run_live' },
+  };
+
+  // Even when focused on a pane bound to an old stopped run, active run takes precedence.
+  const liveVm = board.buildBoardViewModel(snapshot, {
+    activePtyId: 'local-old-coord',
+    agentStatuses: statuses,
+    livePaneIds: new Set(['local-live-coord', 'local-worker-1']),
+  });
+  assert.equal(liveVm.run?.id, 'run_live');
+  assert.equal(liveVm.isLive, true);
+  assert.equal(liveVm.runStatusLabel, 'Live');
+  assert.equal(liveVm.coordinator?.status, 'working');
+  assert.equal(liveVm.coordinator?.stageLabel, '执行中');
+  assert.equal(liveVm.coordinator?.liveActivity, 'Read: src/app.ts');
+  assert.equal(liveVm.members[0]?.liveActivity, 'exec_command: npm test');
+
+  // Explicitly inspecting the historical stopped run must NOT show coordinator as online.
+  const stoppedVm = board.buildBoardViewModel(snapshot, {
+    runId: 'run_old',
+    agentStatuses: statuses,
+  });
+  assert.equal(stoppedVm.isLive, false);
+  assert.equal(stoppedVm.runStatusLabel, '历史 · 已停止');
+  assert.equal(stoppedVm.coordinator?.status, 'stopped');
+  assert.equal(stoppedVm.coordinator?.stageLabel, '已结束');
+  assert.equal(stoppedVm.coordinator?.liveActivity, null);
+});

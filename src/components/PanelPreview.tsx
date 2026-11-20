@@ -40,6 +40,7 @@ export interface AgentPromptTarget {
   leafId: string;
   label: string;
   cwd?: string;
+  cliId?: string;
   /** Launched as an agent CLI rather than a plain shell. */
   isAgent: boolean;
   isActive: boolean;

@@ -220,6 +220,7 @@ export function LocalTerminalWorkspace({
         leafId,
         label: `${pane?.title ?? win.title}${leafIds.length > 1 ? ` · 窗格 ${index + 1}` : ''}`,
         cwd: terminalSessionStore.getState(leafId).cwd ?? pane?.cwd ?? win.cwd,
+        cliId: cliId && cliId !== 'shell' ? cliId : undefined,
         isAgent: Boolean(cliId && cliId !== 'shell'),
         isActive: leafId === activeLeafId && win.id === active?.id,
         status,

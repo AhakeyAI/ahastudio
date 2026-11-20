@@ -9,6 +9,7 @@ import {
   type ReactElement,
 } from 'react';
 import { FolderTree, GitBranch, GitFork, Maximize2, Minimize2, Network, RefreshCw, X } from 'lucide-react';
+import { agentStatusClient } from '../lib/agent-status-client';
 import { buildTreeDecorations } from '../lib/git-panel-model';
 import { orchestrationClient } from '../lib/orchestration-client';
 import type { GitStatusResult } from '../types';
@@ -142,21 +143,40 @@ export function WorkspaceRightPanel({
   }, [commandSignal, scheduleRefresh]);
 
   useEffect(() => {
-    const onFocus = () => scheduleRefresh(true);
+    const syncBoard = () => {
+      if (tab === 'board') {
+        void orchestrationClient.refresh();
+        void agentStatusClient.refresh();
+      }
+    };
+    const onFocus = () => {
+      scheduleRefresh(true);
+      syncBoard();
+    };
     const onVisible = () => {
-      if (document.visibilityState === 'visible') scheduleRefresh(true);
+      if (document.visibilityState === 'visible') {
+        scheduleRefresh(true);
+        syncBoard();
+      }
     };
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onVisible);
     const timer = setInterval(() => {
-      if (document.visibilityState === 'visible' && document.hasFocus()) void refresh();
+      if (document.visibilityState === 'visible' && document.hasFocus()) {
+        if (tab === 'board') {
+          void orchestrationClient.refresh();
+          void agentStatusClient.refresh();
+        } else {
+          void refresh();
+        }
+      }
     }, STATUS_POLL_MS);
     return () => {
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisible);
       clearInterval(timer);
     };
-  }, [refresh, scheduleRefresh]);
+  }, [refresh, scheduleRefresh, tab]);
 
   useEffect(() => {
     setPreview(null);
@@ -239,7 +259,14 @@ export function WorkspaceRightPanel({
 
   let body: ReactElement;
   if (tab === 'board') {
-    body = <OrchestrationBoardPanel activePtyId={activePtyId} onNotify={onNotify} />;
+    body = (
+      <OrchestrationBoardPanel
+        activePtyId={activePtyId}
+        agentTargets={agentTargets}
+        onFocusAgentTarget={onAgentPromptSent}
+        onNotify={onNotify}
+      />
+    );
   } else if (!cwd || !filesRoot) {
     body = (
       <div className="wrp-empty">
@@ -337,8 +364,12 @@ export function WorkspaceRightPanel({
           title="刷新"
           aria-label="刷新"
           onClick={() => {
-            if (tab === 'board') void orchestrationClient.refresh();
-            else scheduleRefresh(true);
+            if (tab === 'board') {
+              void orchestrationClient.refresh();
+              void agentStatusClient.refresh();
+            } else {
+              scheduleRefresh(true);
+            }
           }}
         >
           <RefreshCw size={13} className={loading ? 'wrp-spin' : ''} />

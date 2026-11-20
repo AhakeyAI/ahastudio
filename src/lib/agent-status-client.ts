@@ -34,6 +34,36 @@ function upsert(next: AgentPaneStatus, fromPush: boolean) {
   }
 }
 
+async function refresh(): Promise<void> {
+  if (typeof window === 'undefined') return;
+  const api = window.vibeMeet?.agent;
+  if (!api) return;
+  try {
+    const res = await api.listStatuses();
+    if (!res.ok) return;
+    hookPort = res.hookPort;
+    const seen = new Set<string>();
+    let changed = false;
+    for (const status of res.statuses) {
+      seen.add(status.ptyId);
+      const prev = statuses.get(status.ptyId);
+      if (!prev || prev.updatedAt <= status.updatedAt) {
+        statuses.set(status.ptyId, status);
+        changed = true;
+      }
+    }
+    for (const ptyId of [...statuses.keys()]) {
+      if (!seen.has(ptyId)) {
+        statuses.delete(ptyId);
+        changed = true;
+      }
+    }
+    if (changed) notify();
+  } catch {
+    /* ignore transient IPC failure */
+  }
+}
+
 function start() {
   if (started || typeof window === 'undefined') return;
   const api = window.vibeMeet?.agent;
@@ -43,14 +73,7 @@ function start() {
   api.onFocusPane?.(({ ptyId }) => {
     for (const listener of focusListeners) listener(ptyId);
   });
-  void api
-    .listStatuses()
-    .then((res) => {
-      if (!res.ok) return;
-      hookPort = res.hookPort;
-      for (const status of res.statuses) upsert(status, false);
-    })
-    .catch(() => {});
+  void refresh();
 }
 
 export const agentStatusClient = {
@@ -64,6 +87,7 @@ export const agentStatusClient = {
   getSnapshot: () => revision,
   get: (ptyId: string): AgentPaneStatus | null => statuses.get(ptyId) ?? null,
   getHookPort: () => hookPort,
+  refresh,
   onAttention(listener: AttentionListener) {
     start();
     attentionListeners.add(listener);

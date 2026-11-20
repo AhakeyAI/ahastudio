@@ -26,6 +26,7 @@ import type {
   OrchestrationBoardPostKind,
   OrchestrationDispatchProposal,
 } from '../types';
+import { agentStatusDetail, agentStatusLabel } from '../lib/agent-status-view';
 import { agentStatusClient } from '../lib/agent-status-client';
 import { orchestrationClient } from '../lib/orchestration-client';
 import {
@@ -40,6 +41,7 @@ import {
 import { isMacSearchPlatform } from '../lib/terminal-search-options';
 import { dispatchFocusOrchestrationTarget } from '../lib/terminal-links/orchestration-terminal-links';
 import { useAgentStatuses } from './AgentStatusBadge';
+import type { AgentPromptTarget } from './PanelPreview';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
 import './orchestration-board-panel.css';
 
@@ -93,9 +95,13 @@ function renderAvatarContent(role: string, cliId: string | null) {
 
 export function OrchestrationBoardPanel({
   activePtyId,
+  agentTargets = [],
+  onFocusAgentTarget,
   onNotify,
 }: {
   activePtyId?: string;
+  agentTargets?: AgentPromptTarget[];
+  onFocusAgentTarget?: (target: AgentPromptTarget) => void;
   onNotify?: (message: string) => void;
 }) {
   const snapshot = useSyncExternalStore(
@@ -144,8 +150,39 @@ export function OrchestrationBoardPanel({
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
 
   const postRefs = useRef(new Map<number, HTMLElement>());
+  const feedRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
+  const prevHeadSeqRef = useRef(0);
+  const seenActiveRunIdsRef = useRef<Set<string> | null>(null);
   const composerInputRef = useRef<HTMLInputElement | null>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const livePaneIds = useMemo(
+    () => new Set(agentTargets.map((target) => target.ptyId)),
+    [agentTargets],
+  );
+
+  // Sync fresh orchestration & agent statuses whenever the Board tab mounts.
+  useEffect(() => {
+    void orchestrationClient.refresh();
+    void agentStatusClient.refresh();
+  }, []);
+
+  // Auto-follow whenever a brand-new active collaboration run starts.
+  useEffect(() => {
+    const activeIds = snapshot.runs.filter((r) => r.status === 'active').map((r) => r.id);
+    if (seenActiveRunIdsRef.current === null) {
+      seenActiveRunIdsRef.current = new Set(activeIds);
+      return;
+    }
+    const brandNew = activeIds.find((id) => !seenActiveRunIdsRef.current!.has(id));
+    seenActiveRunIdsRef.current = new Set(activeIds);
+    if (brandNew) {
+      setSelectedRunId(null);
+      setReplaySeq(null);
+      setPlaying(false);
+    }
+  }, [snapshot.runs]);
 
   const model = useMemo(
     () =>
@@ -153,8 +190,9 @@ export function OrchestrationBoardPanel({
         runId: selectedRunId,
         agentStatuses: agents,
         activePtyId: activePtyId ?? null,
+        livePaneIds,
       }),
-    [snapshot, selectedRunId, agents, agentStatusRev, activePtyId],
+    [snapshot, selectedRunId, agents, agentStatusRev, activePtyId, livePaneIds],
   );
 
   useEffect(() => {
@@ -162,7 +200,26 @@ export function OrchestrationBoardPanel({
     setPlaying(false);
     setRoleFilter('all');
     setKindFilter('all');
+    stickToBottomRef.current = true;
+    prevHeadSeqRef.current = 0;
   }, [model.run?.id]);
+
+  // Auto-scroll to the latest post when new board messages arrive and the user is at the bottom.
+  useEffect(() => {
+    if (subTab !== 'board') return;
+    if (model.headSeq > prevHeadSeqRef.current && stickToBottomRef.current) {
+      const raf = requestAnimationFrame(() => {
+        const el = feedRef.current;
+        if (el) {
+          el.scrollTo({ top: el.scrollHeight, behavior: prevHeadSeqRef.current === 0 ? 'auto' : 'smooth' });
+        }
+      });
+      prevHeadSeqRef.current = model.headSeq;
+      return () => cancelAnimationFrame(raf);
+    }
+    prevHeadSeqRef.current = model.headSeq;
+    return undefined;
+  }, [model.headSeq, subTab]);
 
   useEffect(() => {
     if (model.pendingProposals.length === 0) return;
@@ -299,9 +356,50 @@ export function OrchestrationBoardPanel({
         onNotify?.(res.error);
       } else {
         setComposerText('');
+        stickToBottomRef.current = true;
       }
     } finally {
       setComposerBusy(false);
+    }
+  };
+
+  const handleTogglePaneMode = async (ptyId: string, currentlyEnabled: boolean) => {
+    const api = window.vibeMeet.orchestration?.setPaneMode;
+    if (!api) {
+      onNotify?.('编排模式接口不可用');
+      return;
+    }
+    setBusyId(`mode:${ptyId}`);
+    try {
+      const res = await api({ ptyId, enabled: !currentlyEnabled });
+      if (!res.ok) {
+        onNotify?.(res.error);
+      } else {
+        onNotify?.(res.enabled ? '已开启编排模式' : '已关闭编排模式');
+      }
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleClearHistory = async () => {
+    if (model.hasAnyActiveRun) {
+      onNotify?.('仍有进行中的协作任务，无法清理历史');
+      return;
+    }
+    const api = window.vibeMeet.orchestration?.reset;
+    if (!api) return;
+    setBusyId('reset-history');
+    try {
+      const res = await api({ all: true });
+      if (!res.ok) {
+        onNotify?.(res.error);
+      } else {
+        setSelectedRunId(null);
+        onNotify?.('已清理历史协作记录');
+      }
+    } finally {
+      setBusyId(null);
     }
   };
 
@@ -633,22 +731,134 @@ export function OrchestrationBoardPanel({
     );
   };
 
+  const orchestrationModeSet = useMemo(
+    () => new Set(snapshot.orchestrationModePanes ?? []),
+    [snapshot.orchestrationModePanes],
+  );
+
+  // Live open Agent CLI terminals in the current workspace, synced with agentStatusClient & orchestration mode.
+  const liveWorkspaceAgents = useMemo(() => {
+    const runPaneIds = new Set<string>();
+    if (model.isLive) {
+      if (model.coordinator?.ptyId) runPaneIds.add(model.coordinator.ptyId);
+      for (const m of model.members) {
+        if (m.ptyId && !m.released) runPaneIds.add(m.ptyId);
+      }
+    }
+    return agentTargets
+      .filter((target) => target.isAgent && !runPaneIds.has(target.ptyId))
+      .map((target) => {
+        const liveStatus = agents.get(target.ptyId) ?? target.status ?? null;
+        const state = liveStatus?.state ?? 'idle';
+        const tone =
+          state === 'working'
+            ? 'accent'
+            : state === 'waiting'
+              ? 'warn'
+              : state === 'done'
+                ? 'ok'
+                : state === 'error'
+                  ? 'error'
+                  : 'neutral';
+        const stageLabel = liveStatus ? agentStatusLabel(liveStatus) : '空闲';
+        const detail = liveStatus ? agentStatusDetail(liveStatus) : '';
+        return {
+          target,
+          ptyId: target.ptyId,
+          label: target.label,
+          cliId: liveStatus?.agentId ?? target.cliId ?? null,
+          tone,
+          stageLabel,
+          detail,
+          isOrchestrationMode: orchestrationModeSet.has(target.ptyId),
+          isActive: target.isActive,
+        };
+      });
+  }, [agentTargets, agents, agentStatusRev, model.isLive, model.coordinator?.ptyId, model.members, orchestrationModeSet]);
+
+  const filteredLiveAgents = useMemo(() => {
+    const q = memberSearch.trim().toLowerCase();
+    if (!q) return liveWorkspaceAgents;
+    return liveWorkspaceAgents.filter((item) =>
+      `${item.label} ${item.cliId ?? ''} ${item.stageLabel} ${item.detail}`.toLowerCase().includes(q),
+    );
+  }, [liveWorkspaceAgents, memberSearch]);
+
+  const renderLiveWorkspaceAgentsList = (
+    items: typeof liveWorkspaceAgents,
+    compactHeading?: string,
+  ) => (
+    <div className="obp-live-section">
+      {compactHeading && <div className="obp-team-heading">{compactHeading}</div>}
+      {items.map((item) => (
+        <div
+          key={item.ptyId}
+          className={`obp-member-card is-worker is-workspace-live ${item.isActive ? 'is-focused-pane' : ''}`}
+        >
+          <button
+            type="button"
+            className="obp-member-card-body"
+            onClick={() => onFocusAgentTarget?.(item.target)}
+          >
+            <div className="obp-member-card-top">
+              <span className="obp-avatar-wrap">
+                <span className={`obp-avatar obp-avatar-c${roleColorIndex(item.cliId ?? item.label)}`}>
+                  {renderAvatarContent(item.label, item.cliId)}
+                </span>
+                <span className={`obp-status-dot tone-${item.tone}`} />
+              </span>
+              <div className="obp-member-title-col">
+                <div className="obp-member-name-row">
+                  <strong>{item.label}</strong>
+                  <span className={`obp-stage-pill tone-${item.tone}`}>{item.stageLabel}</span>
+                </div>
+                {item.detail && <p className="obp-member-live-activity">{item.detail}</p>}
+              </div>
+            </div>
+          </button>
+          <div className="obp-member-actions">
+            <button
+              type="button"
+              className={`obp-mode-chip ${item.isOrchestrationMode ? 'is-on' : ''}`}
+              title={item.isOrchestrationMode ? '点击关闭该终端编排模式' : '点击开启该终端编排模式'}
+              disabled={busyId === `mode:${item.ptyId}`}
+              onClick={() => void handleTogglePaneMode(item.ptyId, item.isOrchestrationMode)}
+            >
+              {item.isOrchestrationMode ? '编排中' : '编排'}
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+
   if (!model.run && model.pendingProposals.length === 0) {
     return (
       <div className="obp-root">
-        <div className="wrp-empty obp-empty">
-          <Network size={24} />
-          <p>暂无协作任务</p>
-          <small>
-            点击终端右上角「编排」或按 {shortcutLabel} 开启多 Agent 协作
-          </small>
+        <div className="obp-empty-wrap">
+          <div className="wrp-empty obp-empty">
+            <Network size={22} />
+            <p>暂无进行中的协作任务</p>
+            <small>
+              开启任一终端的「编排」模式（或按 {shortcutLabel}），即可自动派发多 Agent 协作
+            </small>
+          </div>
+          {liveWorkspaceAgents.length > 0 && (
+            <div className="obp-members-list">
+              {renderLiveWorkspaceAgentsList(
+                liveWorkspaceAgents,
+                `当前活跃 AGENT · ${liveWorkspaceAgents.length}`,
+              )}
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
   const availableAgents = agentsRoster.filter((a) => a.available);
-  const memberTotalCount = (model.coordinator ? 1 : 0) + model.members.length;
+  const memberTotalCount =
+    (model.coordinator ? 1 : 0) + model.members.length + liveWorkspaceAgents.length;
   const quickMentionRoles = [
     ...(model.coordinator ? ['coordinator'] : []),
     ...model.members.filter((m) => !m.released).map((m) => m.role),
@@ -753,8 +963,20 @@ export function OrchestrationBoardPanel({
           )}
           <span className={`obp-live-pill ${model.isLive ? 'is-live' : 'is-done'}`}>
             <span className="obp-live-dot" aria-hidden="true" />
-            {model.isLive ? 'Live' : 'Done'}
+            {model.runStatusLabel}
           </span>
+          {!model.hasAnyActiveRun && model.runs.length > 0 && (
+            <button
+              type="button"
+              className="wrp-icon-btn obp-clear-history-btn"
+              title="清理历史协作记录"
+              aria-label="清理历史协作记录"
+              disabled={busyId === 'reset-history'}
+              onClick={() => void handleClearHistory()}
+            >
+              <Trash2 size={12} />
+            </button>
+          )}
         </div>
         <nav className="obp-subtabs" role="tablist" aria-label="协作视图">
           <button
@@ -841,7 +1063,29 @@ export function OrchestrationBoardPanel({
             </select>
           </div>
 
-          <div className="obp-feed">
+          <div
+            ref={feedRef}
+            className="obp-feed"
+            onScroll={(e) => {
+              const el = e.currentTarget;
+              const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+              stickToBottomRef.current = distanceFromBottom <= 60;
+            }}
+          >
+            {!model.isLive && liveWorkspaceAgents.length > 0 && (
+              <div className="obp-history-banner">
+                <span>
+                  当前展示为历史记录 · 工作区另有 <strong>{liveWorkspaceAgents.length}</strong> 个活跃 Agent
+                </span>
+                <button
+                  type="button"
+                  className="obp-banner-link"
+                  onClick={() => setSubTab('members')}
+                >
+                  查看实时状态
+                </button>
+              </div>
+            )}
             {model.pendingProposals.length > 0 && (
               <div className="obp-attention-stack">{renderProposalStrip(model.pendingProposals)}</div>
             )}
@@ -1219,6 +1463,19 @@ export function OrchestrationBoardPanel({
           </div>
 
           <div className="obp-members-list">
+            {filteredLiveAgents.length > 0 &&
+              renderLiveWorkspaceAgentsList(
+                filteredLiveAgents,
+                `当前工作区 AGENT · ${filteredLiveAgents.length}`,
+              )}
+
+            {(showCoordinatorInMembers || filteredMembers.length > 0) && (
+              <div className="obp-team-heading">
+                {model.isLive ? '当前协作团队' : '历史协作记录'} ·{' '}
+                {(showCoordinatorInMembers ? 1 : 0) + filteredMembers.length}
+              </div>
+            )}
+
             {showCoordinatorInMembers && model.coordinator && (
               <button
                 type="button"
@@ -1246,9 +1503,17 @@ export function OrchestrationBoardPanel({
                           : ''}
                       </span>
                     </div>
-                    <div className="obp-member-sub">{model.coordinator.subtitle}</div>
+                    <div className="obp-member-sub-row">
+                      <span className="obp-member-sub">{model.coordinator.subtitle}</span>
+                      <span className={`obp-stage-pill tone-${model.coordinator.tone}`}>
+                        {model.coordinator.stageLabel}
+                      </span>
+                    </div>
                   </div>
                 </div>
+                {model.coordinator.liveActivity && (
+                  <p className="obp-member-live-activity">{model.coordinator.liveActivity}</p>
+                )}
                 {model.coordinator.latestPostPreview && (
                   <p className="obp-member-preview is-two-line">
                     {model.coordinator.latestPostPreview}
@@ -1257,10 +1522,10 @@ export function OrchestrationBoardPanel({
               </button>
             )}
 
-            <div className="obp-team-heading">TEAM {filteredMembers.length}</div>
-
             {filteredMembers.length === 0 ? (
-              <div className="obp-feed-empty">暂无下属 Worker 成员。</div>
+              filteredLiveAgents.length === 0 && (
+                <div className="obp-feed-empty">暂无下属 Worker 成员。</div>
+              )
             ) : (
               filteredMembers.map((member) => {
                 const colorIdx = roleColorIndex(member.role);
@@ -1299,6 +1564,9 @@ export function OrchestrationBoardPanel({
                           </div>
                         </div>
                       </div>
+                      {member.liveActivity && (
+                        <p className="obp-member-live-activity">{member.liveActivity}</p>
+                      )}
                       {member.latestPostPreview && (
                         <p className="obp-member-preview">{member.latestPostPreview}</p>
                       )}

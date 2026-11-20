@@ -55,10 +55,11 @@ export interface BoardCoordinatorCard {
   ptyId: string | null;
   cliId: string | null;
   model: string | null;
-  status: 'working' | 'waiting' | 'idle';
+  status: 'working' | 'waiting' | 'idle' | 'offline' | 'stopped';
   stageLabel: string;
   tone: StatusTone;
   subtitle: string;
+  liveActivity: string | null;
   latestPostSeq: number | null;
   latestPostPreview: string;
 }
@@ -79,6 +80,7 @@ export interface BoardMemberCard {
   branch: string | null;
   worktreePath: string | null;
   taskSummary: string;
+  liveActivity: string | null;
   latestPostSeq: number | null;
   latestPostPreview: string;
   isSettled: boolean;
@@ -91,6 +93,8 @@ export interface BoardViewModel {
   runs: OrchestrationRunRecord[];
   run: OrchestrationRunRecord | null;
   isLive: boolean;
+  runStatusLabel: string;
+  hasAnyActiveRun: boolean;
   headSeq: number;
   posts: BoardPostView[];
   coordinator: BoardCoordinatorCard | null;
@@ -322,6 +326,50 @@ function cleanTaskSummary(task: OrchestrationTaskRecord | null, role: string): s
   return desc || taskTitle(task);
 }
 
+function formatLiveAgentActivity(status: {
+  state?: string;
+  waitKind?: string;
+  toolName?: string;
+  toolInput?: string;
+  message?: string;
+} | null | undefined): string | null {
+  if (!status) return null;
+  const tool = status.toolName?.trim();
+  const input = status.toolInput?.trim();
+  const msg = status.message?.trim();
+  if (status.state === 'waiting') {
+    const prefix = status.waitKind === 'question' ? '等待回答' : '等待授权';
+    if (tool && input) return compactPreview(`${prefix} · ${tool}: ${input}`, 110);
+    if (tool) return compactPreview(`${prefix} · ${tool}`, 110);
+    if (msg) return compactPreview(`${prefix} · ${msg}`, 110);
+    return prefix;
+  }
+  if (status.state === 'working') {
+    if (tool && input) return compactPreview(`${tool}: ${input}`, 110);
+    if (tool) return compactPreview(`正在执行 ${tool}`, 110);
+    if (msg) return compactPreview(msg, 110);
+    return null;
+  }
+  if (status.state === 'error' && msg) {
+    return compactPreview(msg, 110);
+  }
+  return null;
+}
+
+function runStatusDisplayLabel(status: OrchestrationRunRecord['status']): string {
+  switch (status) {
+    case 'active':
+      return 'Live';
+    case 'completed':
+      return '历史 · 已完成';
+    case 'failed':
+      return '历史 · 失败';
+    case 'stopped':
+    default:
+      return '历史 · 已停止';
+  }
+}
+
 function pickTargetRun(
   snapshot: OrchestrationSnapshot,
   opts: { runId?: string | null; activePtyId?: string | null },
@@ -332,29 +380,55 @@ function pickTargetRun(
     const explicit = sorted.find((r) => r.id === opts.runId);
     if (explicit) return explicit;
   }
-  if (opts.activePtyId) {
-    const ptyId = opts.activePtyId;
+
+  const activeRuns = sorted.filter((r) => r.status === 'active');
+
+  const findBoundRunForPty = (ptyId: string, pool: OrchestrationRunRecord[]): OrchestrationRunRecord | null => {
     const boundId = snapshot.currentRunByConsumer[ptyId];
     if (boundId) {
-      const bound = sorted.find((r) => r.id === boundId);
+      const bound = pool.find((r) => r.id === boundId);
       if (bound) return bound;
     }
-    const coordRun = sorted.find(
+    const coordRun = pool.find(
       (r) => r.coordinatorPaneId === ptyId || r.coordinatorHandle === ptyId,
     );
     if (coordRun) return coordRun;
     const activeDispatch = snapshot.dispatches.find(
       (d) =>
         (d.assigneePaneId === ptyId || d.assigneeHandle === ptyId) &&
-        (d.status === 'pending' || d.status === 'dispatched'),
+        (d.status === 'pending' || d.status === 'dispatched') &&
+        pool.some((r) => r.id === d.runId),
     );
     const anyDispatch =
       activeDispatch ??
-      snapshot.dispatches.find((d) => d.assigneePaneId === ptyId || d.assigneeHandle === ptyId);
+      snapshot.dispatches.find(
+        (d) =>
+          (d.assigneePaneId === ptyId || d.assigneeHandle === ptyId) &&
+          pool.some((r) => r.id === d.runId),
+      );
     if (anyDispatch) {
-      const workerRun = sorted.find((r) => r.id === anyDispatch.runId);
-      if (workerRun) return workerRun;
+      return pool.find((r) => r.id === anyDispatch.runId) ?? null;
     }
+    return null;
+  };
+
+  // Prefer active runs over historical stopped runs so a live collaboration is never hidden by old history.
+  if (activeRuns.length > 0) {
+    if (opts.activePtyId) {
+      const activeForPane = findBoundRunForPty(opts.activePtyId, activeRuns);
+      if (activeForPane) return activeForPane;
+    }
+    const activeCoordRunId = snapshot.activeCoordinatorRun?.runId;
+    if (activeCoordRunId) {
+      const found = activeRuns.find((r) => r.id === activeCoordRunId);
+      if (found) return found;
+    }
+    return activeRuns[0] ?? null;
+  }
+
+  if (opts.activePtyId) {
+    const historicalForPane = findBoundRunForPty(opts.activePtyId, sorted);
+    if (historicalForPane) return historicalForPane;
   }
   const activeCoordRunId = snapshot.activeCoordinatorRun?.runId;
   if (activeCoordRunId) {
@@ -370,9 +444,11 @@ export function buildBoardViewModel(
     runId?: string | null;
     agentStatuses?: AgentStatusLookup;
     activePtyId?: string | null;
+    livePaneIds?: ReadonlySet<string>;
   } = {},
 ): BoardViewModel {
   const runs = sortRuns(snapshot.runs);
+  const hasAnyActiveRun = runs.some((r) => r.status === 'active');
   const run = pickTargetRun(snapshot, opts);
   const pendingProposalsAll = (snapshot.pendingProposals ?? []).filter(
     (p) => p.status === 'pending',
@@ -383,6 +459,8 @@ export function buildBoardViewModel(
       runs,
       run: null,
       isLive: false,
+      runStatusLabel: '空闲',
+      hasAnyActiveRun,
       headSeq: 0,
       posts: [],
       coordinator: null,
@@ -528,12 +606,35 @@ export function buildBoardViewModel(
   }
 
   const coordLatestPost = latestPostByRole.get('coordinator') ?? null;
-  const coordStatus: 'working' | 'waiting' | 'idle' =
-    coordAgentStatus?.state === 'working'
-      ? 'working'
-      : coordAgentStatus?.state === 'waiting'
-        ? 'waiting'
-        : 'idle';
+  const coordPaneAlive =
+    Boolean(coordAgentStatus) || Boolean(coordPtyId && opts.livePaneIds?.has(coordPtyId));
+  let coordStatus: BoardCoordinatorCard['status'];
+  let coordStageLabel: string;
+  let coordTone: StatusTone;
+  if (run.status !== 'active') {
+    coordStatus = 'stopped';
+    coordStageLabel =
+      run.status === 'completed' ? '已完成' : run.status === 'failed' ? '失败' : '已结束';
+    coordTone = run.status === 'completed' ? 'ok' : run.status === 'failed' ? 'error' : 'neutral';
+  } else if (coordAgentStatus?.state === 'working') {
+    coordStatus = 'working';
+    coordStageLabel = '执行中';
+    coordTone = 'accent';
+  } else if (coordAgentStatus?.state === 'waiting') {
+    coordStatus = 'waiting';
+    coordStageLabel = coordAgentStatus.waitKind === 'question' ? '待回答' : '待授权';
+    coordTone = 'warn';
+  } else if (coordPaneAlive) {
+    coordStatus = 'idle';
+    coordStageLabel = '在线';
+    coordTone = 'ok';
+  } else {
+    coordStatus = 'offline';
+    coordStageLabel = '离线';
+    coordTone = 'neutral';
+  }
+  const coordLiveActivity =
+    run.status === 'active' ? formatLiveAgentActivity(coordAgentStatus) : null;
   const coordinator: BoardCoordinatorCard = {
     role: 'coordinator',
     label: '@coordinator',
@@ -541,10 +642,10 @@ export function buildBoardViewModel(
     cliId: coordCliId,
     model: null,
     status: coordStatus,
-    stageLabel:
-      coordStatus === 'working' ? '执行中' : coordStatus === 'waiting' ? '待输入' : '在线',
-    tone: coordStatus === 'working' ? 'accent' : coordStatus === 'waiting' ? 'warn' : 'neutral',
+    stageLabel: coordStageLabel,
+    tone: coordTone,
     subtitle: coordCliId ? `Coordinator · ${coordCliId}` : 'Coordinator',
+    liveActivity: coordLiveActivity,
     latestPostSeq: coordLatestPost?.boardSeq ?? null,
     latestPostPreview: coordLatestPost
       ? compactPreview(coordLatestPost.body, 140)
@@ -589,6 +690,8 @@ export function buildBoardViewModel(
       const cliId = dispatch.cliId ?? agentStatus?.agentId ?? null;
       const latestPost = latestPostByRole.get(role.toLowerCase()) ?? null;
       const summary = cleanTaskSummary(task, role);
+      const liveActivity =
+        !isSettled && !dispatch.releasedAt ? formatLiveAgentActivity(agentStatus) : null;
 
       return {
         key: dispatch.id,
@@ -606,6 +709,7 @@ export function buildBoardViewModel(
         branch: dispatch.branch ?? null,
         worktreePath: dispatch.worktreePath ?? task?.worktreePath ?? null,
         taskSummary: summary,
+        liveActivity,
         latestPostSeq: latestPost?.boardSeq ?? null,
         latestPostPreview: latestPost
           ? compactPreview(latestPost.body, 110)
@@ -637,6 +741,8 @@ export function buildBoardViewModel(
     runs,
     run,
     isLive: run.status === 'active',
+    runStatusLabel: runStatusDisplayLabel(run.status),
+    hasAnyActiveRun,
     headSeq,
     posts,
     coordinator,
