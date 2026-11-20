@@ -262,7 +262,7 @@ export class DaemonTerminalSessions {
         : payload.extraArgs;
       const target =
         payload.terminalId || payload.cliId || payload.shellId
-          ? resolveLocalTerminal(payload.cliId, payload.shellId, mergedArgs)
+          ? resolveLocalTerminal(payload.cliId, payload.shellId, mergedArgs, { appearance: payload.appearance })
           : null;
       const cwd = resolve(payload.cwd ?? target?.cwd ?? this.currentCwd() ?? process.cwd());
       const rawFile = target?.file ?? resolveDefaultShell();

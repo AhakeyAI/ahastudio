@@ -49,6 +49,42 @@ function decode(data: string) {
   return Uint8Array.from(atob(data), (char) => char.charCodeAt(0));
 }
 
+function parseHexRgb(hex: string | undefined): [number, number, number] | null {
+  if (!hex) return null;
+  const trimmed = hex.trim().replace(/^#/, '');
+  if (trimmed.length === 3 && /^[0-9a-fA-F]{3}$/.test(trimmed)) {
+    return [
+      Number.parseInt(trimmed[0] + trimmed[0], 16),
+      Number.parseInt(trimmed[1] + trimmed[1], 16),
+      Number.parseInt(trimmed[2] + trimmed[2], 16),
+    ];
+  }
+  if ((trimmed.length === 6 || trimmed.length === 8) && /^[0-9a-fA-F]+$/.test(trimmed)) {
+    return [
+      Number.parseInt(trimmed.slice(0, 2), 16),
+      Number.parseInt(trimmed.slice(2, 4), 16),
+      Number.parseInt(trimmed.slice(4, 6), 16),
+    ];
+  }
+  return null;
+}
+
+function formatOscRgb16(hex: string | undefined, fallback: string): string {
+  const [r, g, b] = parseHexRgb(hex) ?? parseHexRgb(fallback) ?? [0x1e, 0x1e, 0x1e];
+  const ch = (n: number) => n.toString(16).padStart(2, '0').repeat(2);
+  return `rgb:${ch(r)}/${ch(g)}/${ch(b)}`;
+}
+
+function isLightThemeBackground(theme: ITheme | undefined): boolean {
+  const rgb = parseHexRgb(theme?.background);
+  if (!rgb) return false;
+  return (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) / 255 >= 0.5;
+}
+
+function colorSchemeReport(theme: ITheme | undefined): string {
+  return isLightThemeBackground(theme) ? '\x1b[?997;2n' : '\x1b[?997;1n';
+}
+
 /** Owns the terminal screen and stream; a React surface only borrows its DOM. */
 export class TerminalSession {
   readonly element = document.createElement('div');
@@ -75,6 +111,8 @@ export class TerminalSession {
   private closePromise?: Promise<void>;
   private state = INITIAL_TERMINAL_STATE;
   private decoder = new TextDecoder('utf-8', { fatal: false });
+  private replayDepth = 0;
+  private colorSchemeReporting = false;
   private oscTracker = createTerminalOscTracker({
     onUpdate: (osc) => {
       this.setState({
@@ -115,6 +153,7 @@ export class TerminalSession {
     });
     const title = this.terminal.onTitleChange((value) => this.setState({ title: value }));
     this.cleanup.push(() => input.dispose(), () => title.dispose());
+    this.registerColorSchemeResponders();
     this.streamCleanup.push(transport.onData((event) => {
       if (event.ptyId !== (this.ptyId ?? transport.expectedPtyId)) return;
       if (this.destroyed || this.closeRequested || this.overflowed) return;
@@ -261,6 +300,82 @@ export class TerminalSession {
     }
   }
 
+  private emitProtocolReply(reply: string) {
+    if (!this.ptyId || this.closeRequested || this.destroyed || this.state.phase !== 'running' || this.replayDepth > 0) {
+      return;
+    }
+    const targetPtyId = this.ptyId;
+    void Promise.resolve().then(() => {
+      if (!this.closeRequested && !this.destroyed && this.state.phase === 'running' && this.ptyId === targetPtyId) {
+        return this.transport.input(targetPtyId, reply);
+      }
+    }).catch((error) => this.setState({ error: String(error) }));
+  }
+
+  private registerColorSchemeResponders() {
+    const parser = this.terminal.parser;
+    if (!parser) return;
+    const oscColorFor = (ident: number): string | null => {
+      const theme = this.terminal.options.theme;
+      if (ident === 10) return formatOscRgb16(theme?.foreground, '#d4d4d4');
+      if (ident === 11) return formatOscRgb16(theme?.background, '#1e1e1e');
+      if (ident === 12) return formatOscRgb16(theme?.cursor ?? theme?.foreground, '#ffffff');
+      return null;
+    };
+    const disposables: IDisposable[] = [];
+    for (const baseIdent of [10, 11, 12] as const) {
+      disposables.push(parser.registerOscHandler(baseIdent, (data) => {
+        const parts = data.split(';');
+        let answered = false;
+        for (let i = 0; i < parts.length; i++) {
+          if (parts[i] !== '?') continue;
+          const targetIdent = baseIdent + i;
+          const color = oscColorFor(targetIdent);
+          if (color) {
+            this.emitProtocolReply(`\x1b]${targetIdent};${color}\x1b\\`);
+            answered = true;
+          }
+        }
+        return answered && parts.every((part) => part === '?');
+      }));
+    }
+    disposables.push(parser.registerCsiHandler({ prefix: '?', final: 'n' }, (params) => {
+      if (params.length > 0 && params[0] === 996) {
+        this.emitProtocolReply(colorSchemeReport(this.terminal.options.theme));
+        return true;
+      }
+      return false;
+    }));
+    disposables.push(parser.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => {
+      if (params.some((param) => param === 2031)) {
+        this.colorSchemeReporting = true;
+      }
+      return false;
+    }));
+    disposables.push(parser.registerCsiHandler({ prefix: '?', final: 'l' }, (params) => {
+      if (params.some((param) => param === 2031)) {
+        this.colorSchemeReporting = false;
+      }
+      return false;
+    }));
+    this.cleanup.push(() => {
+      for (const disposable of disposables) {
+        try { disposable.dispose(); } catch { /* ignore */ }
+      }
+    });
+  }
+
+  private writeSuppressed(data: string | Uint8Array) {
+    if (!this.terminal.parser) {
+      this.terminal.write(data);
+      return;
+    }
+    this.replayDepth += 1;
+    this.terminal.write(data, () => {
+      this.replayDepth = Math.max(0, this.replayDepth - 1);
+    });
+  }
+
   private restoreScreen(result: TerminalRestoreEvent, replacing: boolean): void {
     this.sequence = result.sequence ?? 0;
     const snapshot = result.screenSnapshot;
@@ -280,14 +395,15 @@ export class TerminalSession {
     if (snapshot && (snapshot.snapshotAnsi || snapshot.scrollbackAnsi)) {
       const normal = snapshot.modes?.alternateScreen
         ? (snapshot.scrollbackAnsi ?? '') + '\x1b[?1049h\x1b[2J\x1b[H' : '';
-      this.terminal.write(new TextEncoder().encode(clear + normal + (snapshot.snapshotAnsi ?? '') +
+      this.writeSuppressed(new TextEncoder().encode(clear + normal + (snapshot.snapshotAnsi ?? '') +
         (snapshot.rehydrateSequences ?? '') + (snapshot.pendingEscapeTailAnsi ?? '')));
     } else {
-      if (replacing) this.terminal.write(clear);
+      if (replacing) this.writeSuppressed(clear);
       if (result.replay) {
         const bytes = decode(result.replay);
         this.oscTracker.feed(this.decoder.decode(bytes, { stream: true }));
-        this.terminal.write(bytes);
+        if (replacing) this.writeSuppressed(bytes);
+        else this.terminal.write(bytes);
       }
     }
   }
@@ -336,9 +452,14 @@ export class TerminalSession {
   }
 
   setTheme(theme: ITheme, minimumContrastRatio?: number) {
+    const prevLight = isLightThemeBackground(this.terminal.options.theme);
     this.terminal.options.theme = theme;
     if (minimumContrastRatio !== undefined) {
       this.terminal.options.minimumContrastRatio = minimumContrastRatio;
+    }
+    const nextLight = isLightThemeBackground(theme);
+    if (this.colorSchemeReporting && prevLight !== nextLight) {
+      this.emitProtocolReply(colorSchemeReport(theme));
     }
   }
 

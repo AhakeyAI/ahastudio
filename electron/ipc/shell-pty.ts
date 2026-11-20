@@ -30,6 +30,7 @@ export const shellPtyCreateSchema = z.object({
   rows: z.number().int().min(1).max(500).optional(),
   cliId: z.enum(ORCHESTRATION_CLI_IDS).optional(),
   shellId: z.enum(LOCAL_SHELL_IDS).optional(),
+  appearance: z.enum(['light', 'dark']).optional(),
   // The process id is `local-<terminalId>` and must still pass PTY_ID_RE on input/resize/kill.
   terminalId: z.string().regex(PTY_ID_RE).max(128 - 'local-'.length).optional(),
 }).strict().refine((value) => !(value.cliId && value.shellId), '选择 CLI 或 shell 其中一种');
@@ -201,6 +202,7 @@ export function registerShellPtyIpc(ctx: IpcContext): {
     extraArgs?: string[];
     cols?: number;
     rows?: number;
+    appearance?: 'light' | 'dark';
     /** Resolve only after the program has printed output and then gone quiet (bounded wait). */
     waitForReady?: { quietMs?: number; maxMs?: number };
   }) => Promise<{ ptyId: string; cwd?: string }>;
@@ -510,6 +512,7 @@ export function registerShellPtyIpc(ctx: IpcContext): {
         cwd,
         ...target,
         ...(payload.extraArgs && payload.extraArgs.length > 0 ? { extraArgs: payload.extraArgs } : {}),
+        ...(payload.appearance ? { appearance: payload.appearance } : {}),
         cols: payload.cols ?? 120,
         rows: payload.rows ?? 32,
       };

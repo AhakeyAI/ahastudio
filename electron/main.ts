@@ -359,6 +359,7 @@ app.whenReady().then(async () => {
         cliId,
         cwd,
         extraArgs,
+        appearance: nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
         waitForReady: { quietMs: 1_500, maxMs: 20_000 },
       });
     },
@@ -496,7 +497,10 @@ app.whenReady().then(async () => {
         terminalTracker: shellPtyCtrl.tracker,
         agentStatusStore,
         writePty: shellPtyCtrl.sendInput,
-        createPty: shellPtyCtrl.createPty,
+        createPty: (opts) => shellPtyCtrl.createPty({
+          ...opts,
+          appearance: nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
+        }),
         closePty: shellPtyCtrl.closePty,
         getDefaultCwd: resolveFallbackCwd,
         orchestrationService: () => orchestrationService,

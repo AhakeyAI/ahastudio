@@ -6,7 +6,24 @@ import ts from 'typescript';
 // Exercise the renderer owner with deterministic create/terminate promises.
 // Real xterm/ConPTY rendering is validated separately in the browser smoke.
 class TestTerminal {
-  constructor(opts = {}) { this.options = { ...opts }; }
+  constructor(opts = {}) {
+    this.options = { ...opts };
+    this._oscHandlers = new Map();
+    this._csiHandlers = [];
+    this.parser = {
+      registerOscHandler: (ident, cb) => {
+        const list = this._oscHandlers.get(ident) ?? [];
+        list.push(cb);
+        this._oscHandlers.set(ident, list);
+        return { dispose: () => { const cur = this._oscHandlers.get(ident); if (cur) this._oscHandlers.set(ident, cur.filter((x) => x !== cb)); } };
+      },
+      registerCsiHandler: (id, cb) => {
+        const entry = { id, cb };
+        this._csiHandlers.push(entry);
+        return { dispose: () => { this._csiHandlers = this._csiHandlers.filter((x) => x !== entry); } };
+      },
+    };
+  }
   unicode = {};
   rows = 24;
   cols = 80;
@@ -19,10 +36,23 @@ class TestTerminal {
   refresh() {}
   onData(cb) { this.send = cb; return { dispose() {} }; }
   onTitleChange() { return { dispose() {} }; }
-  write(data) {
-    const value = new TextDecoder().decode(data);
+  write(data, cb) {
+    const value = typeof data === 'string' ? data : new TextDecoder().decode(data);
     this.writes.push(value);
     if (value.includes('\x1b[5n')) this.send('\x1b[0n');
+    for (const m of value.matchAll(/\x1b\](\d+);([^\x07\x1b]*)(?:\x07|\x1b\\)/g)) {
+      const ident = Number(m[1]);
+      for (const h of this._oscHandlers.get(ident) ?? []) h(m[2]);
+    }
+    for (const m of value.matchAll(/\x1b\[(\??)([0-9;]*)([a-zA-Z])/g)) {
+      const prefix = m[1] || undefined;
+      const params = m[2] ? m[2].split(';').map((n) => Number(n)) : [];
+      const final = m[3];
+      for (const { id, cb: h } of this._csiHandlers) {
+        if ((id.prefix || undefined) === prefix && id.final === final) h(params);
+      }
+    }
+    cb?.();
   }
   dispose() { this.disposed = true; }
 }
@@ -381,4 +411,60 @@ test('terminal appearance defaults to system, tracks OS color-scheme changes, an
     delete globalThis.window;
     globalThis.localStorage = origStorage;
   }
+});
+
+test('terminal responds to OSC 10/11/12 and CSI ?996n, suppresses snapshot replay queries, and pushes Mode 2031 updates on theme switch', async () => {
+  const f = fixture();
+  const lightTheme = { background: '#ffffff', foreground: '#1f2328', cursor: '#0969da' };
+  const darkTheme = { background: '#1e1e1e', foreground: '#d4d4d4', cursor: '#ffffff' };
+  const session = new TerminalSession(f.transport, 14, () => {}, lightTheme);
+  session.mount(host);
+  await f.ready({
+    sequence: 1,
+    screenSnapshot: {
+      snapshotAnsi: 'OLD\x1b]11;?\x07\x1b[?996n',
+      scrollbackAnsi: '',
+      modes: { alternateScreen: false },
+    },
+  });
+  await tick();
+  assert.deepEqual(f.calls.input, [], 'replayed screen snapshots must not emit color-scheme replies');
+
+  // Live OSC 10/11/12 queries (including chained 10;?;?) and CSI ?996n.
+  f.emit('\x1b]10;?;?\x07\x1b]12;?\x07\x1b[?996n', 2);
+  await tick();
+  assert.deepEqual(f.calls.input, [
+    '\x1b]10;rgb:1f1f/2323/2828\x1b\\',
+    '\x1b]11;rgb:ffff/ffff/ffff\x1b\\',
+    '\x1b]12;rgb:0909/6969/dada\x1b\\',
+    '\x1b[?997;2n',
+  ]);
+  f.calls.input.length = 0;
+
+  // Enable Mode 2031 (?2031h) -> theme polarity switch pushes unsolicited ?997 report.
+  f.emit('\x1b[?2031h', 3);
+  session.setTheme(darkTheme);
+  await tick();
+  assert.deepEqual(f.calls.input, ['\x1b[?997;1n']);
+  f.calls.input.length = 0;
+
+  // Same polarity does not emit duplicate notification.
+  session.setTheme({ ...darkTheme, background: '#141414' });
+  await tick();
+  assert.deepEqual(f.calls.input, []);
+
+  // Switching back to light emits light report.
+  session.setTheme(lightTheme);
+  await tick();
+  assert.deepEqual(f.calls.input, ['\x1b[?997;2n']);
+  f.calls.input.length = 0;
+
+  // Disabling Mode 2031 (?2031l) stops unsolicited updates.
+  f.emit('\x1b[?2031l', 4);
+  session.setTheme(darkTheme);
+  await tick();
+  assert.deepEqual(f.calls.input, []);
+
+  await session.close();
+  await f.session.close();
 });

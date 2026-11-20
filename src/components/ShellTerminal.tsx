@@ -85,7 +85,14 @@ function PersistentShellTerminal({
     const session = terminalSessionStore.acquire(terminalId, {
       expectedPtyId: `local-${terminalId}`,
       attach: async (size) => {
-        const result = await api.create({ cwd: cwdRef.current, cliId, shellId, terminalId, ...size });
+        const result = await api.create({
+          cwd: cwdRef.current,
+          cliId,
+          shellId,
+          terminalId,
+          appearance: terminalSessionStore.getAppearance(),
+          ...size,
+        });
         return result.ok ? result : { ok: false, error: result.error ?? '无法启动终端' };
       },
       input: async (id, data) => {
@@ -191,7 +198,9 @@ function PersistentShellTerminal({
 
 function LegacyShellTerminal({ cwd, cliId, terminalId }: ShellTerminalProps) {
   const attach = useCallback(async () => {
-    const r = await window.vibeMeet.shellPty.create({ cwd, cliId, terminalId, cols: 100, rows: 30 });
+    const r = await window.vibeMeet.shellPty.create({
+      cwd, cliId, terminalId, cols: 100, rows: 30, appearance: terminalSessionStore.getAppearance(),
+    });
     if (r.ok) return r;
     return { ok: false as const, error: r.error ?? '无法启动终端' };
   }, [cwd, cliId, terminalId]);

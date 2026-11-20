@@ -69,6 +69,58 @@ test('Grok Build resolves from GROK_HOME/bin and disables interactive autoupdate
   assert.equal(target.env.GROK_DISABLE_AUTOUPDATER, '1');
 });
 
+test('resolveLocalTerminal propagates light/dark appearance via COLORFGBG and Grok theme defaults', async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'aha-grok-theme-')));
+  const binDir = join(root, 'bin');
+  await mkdir(binDir, { recursive: true });
+  const filename = process.platform === 'win32' ? 'grok.exe' : 'grok';
+  const binary = join(binDir, filename);
+  await writeFile(binary, process.platform === 'win32' ? '' : '#!/bin/sh\n', { mode: 0o755 });
+  const keys = ['GROK_HOME', 'PATH', 'COLORFGBG', 'GROK_THEME', 'LC_GROK_THEME', 'GROK_APPEARANCE', 'LC_GROK_APPEARANCE'];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  process.env.GROK_HOME = root;
+  process.env.PATH = '';
+  for (const k of ['COLORFGBG', 'GROK_THEME', 'LC_GROK_THEME', 'GROK_APPEARANCE', 'LC_GROK_APPEARANCE']) {
+    delete process.env[k];
+  }
+  t.after(async () => {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    await rm(root, { recursive: true, force: true });
+  });
+
+  // Default (no theme in config.toml) follows app appearance.
+  const light = resolveLocalTerminal('grok', 'default', undefined, { appearance: 'light' });
+  assert.equal(light.env.COLORFGBG, '0;15');
+  assert.equal(light.env.GROK_APPEARANCE, 'light');
+  assert.equal(light.env.GROK_THEME, 'grokday');
+
+  const dark = resolveLocalTerminal('grok', 'default', undefined, { appearance: 'dark' });
+  assert.equal(dark.env.COLORFGBG, '15;0');
+  assert.equal(dark.env.GROK_APPEARANCE, 'dark');
+  assert.equal(dark.env.GROK_THEME, 'groknight');
+
+  // Auto mode with custom auto_light_theme uses the user's configured light theme.
+  await writeFile(join(root, 'config.toml'), '[ui]\ntheme = "auto"\nauto_light_theme = "custom-day"\n');
+  const autoCustom = resolveLocalTerminal('grok', 'default', undefined, { appearance: 'light' });
+  assert.equal(autoCustom.env.GROK_THEME, 'custom-day');
+
+  // Explicit fixed theme in config.toml is preserved untouched.
+  await writeFile(join(root, 'config.toml'), '[ui]\ntheme = "tokyonight"\n');
+  const fixed = resolveLocalTerminal('grok', 'default', undefined, { appearance: 'light' });
+  assert.equal(fixed.env.GROK_THEME, undefined);
+  assert.equal(fixed.env.COLORFGBG, '0;15');
+
+  // Explicit env vars are never overridden.
+  await writeFile(join(root, 'config.toml'), '[ui]\n');
+  process.env.GROK_THEME = 'rose-pine';
+  process.env.COLORFGBG = '7;0';
+  const envOverride = resolveLocalTerminal('grok', 'default', undefined, { appearance: 'light' });
+  assert.equal(envOverride.env.GROK_THEME, 'rose-pine');
+  assert.equal(envOverride.env.COLORFGBG, '7;0');
+});
+
 test('manual terminal IPC retains the same PTY across reattach and closes only its tab', async (t) => {
   const handlers = new Map();
   t.mock.method(ipcMain, 'handle', (channel, fn) => handlers.set(channel, fn));

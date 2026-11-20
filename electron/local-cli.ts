@@ -1,7 +1,7 @@
 // Manual terminals launch the user's installed commands with their own
 // configuration. They do not use meeting backends, SDKs, or app API keys.
 import { homedir } from 'node:os';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { basename, delimiter, dirname, join } from 'node:path';
 import { augmentedPath, resolveBinaryFromPath } from './bin-resolve.js';
 import { resolveDefaultShell } from './pty-host.js';
@@ -154,10 +154,57 @@ export function mergeTerminalProcessEnv(
   return out;
 }
 
+function readGrokUiThemeConfig(env: NodeJS.ProcessEnv): {
+  theme?: string;
+  autoLightTheme?: string;
+  autoDarkTheme?: string;
+} {
+  const grokHome = env.GROK_HOME?.trim() || join(homedir(), '.grok');
+  const configPath = join(grokHome, 'config.toml');
+  if (!existsSync(configPath)) return {};
+  let raw: string;
+  try {
+    raw = readFileSync(configPath, 'utf8');
+  } catch {
+    return {};
+  }
+  let inUiSection = false;
+  const out: { theme?: string; autoLightTheme?: string; autoDarkTheme?: string } = {};
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const sectionMatch = /^\[([^\]]+)\]/.exec(line);
+    if (sectionMatch) {
+      inUiSection = sectionMatch[1].trim() === 'ui';
+      continue;
+    }
+    if (!inUiSection) continue;
+    const kv = /^(theme|auto_light_theme|auto_dark_theme)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(line);
+    if (!kv) continue;
+    const value = (kv[2] ?? kv[3] ?? '').trim();
+    if (kv[1] === 'theme') out.theme = value;
+    else if (kv[1] === 'auto_light_theme') out.autoLightTheme = value;
+    else if (kv[1] === 'auto_dark_theme') out.autoDarkTheme = value;
+  }
+  return out;
+}
+
+function resolveGrokDefaultTheme(appearance: 'light' | 'dark', env: NodeJS.ProcessEnv): string | null {
+  const cfg = readGrokUiThemeConfig(env);
+  const configured = cfg.theme?.toLowerCase();
+  if (configured && configured !== 'auto' && configured !== 'system') {
+    return null;
+  }
+  return appearance === 'light'
+    ? (cfg.autoLightTheme || 'grokday')
+    : (cfg.autoDarkTheme || 'groknight');
+}
+
 export function resolveLocalTerminal(
   cliId?: OrchestrationCliId,
   shellId: LocalShellId = 'default',
   extraArgs?: readonly string[],
+  options?: { appearance?: 'light' | 'dark' },
 ) {
   const file = cliId ? resolveBinaryFromPath(ALL_COMMANDS[cliId].command)
     : shellId === 'default' ? resolveDefaultShell() : listLocalShells().find((shell) => shell.id === shellId)?.binaryPath;
@@ -170,10 +217,20 @@ export function resolveLocalTerminal(
   env[pathKey] = augmentedPath();
   env.TERM = 'xterm-256color';
   env.COLORTERM = 'truecolor';
+  if (options?.appearance) {
+    if (!env.COLORFGBG) env.COLORFGBG = options.appearance === 'light' ? '0;15' : '15;0';
+    if (!env.GROK_APPEARANCE && !env.LC_GROK_APPEARANCE) env.GROK_APPEARANCE = options.appearance;
+  }
   // Electron switches belong to the app, not a manually launched CLI.
   delete env.ELECTRON_RUN_AS_NODE;
   delete env.ELECTRON_NO_ASAR;
-  if (cliId === 'grok' && !env.GROK_DISABLE_AUTOUPDATER) env.GROK_DISABLE_AUTOUPDATER = '1';
+  if (cliId === 'grok') {
+    if (!env.GROK_DISABLE_AUTOUPDATER) env.GROK_DISABLE_AUTOUPDATER = '1';
+    if (options?.appearance && !env.GROK_THEME && !env.LC_GROK_THEME) {
+      const grokTheme = resolveGrokDefaultTheme(options.appearance, env);
+      if (grokTheme) env.GROK_THEME = grokTheme;
+    }
+  }
   const baseArgs = !cliId && shellId === 'git-bash' ? ['--login', '-i'] : [];
   const args = extraArgs && extraArgs.length > 0 ? [...baseArgs, ...extraArgs] : baseArgs;
   // Keep the user's color and theme preferences unchanged. TERM and

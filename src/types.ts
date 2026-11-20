@@ -163,6 +163,7 @@ export interface VibeMeetApi {
       cliId?: string;
       shellId?: string;
       terminalId?: string;
+      appearance?: 'light' | 'dark';
     }) => Promise<
       | {
           ok: true;

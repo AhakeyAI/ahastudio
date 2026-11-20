@@ -13,6 +13,7 @@ export interface LocalTerminalLaunch {
   cols?: number;
   rows?: number;
   extraArgs?: string[];
+  appearance?: 'light' | 'dark';
 }
 
 export interface LocalTerminalData { ptyId: string; data: string; sequence: number }
@@ -65,7 +66,7 @@ export class LocalTerminalSessions {
       ? mergeCliLaunchArgs(this.mcpLaunchArgsForCli?.(payload.cliId) ?? [], payload.extraArgs)
       : payload.extraArgs;
     const target = payload.terminalId || payload.cliId || payload.shellId
-      ? resolveLocalTerminal(payload.cliId, payload.shellId, mergedArgs) : null;
+      ? resolveLocalTerminal(payload.cliId, payload.shellId, mergedArgs, { appearance: payload.appearance }) : null;
     const cwd = payload.cwd ?? target?.cwd ?? this.currentCwd() ?? process.cwd();
     const rawFile = target?.file ?? resolveDefaultShell();
     const baseEnv = mergeTerminalProcessEnv(
