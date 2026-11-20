@@ -41,6 +41,7 @@ export interface GitCommandOptions {
   timeoutMs?: number;
   maxBytes?: number;
   readOnly?: boolean;
+  env?: Record<string, string>;
 }
 
 export interface GitCommandResult {
@@ -67,6 +68,7 @@ export function runGitCommand(args: string[], opts: GitCommandOptions): Promise<
         GCM_INTERACTIVE: 'never',
         LC_ALL: 'C.UTF-8',
         ...(opts.readOnly ? { GIT_OPTIONAL_LOCKS: '0' } : {}),
+        ...(opts.env ?? {}),
       },
     });
 

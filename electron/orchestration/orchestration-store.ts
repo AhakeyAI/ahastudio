@@ -25,6 +25,7 @@ import {
   type OrchestrationDispatchStage,
   type OrchestrationGateRecord,
   type OrchestrationGateStatus,
+  type OrchestrationIntegrationStatus,
   type OrchestrationMemberCursor,
   type OrchestrationMessagePriority,
   type OrchestrationMessageRecord,
@@ -32,6 +33,8 @@ import {
   type OrchestrationPersistedState,
   type OrchestrationQuestionRecord,
   type OrchestrationReportArtifacts,
+  type OrchestrationReviewFinding,
+  type OrchestrationReviewStatus,
   type OrchestrationRunRecord,
   type OrchestrationSnapshot,
   type OrchestrationStartObservation,
@@ -1199,7 +1202,14 @@ export class OrchestrationStore {
     parentPaneId?: string | null;
     worktreePath?: string | null;
     branch?: string | null;
+    baseCommit?: string | null;
+    repoRootPath?: string | null;
     ownsWorktree?: boolean;
+    ownsBranch?: boolean;
+    isDetachedReviewWorktree?: boolean;
+    reviewOfDispatchId?: string | null;
+    reviewFocus?: string | null;
+    reviewSnapshotOid?: string | null;
     ownsPane?: boolean;
     cliId?: string | null;
     model?: string | null;
@@ -1301,7 +1311,14 @@ export class OrchestrationStore {
       processIncarnation: input.processIncarnation ?? null,
       worktreePath: resolvedWorktreePath,
       branch: input.branch ?? null,
+      ...(input.baseCommit ? { baseCommit: input.baseCommit } : {}),
+      ...(input.repoRootPath ? { repoRootPath: input.repoRootPath } : {}),
       ownsWorktree: input.ownsWorktree ?? false,
+      ...(input.ownsBranch ? { ownsBranch: true } : {}),
+      ...(input.isDetachedReviewWorktree ? { isDetachedReviewWorktree: true } : {}),
+      ...(input.reviewOfDispatchId ? { reviewOfDispatchId: input.reviewOfDispatchId } : {}),
+      ...(input.reviewFocus ? { reviewFocus: input.reviewFocus } : {}),
+      ...(input.reviewSnapshotOid ? { reviewSnapshotOid: input.reviewSnapshotOid } : {}),
       ownsPane: input.ownsPane ?? false,
       cliId: input.cliId ?? null,
       model: input.model ?? null,
@@ -1620,6 +1637,55 @@ export class OrchestrationStore {
     task.updatedAt = now;
     this.persist();
     return { ...task, deps: [...task.deps] };
+  }
+
+  listReviewDispatchesForTarget(targetDispatchId: string): OrchestrationDispatchRecord[] {
+    return [...this.dispatches.values()]
+      .filter((d) => d.reviewOfDispatchId === targetDispatchId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map((d) => ({ ...d }));
+  }
+
+  updateDispatchReviewState(
+    dispatchId: string,
+    patch: {
+      reviewStatus?: OrchestrationReviewStatus;
+      reviewRound?: number;
+      reviewSnapshotOid?: string | null;
+      reviewFindings?: OrchestrationReviewFinding[];
+      reviewMutatedWorkspace?: boolean;
+    },
+  ): OrchestrationDispatchRecord | null {
+    const dispatch = this.dispatches.get(dispatchId);
+    if (!dispatch) return null;
+    if (patch.reviewStatus !== undefined) dispatch.reviewStatus = patch.reviewStatus;
+    if (patch.reviewRound !== undefined) dispatch.reviewRound = patch.reviewRound;
+    if (patch.reviewSnapshotOid !== undefined) dispatch.reviewSnapshotOid = patch.reviewSnapshotOid;
+    if (patch.reviewFindings !== undefined) {
+      dispatch.reviewFindings = patch.reviewFindings.map((f) => ({ ...f }));
+    }
+    if (patch.reviewMutatedWorkspace !== undefined) {
+      dispatch.reviewMutatedWorkspace = patch.reviewMutatedWorkspace;
+    }
+    dispatch.updatedAt = this.now();
+    this.persist();
+    return { ...dispatch };
+  }
+
+  updateDispatchIntegrationState(
+    dispatchId: string,
+    patch: {
+      integrationStatus?: OrchestrationIntegrationStatus;
+      integratedCommit?: string | null;
+    },
+  ): OrchestrationDispatchRecord | null {
+    const dispatch = this.dispatches.get(dispatchId);
+    if (!dispatch) return null;
+    if (patch.integrationStatus !== undefined) dispatch.integrationStatus = patch.integrationStatus;
+    if (patch.integratedCommit !== undefined) dispatch.integratedCommit = patch.integratedCommit;
+    dispatch.updatedAt = this.now();
+    this.persist();
+    return { ...dispatch };
   }
 
   setDispatchBriefFilePath(dispatchId: string, briefFilePath: string | null): OrchestrationDispatchRecord | null {

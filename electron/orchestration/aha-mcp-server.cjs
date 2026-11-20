@@ -177,7 +177,19 @@ function buildDelegateTaskTool(ctx) {
         task: {
           type: 'string',
           description:
-            'Clear, self-contained task specification for the worker (workers start with a blank context and cannot see your prior chat).',
+            'Clear, self-contained task specification for the worker (workers start with a blank context and cannot see your prior chat). Optional when reviewOf is set.',
+        },
+        reviewOf: {
+          type: 'string',
+          maxLength: 128,
+          description:
+            'Launch an isolated read-only adversarial review of this settled worker (@role or dispatchId). Automatically selects a heterogeneous Coding Agent avoiding the author CLI, snapshots the diff into a detached review worktree, and withholds author self-summary.',
+        },
+        reviewFocus: {
+          type: 'string',
+          maxLength: 400,
+          description:
+            'Optional review focus angle when reviewOf is set (enables parallel multi-perspective L2 reviews, e.g. "security & state transitions" vs "edge cases & tests").',
         },
         context: {
           type: 'string',
@@ -255,7 +267,6 @@ function buildDelegateTaskTool(ctx) {
           description: 'One-sentence human-readable summary of what this worker will do.',
         },
       },
-      required: ['task'],
     },
   };
 }
@@ -391,6 +402,28 @@ function buildToolsForContext(ctx) {
               type: 'string',
               description: 'Concise summary of what changed, verification results, or root cause.',
             },
+            verdict: {
+              type: 'string',
+              enum: ['pass', 'reject'],
+              description:
+                'For adversarial review tasks only: final verdict ("pass" or "reject"). Any P0/P1 finding forces reject.',
+            },
+            findings: {
+              type: 'array',
+              maxItems: 25,
+              description: 'For adversarial review tasks only: concrete verified findings.',
+              items: {
+                type: 'object',
+                properties: {
+                  severity: { type: 'string', enum: ['P0', 'P1', 'P2'] },
+                  location: { type: 'string', maxLength: 240 },
+                  title: { type: 'string', maxLength: 240 },
+                  evidence: { type: 'string', maxLength: 1200 },
+                  fix: { type: 'string', maxLength: 800 },
+                },
+                required: ['severity', 'location', 'title', 'evidence'],
+              },
+            },
           },
           required: ['summary'],
         },
@@ -515,6 +548,72 @@ function buildToolsForContext(ctx) {
           },
         },
         required: ['role', 'action'],
+      },
+    },
+    {
+      name: 'inspect_worker_diff',
+      description:
+        'Read-only inspection of a worker real Git changes (baseCommit..snapshot including committed and uncommitted files), diff stat, bounded unified diff, and recommended adversarial review tier (L0/L1/L2).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          role: {
+            type: 'string',
+            description: 'Target worker @role name, dispatch id, or task id.',
+          },
+          files: {
+            type: 'array',
+            maxItems: 30,
+            items: { type: 'string', minLength: 1, maxLength: 400 },
+            description: 'Optional relative file paths to inspect full diff for specific files.',
+          },
+          maxDiffBytes: {
+            type: 'number',
+            description: 'Optional diff byte budget (1024..131072, default 32768).',
+          },
+        },
+        required: ['role'],
+      },
+    },
+    {
+      name: 'integrate_worker',
+      description:
+        'Safely check or integrate a settled worker changes into the main workspace (default mode="squash" for one clean commit per worker, releaseAfter=true to clean up panes, worktrees, and temporary aha/worker/* branches). Aborts cleanly on conflict and refuses to overwrite a dirty main workspace.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          role: {
+            type: 'string',
+            description: 'Target worker @role name, dispatch id, or task id.',
+          },
+          mode: {
+            type: 'string',
+            enum: ['check', 'squash', 'merge'],
+            description: 'Integration mode: "check" (read-only conflict check), "squash" (default, one clean commit), or "merge".',
+          },
+          expectedSnapshotOid: {
+            type: 'string',
+            description: 'Optional snapshot OID from review/diff to guarantee no changes occurred after review.',
+          },
+          commitMessage: {
+            type: 'string',
+            maxLength: 500,
+            description: 'Optional commit message for squash/merge integration.',
+          },
+          releaseAfter: {
+            type: 'boolean',
+            description: 'Automatically release worker + review panes, worktrees, and temporary branches after integration (default: true).',
+          },
+          deleteBranch: {
+            type: 'boolean',
+            description: 'Delete the owned aha/worker/* branch on release (default: true).',
+          },
+          force: {
+            type: 'boolean',
+            description: 'Skip automatic reviewed-snapshot OID check if intentionally integrating an updated snapshot.',
+          },
+        },
+        required: ['role'],
       },
     },
   ];
@@ -750,13 +849,17 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       const effort = nonEmptyStr(args.effort);
       const terminal = nonEmptyStr(args.terminal);
       const planSummary = nonEmptyStr(args.planSummary ?? args.plan_summary);
+      const reviewOf = nonEmptyStr(args.reviewOf ?? args.review_of);
+      const reviewFocus = nonEmptyStr(args.reviewFocus ?? args.review_focus);
       const context = nonEmptyStr(args.context) || nonEmptyStr(args.background);
       const proposalId = nonEmptyStr(args.proposalId);
       const taskContext = args.taskContext;
 
       const payload = {
         ...(role ? { role } : {}),
-        task: typeof args.task === 'string' ? args.task : '',
+        ...(typeof args.task === 'string' && args.task.trim() ? { task: args.task } : {}),
+        ...(reviewOf ? { reviewOf } : {}),
+        ...(reviewFocus ? { reviewFocus } : {}),
         ...(context ? { context } : {}),
         ...(taskContext !== undefined ? { taskContext } : {}),
         ...(proposalId ? { proposalId } : {}),
@@ -884,10 +987,75 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       if (!res.ok) return toolText(res.errorText, true);
       return toolText(formatManageWorkerText(res.result));
     }
+    case 'inspect_worker_diff': {
+      const target = nonEmptyStr(args.role ?? args.worker ?? args.dispatchId ?? args.dispatch_id);
+      const files = Array.isArray(args.files)
+        ? args.files.map(nonEmptyStr).filter(Boolean)
+        : undefined;
+      const maxDiffBytes = finitePositiveInt(args.maxDiffBytes ?? args.max_diff_bytes);
+      const res = await callAction('worker-diff', {
+        ...(target ? { worker: target } : {}),
+        ...(files && files.length > 0 ? { files } : {}),
+        ...(maxDiffBytes !== undefined ? { maxDiffBytes } : {}),
+      });
+      if (!res.ok) return toolText(res.errorText, true);
+      const r = res.result || {};
+      const lines = [
+        `Worker @${r.role || target} (${r.dispatchId || ''}) · review=${r.reviewStatus || 'none'} (R${r.reviewRound || 0}) · integration=${r.integrationStatus || 'none'}`,
+        r.isGitRepo
+          ? `Git: branch=${r.branch || '(detached)'} | base=${(r.baseCommit || '').slice(0, 10) || 'none'} | head=${(r.headCommit || '').slice(0, 10) || 'none'} | snapshot=${(r.snapshotOid || '').slice(0, 10) || 'none'} | commitsAhead=${r.commitsAhead || 0} | uncommitted=${(r.uncommittedFiles || []).length}`
+          : `Non-git workspace: ${r.worktreePath || ''}`,
+        `Recommended review tier: ${r.recommendedReviewTier || 'L0'} (${r.tierReason || ''})`,
+      ];
+      if (Array.isArray(r.commits) && r.commits.length > 0) {
+        lines.push('Commits:', ...r.commits.map((c) => `  - ${c.sha} ${c.subject}`));
+      }
+      if (r.diffStat) {
+        lines.push('Diff stat:', r.diffStat);
+      }
+      if (r.diff) {
+        lines.push('', r.diff);
+      } else if (r.isGitRepo) {
+        lines.push('No diff changes.');
+      }
+      return toolText(lines.join('\n'));
+    }
+    case 'integrate_worker': {
+      const target = nonEmptyStr(args.role ?? args.worker ?? args.dispatchId ?? args.dispatch_id);
+      const mode = nonEmptyStr(args.mode);
+      const expectedSnapshotOid = nonEmptyStr(args.expectedSnapshotOid ?? args.expected_snapshot_oid);
+      const commitMessage = nonEmptyStr(args.commitMessage ?? args.commit_message);
+      const res = await callAction('worker-integrate', {
+        ...(target ? { worker: target } : {}),
+        ...(mode ? { mode } : {}),
+        ...(expectedSnapshotOid ? { expectedSnapshotOid } : {}),
+        ...(commitMessage ? { commitMessage } : {}),
+        ...(typeof args.releaseAfter === 'boolean' ? { releaseAfter: args.releaseAfter } : {}),
+        ...(typeof args.deleteBranch === 'boolean' ? { deleteBranch: args.deleteBranch } : {}),
+        ...(typeof args.force === 'boolean' ? { force: args.force } : {}),
+      });
+      if (!res.ok) return toolText(res.errorText, true);
+      const r = res.result || {};
+      const lines = [
+        `Integration [${r.mode || 'squash'}] for @${r.role || target}: ${r.message || ''}`,
+        ...(r.integratedCommit ? [`Commit: ${r.integratedCommit}`] : []),
+        ...(r.snapshotOid ? [`Snapshot: ${r.snapshotOid}`] : []),
+        ...(Array.isArray(r.conflictFiles) && r.conflictFiles.length > 0
+          ? [`Conflicts: ${r.conflictFiles.join(', ')}`]
+          : []),
+        ...(r.released
+          ? [`Cleaned up worker resources${r.releasedReviews ? ` + ${r.releasedReviews} review helper(s)` : ''}.`]
+          : []),
+      ];
+      return toolText(lines.join('\n'));
+    }
     case 'report_done': {
       const outcome = nonEmptyStr(args.outcome);
+      const verdict = nonEmptyStr(args.verdict);
       const res = await callAction('worker-done-self', {
         ...(outcome ? { outcome } : {}),
+        ...(verdict ? { verdict } : {}),
+        ...(Array.isArray(args.findings) ? { findings: args.findings } : {}),
         summary: typeof args.summary === 'string' ? args.summary : '',
       });
       if (!res.ok) return toolText(res.errorText, true);

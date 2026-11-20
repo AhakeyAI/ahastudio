@@ -59,6 +59,8 @@ export interface SelectAgentForTaskOptions {
   requestedAgent?: string | null;
   taskKind?: OrchestrationTaskKind | null;
   coordinatorCliId?: string | null;
+  /** CLI that authored the work under review; review tasks strictly avoid it first. */
+  authorCliId?: string | null;
   excludeCliIds?: readonly string[];
   preferIdle?: boolean;
 }
@@ -194,18 +196,27 @@ function rankCandidates(
   opts: {
     taskKind?: OrchestrationTaskKind | null;
     coordinatorCliId?: string | null;
+    authorCliId?: string | null;
     preferIdle?: boolean;
   },
 ): Array<{ entry: OrchestrationAgentRosterEntry; score: number; heterogeneousReview: boolean; usedIdleBoost: boolean }> {
   return candidates
     .map((entry, index) => {
       let score = affinityScore(entry.cliId, opts.taskKind);
-      const heterogeneousReview =
-        opts.taskKind === 'review' &&
-        Boolean(opts.coordinatorCliId) &&
-        entry.cliId !== opts.coordinatorCliId;
-      if (heterogeneousReview) {
-        score += 50;
+      let heterogeneousReview = false;
+      if (opts.taskKind === 'review') {
+        if (opts.authorCliId) {
+          if (entry.cliId !== opts.authorCliId) {
+            score += 60;
+            heterogeneousReview = true;
+          }
+          if (opts.coordinatorCliId && entry.cliId !== opts.coordinatorCliId) {
+            score += 20;
+          }
+        } else if (opts.coordinatorCliId && entry.cliId !== opts.coordinatorCliId) {
+          score += 50;
+          heterogeneousReview = true;
+        }
       }
       const usedIdleBoost = Boolean(opts.preferIdle && entry.idlePanes.length > 0);
       if (usedIdleBoost) {
@@ -227,6 +238,7 @@ export function selectAgentForTask(opts: SelectAgentForTaskOptions): SelectedAge
   const coordinatorCliId = opts.coordinatorCliId
     ? normalizeAgentCliAlias(opts.coordinatorCliId)
     : null;
+  const authorCliId = opts.authorCliId ? normalizeAgentCliAlias(opts.authorCliId) : null;
   const availableEntries = opts.roster.filter(
     (entry) => entry.available && !excluded.has(entry.cliId),
   );
@@ -257,7 +269,7 @@ export function selectAgentForTask(opts: SelectAgentForTaskOptions): SelectedAge
     }
     const fallbacks = rankCandidates(
       availableEntries.filter((item) => item.cliId !== entry.cliId),
-      { taskKind: opts.taskKind, coordinatorCliId, preferIdle: opts.preferIdle },
+      { taskKind: opts.taskKind, coordinatorCliId, authorCliId, preferIdle: opts.preferIdle },
     ).map((item) => item.entry.cliId);
 
     return {
@@ -286,12 +298,17 @@ export function selectAgentForTask(opts: SelectAgentForTaskOptions): SelectedAge
   const ranked = rankCandidates(availableEntries, {
     taskKind: opts.taskKind,
     coordinatorCliId,
+    authorCliId,
     preferIdle: opts.preferIdle,
   });
   const top = ranked[0];
   const reasons: string[] = [];
-  if (top.heterogeneousReview && coordinatorCliId) {
-    reasons.push(`异构评审（避开协调者 ${coordinatorCliId}）`);
+  if (top.heterogeneousReview) {
+    if (authorCliId) {
+      reasons.push(`异构评审（避开实现者 ${authorCliId}）`);
+    } else if (coordinatorCliId) {
+      reasons.push(`异构评审（避开协调者 ${coordinatorCliId}）`);
+    }
   }
   if (opts.taskKind) {
     reasons.push(`匹配任务类型 ${opts.taskKind}`);

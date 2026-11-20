@@ -6,7 +6,10 @@ import {
   listGitWorktrees,
   removeGitWorktree,
 } from '../git/git-service.js';
+import { runGitCommand, validateGitRefName } from '../git/git-exec.js';
 import { OrchestrationError } from './orchestration-types.js';
+
+export const WORKER_BRANCH_PREFIX = 'aha/worker/';
 
 export interface WorkerWorktreePlacementInput {
   baseCwd: string;
@@ -24,7 +27,9 @@ export interface WorkerWorktreePlacementResult {
   cwd: string;
   worktreePath: string | null;
   branch: string | null;
+  baseCommit: string | null;
   ownsWorktree: boolean;
+  ownsBranch: boolean;
   repoRootPath: string | null;
 }
 
@@ -38,16 +43,32 @@ function slugifySegment(raw: string, fallback: string): string {
   return cleaned || fallback;
 }
 
+async function resolveFullHeadCommit(cwd: string, fallback?: string | null): Promise<string | null> {
+  const res = await runGitCommand(['rev-parse', '--verify', 'HEAD^{commit}'], {
+    cwd,
+    readOnly: true,
+    timeoutMs: 10_000,
+  }).catch(() => null);
+  if (res && res.exitCode === 0 && res.stdout.trim()) {
+    return res.stdout.trim();
+  }
+  return fallback?.trim() || null;
+}
+
 export async function prepareWorkerWorktreePlacement(
   input: WorkerWorktreePlacementInput
 ): Promise<WorkerWorktreePlacementResult> {
   if (input.reusingTerminalCwd) {
+    const inspected = await inspectGitRepo(input.reusingTerminalCwd).catch(() => null);
+    const repo = inspected && inspected.ok && inspected.isGitRepo ? inspected : null;
     return {
       cwd: input.reusingTerminalCwd,
       worktreePath: input.reusingTerminalCwd,
-      branch: null,
+      branch: repo ? repo.branch : null,
+      baseCommit: repo ? await resolveFullHeadCommit(input.reusingTerminalCwd, repo.head) : null,
       ownsWorktree: false,
-      repoRootPath: null,
+      ownsBranch: false,
+      repoRootPath: repo ? repo.rootPath : null,
     };
   }
 
@@ -66,12 +87,15 @@ export async function prepareWorkerWorktreePlacement(
       );
     }
     const inspected = await inspectGitRepo(input.baseCwd);
+    const repo = inspected.ok && inspected.isGitRepo ? inspected : null;
     return {
       cwd: input.baseCwd,
       worktreePath: input.baseCwd,
-      branch: inspected.ok && inspected.isGitRepo ? inspected.branch : null,
+      branch: repo ? repo.branch : null,
+      baseCommit: repo ? await resolveFullHeadCommit(input.baseCwd, repo.head) : null,
       ownsWorktree: false,
-      repoRootPath: inspected.ok && inspected.isGitRepo ? inspected.rootPath : null,
+      ownsBranch: false,
+      repoRootPath: repo ? repo.rootPath : null,
     };
   }
 
@@ -100,7 +124,9 @@ export async function prepareWorkerWorktreePlacement(
       cwd: input.baseCwd,
       worktreePath: input.baseCwd,
       branch: null,
+      baseCommit: null,
       ownsWorktree: false,
+      ownsBranch: false,
       repoRootPath: null,
     };
   }
@@ -127,7 +153,8 @@ export async function prepareWorkerWorktreePlacement(
       : resolve(mainWorktreeRoot, rawWt)
     : join(dirname(mainWorktreeRoot), `${basename(mainWorktreeRoot)}.aha-worktrees`, slug);
 
-  const desiredBranch = input.branch?.trim() || `aha/worker/${slug}`;
+  const autoBranch = !input.branch?.trim();
+  const desiredBranch = input.branch?.trim() || `${WORKER_BRANCH_PREFIX}${slug}`;
   const startPoint = input.baseBranch?.trim() ||
     (rawWt === 'new-top-level' ? undefined : inspected.head);
 
@@ -138,23 +165,29 @@ export async function prepareWorkerWorktreePlacement(
     startPoint,
   });
 
+  let createdNewBranch = created.ok;
   if (!created.ok && input.branch?.trim() && /already exists/i.test(created.error)) {
     created = await addGitWorktree({
       cwd: mainWorktreeRoot,
       worktreePath: targetWorktreePath,
       branch: desiredBranch,
     });
+    createdNewBranch = false;
   }
 
   if (!created.ok) {
     throw new OrchestrationError('worktree_failed', created.error);
   }
 
+  const resolvedBaseCommit = await resolveFullHeadCommit(created.path, inspected.head);
+
   return {
     cwd: created.path,
     worktreePath: created.path,
     branch: desiredBranch,
+    baseCommit: resolvedBaseCommit,
     ownsWorktree: true,
+    ownsBranch: autoBranch && createdNewBranch,
     repoRootPath: mainWorktreeRoot,
   };
 }
@@ -174,7 +207,8 @@ export async function removeOwnedWorkerWorktree(opts: {
   worktreePath: string;
   repoRootPath?: string | null;
   force?: boolean;
-}): Promise<{ removed: boolean; path: string }> {
+  deleteBranch?: string | null;
+}): Promise<{ removed: boolean; removedBranch: boolean; path: string }> {
   if (!opts.force) await assertWorkerWorktreeClean(opts.worktreePath);
 
   let listed = await listGitWorktrees(opts.worktreePath);
@@ -188,7 +222,7 @@ export async function removeOwnedWorkerWorktree(opts: {
     }
   }
   if (!listed.ok || !listed.isGitRepo) {
-    return { removed: false, path: opts.worktreePath };
+    return { removed: false, removedBranch: false, path: opts.worktreePath };
   }
   const normTarget =
     process.platform === 'win32'
@@ -198,8 +232,10 @@ export async function removeOwnedWorkerWorktree(opts: {
     const normWt = process.platform === 'win32' ? resolve(wt.path).toLowerCase() : resolve(wt.path);
     return normWt === normTarget;
   });
+  const mainRoot = listed.worktrees.find((wt) => wt.isMainWorktree)?.path;
   if (!matched) {
-    return { removed: false, path: opts.worktreePath };
+    const removedBranch = mainRoot ? await deleteOwnedWorkerBranch(mainRoot, opts.deleteBranch) : false;
+    return { removed: false, removedBranch, path: opts.worktreePath };
   }
   if (!opts.force && matched.locked) {
     throw new OrchestrationError(
@@ -208,9 +244,8 @@ export async function removeOwnedWorkerWorktree(opts: {
       { worktreePath: opts.worktreePath, locked: true }
     );
   }
-  const mainRoot = listed.worktrees.find((wt) => wt.isMainWorktree)?.path;
   if (!mainRoot) {
-    return { removed: false, path: opts.worktreePath };
+    return { removed: false, removedBranch: false, path: opts.worktreePath };
   }
 
   const removed = await removeGitWorktree({
@@ -221,7 +256,23 @@ export async function removeOwnedWorkerWorktree(opts: {
   if (!removed.ok) {
     throw new OrchestrationError('worktree_failed', removed.error);
   }
-  return { removed: true, path: removed.path };
+  const removedBranch = await deleteOwnedWorkerBranch(mainRoot, opts.deleteBranch);
+  return { removed: true, removedBranch, path: removed.path };
+}
+
+export async function deleteOwnedWorkerBranch(
+  repoRootPath: string,
+  branchName?: string | null,
+): Promise<boolean> {
+  const trimmed = branchName?.trim();
+  if (!trimmed || !trimmed.startsWith(WORKER_BRANCH_PREFIX)) return false;
+  const valid = validateGitRefName(trimmed);
+  if (!valid) return false;
+  const res = await runGitCommand(['branch', '-D', '--', valid], {
+    cwd: repoRootPath,
+    timeoutMs: 15_000,
+  });
+  return res.exitCode === 0;
 }
 
 export async function assertWorkerWorktreeClean(worktreePath: string): Promise<void> {

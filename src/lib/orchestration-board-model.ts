@@ -87,6 +87,7 @@ export interface BoardMemberCard {
   retained: boolean;
   released: boolean;
   needsAttention: boolean;
+  verificationBadge?: { label: string; tone: StatusTone } | null;
 }
 
 export interface BoardViewModel {
@@ -692,6 +693,20 @@ export function buildBoardViewModel(
       const summary = cleanTaskSummary(task, role);
       const liveActivity =
         !isSettled && !dispatch.releasedAt ? formatLiveAgentActivity(agentStatus) : null;
+      let verificationBadge: { label: string; tone: StatusTone } | null = null;
+      if (dispatch.integrationStatus === 'merged') {
+        verificationBadge = { label: '已合入', tone: 'ok' };
+      } else if (dispatch.integrationStatus === 'conflict') {
+        verificationBadge = { label: '合入冲突', tone: 'error' };
+      } else if (dispatch.reviewStatus === 'escalated') {
+        verificationBadge = { label: '审查升级', tone: 'error' };
+      } else if (dispatch.reviewStatus === 'rejected') {
+        verificationBadge = { label: `打回 R${dispatch.reviewRound ?? 1}`, tone: 'warn' };
+      } else if (dispatch.reviewStatus === 'pending') {
+        verificationBadge = { label: '对抗审查中', tone: 'accent' };
+      } else if (dispatch.reviewStatus === 'passed') {
+        verificationBadge = { label: '审查通过', tone: 'ok' };
+      }
 
       return {
         key: dispatch.id,
@@ -720,6 +735,7 @@ export function buildBoardViewModel(
         retained: Boolean(dispatch.retained),
         released: Boolean(dispatch.releasedAt),
         needsAttention,
+        verificationBadge,
       };
     })
     .sort((a, b) => {

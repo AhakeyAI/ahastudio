@@ -765,7 +765,7 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   const coordClient = spawnMcpClient(t, coordEnv, 'newline');
   await coordClient.request('initialize', { protocolVersion: '2024-11-05' });
 
-  // Coordinator gets 9 tools (including shared board tools) with dynamic agent enum.
+  // Coordinator gets 11 tools (including shared board + diff/integrate close-out tools) with dynamic agent enum.
   const coordToolsRes = await coordClient.request('tools/list', {});
   const coordToolNames = coordToolsRes.result.tools.map((tool) => tool.name);
   assert.deepEqual(coordToolNames, [
@@ -778,6 +778,8 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
     'team_wait',
     'message_worker',
     'manage_worker',
+    'inspect_worker_diff',
+    'integrate_worker',
   ]);
   const delegateTool = coordToolsRes.result.tools.find((tool) => tool.name === 'delegate_task');
   assert.deepEqual(delegateTool.inputSchema.properties.agent.enum, [

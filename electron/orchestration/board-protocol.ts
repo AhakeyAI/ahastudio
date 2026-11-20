@@ -1,8 +1,10 @@
 import { getGitStatus, inspectGitRepo } from '../git/git-service.js';
+import { runGitCommand } from '../git/git-exec.js';
 
 export const DEFAULT_PEER_PING_PONG_LIMIT = 3;
 const MAX_REPORT_CHANGED_FILES = 20;
 const MAX_INLINE_ARTIFACT_FILES = 8;
+const GIT_SHA_RE = /^[0-9a-f]{7,40}$/i;
 
 const MENTION_PATTERN = /(?:^|[\s([{"'（【「,，、:：;；])@([a-zA-Z0-9][a-zA-Z0-9._-]{0,63})/g;
 const REF_PATTERN = /(?:^|[\s([{"'（【「,])#([1-9]\d{0,5})\b/g;
@@ -10,7 +12,11 @@ const REF_PATTERN = /(?:^|[\s([{"'（【「,])#([1-9]\d{0,5})\b/g;
 export interface BoardReportArtifacts {
   branch: string | null;
   worktreePath: string | null;
+  baseCommit?: string | null;
   headCommit: string | null;
+  snapshotOid?: string | null;
+  commitsAhead?: number;
+  uncommittedCount?: number;
   changedFiles: string[];
   changedFileCount: number;
 }
@@ -28,7 +34,11 @@ export interface BoardPostFormatInput {
   artifacts?: {
     branch?: string | null;
     worktreePath?: string | null;
+    baseCommit?: string | null;
     headCommit?: string | null;
+    snapshotOid?: string | null;
+    commitsAhead?: number;
+    uncommittedCount?: number;
     changedFiles?: readonly string[];
     changedFileCount?: number;
   } | null;
@@ -134,14 +144,17 @@ export async function collectWorkerReportArtifacts(
   worktreePath?: string | null,
   branch?: string | null,
   deps?: CollectWorkerReportArtifactsDeps,
+  baseCommit?: string | null,
 ): Promise<BoardReportArtifacts | null> {
   const trimmedBranch = branch?.trim() || null;
   const trimmedPath = worktreePath?.trim() || null;
+  const trimmedBase = baseCommit?.trim() && GIT_SHA_RE.test(baseCommit.trim()) ? baseCommit.trim() : null;
   if (!trimmedPath) {
     return trimmedBranch
       ? {
           branch: trimmedBranch,
           worktreePath: null,
+          ...(trimmedBase ? { baseCommit: trimmedBase.slice(0, 10) } : {}),
           headCommit: null,
           changedFiles: [],
           changedFileCount: 0,
@@ -165,21 +178,52 @@ export async function collectWorkerReportArtifacts(
       (inspected && inspected.ok && inspected.isGitRepo ? inspected.head : null) ??
       null;
     const headCommit = rawHead ? rawHead.trim().slice(0, 10) || null : null;
-    const allPaths =
+    const dirtyPaths =
       status && status.ok && status.isGitRepo
         ? status.entries.map((entry) => entry.path).filter((path): path is string => Boolean(path))
         : [];
+
+    let committedPaths: string[] = [];
+    let commitsAhead = 0;
+    if (trimmedBase && rawHead && status?.ok && status.isGitRepo && !deps?.getGitStatus) {
+      const [diffNames, countRes] = await Promise.all([
+        runGitCommand(['diff', '--name-only', `${trimmedBase}..HEAD`], {
+          cwd: trimmedPath,
+          timeoutMs: 10_000,
+        }).catch(() => null),
+        runGitCommand(['rev-list', '--count', `${trimmedBase}..HEAD`], {
+          cwd: trimmedPath,
+          timeoutMs: 10_000,
+        }).catch(() => null),
+      ]);
+      if (diffNames && diffNames.exitCode === 0) {
+        committedPaths = diffNames.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean);
+      }
+      if (countRes && countRes.exitCode === 0) {
+        const parsed = Number.parseInt(countRes.stdout.trim(), 10);
+        if (Number.isFinite(parsed) && parsed > 0) commitsAhead = parsed;
+      }
+    }
+
+    const mergedPaths = [...new Set([...committedPaths, ...dirtyPaths])];
     return {
       branch: resolvedBranch,
       worktreePath: trimmedPath,
+      ...(trimmedBase ? { baseCommit: trimmedBase.slice(0, 10) } : {}),
       headCommit,
-      changedFiles: allPaths.slice(0, MAX_REPORT_CHANGED_FILES),
-      changedFileCount: allPaths.length,
+      ...(commitsAhead > 0 ? { commitsAhead } : {}),
+      ...(dirtyPaths.length > 0 ? { uncommittedCount: dirtyPaths.length } : {}),
+      changedFiles: mergedPaths.slice(0, MAX_REPORT_CHANGED_FILES),
+      changedFileCount: mergedPaths.length,
     };
   } catch {
     return {
       branch: trimmedBranch,
       worktreePath: trimmedPath,
+      ...(trimmedBase ? { baseCommit: trimmedBase.slice(0, 10) } : {}),
       headCommit: null,
       changedFiles: [],
       changedFileCount: 0,
@@ -212,6 +256,12 @@ export function formatBoardPostForAgent(post: BoardPostFormatInput): string {
     const parts: string[] = [];
     if (artifacts.branch?.trim()) parts.push(`branch=${artifacts.branch.trim()}`);
     if (artifacts.headCommit?.trim()) parts.push(`commit=${artifacts.headCommit.trim()}`);
+    if (typeof artifacts.commitsAhead === 'number' && artifacts.commitsAhead > 0) {
+      parts.push(`+${artifacts.commitsAhead} commit(s)`);
+    }
+    if (typeof artifacts.uncommittedCount === 'number' && artifacts.uncommittedCount > 0) {
+      parts.push(`${artifacts.uncommittedCount} uncommitted`);
+    }
     const files = (artifacts.changedFiles ?? []).filter(Boolean);
     const count = artifacts.changedFileCount ?? files.length;
     if (count > 0) {

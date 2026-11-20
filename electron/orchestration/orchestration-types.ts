@@ -127,12 +127,31 @@ export interface OrchestrationMemberCursor {
   lastDeliveredSeq: number;
 }
 
+export type OrchestrationReviewSeverity = 'P0' | 'P1' | 'P2';
+export type OrchestrationReviewVerdict = 'pass' | 'reject';
+export type OrchestrationReviewStatus = 'none' | 'pending' | 'passed' | 'rejected' | 'escalated';
+export type OrchestrationIntegrationStatus = 'none' | 'checked' | 'merged' | 'conflict' | 'skipped';
+
+export interface OrchestrationReviewFinding {
+  severity: OrchestrationReviewSeverity;
+  location: string;
+  title: string;
+  evidence: string;
+  fix?: string;
+}
+
 export interface OrchestrationReportArtifacts {
   branch?: string | null;
   worktreePath?: string | null;
+  baseCommit?: string | null;
   headCommit?: string | null;
+  snapshotOid?: string | null;
+  commitsAhead?: number;
+  uncommittedCount?: number;
   changedFiles?: string[];
   changedFileCount?: number;
+  reviewVerdict?: OrchestrationReviewVerdict;
+  reviewFindings?: OrchestrationReviewFinding[];
 }
 
 export const ORCHESTRATION_TASK_KINDS = [
@@ -287,8 +306,21 @@ export interface OrchestrationDispatchRecord {
   processIncarnation: string | null;
   worktreePath?: string | null;
   branch?: string | null;
+  baseCommit?: string | null;
+  repoRootPath?: string | null;
   briefFilePath?: string | null;
   ownsWorktree?: boolean;
+  ownsBranch?: boolean;
+  isDetachedReviewWorktree?: boolean;
+  reviewOfDispatchId?: string | null;
+  reviewFocus?: string | null;
+  reviewSnapshotOid?: string | null;
+  reviewStatus?: OrchestrationReviewStatus;
+  reviewRound?: number;
+  reviewFindings?: OrchestrationReviewFinding[];
+  reviewMutatedWorkspace?: boolean;
+  integrationStatus?: OrchestrationIntegrationStatus;
+  integratedCommit?: string | null;
   ownsPane?: boolean;
   cliId?: string | null;
   model?: string | null;

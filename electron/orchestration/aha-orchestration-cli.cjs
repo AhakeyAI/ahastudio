@@ -10,7 +10,20 @@ const TWO_WORD_COMMANDS = {
   task: ['create', 'list', 'update', 'show', 'done', 'fail'],
   gate: ['create', 'resolve', 'list'],
   dispatch: ['show'],
-  worker: ['start', 'list', 'show', 'read', 'keep-open', 'retain', 'release', 'stop', 'abandon', 'done'],
+  worker: [
+    'start',
+    'list',
+    'show',
+    'read',
+    'diff',
+    'integrate',
+    'keep-open',
+    'retain',
+    'release',
+    'stop',
+    'abandon',
+    'done',
+  ],
   coordinator: ['start', 'stop', 'tick', 'status'],
 };
 
@@ -41,6 +54,8 @@ const BOOLEAN_FLAGS = new Set([
   'includeExited',
   'includeSettled',
   'detach',
+  'releaseAfter',
+  'deleteBranch',
   'tasks',
   'messages',
   'help',
@@ -693,6 +708,8 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
           ...(flags.deps ? { deps: splitCsv(String(flags.deps)) } : {}),
           ...(flags.priority ? { priority: String(flags.priority) } : {}),
           ...(flags.retryOf ? { retryOfDispatchId: String(flags.retryOf) } : {}),
+          ...(flags.reviewOf ? { reviewOf: String(flags.reviewOf) } : {}),
+          ...(flags.reviewFocus ? { reviewFocus: String(flags.reviewFocus) } : {}),
           ...(workerCli ? { cliId: String(workerCli) } : {}),
           ...(flags.model ? { model: String(flags.model) } : {}),
           ...(flags.effort ? { effort: String(flags.effort) } : {}),
@@ -709,6 +726,51 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
         },
       };
     }
+    case 'worker-diff': {
+      const files = [
+        ...(Array.isArray(flags.file) ? flags.file : flags.file ? [flags.file] : []),
+        ...(flags.files ? splitCsv(String(flags.files)) || [] : []),
+      ]
+        .map((v) => String(v).trim())
+        .filter(Boolean);
+      return {
+        action: 'worker-diff',
+        payload: {
+          ...(flags.dispatch || flags.dispatchId || flags.id
+            ? { dispatchId: String(flags.dispatch ?? flags.dispatchId ?? flags.id) }
+            : positional[0]
+              ? { worker: String(positional[0]) }
+              : {}),
+          ...(flags.worker ? { worker: String(flags.worker) } : {}),
+          ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
+          ...(files.length > 0 ? { files } : {}),
+          ...(flags.maxDiffBytes ? { maxDiffBytes: toNumber(flags.maxDiffBytes) } : {}),
+        },
+      };
+    }
+    case 'worker-integrate':
+      return {
+        action: 'worker-integrate',
+        payload: {
+          ...(flags.dispatch || flags.dispatchId || flags.id
+            ? { dispatchId: String(flags.dispatch ?? flags.dispatchId ?? flags.id) }
+            : positional[0]
+              ? { worker: String(positional[0]) }
+              : {}),
+          ...(flags.worker ? { worker: String(flags.worker) } : {}),
+          ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
+          ...(flags.mode ? { mode: String(flags.mode) } : {}),
+          ...(flags.expectedSnapshot || flags.expectedSnapshotOid
+            ? { expectedSnapshotOid: String(flags.expectedSnapshot ?? flags.expectedSnapshotOid) }
+            : {}),
+          ...(flags.commitMessage || flags.message
+            ? { commitMessage: String(flags.commitMessage ?? flags.message) }
+            : {}),
+          ...(flags.releaseAfter !== undefined ? { releaseAfter: toBoolean(flags.releaseAfter) } : {}),
+          ...(flags.deleteBranch !== undefined ? { deleteBranch: toBoolean(flags.deleteBranch) } : {}),
+          ...(flags.force !== undefined ? { force: toBoolean(flags.force) } : {}),
+        },
+      };
     case 'worker-list':
       return {
         action: 'worker-list',
@@ -917,6 +979,8 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
             : positional.length > 0
               ? { summary: positional.join(' ') }
               : {}),
+          ...(flags.verdict ? { verdict: String(flags.verdict).toLowerCase() } : {}),
+          ...(flags.findingsJson ? { findings: JSON.parse(String(flags.findingsJson)) } : {}),
           receiptText: !wantJson,
           full,
         }),

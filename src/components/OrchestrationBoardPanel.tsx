@@ -1601,6 +1601,11 @@ export function OrchestrationBoardPanel({
                           </div>
                           <div className="obp-member-sub-row">
                             <span className="obp-member-sub">{member.taskSummary}</span>
+                            {member.verificationBadge && (
+                              <span className={`obp-stage-pill tone-${member.verificationBadge.tone}`}>
+                                {member.verificationBadge.label}
+                              </span>
+                            )}
                             <span className={`obp-stage-pill tone-${member.tone}`}>
                               {member.stageLabel}
                             </span>

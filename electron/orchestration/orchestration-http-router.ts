@@ -118,6 +118,15 @@ const sendSchema = z.object({
   threadId: z.string().trim().min(1).optional(),
 });
 
+const reviewVerdictEnum = z.enum(['pass', 'reject']);
+const reviewFindingSchema = z.object({
+  severity: z.enum(['P0', 'P1', 'P2']),
+  location: z.string().trim().min(1).max(240),
+  title: z.string().trim().min(1).max(240),
+  evidence: z.string().trim().min(1).max(1_200),
+  fix: z.string().trim().max(800).optional(),
+});
+
 const workerDoneSchema = z.object({
   capability: z.string().trim().min(1).optional(),
   from: z.string().trim().min(1).optional(),
@@ -125,6 +134,8 @@ const workerDoneSchema = z.object({
   dispatchId: z.string().trim().min(1).optional(),
   outcome: workerOutcomeEnum.optional(),
   summary: z.string().optional(),
+  verdict: reviewVerdictEnum.optional(),
+  findings: z.array(reviewFindingSchema).max(25).optional(),
 });
 
 const workerStartSchema = z.object({
@@ -138,6 +149,8 @@ const workerStartSchema = z.object({
   deps: z.array(z.string().trim().min(1)).optional(),
   priority: priorityEnum.optional(),
   retryOfDispatchId: z.string().trim().min(1).optional(),
+  reviewOf: z.string().trim().min(1).max(128).optional(),
+  reviewFocus: z.string().trim().min(1).max(400).optional(),
   cliId: z.string().trim().min(1).optional(),
   agent: z.string().trim().min(1).optional(),
   model: z.string().trim().min(1).optional(),
@@ -284,10 +297,32 @@ const mcpContextSchema = z.object({
   ptyId: z.string().trim().min(1).optional(),
 });
 
+const workerDiffSchema = z.object({
+  dispatchId: z.string().trim().min(1).optional(),
+  worker: z.string().trim().min(1).optional(),
+  taskId: z.string().trim().min(1).optional(),
+  files: z.array(z.string().trim().min(1).max(400)).max(30).optional(),
+  maxDiffBytes: z.number().int().min(1_024).max(131_072).optional(),
+});
+
+const workerIntegrateSchema = z.object({
+  dispatchId: z.string().trim().min(1).optional(),
+  worker: z.string().trim().min(1).optional(),
+  taskId: z.string().trim().min(1).optional(),
+  mode: z.enum(['check', 'squash', 'merge']).optional(),
+  expectedSnapshotOid: z.string().trim().min(7).max(40).optional(),
+  commitMessage: z.string().trim().min(1).max(500).optional(),
+  releaseAfter: z.boolean().optional(),
+  deleteBranch: z.boolean().optional(),
+  force: z.boolean().optional(),
+});
+
 const delegateTaskSchema = z.object({
   from: z.string().trim().min(1).optional(),
   role: z.string().trim().max(120).optional(),
-  task: z.string().trim().min(1),
+  task: z.string().trim().min(1).optional(),
+  reviewOf: z.string().trim().min(1).max(128).optional(),
+  reviewFocus: z.string().trim().min(1).max(400).optional(),
   ...taskContextFields,
   agent: z.string().trim().min(1).optional(),
   taskKind: taskKindEnum.optional(),
@@ -300,12 +335,16 @@ const delegateTaskSchema = z.object({
   planSummary: z.string().trim().max(1_000).optional(),
   runId: z.string().trim().min(1).optional(),
   callerCwd: z.string().trim().min(1).optional(),
+}).refine((val) => Boolean(val.task || val.reviewOf), {
+  message: 'Either task or reviewOf is required.',
 });
 
 const workerDoneSelfSchema = z.object({
   from: z.string().trim().min(1).optional(),
   outcome: workerOutcomeEnum.optional(),
   summary: z.string().trim().min(1),
+  verdict: reviewVerdictEnum.optional(),
+  findings: z.array(reviewFindingSchema).max(25).optional(),
 });
 
 const askSelfSchema = z.object({
@@ -402,6 +441,7 @@ const READ_ONLY_ORCHESTRATION_ACTIONS = new Set([
   'worker-list',
   'worker-show',
   'worker-read',
+  'worker-diff',
   'coordinator-status',
   'gate-list',
   'inbox',
@@ -519,13 +559,16 @@ export async function dispatchOrchestrationHttpAction(
         result = await service.send(sendSchema.parse(payload));
         break;
       case 'worker-done':
-        result = service.workerDone(workerDoneSchema.parse(payload));
+        result = await service.workerDoneWithArtifacts(workerDoneSchema.parse(payload));
         break;
       case 'task-done':
-        result = service.taskDone(workerDoneSchema.parse(payload));
+        result = await service.workerDoneWithArtifacts({
+          ...workerDoneSchema.parse(payload),
+          outcome: 'completed',
+        });
         break;
       case 'task-fail':
-        result = service.taskFail({
+        result = await service.workerDoneWithArtifacts({
           ...workerDoneSchema.parse(payload),
           outcome: 'failed',
         });
@@ -547,6 +590,12 @@ export async function dispatchOrchestrationHttpAction(
         break;
       case 'worker-read':
         result = service.workerRead(workerReadSchema.parse(payload), httpCallerPane());
+        break;
+      case 'worker-diff':
+        result = await service.workerDiff(workerDiffSchema.parse(payload), httpCallerPane());
+        break;
+      case 'worker-integrate':
+        result = await service.workerIntegrate(workerIntegrateSchema.parse(payload), httpCallerPane());
         break;
       case 'worker-keep-open':
       case 'worker-retain': {
@@ -679,6 +728,8 @@ export async function dispatchOrchestrationHttpAction(
         result = await service.workerDoneByPane(caller, {
           outcome: parsed.outcome,
           summary: parsed.summary,
+          verdict: parsed.verdict,
+          findings: parsed.findings,
         });
         break;
       }
