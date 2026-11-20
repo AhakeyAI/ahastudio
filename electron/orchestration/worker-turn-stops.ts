@@ -21,6 +21,7 @@ export interface WorkerTurnStopMonitorDependencies {
   capturePaneTail?: (ptyId: string, maxChars: number) => string;
   hasOpenApprovalForDispatch?: (dispatchId: string) => boolean;
   isDeliveryInFlight?: (dispatchId: string) => boolean;
+  resolveRoleName?: (dispatch: OrchestrationDispatchRecord) => string | null;
   notifyMailbox: (mailboxHandle: string, type: OrchestrationMessageType) => void;
   onTurnStopEscalated?: (dispatchId: string, runId: string, stopReason: WorkerTurnStopReason) => void;
   cliCommand?: string;
@@ -247,8 +248,10 @@ export class WorkerTurnStopMonitor {
       }
     }
 
-    const subject = this.buildSubject(fresh, stopReason);
-    const body = this.buildBody(fresh, ptyId, stopReason, status, tail);
+    const roleName =
+      this.deps.resolveRoleName?.(fresh)?.trim().replace(/^@+/, '') || null;
+    const subject = this.buildSubject(fresh, stopReason, roleName);
+    const body = this.buildBody(fresh, ptyId, stopReason, status, tail, roleName);
     const payload = JSON.stringify({
       syntheticTurnStop: true,
       advisory: stopReason !== 'exited',
@@ -258,6 +261,7 @@ export class WorkerTurnStopMonitor {
       runId: fresh.runId,
       processGeneration: generation,
       workerHandle: fresh.assigneeHandle,
+      ...(roleName ? { role: roleName } : {}),
       ptyId,
       ...(tail ? { terminalTail: tail } : {}),
     });
@@ -272,6 +276,9 @@ export class WorkerTurnStopMonitor {
       subject,
       body,
       payload,
+      fromRole: roleName ?? undefined,
+      mentions: ['coordinator'],
+      kind: 'stall',
     });
 
     this.deps.notifyMailbox(parentMailbox, 'escalation');
@@ -317,30 +324,36 @@ export class WorkerTurnStopMonitor {
 
   private buildSubject(
     dispatch: OrchestrationDispatchRecord,
-    stopReason: WorkerTurnStopReason
+    stopReason: WorkerTurnStopReason,
+    roleName: string | null = null
   ): string {
+    const label = roleName ? `@${roleName} (${dispatch.id})` : `${dispatch.taskId} (${dispatch.id})`;
     switch (stopReason) {
       case 'errored':
-        return `Worker turn errored on ${dispatch.taskId} (${dispatch.id})`;
+        return `Worker turn errored on ${label}`;
       case 'needs-input':
-        return `Worker waiting for input on ${dispatch.taskId} (${dispatch.id})`;
+        return `Worker waiting for input on ${label}`;
       case 'exited':
-        return `Worker terminal exited without reporting on ${dispatch.taskId} (${dispatch.id})`;
+        return `Worker terminal exited without reporting on ${label}`;
       case 'finished':
       default:
-        return `Worker turn stopped without task-done on ${dispatch.taskId} (${dispatch.id})`;
+        return `Worker turn stopped without task-done on ${label}`;
     }
   }
 
   private buildBody(
     dispatch: OrchestrationDispatchRecord,
-    ptyId: string,
+    _ptyId: string,
     stopReason: WorkerTurnStopReason,
     status: AgentPaneStatus | null,
-    tail: string
+    tail: string,
+    roleName: string | null = null
   ): string {
+    const workerTag = roleName
+      ? `@${roleName} (${dispatch.assigneeHandle}, dispatch ${dispatch.id}, generation ${dispatch.processGeneration ?? 1})`
+      : `${dispatch.assigneeHandle} (dispatch ${dispatch.id}, generation ${dispatch.processGeneration ?? 1})`;
     const lines: string[] = [
-      `Worker ${dispatch.assigneeHandle} (dispatch ${dispatch.id}, generation ${dispatch.processGeneration ?? 1}) stopped (${stopReason}) without calling task-done/worker-done.`,
+      `Worker ${workerTag} stopped (${stopReason}) without calling task-done/worker-done.`,
     ];
     if (status?.message) {
       lines.push(`Last status: ${status.message}`);
@@ -351,6 +364,11 @@ export class WorkerTurnStopMonitor {
     lines.push(
       '',
       'Coordinator actions:',
+      ...(roleName
+        ? [
+            `- MCP: manage_worker(role="${roleName}", action="read") or post_message(text="@${roleName} ...")`,
+          ]
+        : []),
       `- Read output: ${this.cliCommand} orchestration worker-read --dispatch ${dispatch.id} --screen`,
       `- Steer / follow up: ${this.cliCommand} orchestration send --to dispatch:${dispatch.id} --subject "Follow-up" --body "..."`,
       `- Mark task done: ${this.cliCommand} orchestration task-update --id ${dispatch.taskId} --status completed`

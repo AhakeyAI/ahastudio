@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import {
   AgentHookServer,
   formatAdditionalContextHookStdout,
+  formatPostToolContextHookStdout,
+  supportsPostToolContextInjection,
 } from './agent/agent-hook-server.js';
 import { AgentHookInstaller } from './agent/agent-hook-installer.js';
 import {
@@ -369,6 +371,10 @@ app.whenReady().then(async () => {
       normalizeOrchestrationSettings(getSettings().orchestration).confirmBeforeDispatch,
     getDefaultWorktree: () =>
       normalizeOrchestrationSettings(getSettings().orchestration).defaultWorktree,
+    getPeerMessagingMode: () =>
+      normalizeOrchestrationSettings(getSettings().orchestration).peerMessagingMode,
+    stallWatchdogIntervalMs: 10_000,
+    stallThresholdMs: 25_000,
     isMcpEnabledForCli: (cliId) => {
       if (!mcpCliIdSet.has(cliId)) return false;
       try {
@@ -438,6 +444,15 @@ app.whenReady().then(async () => {
   agentHookServer.setPermissionHookInterceptor((req) =>
     orchestrationService.handlePermissionHookRequest(req)
   );
+  agentHookServer.setPostToolInterceptor((req) => {
+    if (!supportsPostToolContextInjection(req.provider, req.eventName)) {
+      return null;
+    }
+    const text = orchestrationService.consumeMidTurnBoardInjections(req.ptyId);
+    if (!text) return null;
+    const hookStdout = formatPostToolContextHookStdout(req.provider, req.eventName, text);
+    return hookStdout ? { hookStdout } : null;
+  });
   agentHookServer.setUserPromptInterceptor((req) => {
     orchestrationService.recordUserPromptTurn(req.ptyId, 'hook');
     if (!orchestrationService.isPaneOrchestrationMode(req.ptyId)) {
@@ -459,7 +474,7 @@ app.whenReady().then(async () => {
         : '(no available coding agents detected)';
     const lines = [
       '[AhaStation Orchestration Mode Active — Coordinator]',
-      'Prefer AhaStation MCP tools (`delegate_task`, `team_wait`, `team_status`, `message_worker`, `manage_worker`) over built-in subagents so tasks run in visible AhaStation Coding Agent terminals with optional isolated Git worktrees.',
+      'Prefer AhaStation MCP tools (`delegate_task`, `post_message`, `read_board`, `board_wait`, `team_status`, `manage_worker`) over built-in subagents so tasks run in visible AhaStation Coding Agent terminals with optional isolated Git worktrees.',
       `Available Coding Agents: ${agentListText}.`,
       'Pick the Coding Agent best suited to each subtask (prefer a heterogeneous CLI for independent review/tests).',
       ...(mcpCtx.confirmMode === 'chat-and-guard'

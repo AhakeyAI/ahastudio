@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {
+  ORCHESTRATION_BOARD_POST_KINDS,
   ORCHESTRATION_MESSAGE_TYPES,
   ORCHESTRATION_TASK_KINDS,
   OrchestrationError,
@@ -11,6 +12,7 @@ const optionalSchema = <T extends z.ZodTypeAny>(schema: T): z.ZodType<z.output<T
   z.preprocess((val) => (val === undefined ? {} : val), schema) as unknown as z.ZodType<z.output<T>>;
 
 const nonEmptyId = z.string().trim().min(1).max(200);
+const boardPostKindEnum = z.enum(ORCHESTRATION_BOARD_POST_KINDS);
 const messageTypeEnum = z.enum(ORCHESTRATION_MESSAGE_TYPES);
 const taskKindEnum = z.enum(ORCHESTRATION_TASK_KINDS);
 const priorityEnum = z.enum(['low', 'normal', 'high', 'urgent']);
@@ -421,6 +423,26 @@ const proposalRejectSchema = z
   })
   .strict();
 
+const boardPostSchema = z
+  .object({
+    runId: nonEmptyId.optional(),
+    text: z.string().trim().min(1).max(64_000),
+    kind: boardPostKindEnum.optional(),
+    subject: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+
+const boardReadSchema = optionalSchema(
+  z
+    .object({
+      runId: nonEmptyId.optional(),
+      since: z.number().int().min(0).optional(),
+      seqs: z.array(z.number().int().min(1)).max(200).optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+    })
+    .strict()
+);
+
 function formatIpcFailure(error: unknown): {
   ok: false;
   code: string;
@@ -813,6 +835,35 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     authorizeError,
     handler: ({ id, reason }) =>
       runAction(() => requireService().rejectDispatchProposal(id, reason)),
+  });
+
+  handleSecure('orchestration:board-post', {
+    schema: boardPostSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) =>
+      act(() =>
+        requireService().boardPost({
+          ...payload,
+          from: 'user',
+          isUser: true,
+        })
+      ),
+  });
+
+  handleSecure('orchestration:board-read', {
+    schema: boardReadSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) =>
+      runAction(() =>
+        requireService().boardRead({
+          ...payload,
+          from: 'user',
+          isUser: true,
+          markRead: false,
+        })
+      ),
   });
 
   if (!service) {

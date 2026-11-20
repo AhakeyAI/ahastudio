@@ -17,17 +17,20 @@ import {
   ORCHESTRATION_DELIVERY_BATCH_LIMIT,
   OrchestrationError,
   UNBOUND_RUN_ID,
+  type OrchestrationBoardPostKind,
   type OrchestrationCoordinatorRunRecord,
   type OrchestrationDeliveryRecord,
   type OrchestrationDispatchRecord,
   type OrchestrationDispatchStage,
   type OrchestrationGateRecord,
   type OrchestrationGateStatus,
+  type OrchestrationMemberCursor,
   type OrchestrationMessagePriority,
   type OrchestrationMessageRecord,
   type OrchestrationMessageType,
   type OrchestrationPersistedState,
   type OrchestrationQuestionRecord,
+  type OrchestrationReportArtifacts,
   type OrchestrationRunRecord,
   type OrchestrationSnapshot,
   type OrchestrationStartObservation,
@@ -64,6 +67,24 @@ function emptyPersistedState(): OrchestrationPersistedState {
     questions: [],
     coordinatorRuns: [],
     capabilities: {},
+    nextBoardSeqByRun: {},
+    memberCursorsByRun: {},
+  };
+}
+
+function cloneMessageRecord(msg: OrchestrationMessageRecord): OrchestrationMessageRecord {
+  return {
+    ...msg,
+    ...(msg.mentions ? { mentions: [...msg.mentions] } : {}),
+    ...(msg.refs ? { refs: [...msg.refs] } : {}),
+    ...(msg.artifacts
+      ? {
+          artifacts: {
+            ...msg.artifacts,
+            ...(msg.artifacts.changedFiles ? { changedFiles: [...msg.artifacts.changedFiles] } : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -112,6 +133,8 @@ export class OrchestrationStore {
   private readonly deferredPrompts = new Map<
     string, { ptyId: string; prompt: string; submit: boolean }
   >();
+  private nextBoardSeqByRun = new Map<string, number>();
+  private memberCursorsByRun = new Map<string, Map<string, OrchestrationMemberCursor>>();
 
   constructor(options: OrchestrationStoreOptions = {}) {
     this.customClock = typeof options.now === 'function';
@@ -293,15 +316,70 @@ export class OrchestrationStore {
       }
     }
 
+    this.nextBoardSeqByRun.clear();
+    if (parsed.nextBoardSeqByRun && typeof parsed.nextBoardSeqByRun === 'object') {
+      for (const [runId, nextSeq] of Object.entries(parsed.nextBoardSeqByRun)) {
+        if (typeof nextSeq === 'number' && Number.isInteger(nextSeq) && nextSeq > 0) {
+          this.nextBoardSeqByRun.set(runId, nextSeq);
+        }
+      }
+    }
+
+    this.memberCursorsByRun.clear();
+    if (parsed.memberCursorsByRun && typeof parsed.memberCursorsByRun === 'object') {
+      for (const [runId, byMember] of Object.entries(parsed.memberCursorsByRun)) {
+        if (!byMember || typeof byMember !== 'object') continue;
+        const memberMap = new Map<string, OrchestrationMemberCursor>();
+        for (const [memberKey, rawCursor] of Object.entries(byMember)) {
+          if (!rawCursor || typeof rawCursor !== 'object') continue;
+          memberMap.set(memberKey, {
+            lastReadSeq:
+              typeof rawCursor.lastReadSeq === 'number' && Number.isFinite(rawCursor.lastReadSeq)
+                ? Math.max(0, Math.floor(rawCursor.lastReadSeq))
+                : 0,
+            lastPostSeq:
+              typeof rawCursor.lastPostSeq === 'number' && Number.isFinite(rawCursor.lastPostSeq)
+                ? Math.max(0, Math.floor(rawCursor.lastPostSeq))
+                : 0,
+            lastDeliveredSeq:
+              typeof rawCursor.lastDeliveredSeq === 'number' &&
+              Number.isFinite(rawCursor.lastDeliveredSeq)
+                ? Math.max(0, Math.floor(rawCursor.lastDeliveredSeq))
+                : 0,
+          });
+        }
+        if (memberMap.size > 0) {
+          this.memberCursorsByRun.set(runId, memberMap);
+        }
+      }
+    }
+
     this.messages.clear();
     this.messageOrder = [];
     const sortedMsgs = [...(parsed.messages ?? [])].sort((a, b) => a.seq - b.seq);
     for (const msg of sortedMsgs) {
       if (msg && typeof msg.id === 'string') {
-        this.messages.set(msg.id, { ...msg });
-        this.messageOrder.push(msg.id);
-        if (msg.seq >= this.nextSequence) {
-          this.nextSequence = msg.seq + 1;
+        const cloned = cloneMessageRecord(msg);
+        if (cloned.type !== 'heartbeat') {
+          if (
+            typeof cloned.boardSeq === 'number' &&
+            Number.isInteger(cloned.boardSeq) &&
+            cloned.boardSeq > 0
+          ) {
+            const curNext = this.nextBoardSeqByRun.get(cloned.runId) ?? 1;
+            if (cloned.boardSeq >= curNext) {
+              this.nextBoardSeqByRun.set(cloned.runId, cloned.boardSeq + 1);
+            }
+          } else {
+            const assigned = this.nextBoardSeqByRun.get(cloned.runId) ?? 1;
+            cloned.boardSeq = assigned;
+            this.nextBoardSeqByRun.set(cloned.runId, assigned + 1);
+          }
+        }
+        this.messages.set(cloned.id, cloned);
+        this.messageOrder.push(cloned.id);
+        if (cloned.seq >= this.nextSequence) {
+          this.nextSequence = cloned.seq + 1;
         }
       }
     }
@@ -415,7 +493,125 @@ export class OrchestrationStore {
       coordinatorRuns: [...this.coordinatorRuns.values()],
       capabilities: Object.fromEntries(this.dispatchCapabilities),
       deferredDispatchPrompts: Object.fromEntries(this.listDeferredDispatchPrompts()),
+      nextBoardSeqByRun: Object.fromEntries(this.nextBoardSeqByRun.entries()),
+      memberCursorsByRun: this.exportMemberCursorsByRun(),
     };
+  }
+
+  private exportMemberCursorsByRun(
+    filterRunId?: string
+  ): Record<string, Record<string, OrchestrationMemberCursor>> {
+    const out: Record<string, Record<string, OrchestrationMemberCursor>> = {};
+    for (const [runId, memberMap] of this.memberCursorsByRun.entries()) {
+      if (filterRunId && runId !== filterRunId) continue;
+      const entries: Record<string, OrchestrationMemberCursor> = {};
+      for (const [memberKey, cursor] of memberMap.entries()) {
+        entries[memberKey] = { ...cursor };
+      }
+      out[runId] = entries;
+    }
+    return out;
+  }
+
+  private allocateBoardSeq(runId: string): number {
+    const next = this.nextBoardSeqByRun.get(runId) ?? 1;
+    this.nextBoardSeqByRun.set(runId, next + 1);
+    return next;
+  }
+
+  getHeadBoardSeq(runId: string): number {
+    const next = this.nextBoardSeqByRun.get(runId);
+    return next && next > 1 ? next - 1 : 0;
+  }
+
+  getMemberCursor(runId: string, memberKey: string): OrchestrationMemberCursor {
+    const existing = this.memberCursorsByRun.get(runId)?.get(memberKey);
+    return existing
+      ? { ...existing }
+      : { lastReadSeq: 0, lastPostSeq: 0, lastDeliveredSeq: 0 };
+  }
+
+  advanceMemberCursor(
+    runId: string,
+    memberKey: string,
+    patch: Partial<OrchestrationMemberCursor>
+  ): OrchestrationMemberCursor {
+    const cleanRunId = runId.trim();
+    const cleanKey = memberKey.trim();
+    if (!cleanRunId || !cleanKey) {
+      return { lastReadSeq: 0, lastPostSeq: 0, lastDeliveredSeq: 0 };
+    }
+    let memberMap = this.memberCursorsByRun.get(cleanRunId);
+    if (!memberMap) {
+      memberMap = new Map();
+      this.memberCursorsByRun.set(cleanRunId, memberMap);
+    }
+    const existing = memberMap.get(cleanKey) ?? {
+      lastReadSeq: 0,
+      lastPostSeq: 0,
+      lastDeliveredSeq: 0,
+    };
+    const nextRead =
+      typeof patch.lastReadSeq === 'number' && Number.isFinite(patch.lastReadSeq)
+        ? Math.max(existing.lastReadSeq, Math.floor(patch.lastReadSeq))
+        : existing.lastReadSeq;
+    const nextPost =
+      typeof patch.lastPostSeq === 'number' && Number.isFinite(patch.lastPostSeq)
+        ? Math.max(existing.lastPostSeq, Math.floor(patch.lastPostSeq))
+        : existing.lastPostSeq;
+    const nextDelivered =
+      typeof patch.lastDeliveredSeq === 'number' && Number.isFinite(patch.lastDeliveredSeq)
+        ? Math.max(existing.lastDeliveredSeq, Math.floor(patch.lastDeliveredSeq))
+        : existing.lastDeliveredSeq;
+
+    const changed =
+      !memberMap.has(cleanKey) ||
+      nextRead !== existing.lastReadSeq ||
+      nextPost !== existing.lastPostSeq ||
+      nextDelivered !== existing.lastDeliveredSeq;
+
+    const updated: OrchestrationMemberCursor = {
+      lastReadSeq: nextRead,
+      lastPostSeq: nextPost,
+      lastDeliveredSeq: nextDelivered,
+    };
+    if (changed) {
+      memberMap.set(cleanKey, updated);
+      this.persist();
+    }
+    return { ...updated };
+  }
+
+  listBoardPosts(
+    runId: string,
+    opts?: { since?: number; seqs?: readonly number[]; limit?: number }
+  ): OrchestrationMessageRecord[] {
+    const allForRun: OrchestrationMessageRecord[] = [];
+    for (const id of this.messageOrder) {
+      const msg = this.messages.get(id);
+      if (!msg || msg.runId !== runId || msg.type === 'heartbeat') continue;
+      if (typeof msg.boardSeq !== 'number') continue;
+      allForRun.push(msg);
+    }
+    allForRun.sort((a, b) => (a.boardSeq ?? 0) - (b.boardSeq ?? 0));
+
+    if (opts?.seqs && opts.seqs.length > 0) {
+      const seqSet = new Set(opts.seqs);
+      return allForRun
+        .filter((msg) => msg.boardSeq !== undefined && seqSet.has(msg.boardSeq))
+        .map(cloneMessageRecord);
+    }
+
+    const limit = Math.max(1, Math.min(500, Math.floor(opts?.limit ?? 50)));
+    if (typeof opts?.since === 'number' && Number.isFinite(opts.since)) {
+      const since = Math.max(0, Math.floor(opts.since));
+      return allForRun
+        .filter((msg) => (msg.boardSeq ?? 0) > since)
+        .slice(0, limit)
+        .map(cloneMessageRecord);
+    }
+
+    return allForRun.slice(-limit).map(cloneMessageRecord);
   }
 
   private persist(): void {
@@ -2009,6 +2205,11 @@ export class OrchestrationStore {
     body?: string;
     payload?: string | null;
     threadId?: string | null;
+    fromRole?: string;
+    mentions?: readonly string[];
+    refs?: readonly number[];
+    kind?: OrchestrationBoardPostKind;
+    artifacts?: OrchestrationReportArtifacts | null;
   }): OrchestrationMessageRecord {
     let runId = input.runId?.trim();
     if (!runId) {
@@ -2042,14 +2243,27 @@ export class OrchestrationStore {
         this.deleteMessageIds(staleHeartbeats);
       }
     }
+    const cleanFromRole = input.fromRole?.trim().replace(/^@+/, '') || undefined;
+    const cleanMentions = input.mentions
+      ? [...new Set(input.mentions.map((m) => m.trim().replace(/^@+/, '').toLowerCase()).filter(Boolean))]
+      : undefined;
+    const cleanRefs = input.refs
+      ? [...new Set(input.refs.filter((r) => Number.isInteger(r) && r > 0))]
+      : undefined;
     const msg: OrchestrationMessageRecord = {
       id: input.id?.trim() || generatePrefixedId('msg'),
       runId,
       seq: this.nextSequence++,
+      ...(!isHeartbeat ? { boardSeq: this.allocateBoardSeq(runId) } : {}),
       type,
       priority: input.priority ?? 'normal',
       fromHandle: input.from,
       toHandle: input.to,
+      ...(cleanFromRole ? { fromRole: cleanFromRole } : {}),
+      ...(cleanMentions && cleanMentions.length > 0 ? { mentions: cleanMentions } : {}),
+      ...(cleanRefs && cleanRefs.length > 0 ? { refs: cleanRefs } : {}),
+      ...(input.kind ? { kind: input.kind } : {}),
+      ...(input.artifacts !== undefined ? { artifacts: input.artifacts } : {}),
       subject: input.subject,
       body: input.body ?? '',
       payload: input.payload ?? null,
@@ -2064,7 +2278,7 @@ export class OrchestrationStore {
     this.messageOrder.push(msg.id);
     this.prune();
     this.persist();
-    return { ...msg };
+    return cloneMessageRecord(msg);
   }
 
   getMessageById(id: string): OrchestrationMessageRecord | undefined {
@@ -2666,6 +2880,10 @@ export class OrchestrationStore {
     messageId: string;
     answeredBy: string;
     body: string;
+    fromRole?: string;
+    mentions?: readonly string[];
+    refs?: readonly number[];
+    existingAnswerMessageId?: string;
   }): {
     question: OrchestrationQuestionRecord;
     message: OrchestrationMessageRecord;
@@ -2698,6 +2916,10 @@ export class OrchestrationStore {
               subject: `Re: ${q.question.slice(0, 60)}`,
               body: input.body,
               threadId: q.messageId,
+              fromRole: input.fromRole,
+              mentions: input.mentions,
+              refs: input.refs,
+              kind: 'answer',
             }),
           duplicate: true,
         };
@@ -2709,16 +2931,25 @@ export class OrchestrationStore {
       );
     }
 
-    const answerMsg = this.insertMessage({
-      runId: q.runId,
-      from: input.answeredBy,
-      to: `dispatch:${q.dispatchId}`,
-      type: 'status',
-      priority: 'high',
-      subject: `Answer to question ${q.messageId}`,
-      body: input.body,
-      threadId: q.messageId,
-    });
+    const reusedMsg = input.existingAnswerMessageId
+      ? this.messages.get(input.existingAnswerMessageId)
+      : undefined;
+    const answerMsg =
+      reusedMsg ??
+      this.insertMessage({
+        runId: q.runId,
+        from: input.answeredBy,
+        to: `dispatch:${q.dispatchId}`,
+        type: 'status',
+        priority: 'high',
+        subject: `Answer to question ${q.messageId}`,
+        body: input.body,
+        threadId: q.messageId,
+        fromRole: input.fromRole,
+        mentions: input.mentions,
+        refs: input.refs,
+        kind: 'answer',
+      });
     this.markAsRead([q.messageId]);
     this.acknowledgeDeliveriesForMessages([q.messageId]);
 
@@ -2730,7 +2961,7 @@ export class OrchestrationStore {
     this.persist();
     return {
       question: { ...q, options: [...q.options] },
-      message: answerMsg,
+      message: { ...answerMsg },
       duplicate: false,
     };
   }
@@ -2839,6 +3070,7 @@ export class OrchestrationStore {
       gates,
       messages,
       questions,
+      memberCursorsByRun: this.exportMemberCursorsByRun(runId),
       coordinatorRuns,
       activeCoordinatorRun,
       currentRunByConsumer: Object.fromEntries(this.currentRunByConsumer.entries()),
@@ -2956,6 +3188,8 @@ export class OrchestrationStore {
         const deletedRunIds = new Set(candidates.slice(0, deleteCount).map((r) => r.id));
         for (const runId of deletedRunIds) {
           this.runs.delete(runId);
+          this.nextBoardSeqByRun.delete(runId);
+          this.memberCursorsByRun.delete(runId);
         }
         for (const [id, t] of this.tasks.entries()) {
           if (deletedRunIds.has(t.runId)) this.tasks.delete(id);
@@ -3028,6 +3262,8 @@ export class OrchestrationStore {
       this.questions.clear();
       this.coordinatorRuns.clear();
       this.nextSequence = 1;
+      this.nextBoardSeqByRun.clear();
+      this.memberCursorsByRun.clear();
     } else if (scope === 'tasks') {
       removed.tasks = this.tasks.size;
       removed.dispatches = this.dispatches.size;
@@ -3047,6 +3283,8 @@ export class OrchestrationStore {
       this.consumerReadByMessageId.clear();
       this.consumerDeliveredByMessageId.clear();
       this.questions.clear();
+      this.nextBoardSeqByRun.clear();
+      this.memberCursorsByRun.clear();
     }
 
     this.persist();

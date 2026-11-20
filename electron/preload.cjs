@@ -216,6 +216,8 @@ const api = {
     delegateTask: (opts) => ipcRenderer.invoke('orchestration:delegate-task', opts),
     proposalApprove: (opts) => ipcRenderer.invoke('orchestration:proposal-approve', opts),
     proposalReject: (opts) => ipcRenderer.invoke('orchestration:proposal-reject', opts),
+    boardPost: (opts) => ipcRenderer.invoke('orchestration:board-post', opts),
+    boardRead: (opts) => ipcRenderer.invoke('orchestration:board-read', opts),
     onEvent: (cb) => {
       const listener = (_, event) => cb(event);
       ipcRenderer.on('orchestration:event', listener);

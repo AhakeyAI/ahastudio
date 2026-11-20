@@ -7,6 +7,7 @@ import {
   normalizeOrchestrationSettings,
   type OrchestrationAgentProfile,
   type OrchestrationConfirmMode,
+  type OrchestrationPeerMessagingMode,
   type OrchestrationSettings,
   type Settings,
   type VoicePrint,
@@ -35,12 +36,14 @@ function broadcastOrchestrationSettingsChanged(): void {
 export interface OrchestrationSettingsPatch {
   confirmBeforeDispatch?: OrchestrationConfirmMode;
   defaultWorktree?: boolean;
+  peerMessagingMode?: OrchestrationPeerMessagingMode;
   agentProfiles?: Record<string, OrchestrationAgentProfile | null>;
 }
 
 const ORCHESTRATION_SETTING_KEYS = new Set([
   'confirmBeforeDispatch',
   'defaultWorktree',
+  'peerMessagingMode',
   'agentProfiles',
 ]);
 
@@ -82,6 +85,14 @@ export function buildOrchestrationSettingsUpdate(
       return { ok: false, error: 'defaultWorktree must be a boolean' };
     }
     next.defaultWorktree = patchObj.defaultWorktree;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patchObj, 'peerMessagingMode')) {
+    const mode = patchObj.peerMessagingMode;
+    if (mode !== 'controlled-p2p' && mode !== 'hub-only') {
+      return { ok: false, error: 'invalid peerMessagingMode' };
+    }
+    next.peerMessagingMode = mode;
   }
 
   if (Object.prototype.hasOwnProperty.call(patchObj, 'agentProfiles')) {

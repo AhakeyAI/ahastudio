@@ -84,9 +84,11 @@ function readDirectories(): string[] {
   }
 }
 
+export const OPEN_ORCHESTRATION_BOARD_EVENT = 'aha:open-orchestration-board';
+
 function readRightPanelTab(): RightPanelTab {
   const value = localStorage.getItem('aha.rightPanel.tab');
-  return value === 'files' || value === 'worktrees' ? value : 'changes';
+  return value === 'files' || value === 'worktrees' || value === 'board' ? value : 'changes';
 }
 
 function paneCwd(win: { cwd?: string; panes?: Record<string, { cwd?: string }> }, leafId: string) {
@@ -505,6 +507,15 @@ export function LocalTerminalWorkspace({
       true,
     );
   };
+
+  useEffect(() => {
+    const onOpenBoard = () => {
+      changeRightTab('board');
+      toggleRightPanel(true);
+    };
+    window.addEventListener(OPEN_ORCHESTRATION_BOARD_EVENT, onOpenBoard);
+    return () => window.removeEventListener(OPEN_ORCHESTRATION_BOARD_EVENT, onOpenBoard);
+  }, [changeRightTab, toggleRightPanel]);
 
   useEffect(() => {
     const onFocusTarget = (ev: Event) => {
@@ -1041,6 +1052,7 @@ export function LocalTerminalWorkspace({
           worktreeActions={worktreeActions}
           agentTargets={agentTargets}
           onAgentPromptSent={focusAgentTarget}
+          activePtyId={activePtyId}
         />
       )}
 

@@ -4,6 +4,7 @@ import type {
   LocalCliInventoryEntry,
   OrchestrationAgentProfile,
   OrchestrationConfirmMode,
+  OrchestrationPeerMessagingMode,
   OrchestrationSettings,
   OrchestrationSettingsPatch,
 } from '../types';
@@ -13,6 +14,7 @@ import { AgentMcpPanel } from './AgentMcpPanel';
 const DEFAULT_ORCHESTRATION_SETTINGS: OrchestrationSettings = {
   confirmBeforeDispatch: 'chat-and-guard',
   defaultWorktree: true,
+  peerMessagingMode: 'controlled-p2p',
   agentProfiles: {},
 };
 
@@ -215,6 +217,28 @@ export function CliAgentSettingsPanel() {
                 <option value="chat-and-guard">对话确认 + 防抢跑（推荐）</option>
                 <option value="always-ui">每次胶囊一键确认</option>
                 <option value="auto">自动派发免确认</option>
+              </select>
+            </div>
+            <div className="settings-row">
+              <div>
+                <div className="settings-orchestration-label">跨 Worker 协作</div>
+                <p className="settings-orchestration-hint">
+                  控制同任务下 Worker 之间是否允许在协作板上直接点对点交接。
+                </p>
+              </div>
+              <select
+                className="settings-select"
+                aria-label="跨 Worker 协作"
+                disabled={orchSaving}
+                value={orchSettings.peerMessagingMode ?? 'controlled-p2p'}
+                onChange={(e) =>
+                  void persistOrchestrationPatch({
+                    peerMessagingMode: e.target.value as OrchestrationPeerMessagingMode,
+                  })
+                }
+              >
+                <option value="controlled-p2p">允许受控点对点交接（3 轮熔断升级主控，推荐）</option>
+                <option value="hub-only">严格经主控中转</option>
               </select>
             </div>
             <label className="settings-checkbox-row">

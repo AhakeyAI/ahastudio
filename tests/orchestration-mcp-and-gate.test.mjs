@@ -683,7 +683,7 @@ test('Slim MCP preamble omits capability & CLI manual; workerDoneByPane, askCoor
   assert.equal(askRes.answer, 'Yes, preserve v1');
 
   // Worker completes via workerDoneByPane (no capability arg needed!).
-  const doneRes = service.workerDoneByPane(delegated.ptyId, {
+  const doneRes = await service.workerDoneByPane(delegated.ptyId, {
     outcome: 'completed',
     summary: 'Leak fixed and verified',
   });
@@ -756,13 +756,16 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   const coordClient = spawnMcpClient(t, coordEnv, 'newline');
   await coordClient.request('initialize', { protocolVersion: '2024-11-05' });
 
-  // Coordinator gets 6 tools with dynamic agent enum.
+  // Coordinator gets 9 tools (including shared board tools) with dynamic agent enum.
   const coordToolsRes = await coordClient.request('tools/list', {});
   const coordToolNames = coordToolsRes.result.tools.map((tool) => tool.name);
   assert.deepEqual(coordToolNames, [
     'list_coding_agents',
     'delegate_task',
     'team_status',
+    'post_message',
+    'read_board',
+    'board_wait',
     'team_wait',
     'message_worker',
     'manage_worker',
@@ -836,14 +839,14 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   });
   assert.match(statusCall.result.content[0].text, /@reviewer/);
 
-  // Spawn worker MCP client for local-mcp-w1 -> gets exactly 2 tools (report_done, ask_coordinator).
+  // Spawn worker MCP client for local-mcp-w1 -> gets worker tools (report_done, ask_coordinator + shared board tools).
   const workerEnv = hookServer.envForPane(workerPtyId);
   const workerClient = spawnMcpClient(t, workerEnv, 'newline');
   await workerClient.request('initialize', { protocolVersion: '2024-11-05' });
   const workerToolsRes = await workerClient.request('tools/list', {});
   assert.deepEqual(
     workerToolsRes.result.tools.map((tool) => tool.name),
-    ['report_done', 'ask_coordinator']
+    ['report_done', 'ask_coordinator', 'post_message', 'read_board', 'board_wait']
   );
 
   // Worker calls ask_coordinator -> Coordinator replies via message_worker -> Worker gets answer!

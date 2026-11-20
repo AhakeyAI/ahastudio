@@ -116,6 +116,7 @@ test('normalizeOrchestrationSettings and buildOrchestrationSettingsUpdate enforc
     {
       confirmBeforeDispatch: 'chat-and-guard',
       defaultWorktree: true,
+      peerMessagingMode: 'controlled-p2p',
       agentProfiles: {
         codex: { enabled: false, specialty: '测试与评审', defaultModel: 'o3' },
       },
@@ -136,6 +137,7 @@ test('normalizeOrchestrationSettings and buildOrchestrationSettingsUpdate enforc
   assert.deepEqual(step1.settings, {
     confirmBeforeDispatch: 'always-ui',
     defaultWorktree: false,
+    peerMessagingMode: 'controlled-p2p',
     agentProfiles: {
       codex: { enabled: true, specialty: '代码审查', defaultModel: 'gpt-5-codex', defaultEffort: 'high' },
     },

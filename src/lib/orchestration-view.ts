@@ -4,6 +4,7 @@ import type {
   OrchestrationDispatchRecord,
   OrchestrationDispatchStatus,
   OrchestrationGateRecord,
+  OrchestrationMemberCursor,
   OrchestrationMessagePriority,
   OrchestrationMessageRecord,
   OrchestrationMessageType,
@@ -28,6 +29,7 @@ export const EMPTY_SNAPSHOT: OrchestrationSnapshot = {
   questions: [],
   pendingProposals: [],
   orchestrationModePanes: [],
+  memberCursorsByRun: {},
   coordinatorRuns: [],
   activeCoordinatorRun: null,
   currentRunByConsumer: {},
@@ -456,6 +458,24 @@ export function mergeRunSnapshot(
       : prev.orchestrationModePanes !== undefined
         ? { orchestrationModePanes: prev.orchestrationModePanes }
         : {}),
+    ...(incoming.memberCursorsByRun !== undefined || prev.memberCursorsByRun !== undefined
+      ? {
+          memberCursorsByRun: (() => {
+            const merged: Record<string, Record<string, OrchestrationMemberCursor>> = {};
+            for (const [id, cursors] of Object.entries(prev.memberCursorsByRun ?? {})) {
+              if (id !== runId && validRunIds.has(id)) {
+                merged[id] = cursors;
+              }
+            }
+            for (const [id, cursors] of Object.entries(incoming.memberCursorsByRun ?? {})) {
+              if (validRunIds.has(id)) {
+                merged[id] = cursors;
+              }
+            }
+            return merged;
+          })(),
+        }
+      : {}),
     coordinatorRuns: mergeScopedRecords(
       prev.coordinatorRuns,
       incoming.coordinatorRuns,

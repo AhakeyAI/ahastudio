@@ -4,19 +4,22 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type PointerEvent as ReactPointerEvent,
   type ReactElement,
 } from 'react';
-import { FolderTree, GitBranch, GitFork, Maximize2, Minimize2, RefreshCw, X } from 'lucide-react';
+import { FolderTree, GitBranch, GitFork, Maximize2, Minimize2, Network, RefreshCw, X } from 'lucide-react';
 import { buildTreeDecorations } from '../lib/git-panel-model';
+import { orchestrationClient } from '../lib/orchestration-client';
 import type { GitStatusResult } from '../types';
 import { GitChangesPanel } from './GitChangesPanel';
 import { GitWorktreesPanel, type WorktreeHostActions } from './GitWorktreesPanel';
+import { OrchestrationBoardPanel } from './OrchestrationBoardPanel';
 import { PanelPreview, previewKey, type AgentPromptTarget, type PanelPreviewTarget } from './PanelPreview';
 import { WorkspaceFilesPanel } from './WorkspaceFilesPanel';
 import './workspace-right-panel.css';
 
-export type RightPanelTab = 'changes' | 'files' | 'worktrees';
+export type RightPanelTab = 'changes' | 'files' | 'worktrees' | 'board';
 
 export const RIGHT_PANEL_MIN_WIDTH = 260;
 export const RIGHT_PANEL_MAX_WIDTH = 1100;
@@ -79,6 +82,7 @@ export function WorkspaceRightPanel({
   worktreeActions,
   agentTargets,
   onAgentPromptSent,
+  activePtyId,
 }: {
   cwd: string | undefined;
   tab: RightPanelTab;
@@ -93,8 +97,13 @@ export function WorkspaceRightPanel({
   /** Terminal panes in the current project that can receive file/diff context. */
   agentTargets: AgentPromptTarget[];
   onAgentPromptSent: (target: AgentPromptTarget) => void;
+  activePtyId?: string;
 }) {
   const { status, loading, token, refresh } = useGitStatus(cwd);
+  const orchestration = useSyncExternalStore(
+    orchestrationClient.subscribe,
+    orchestrationClient.getSnapshot,
+  );
   const [fsSignal, setFsSignal] = useState(0);
   const [preview, setPreview] = useState<PanelPreviewTarget | null>(null);
   const [previewMax, setPreviewMax] = useState(false);
@@ -164,6 +173,21 @@ export function WorkspaceRightPanel({
   );
 
   const changeCount = status?.ok ? status.entries.length : 0;
+  const boardAttention = useMemo(() => {
+    const proposals = (orchestration.pendingProposals ?? []).filter((p) => p.status === 'pending').length;
+    const approvals = (orchestration.openApprovals ?? []).filter((a) => a.status === 'pending').length;
+    const questions = orchestration.questions.filter((q) => q.status === 'pending').length;
+    const gates = orchestration.gates.filter((g) => g.status === 'pending').length;
+    return proposals + approvals + questions + gates;
+  }, [orchestration]);
+  const boardWorking = useMemo(
+    () =>
+      orchestration.dispatches.filter(
+        (d) => !d.releasedAt && (d.status === 'pending' || d.status === 'dispatched'),
+      ).length,
+    [orchestration.dispatches],
+  );
+  const boardBadge = boardAttention > 0 ? boardAttention : boardWorking;
 
   const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -193,14 +217,30 @@ export function WorkspaceRightPanel({
 
   const selectedKey = previewKey(preview);
 
-  const tabs: Array<{ id: RightPanelTab; label: string; icon: ReactElement; badge?: number; disabled?: boolean }> = [
+  const tabs: Array<{
+    id: RightPanelTab;
+    label: string;
+    icon: ReactElement;
+    badge?: number;
+    badgeWarn?: boolean;
+    disabled?: boolean;
+  }> = [
     { id: 'changes', label: '变更', icon: <GitBranch size={13} />, badge: changeCount || undefined, disabled: !isRepo },
     { id: 'files', label: '文件', icon: <FolderTree size={13} /> },
     { id: 'worktrees', label: '工作树', icon: <GitFork size={13} />, disabled: !isRepo },
+    {
+      id: 'board',
+      label: '协作',
+      icon: <Network size={13} />,
+      badge: boardBadge || undefined,
+      badgeWarn: boardAttention > 0,
+    },
   ];
 
   let body: ReactElement;
-  if (!cwd || !filesRoot) {
+  if (tab === 'board') {
+    body = <OrchestrationBoardPanel activePtyId={activePtyId} onNotify={onNotify} />;
+  } else if (!cwd || !filesRoot) {
     body = (
       <div className="wrp-empty">
         <FolderTree size={22} />
@@ -284,7 +324,7 @@ export function WorkspaceRightPanel({
               {item.icon}
               <span>{item.label}</span>
               {item.badge !== undefined && (
-                <span className="wrp-badge">
+                <span className={`wrp-badge ${item.badgeWarn ? 'is-warn' : ''}`}>
                   {item.badge > 999 ? '999+' : item.badge}
                 </span>
               )}
@@ -296,7 +336,10 @@ export function WorkspaceRightPanel({
           className="wrp-header-btn"
           title="刷新"
           aria-label="刷新"
-          onClick={() => scheduleRefresh(true)}
+          onClick={() => {
+            if (tab === 'board') void orchestrationClient.refresh();
+            else scheduleRefresh(true);
+          }}
         >
           <RefreshCw size={13} className={loading ? 'wrp-spin' : ''} />
         </button>
@@ -304,9 +347,9 @@ export function WorkspaceRightPanel({
           <X size={14} />
         </button>
       </header>
-      <div className={`wrp-body ${preview ? 'has-preview' : ''} ${preview && previewMax ? 'is-preview-max' : ''}`}>
+      <div className={`wrp-body ${tab !== 'board' && preview ? 'has-preview' : ''} ${tab !== 'board' && preview && previewMax ? 'is-preview-max' : ''}`}>
         <div className="wrp-main">{body}</div>
-        {preview && filesRoot && (
+        {tab !== 'board' && preview && filesRoot && (
           <div className="wrp-preview-host">
             <PanelPreview
               key={previewKey(preview)}

@@ -57,10 +57,16 @@ export function exposeMessage(
   return {
     id: msg.id,
     runId: msg.runId,
+    ...(msg.boardSeq !== undefined ? { boardSeq: msg.boardSeq } : {}),
     type: msg.type,
     priority: msg.priority,
     fromHandle: msg.fromHandle,
     toHandle: msg.toHandle,
+    ...(msg.fromRole ? { fromRole: msg.fromRole } : {}),
+    ...(msg.mentions && msg.mentions.length > 0 ? { mentions: [...msg.mentions] } : {}),
+    ...(msg.refs && msg.refs.length > 0 ? { refs: [...msg.refs] } : {}),
+    ...(msg.kind ? { kind: msg.kind } : {}),
+    ...(msg.artifacts !== undefined ? { artifacts: msg.artifacts } : {}),
     subject: msg.subject,
     body: msg.body,
     payload: msg.payload,
@@ -90,7 +96,12 @@ export function exposeMessages(
 
 export function formatMessageBanner(
   msg: OrchestrationMessageRecord,
-  options: { cliCommand?: string; followUp?: OrchestrationReportFollowUp } = {}
+  options: {
+    cliCommand?: string;
+    followUp?: OrchestrationReportFollowUp;
+    mcpMode?: boolean;
+    roleLabel?: string;
+  } = {}
 ): string {
   const cli = options.cliCommand ?? 'aha';
   const priorityTag =
@@ -98,6 +109,55 @@ export function formatMessageBanner(
   const rejectedTag = msg.lifecycleRejectedReason
     ? ` [REJECTED: ${msg.lifecycleRejectedReason}]`
     : '';
+
+  if (options.mcpMode) {
+    const cleanRole =
+      options.roleLabel?.trim().replace(/^@+/, '') ||
+      msg.fromRole?.trim().replace(/^@+/, '') ||
+      msg.fromHandle;
+    const senderTag = cleanRole.startsWith('@') ? cleanRole : `@${cleanRole}`;
+    const mentionsTag =
+      msg.mentions && msg.mentions.length > 0
+        ? ` → ${msg.mentions.map((m) => `@${m}`).join(' ')}`
+        : '';
+    const seqNum = msg.boardSeq ?? msg.seq;
+    const kindLabel = msg.kind ?? msg.type;
+    const lines: string[] = [
+      `[#${seqNum} · ${senderTag}${mentionsTag} · ${kindLabel}]${priorityTag}${rejectedTag}`,
+    ];
+    if (msg.body) {
+      lines.push(msg.body);
+    } else if (msg.subject) {
+      lines.push(msg.subject);
+    }
+    if (msg.artifacts) {
+      const parts: string[] = [];
+      if (msg.artifacts.branch) parts.push(`branch=${msg.artifacts.branch}`);
+      if (msg.artifacts.headCommit) parts.push(`commit=${msg.artifacts.headCommit}`);
+      if (typeof msg.artifacts.changedFileCount === 'number') {
+        const filesList = msg.artifacts.changedFiles?.length
+          ? `: ${msg.artifacts.changedFiles.slice(0, 6).join(', ')}${msg.artifacts.changedFileCount > 6 ? '…' : ''}`
+          : '';
+        parts.push(`${msg.artifacts.changedFileCount} changed file(s)${filesList}`);
+      }
+      if (parts.length > 0) {
+        lines.push(`Artifacts: ${parts.join(' | ')}`);
+      }
+    }
+    if (msg.kind === 'approval') {
+      lines.push(
+        `[Action: manage_worker(role="${cleanRole}", action="approve" | "deny")]`
+      );
+    } else if (options.followUp) {
+      lines.push(
+        `[Worker ${senderTag} settled; mention ${senderTag} via post_message to reactivate or manage_worker(role="${cleanRole}", action="release").]`
+      );
+    } else if (msg.type !== 'heartbeat') {
+      lines.push(`[Reply: post_message(text="${senderTag} ...")]`);
+    }
+    return lines.join('\n');
+  }
+
   const senderName = msg.fromHandle.toUpperCase();
   const header = `──── From: ${senderName} (${msg.fromHandle})${priorityTag}${rejectedTag} (${msg.type}) ────`;
 

@@ -19,6 +19,16 @@ const TASK_KIND_ENUM = [
   'research',
   'docs',
 ];
+const BOARD_POST_KIND_ENUM = [
+  'brief',
+  'post',
+  'handoff',
+  'question',
+  'answer',
+  'report',
+  'approval',
+  'stall',
+];
 
 function readEndpointFile() {
   const file = process.env.AHA_AGENT_HOOK_ENDPOINT_FILE;
@@ -208,14 +218,106 @@ function buildDelegateTaskTool(ctx) {
   };
 }
 
+function buildPostMessageTool(ctx) {
+  const isWorker = Boolean(ctx && ctx.role === 'worker');
+  return {
+    name: 'post_message',
+    description: isWorker
+      ? 'Post a message to the shared run board. Mention @coordinator or an active sibling @role (e.g. @verifier) to wake them, cite earlier posts by #seq (e.g. #4), or post unaddressed status updates without waking anyone. Worker @all is visible on the board but never wakes peers.'
+      : 'Post a message to the shared run board. Mention @role to answer a pending question, steer an active worker, or reactivate a settled worker; mention @all to broadcast to all active workers; cite earlier posts by #seq.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: {
+          type: 'string',
+          description: 'Message text to post on the shared board (supports @role mentions and #seq references).',
+        },
+        kind: {
+          type: 'string',
+          enum: BOARD_POST_KIND_ENUM,
+          description: 'Optional board post kind (defaults to handoff for peer mentions or post otherwise).',
+        },
+        subject: {
+          type: 'string',
+          description: 'Optional short subject line for the post.',
+        },
+      },
+      required: ['text'],
+    },
+  };
+}
+
+function buildReadBoardTool() {
+  return {
+    name: 'read_board',
+    description:
+      'Read messages from the shared run board (oldest first) alongside a compact team status summary. Pass since=<seq> to read only posts after that sequence number, or seqs=[...] to pull specific posts without advancing your cursor.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: {
+          type: 'number',
+          description: 'Return posts with boardSeq strictly greater than this number.',
+        },
+        seqs: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Fetch only these specific board sequence numbers without advancing lastReadSeq.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of posts to return (default 20).',
+        },
+      },
+    },
+  };
+}
+
+function buildBoardWaitTool() {
+  return {
+    name: 'board_wait',
+    description:
+      'Sleep reactively until another member posts to the shared board (never poll in a loop). Pass since=<lastReadSeq> so messages posted while you were busy wake you immediately. Defaults to mentionsOnly=true (wakes on @your-role, reports/questions/approvals, or coordinator @all); pass mentionsOnly=false to wake on any new post.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: {
+          type: 'number',
+          description: 'Highest boardSeq you have already read (defaults to your server-tracked lastReadSeq).',
+        },
+        mentionsOnly: {
+          type: 'boolean',
+          description: 'Wake only for posts addressing you or privileged @all (default: true).',
+        },
+        timeoutMs: {
+          type: 'number',
+          description: 'Maximum wait duration in milliseconds (default 120000).',
+        },
+        peek: {
+          type: 'boolean',
+          description: 'If true, inspect board posts immediately without waiting or advancing your cursor.',
+        },
+      },
+    },
+  };
+}
+
 function buildTeamWaitTool() {
   return {
     name: 'team_wait',
     description:
-      'Wait reactively for worker completions, questions, permission approval requests, or turn-stop escalations (never poll in a loop).',
+      'Alias of board_wait: wait reactively for board updates, worker completions, questions, permission approval requests, or turn-stop escalations (never poll in a loop).',
     inputSchema: {
       type: 'object',
       properties: {
+        since: {
+          type: 'number',
+          description: 'Highest boardSeq you have already read (defaults to your server-tracked lastReadSeq).',
+        },
+        mentionsOnly: {
+          type: 'boolean',
+          description: 'Wake only for posts addressing you or privileged @all (default: true).',
+        },
         timeoutMs: {
           type: 'number',
           description: 'Maximum wait duration in milliseconds (default 120000).',
@@ -279,6 +381,9 @@ function buildToolsForContext(ctx) {
           required: ['question'],
         },
       },
+      buildPostMessageTool(ctx),
+      buildReadBoardTool(),
+      buildBoardWaitTool(),
     ];
     if (ctx.canDelegate) {
       tools.push(buildDelegateTaskTool(ctx), buildTeamWaitTool());
@@ -311,6 +416,9 @@ function buildToolsForContext(ctx) {
         },
       },
     },
+    buildPostMessageTool(ctx),
+    buildReadBoardTool(),
+    buildBoardWaitTool(),
     buildTeamWaitTool(),
     {
       name: 'message_worker',
@@ -444,24 +552,75 @@ function formatDelegateResultText(res) {
     `Agent: ${res.agent}${res.fallbackFrom ? ` (fallback from ${res.fallbackFrom})` : ''}`,
     ...(res.selectionReason ? [`Selection: ${res.selectionReason}`] : []),
     ...(res.dispatch && res.dispatch.id ? [`Dispatch: ${res.dispatch.id}`] : []),
+    ...(typeof res.briefBoardSeq === 'number' ? [`Board: #${res.briefBoardSeq}`] : []),
     ...(res.ptyId ? [`Pane: ${res.ptyId}`] : []),
     ...(res.worktreePath ? [`Worktree: ${res.worktreePath}`] : []),
     ...(res.branch ? [`Branch: ${res.branch}`] : []),
-    'Use team_wait to wait reactively for completion, questions, or approvals.',
+    'Use board_wait (or team_wait) to wait reactively for board updates, completions, questions, or approvals.',
   ];
   return lines.join('\n');
 }
 
 function formatMessageWorkerText(res) {
   if (!res || typeof res !== 'object') return 'Message delivered.';
+  const seqPart =
+    res.message && typeof res.message.boardSeq === 'number' ? ` (#${res.message.boardSeq})` : '';
   if (res.mode === 'replied') {
-    return `Answered pending question for worker (${res.dispatch ? res.dispatch.id : ''}).`;
+    return `Answered pending question${seqPart} for worker (${res.dispatch ? res.dispatch.id : ''}).`;
   }
   if (res.mode === 'reactivated') {
     const nextId = res.followUp && res.followUp.dispatch ? res.followUp.dispatch.id : '';
-    return `Reactivated settled worker as ${nextId}. Use team_wait for its reply.`;
+    return `Reactivated settled worker${seqPart} as ${nextId}. Use board_wait for its reply.`;
   }
-  return `Message delivered to worker (${res.dispatch ? res.dispatch.id : ''}).`;
+  return `Message delivered${seqPart} to worker (${res.dispatch ? res.dispatch.id : ''}).`;
+}
+
+function formatBoardPostText(res) {
+  if (!res || typeof res !== 'object') return 'Posted to board.';
+  const seq = typeof res.boardSeq === 'number' ? `#${res.boardSeq}` : '(unnumbered)';
+  const head = typeof res.headSeq === 'number' ? ` (head=#${res.headSeq})` : '';
+  const wokeList = Array.isArray(res.woke) ? res.woke.filter(Boolean) : [];
+  const wokePart =
+    wokeList.length > 0
+      ? ` Woke: ${wokeList.map((role) => `@${role}`).join(', ')}.`
+      : ' (no members woken).';
+  const escalatedPart = res.escalatedToCoordinator ? ' Escalated to @coordinator.' : '';
+  return `Posted ${seq}${head}.${wokePart}${escalatedPart}`;
+}
+
+function formatBoardReadText(res) {
+  if (!res || typeof res !== 'object') return '(no board posts)';
+  const posts = Array.isArray(res.posts) ? res.posts : [];
+  const header = `[Board run=${res.runId || ''} | head=#${res.headSeq ?? 0} | lastRead=#${res.lastReadSeq ?? 0} | posts=${posts.length}]`;
+  const parts = [header];
+  if (typeof res.formatted === 'string' && res.formatted.trim()) {
+    parts.push(res.formatted.trim());
+  } else {
+    parts.push('(no board posts)');
+  }
+  if (typeof res.teamSummary === 'string' && res.teamSummary.trim()) {
+    parts.push(res.teamSummary.trim());
+  }
+  return parts.join('\n\n');
+}
+
+function formatBoardWaitText(res) {
+  if (!res || typeof res !== 'object') return 'No new board updates.';
+  const posts = Array.isArray(res.posts) ? res.posts : [];
+  const head = res.headSeq ?? 0;
+  const lastRead = res.lastReadSeq ?? 0;
+  const summary =
+    typeof res.teamSummary === 'string' && res.teamSummary.trim() ? `\n\n${res.teamSummary.trim()}` : '';
+  if (posts.length > 0 && typeof res.formatted === 'string' && res.formatted.trim()) {
+    return `[Board head=#${head} | lastRead=#${lastRead}]\n${res.formatted.trim()}${summary}`;
+  }
+  if (res.timedOut) {
+    return `No new board updates (wait timed out; head=#${head}, lastRead=#${lastRead}).${summary}`;
+  }
+  if (res.cancelled) {
+    return `Board wait cancelled (head=#${head}, lastRead=#${lastRead}).${summary}`;
+  }
+  return `No new board updates (head=#${head}, lastRead=#${lastRead}).${summary}`;
 }
 
 function formatManageWorkerText(res) {
@@ -503,6 +662,18 @@ function finiteNonNegativeInt(value) {
   return Math.max(0, Math.floor(value));
 }
 
+function finitePositiveInt(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  const n = Math.floor(value);
+  return n >= 1 ? n : undefined;
+}
+
+function positiveIntArray(value) {
+  if (!Array.isArray(value)) return undefined;
+  const parsed = value.map(finitePositiveInt).filter((n) => n !== undefined);
+  return parsed.length > 0 ? parsed : undefined;
+}
+
 async function handleToolCall(name, rawArgs, activeRequests) {
   if (!process.env.AHA_TERMINAL_ID) {
     return toolText(
@@ -515,9 +686,10 @@ async function handleToolCall(name, rawArgs, activeRequests) {
   const callAction = async (action, payload) => {
     const res = await postOrchestrationAction(action, payload, activeRequests);
     if (!res.body || res.body.ok !== true) {
-      const code = res.body && res.body.code ? `[${res.body.code}] ` : '';
+      const rawCode = res.body && typeof res.body.code === 'string' ? res.body.code : '';
+      const code = rawCode ? `[${rawCode}] ` : '';
       const errMsg = (res.body && res.body.error) || `HTTP ${res.status}`;
-      return { ok: false, errorText: `${code}${errMsg}` };
+      return { ok: false, code: rawCode, errorText: `${code}${errMsg}` };
     }
     return { ok: true, result: res.body.result };
   };
@@ -564,25 +736,79 @@ async function handleToolCall(name, rawArgs, activeRequests) {
             : undefined;
       return toolText(formatTeamStatusText(res.result, includeSettled));
     }
+    case 'post_message': {
+      const kind = nonEmptyStr(args.kind);
+      const subject = nonEmptyStr(args.subject);
+      const res = await callAction('board-post', {
+        text: typeof args.text === 'string' ? args.text : '',
+        ...(kind ? { kind } : {}),
+        ...(subject ? { subject } : {}),
+      });
+      if (!res.ok) return toolText(res.errorText, true);
+      return toolText(formatBoardPostText(res.result));
+    }
+    case 'read_board': {
+      const since = finiteNonNegativeInt(args.since);
+      const seqs = positiveIntArray(args.seqs);
+      const limit = finitePositiveInt(args.limit);
+      const res = await callAction('board-read', {
+        ...(since !== undefined ? { since } : {}),
+        ...(seqs ? { seqs } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+      });
+      if (!res.ok) return toolText(res.errorText, true);
+      return toolText(formatBoardReadText(res.result));
+    }
+    case 'board_wait':
     case 'team_wait': {
       const peek = args.peek === true;
+      const since = finiteNonNegativeInt(args.since);
+      const mentionsOnly =
+        typeof args.mentionsOnly === 'boolean'
+          ? args.mentionsOnly
+          : typeof args.mentions_only === 'boolean'
+            ? args.mentions_only
+            : undefined;
       const timeoutMs = finiteNonNegativeInt(args.timeoutMs ?? args.timeout_ms);
-      const payload = {
-        from: process.env.AHA_TERMINAL_ID,
-        wait: !peek,
-        peek,
-        format: true,
-        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-      };
-      const res = await callAction('check', payload);
-      if (!res.ok) return toolText(res.errorText, true);
-      const r = res.result || {};
-      if (r.count > 0 && typeof r.formatted === 'string' && r.formatted.trim()) {
-        return toolText(r.formatted);
+      if (peek) {
+        const res = await callAction('board-read', {
+          ...(since !== undefined ? { since } : {}),
+          markRead: false,
+        });
+        if (!res.ok) {
+          if (name === 'team_wait' && res.code === 'run_not_found') {
+            return toolText('No unread worker updates.');
+          }
+          return toolText(res.errorText, true);
+        }
+        return toolText(formatBoardReadText(res.result));
       }
-      if (r.timedOut) return toolText('No new worker updates (wait timed out).');
-      if (r.cancelled) return toolText('Wait cancelled.');
-      return toolText('No unread worker updates.');
+      const res = await callAction('board-wait', {
+        ...(since !== undefined ? { since } : {}),
+        ...(mentionsOnly !== undefined ? { mentionsOnly } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      });
+      if (!res.ok) {
+        if (name === 'team_wait' && res.code === 'run_not_found') {
+          const fallback = await callAction('check', {
+            from: process.env.AHA_TERMINAL_ID,
+            wait: true,
+            peek: false,
+            format: true,
+            ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+          });
+          if (!fallback.ok) return toolText(fallback.errorText, true);
+          const fr = fallback.result || {};
+          if (fr.count > 0 && typeof fr.formatted === 'string' && fr.formatted.trim()) {
+            return toolText(fr.formatted);
+          }
+          if (fr.timedOut) return toolText('No new worker updates (wait timed out).');
+          if (fr.cancelled) return toolText('Wait cancelled.');
+          return toolText('No unread worker updates.');
+        }
+        return toolText(res.errorText, true);
+      }
+      return toolText(formatBoardWaitText(res.result));
     }
     case 'message_worker': {
       const subject = nonEmptyStr(args.subject);
@@ -614,8 +840,12 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       });
       if (!res.ok) return toolText(res.errorText, true);
       const d = res.result && res.result.dispatch;
+      const seqPart =
+        res.result && res.result.message && typeof res.result.message.boardSeq === 'number'
+          ? ` as #${res.result.message.boardSeq}`
+          : '';
       return toolText(
-        `Completion report recorded (${d ? `${d.id}: ${d.status}` : 'settled'}).`
+        `Completion report recorded${seqPart} (${d ? `${d.id}: ${d.status}` : 'settled'}).`
       );
     }
     case 'ask_coordinator': {

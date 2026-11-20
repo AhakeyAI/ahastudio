@@ -104,6 +104,37 @@ export interface WorkerApprovalPayload {
 
 export type OrchestrationConfirmMode = 'chat-and-guard' | 'always-ui' | 'auto';
 
+export const ORCHESTRATION_PEER_MESSAGING_MODES = ['controlled-p2p', 'hub-only'] as const;
+export type OrchestrationPeerMessagingMode = (typeof ORCHESTRATION_PEER_MESSAGING_MODES)[number];
+
+export const ORCHESTRATION_BOARD_POST_KINDS = [
+  'brief',
+  'post',
+  'update',
+  'handoff',
+  'question',
+  'answer',
+  'report',
+  'approval',
+  'stall',
+  'system',
+] as const;
+export type OrchestrationBoardPostKind = (typeof ORCHESTRATION_BOARD_POST_KINDS)[number];
+
+export interface OrchestrationMemberCursor {
+  lastReadSeq: number;
+  lastPostSeq: number;
+  lastDeliveredSeq: number;
+}
+
+export interface OrchestrationReportArtifacts {
+  branch?: string | null;
+  worktreePath?: string | null;
+  headCommit?: string | null;
+  changedFiles?: string[];
+  changedFileCount?: number;
+}
+
 export const ORCHESTRATION_TASK_KINDS = [
   'architecture',
   'implementation',
@@ -301,10 +332,16 @@ export interface OrchestrationMessageRecord {
   id: string;
   runId: string;
   seq: number;
+  boardSeq?: number;
   type: OrchestrationMessageType;
   priority: OrchestrationMessagePriority;
   fromHandle: string;
   toHandle: string;
+  fromRole?: string;
+  mentions?: string[];
+  refs?: number[];
+  kind?: OrchestrationBoardPostKind;
+  artifacts?: OrchestrationReportArtifacts | null;
   subject: string;
   body: string;
   payload: string | null;
@@ -324,10 +361,16 @@ export interface OrchestrationReportFollowUp {
 export interface OrchestrationExposedMessage {
   id: string;
   runId: string;
+  boardSeq?: number;
   type: OrchestrationMessageType;
   priority: OrchestrationMessagePriority;
   fromHandle: string;
   toHandle: string;
+  fromRole?: string;
+  mentions?: string[];
+  refs?: number[];
+  kind?: OrchestrationBoardPostKind;
+  artifacts?: OrchestrationReportArtifacts | null;
   subject: string;
   body: string;
   payload: string | null;
@@ -422,6 +465,8 @@ export interface OrchestrationPersistedState {
   /** Per-dispatch worker credentials, keyed by dispatch id. Never part of the UI snapshot. */
   capabilities?: Record<string, string>;
   deferredDispatchPrompts?: Record<string, { ptyId: string; prompt: string; submit: boolean }>;
+  nextBoardSeqByRun?: Record<string, number>;
+  memberCursorsByRun?: Record<string, Record<string, OrchestrationMemberCursor>>;
 }
 
 export interface OrchestrationSnapshot {
@@ -434,6 +479,7 @@ export interface OrchestrationSnapshot {
   openApprovals?: WorkerApprovalPayload[];
   pendingProposals?: OrchestrationDispatchProposal[];
   orchestrationModePanes?: string[];
+  memberCursorsByRun?: Record<string, Record<string, OrchestrationMemberCursor>>;
   coordinatorRuns: OrchestrationCoordinatorRunRecord[];
   activeCoordinatorRun: OrchestrationCoordinatorRunRecord | null;
   currentRunByConsumer: Record<string, string>;

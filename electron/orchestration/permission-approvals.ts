@@ -35,6 +35,7 @@ export interface PermissionApprovalManagerDependencies {
   agentStatusStore: AgentStatusStore;
   notifyMailbox: (mailboxHandle: string, type: OrchestrationMessageType) => void;
   onChanged?: (reason: string, runId: string) => void;
+  resolveRoleName?: (dispatch: OrchestrationDispatchRecord) => string | null;
   cliCommand?: string;
   holdTimeoutMs?: number;
   now?: () => number;
@@ -233,11 +234,21 @@ export class PermissionApprovalManager {
     this.deps.store.updateDispatchStage(dispatch.id, 'waiting_permission');
 
     const parentMailbox = this.resolveParentMailbox(dispatch);
+    const roleName =
+      this.deps.resolveRoleName?.(dispatch)?.trim().replace(/^@+/, '') || null;
+    const workerLabel = roleName
+      ? `@${roleName} (${dispatch.assigneeHandle}, dispatch ${dispatch.id})`
+      : `${dispatch.assigneeHandle} (dispatch ${dispatch.id})`;
     const bodyLines = [
-      `Worker ${dispatch.assigneeHandle} (dispatch ${dispatch.id}) is requesting permission to run tool "${toolName}".`,
+      `Worker ${workerLabel} is requesting permission to run tool "${toolName}".`,
       ...(safeToolInput ? [`Input: ${safeToolInput}`] : []),
       ...(safeMessage ? [`Details: ${safeMessage}`] : []),
       '',
+      ...(roleName
+        ? [
+            `MCP: manage_worker(role="${roleName}", action="approve") or manage_worker(role="${roleName}", action="deny", reason="...")`,
+          ]
+        : []),
       `Approve: ${this.cliCommand} orchestration approve --id ${approvalId}`,
       `Deny:    ${this.cliCommand} orchestration deny --id ${approvalId} --reason "<reason>"`,
     ];
@@ -248,13 +259,18 @@ export class PermissionApprovalManager {
       to: parentMailbox,
       type: 'escalation',
       priority: 'urgent',
-      subject: `Permission approval needed: ${toolName} (${approvalId})`,
+      subject: roleName
+        ? `Permission approval needed from @${roleName}: ${toolName} (${approvalId})`
+        : `Permission approval needed: ${toolName} (${approvalId})`,
       body: bodyLines.join('\n'),
       payload: JSON.stringify({
         permissionApproval: true,
         advisory: true,
         ...payload,
       }),
+      fromRole: roleName ?? undefined,
+      mentions: ['coordinator'],
+      kind: 'approval',
     });
 
     const hookPromise = new Promise<{ hookStdout?: string }>((resolve) => {

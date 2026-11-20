@@ -603,6 +603,48 @@ export type UserPromptInterceptor = (
   | void
   | Promise<{ hookStdout?: string } | null | void>;
 
+export interface PostToolInterceptRequest {
+  ptyId: string;
+  provider: string;
+  eventName: string;
+  toolName?: string;
+}
+
+export type PostToolInterceptor = (
+  req: PostToolInterceptRequest
+) =>
+  | { hookStdout?: string }
+  | null
+  | void
+  | Promise<{ hookStdout?: string } | null | void>;
+
+export function supportsPostToolContextInjection(provider: string, eventName: string): boolean {
+  const normProvider = provider.trim().toLowerCase();
+  const cleanEvent = eventName.trim();
+  return (
+    ((normProvider === 'claude' || normProvider === 'claude-code' || normProvider === 'qwen') &&
+      cleanEvent === 'PostToolUse') ||
+    ((normProvider === 'gemini' || normProvider === 'gemini-cli') && cleanEvent === 'AfterTool')
+  );
+}
+
+export function formatPostToolContextHookStdout(
+  provider: string,
+  eventName: string,
+  text: string
+): string | undefined {
+  if (!supportsPostToolContextInjection(provider, eventName)) return undefined;
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  const cleanEvent = eventName.trim();
+  return `${JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: cleanEvent,
+      additionalContext: trimmed,
+    },
+  })}\n`;
+}
+
 export function formatAdditionalContextHookStdout(
   provider: string,
   eventName: string,
@@ -705,6 +747,7 @@ export class AgentHookServer {
   private companionHandler: CompanionHttpHandler | null = null;
   private permissionHookInterceptor: PermissionHookInterceptor | null = null;
   private userPromptInterceptor: UserPromptInterceptor | null = null;
+  private postToolInterceptor: PostToolInterceptor | null = null;
   private orchestrationBinShim: AgentHookBinShim | null = null;
   private endpointFile: string | null = null;
 
@@ -773,6 +816,10 @@ export class AgentHookServer {
 
   setUserPromptInterceptor(interceptor: UserPromptInterceptor | null): void {
     this.userPromptInterceptor = interceptor;
+  }
+
+  setPostToolInterceptor(interceptor: PostToolInterceptor | null): void {
+    this.postToolInterceptor = interceptor;
   }
 
   setOrchestrationBinShim(shim: AgentHookBinShim | null): void {
@@ -1086,6 +1133,40 @@ export class AgentHookServer {
         return;
       } catch (err) {
         console.warn('[agent-hooks] userPromptInterceptor failed:', err);
+        if (!res.writableEnded) {
+          sendJson(res, 200, {});
+        }
+        return;
+      }
+    }
+
+    if (
+      this.postToolInterceptor &&
+      (eventName === 'PostToolUse' || eventName === 'AfterTool')
+    ) {
+      const provider = providerHint ?? normalized.agentId ?? 'unknown';
+      const { toolName } = extractToolInfo(rawRecord);
+      try {
+        const postToolReply = await this.postToolInterceptor({
+          ptyId: normalized.ptyId,
+          provider,
+          eventName,
+          toolName: toolName ?? normalized.toolName,
+        });
+        if (!res.writableEnded) {
+          sendJson(
+            res,
+            200,
+            postToolReply &&
+              typeof postToolReply.hookStdout === 'string' &&
+              postToolReply.hookStdout.length > 0
+              ? { hookStdout: postToolReply.hookStdout }
+              : {},
+          );
+        }
+        return;
+      } catch (err) {
+        console.warn('[agent-hooks] postToolInterceptor failed:', err);
         if (!res.writableEnded) {
           sendJson(res, 200, {});
         }

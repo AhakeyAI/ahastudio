@@ -46,15 +46,18 @@ test('orchestration settings validation and v2 migration preserve valid preferen
   const updated = settingsIpc.buildOrchestrationSettingsUpdate({
     confirmBeforeDispatch: 'always-ui',
     defaultWorktree: false,
+    peerMessagingMode: 'hub-only',
     agentProfiles: { gemini: { enabled: true, specialty: '调研与文档' } },
   });
   assert.equal(updated.ok, true);
   assert.deepEqual(updated.settings, {
     confirmBeforeDispatch: 'always-ui',
     defaultWorktree: false,
+    peerMessagingMode: 'hub-only',
     agentProfiles: { gemini: { enabled: true, specialty: '调研与文档' } },
   });
   assert.equal(settingsIpc.buildOrchestrationSettingsUpdate({ confirmBeforeDispatch: 'invalid' }).ok, false);
+  assert.equal(settingsIpc.buildOrchestrationSettingsUpdate({ peerMessagingMode: 'invalid' }).ok, false);
   assert.equal(settingsIpc.buildOrchestrationSettingsUpdate({ unknownField: 1 }).ok, false);
 
   const migrated = settingsMigration.migrateSettings({

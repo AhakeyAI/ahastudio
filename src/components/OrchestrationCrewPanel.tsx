@@ -7,6 +7,7 @@ import {
   ExternalLink,
   Eye,
   GitBranch,
+  Network,
   Pin,
   Send,
   ShieldAlert,
@@ -564,6 +565,20 @@ export function OrchestrationCrewPanel({
 
       {expanded && (
         <div className="aha-crew-drawer" role="region" aria-label="Orchestration Crew 详情">
+          <div className="aha-crew-section-header">
+            <span>{crew.isOrchestrationMode ? '编排协作 · 已开启' : '编排协作'}</span>
+            <button
+              type="button"
+              className="aha-crew-mention-all"
+              title="在右侧栏打开完整协作板"
+              onClick={() => {
+                setExpanded(false);
+                window.dispatchEvent(new CustomEvent('aha:open-orchestration-board'));
+              }}
+            >
+              <Network size={11} /> 协作板
+            </button>
+          </div>
           {crew.pendingProposals.length > 0 && (
             <section className="aha-crew-section is-alert">
               <header className="aha-crew-section-header">

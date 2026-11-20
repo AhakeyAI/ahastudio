@@ -665,13 +665,19 @@ export interface OrchestrationMessageRecord {
   id: string;
   runId: string;
   seq: number;
+  boardSeq?: number;
   type: OrchestrationMessageType;
   priority: OrchestrationMessagePriority;
   fromHandle: string;
+  fromRole?: string;
   toHandle: string;
+  mentions?: string[];
+  refs?: number[];
+  kind?: OrchestrationBoardPostKind;
   subject: string;
   body: string;
   payload: string | null;
+  artifacts?: OrchestrationReportArtifacts | null;
   threadId: string | null;
   deliveredAt: string | null;
   read: boolean;
@@ -688,13 +694,19 @@ export interface OrchestrationReportFollowUp {
 export interface OrchestrationExposedMessage {
   id: string;
   runId: string;
+  boardSeq?: number;
   type: OrchestrationMessageType;
   priority: OrchestrationMessagePriority;
   fromHandle: string;
+  fromRole?: string;
   toHandle: string;
+  mentions?: string[];
+  refs?: number[];
+  kind?: OrchestrationBoardPostKind;
   subject: string;
   body: string;
   payload: string | null;
+  artifacts?: OrchestrationReportArtifacts | null;
   threadId: string | null;
   deliveredAt: string | null;
   createdAt: string;
@@ -732,6 +744,33 @@ export interface OrchestrationCoordinatorRunRecord {
 }
 
 export type OrchestrationConfirmMode = 'chat-and-guard' | 'always-ui' | 'auto';
+export type OrchestrationPeerMessagingMode = 'controlled-p2p' | 'hub-only';
+export type OrchestrationBoardPostKind =
+  | 'brief'
+  | 'post'
+  | 'update'
+  | 'handoff'
+  | 'question'
+  | 'answer'
+  | 'report'
+  | 'approval'
+  | 'stall'
+  | 'system';
+
+export interface OrchestrationMemberCursor {
+  lastReadSeq: number;
+  lastPostSeq: number;
+  lastDeliveredSeq: number;
+}
+
+export interface OrchestrationReportArtifacts {
+  branch?: string | null;
+  worktreePath?: string | null;
+  headCommit?: string | null;
+  changedFiles?: string[];
+  changedFileCount?: number;
+}
+
 export type OrchestrationTaskKind =
   | 'architecture'
   | 'implementation'
@@ -751,12 +790,14 @@ export interface OrchestrationAgentProfile {
 export interface OrchestrationSettings {
   confirmBeforeDispatch: OrchestrationConfirmMode;
   defaultWorktree: boolean;
+  peerMessagingMode?: OrchestrationPeerMessagingMode;
   agentProfiles: Record<string, OrchestrationAgentProfile>;
 }
 
 export interface OrchestrationSettingsPatch {
   confirmBeforeDispatch?: OrchestrationConfirmMode;
   defaultWorktree?: boolean;
+  peerMessagingMode?: OrchestrationPeerMessagingMode;
   agentProfiles?: Record<string, OrchestrationAgentProfile | null>;
 }
 
@@ -831,6 +872,7 @@ export interface OrchestrationSnapshot {
   openApprovals?: WorkerApprovalPayload[];
   pendingProposals?: OrchestrationDispatchProposal[];
   orchestrationModePanes?: string[];
+  memberCursorsByRun?: Record<string, Record<string, OrchestrationMemberCursor>>;
   coordinatorRuns: OrchestrationCoordinatorRunRecord[];
   activeCoordinatorRun: OrchestrationCoordinatorRunRecord | null;
   currentRunByConsumer: Record<string, string>;
@@ -1325,6 +1367,35 @@ export interface OrchestrationApi {
     id: string;
     reason?: string;
   }) => Promise<OrchestrationResult<{ proposal: OrchestrationDispatchProposal }>>;
+  boardPost?: (opts: {
+    runId?: string;
+    text: string;
+    kind?: OrchestrationBoardPostKind;
+    subject?: string;
+  }) => Promise<
+    OrchestrationResult<{
+      post: OrchestrationExposedMessage;
+      boardSeq: number;
+      headSeq: number;
+      woke: string[];
+      escalatedToCoordinator?: boolean;
+    }>
+  >;
+  boardRead?: (opts?: {
+    runId?: string;
+    since?: number;
+    seqs?: number[];
+    limit?: number;
+  }) => Promise<
+    OrchestrationResult<{
+      runId: string;
+      headSeq: number;
+      lastReadSeq: number;
+      posts: OrchestrationExposedMessage[];
+      formatted: string;
+      teamSummary: string;
+    }>
+  >;
   onEvent: (cb: (event: OrchestrationEvent) => void) => () => void;
   onPaneSpawned: (cb: (event: OrchestrationPaneSpawnedEvent) => void) => () => void;
   onPaneClosed: (cb: (event: OrchestrationPaneClosedEvent) => void) => () => void;

@@ -27,6 +27,9 @@ export interface XfyunAsrCredentials {
 export const ORCHESTRATION_CONFIRM_MODES = ['chat-and-guard', 'always-ui', 'auto'] as const;
 export type OrchestrationConfirmMode = (typeof ORCHESTRATION_CONFIRM_MODES)[number];
 
+export const ORCHESTRATION_PEER_MESSAGING_MODES = ['controlled-p2p', 'hub-only'] as const;
+export type OrchestrationPeerMessagingMode = (typeof ORCHESTRATION_PEER_MESSAGING_MODES)[number];
+
 export const ORCHESTRATION_TASK_KINDS = [
   'architecture',
   'implementation',
@@ -48,12 +51,14 @@ export interface OrchestrationAgentProfile {
 export interface OrchestrationSettings {
   confirmBeforeDispatch: OrchestrationConfirmMode;
   defaultWorktree: boolean;
+  peerMessagingMode: OrchestrationPeerMessagingMode;
   agentProfiles: Record<string, OrchestrationAgentProfile>;
 }
 
 export const DEFAULT_ORCHESTRATION_SETTINGS: OrchestrationSettings = {
   confirmBeforeDispatch: 'chat-and-guard',
   defaultWorktree: true,
+  peerMessagingMode: 'controlled-p2p',
   agentProfiles: {},
 };
 
@@ -66,6 +71,7 @@ export function normalizeOrchestrationSettings(
     return {
       confirmBeforeDispatch: DEFAULT_ORCHESTRATION_SETTINGS.confirmBeforeDispatch,
       defaultWorktree: DEFAULT_ORCHESTRATION_SETTINGS.defaultWorktree,
+      peerMessagingMode: DEFAULT_ORCHESTRATION_SETTINGS.peerMessagingMode,
       agentProfiles: {},
     };
   }
@@ -81,6 +87,11 @@ export function normalizeOrchestrationSettings(
     typeof raw.defaultWorktree === 'boolean'
       ? raw.defaultWorktree
       : DEFAULT_ORCHESTRATION_SETTINGS.defaultWorktree;
+
+  const peerMessagingMode: OrchestrationPeerMessagingMode =
+    raw.peerMessagingMode === 'controlled-p2p' || raw.peerMessagingMode === 'hub-only'
+      ? raw.peerMessagingMode
+      : DEFAULT_ORCHESTRATION_SETTINGS.peerMessagingMode;
 
   const agentProfiles: Record<string, OrchestrationAgentProfile> = {};
   if (raw.agentProfiles && typeof raw.agentProfiles === 'object' && !Array.isArray(raw.agentProfiles)) {
@@ -120,6 +131,7 @@ export function normalizeOrchestrationSettings(
   return {
     confirmBeforeDispatch,
     defaultWorktree,
+    peerMessagingMode,
     agentProfiles,
   };
 }

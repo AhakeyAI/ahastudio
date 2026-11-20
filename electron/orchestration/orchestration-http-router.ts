@@ -1,11 +1,13 @@
 import { z } from 'zod';
 import { OrchestrationService } from './orchestration-service.js';
 import {
+  ORCHESTRATION_BOARD_POST_KINDS,
   ORCHESTRATION_MESSAGE_TYPES,
   ORCHESTRATION_TASK_KINDS,
   OrchestrationError,
 } from './orchestration-types.js';
 
+const boardPostKindEnum = z.enum(ORCHESTRATION_BOARD_POST_KINDS);
 const messageTypeEnum = z.enum(ORCHESTRATION_MESSAGE_TYPES);
 const taskKindEnum = z.enum(ORCHESTRATION_TASK_KINDS);
 const priorityEnum = z.enum(['low', 'normal', 'high', 'urgent']);
@@ -343,6 +345,32 @@ const roleManageSchema = z.object({
   screen: z.boolean().optional(),
 });
 
+const boardPostSchema = z.object({
+  runId: z.string().trim().min(1).optional(),
+  from: z.string().trim().min(1).optional(),
+  text: z.string().trim().min(1).max(64_000),
+  kind: boardPostKindEnum.optional(),
+  subject: z.string().trim().min(1).max(500).optional(),
+  isUser: z.boolean().optional(),
+});
+
+const boardReadSchema = z.object({
+  runId: z.string().trim().min(1).optional(),
+  from: z.string().trim().min(1).optional(),
+  since: z.number().int().min(0).optional(),
+  seqs: z.array(z.number().int().min(1)).max(200).optional(),
+  limit: z.number().int().min(1).max(500).optional(),
+  markRead: z.boolean().optional(),
+});
+
+const boardWaitSchema = z.object({
+  runId: z.string().trim().min(1).optional(),
+  from: z.string().trim().min(1).optional(),
+  since: z.number().int().min(0).optional(),
+  mentionsOnly: z.boolean().optional(),
+  timeoutMs: z.number().int().min(0).max(3_600_000).optional(),
+});
+
 export interface OrchestrationHttpDispatchResult {
   status: number;
   body: Record<string, unknown>;
@@ -353,7 +381,8 @@ export function isLongPollOrchestrationAction(action: string): boolean {
     action === 'check' ||
     action === 'ask' ||
     action === 'ask-self' ||
-    action === 'delegate-task'
+    action === 'delegate-task' ||
+    action === 'board-wait'
   );
 }
 
@@ -628,7 +657,7 @@ export async function dispatchOrchestrationHttpAction(
           context.callerPaneId !== undefined
             ? requireCallerPane()
             : parsed.from || '';
-        result = service.workerDoneByPane(caller, {
+        result = await service.workerDoneByPane(caller, {
           outcome: parsed.outcome,
           summary: parsed.summary,
         });
@@ -723,6 +752,63 @@ export async function dispatchOrchestrationHttpAction(
           force: parsed.force,
           screen: parsed.screen,
         });
+        break;
+      }
+      case 'board-post': {
+        const parsed = boardPostSchema.parse(payload);
+        if (parsed.isUser === true) {
+          throw new OrchestrationError(
+            'operation_rejected',
+            'Cannot post as @user over HTTP; use the AhaStation UI.'
+          );
+        }
+        const caller =
+          context.callerPaneId !== undefined
+            ? requireCallerPane()
+            : parsed.from || 'coordinator';
+        result = await service.boardPost({
+          runId: parsed.runId,
+          from: caller,
+          text: parsed.text,
+          kind: parsed.kind,
+          subject: parsed.subject,
+          isUser: false,
+        });
+        break;
+      }
+      case 'board-read': {
+        const parsed = boardReadSchema.parse(payload);
+        const caller =
+          context.callerPaneId !== undefined
+            ? requireCallerPane()
+            : parsed.from || 'coordinator';
+        result = service.boardRead({
+          runId: parsed.runId,
+          from: caller,
+          since: parsed.since,
+          seqs: parsed.seqs,
+          limit: parsed.limit,
+          markRead: parsed.markRead,
+          isUser: false,
+        });
+        break;
+      }
+      case 'board-wait': {
+        const parsed = boardWaitSchema.parse(payload);
+        const caller =
+          context.callerPaneId !== undefined
+            ? requireCallerPane()
+            : parsed.from || 'coordinator';
+        result = await service.boardWait(
+          {
+            runId: parsed.runId,
+            from: caller,
+            since: parsed.since,
+            mentionsOnly: parsed.mentionsOnly,
+            timeoutMs: parsed.timeoutMs,
+          },
+          context.signal
+        );
         break;
       }
       default:

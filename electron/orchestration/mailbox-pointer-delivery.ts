@@ -16,6 +16,13 @@ export interface MailboxPointerDeliveryDependencies {
   agentStatusStore: AgentStatusStore;
   writePty: PtyWriteFn;
   isPaneAlive?: (ptyId: string) => boolean;
+  isMcpEnabledForPane?: (ptyId: string) => boolean;
+  resolveMemberKeyForPane?: (
+    ptyId: string
+  ) => { runId: string; memberKey: string; role: string } | null;
+  findPendingBoardPostsForPane?: (ptyId: string) => OrchestrationMessageRecord[];
+  shouldDeliverMessageToPane?: (msg: OrchestrationMessageRecord, ptyId: string) => boolean;
+  formatDirectDeliveryText?: (msgs: OrchestrationMessageRecord[], ptyId: string) => string | null;
   cliCommand?: string;
   debounceMs?: number;
   settleDelayMs?: number;
@@ -264,8 +271,17 @@ export class MailboxPointerDelivery {
   ): { mailboxHandle: string; eligible: OrchestrationMessageRecord[] } | null {
     const ownedMailboxes = this.resolveOwnedMailboxesForPane(ptyId);
     const ownedHandles = new Set(ownedMailboxes.map((o) => o.mailboxHandle));
+    const memberInfo = this.deps.resolveMemberKeyForPane?.(ptyId) ?? null;
+    const memberCursor = memberInfo
+      ? this.deps.store.getMemberCursor(memberInfo.runId, memberInfo.memberKey)
+      : null;
+    const paneBoardWaitHandle = `board-pane:${ptyId}`;
+
     for (const owner of ownedMailboxes) {
       if (this.deps.waiters.hasUnfilteredWaiter(owner.mailboxHandle)) {
+        continue;
+      }
+      if (this.deps.waiters.hasUnfilteredWaiter(paneBoardWaitHandle)) {
         continue;
       }
       const isBroadcast = isBroadcastMailbox(owner.mailboxHandle);
@@ -283,7 +299,25 @@ export class MailboxPointerDelivery {
           if (isBroadcast && (msg.fromHandle === ptyId || ownedHandles.has(msg.fromHandle))) {
             return false;
           }
+          if (
+            memberInfo &&
+            memberCursor &&
+            msg.runId === memberInfo.runId &&
+            typeof msg.boardSeq === 'number' &&
+            msg.boardSeq <= memberCursor.lastDeliveredSeq
+          ) {
+            return false;
+          }
+          if (
+            this.deps.shouldDeliverMessageToPane &&
+            !this.deps.shouldDeliverMessageToPane(msg, ptyId)
+          ) {
+            return false;
+          }
           if (this.deps.waiters.hasMatchingWaiter(owner.mailboxHandle, msg.type)) {
+            return false;
+          }
+          if (this.deps.waiters.hasMatchingWaiter(paneBoardWaitHandle, msg.type)) {
             return false;
           }
           if (
@@ -298,6 +332,35 @@ export class MailboxPointerDelivery {
         });
       if (candidates.length > 0) {
         return { mailboxHandle: owner.mailboxHandle, eligible: candidates };
+      }
+    }
+
+    if (
+      this.deps.isMcpEnabledForPane?.(ptyId) &&
+      this.deps.findPendingBoardPostsForPane &&
+      !this.deps.waiters.hasUnfilteredWaiter(paneBoardWaitHandle)
+    ) {
+      const boardPending = this.deps.findPendingBoardPostsForPane(ptyId).filter((msg) => {
+        if (msg.lifecycleRejectedReason !== null) return false;
+        if (
+          memberInfo &&
+          memberCursor &&
+          msg.runId === memberInfo.runId &&
+          typeof msg.boardSeq === 'number' &&
+          msg.boardSeq <= memberCursor.lastDeliveredSeq
+        ) {
+          return false;
+        }
+        if (this.deps.waiters.hasMatchingWaiter(paneBoardWaitHandle, msg.type)) {
+          return false;
+        }
+        return true;
+      });
+      if (boardPending.length > 0) {
+        return {
+          mailboxHandle: memberInfo ? `run:${memberInfo.runId}` : ptyId,
+          eligible: boardPending,
+        };
       }
     }
     return null;
@@ -323,22 +386,44 @@ export class MailboxPointerDelivery {
     const { mailboxHandle: targetMailbox, eligible } = picked;
     const ids = eligible.map((m) => m.id);
     const held = this.deps.store.getOutstandingDelivery(targetMailbox, ptyId);
+    const mcpEnabled = this.deps.isMcpEnabledForPane?.(ptyId) ?? false;
+    const memberInfo = this.deps.resolveMemberKeyForPane?.(ptyId) ?? null;
 
     state.inFlight = true;
     this.deps.store.markAsDeliveredForConsumer(ids, ptyId);
     let wroteOk = false;
 
     try {
-      const pointerText = formatMessagePointer(
-        eligible.length,
-        targetMailbox,
-        this.cliCommand,
-        held?.id
-      );
+      let promptText: string;
+      if (mcpEnabled) {
+        const directText = this.deps.formatDirectDeliveryText?.(eligible, ptyId)?.trim() || '';
+        if (directText) {
+          promptText = directText;
+        } else {
+          const seqs = eligible
+            .map((m) => m.boardSeq ?? m.seq)
+            .filter((n) => Number.isFinite(n))
+            .sort((a, b) => a - b);
+          const minSeq = seqs[0] ?? 1;
+          const maxSeq = seqs[seqs.length - 1] ?? minSeq;
+          const rangeText = minSeq === maxSeq ? `#${minSeq}` : `#${minSeq}-#${maxSeq}`;
+          const sinceSeq = memberInfo
+            ? this.deps.store.getMemberCursor(memberInfo.runId, memberInfo.memberKey).lastReadSeq
+            : Math.max(0, minSeq - 1);
+          promptText = `[Board 有 ${eligible.length} 条 @你的新消息 (${rangeText})] 请调用 read_board(since=${sinceSeq}) 查看。`;
+        }
+      } else {
+        promptText = formatMessagePointer(
+          eligible.length,
+          targetMailbox,
+          this.cliCommand,
+          held?.id
+        );
+      }
       const res = await deliverPromptToPty(
         {
           ptyId,
-          prompt: pointerText.trim(),
+          prompt: promptText.trim(),
           submit: true,
           settleDelayMs: this.settleDelayMs,
           agentId: this.deps.agentStatusStore.get(ptyId)?.agentId ?? null,
@@ -350,6 +435,19 @@ export class MailboxPointerDelivery {
         this.deps.store.markAsUndeliveredForConsumer(ids, ptyId);
         state.deferredUntilIdle = true;
         return false;
+      }
+      if (mcpEnabled && memberInfo) {
+        let maxBoardSeq = 0;
+        for (const msg of eligible) {
+          if (msg.runId === memberInfo.runId && typeof msg.boardSeq === 'number') {
+            if (msg.boardSeq > maxBoardSeq) maxBoardSeq = msg.boardSeq;
+          }
+        }
+        if (maxBoardSeq > 0) {
+          this.deps.store.advanceMemberCursor(memberInfo.runId, memberInfo.memberKey, {
+            lastDeliveredSeq: maxBoardSeq,
+          });
+        }
       }
       wroteOk = true;
       return true;
