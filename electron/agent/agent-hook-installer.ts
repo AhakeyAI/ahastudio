@@ -7,7 +7,6 @@ export const AGENT_HOOK_CLI_IDS = ['claude', 'antigravity', 'codex', 'gemini', '
 export type AgentHookCliId = typeof AGENT_HOOK_CLI_IDS[number];
 
 export const RELAY_FILE_NAME = 'aha-agent-hook.cjs';
-const CODEX_MARKER = '# managed by AhaStation (agent status hook)';
 
 export type AgentHookInstallState = 'not-installed' | 'installed' | 'outdated' | 'conflict' | 'error';
 
@@ -40,10 +39,11 @@ const LABELS: Record<AgentHookCliId, string> = {
 };
 
 const CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS = 130;
+const CODEX_PERMISSION_HOOK_TIMEOUT_SECONDS = 130;
 const GEMINI_PERMISSION_HOOK_TIMEOUT_MS = 130_000;
 const GEMINI_LIFECYCLE_HOOK_TIMEOUT_MS = 5_000;
 
-const JSON_HOOK_EVENTS: Record<Exclude<AgentHookCliId, 'codex' | 'antigravity' | 'grok'>, readonly string[]> = {
+const JSON_HOOK_EVENTS: Record<Exclude<AgentHookCliId, 'antigravity' | 'grok'>, readonly string[]> = {
   claude: [
     'SessionStart',
     'UserPromptSubmit',
@@ -53,6 +53,17 @@ const JSON_HOOK_EVENTS: Record<Exclude<AgentHookCliId, 'codex' | 'antigravity' |
     'PermissionRequest',
     'Stop',
     'SubagentStop',
+  ],
+  codex: [
+    'SessionStart',
+    'UserPromptSubmit',
+    'PreToolUse',
+    'PermissionRequest',
+    'PostToolUse',
+    'SubagentStart',
+    'SubagentStop',
+    'Stop',
+    'Interrupt',
   ],
   gemini: ['BeforeAgent', 'AfterAgent', 'BeforeTool', 'AfterTool'],
   qwen: [
@@ -174,6 +185,14 @@ export class AgentHookInstaller {
     return isAbsolute(raw) ? raw : resolve(this.home, raw);
   }
 
+  private codexHomeDir(): string {
+    return this.env.CODEX_HOME || join(this.home, '.codex');
+  }
+
+  private codexLegacyConfigPath(): string {
+    return join(this.codexHomeDir(), 'config.toml');
+  }
+
   configPath(cliId: AgentHookCliId): string {
     switch (cliId) {
       case 'claude':
@@ -181,7 +200,7 @@ export class AgentHookInstaller {
       case 'antigravity':
         return join(this.home, '.gemini', 'config', 'hooks.json');
       case 'codex':
-        return join(this.env.CODEX_HOME || join(this.home, '.codex'), 'config.toml');
+        return join(this.codexHomeDir(), 'hooks.json');
       case 'gemini':
         return join(this.env.GEMINI_CLI_HOME || join(this.home, '.gemini'), 'settings.json');
       case 'qwen':
@@ -249,9 +268,10 @@ export class AgentHookInstaller {
 
   uninstall(cliId: AgentHookCliId): AgentHookCliStatus {
     const configPath = this.configPath(cliId);
-    if (existsSync(configPath)) {
-      if (cliId === 'codex') this.uninstallCodex(configPath);
-      else if (cliId === 'antigravity') this.uninstallAntigravity(configPath);
+    if (cliId === 'codex') {
+      this.uninstallCodex(configPath);
+    } else if (existsSync(configPath)) {
+      if (cliId === 'antigravity') this.uninstallAntigravity(configPath);
       else if (cliId === 'grok') this.uninstallGrok(configPath);
       else this.uninstallJson(configPath);
     }
@@ -282,11 +302,16 @@ export class AgentHookInstaller {
   }
 
   private expectedJsonTimeout(
-    cliId: Exclude<AgentHookCliId, 'codex' | 'antigravity' | 'grok'>,
+    cliId: Exclude<AgentHookCliId, 'antigravity' | 'grok'>,
     event: string,
   ): number {
     if (cliId === 'claude') {
       return event === 'PermissionRequest' ? CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS : 5;
+    }
+    if (cliId === 'codex') {
+      if (event === 'PermissionRequest') return CODEX_PERMISSION_HOOK_TIMEOUT_SECONDS;
+      if (event === 'Interrupt') return 3;
+      return 5;
     }
     if (cliId === 'gemini') {
       return event === 'BeforeTool' ? GEMINI_PERMISSION_HOOK_TIMEOUT_MS : GEMINI_LIFECYCLE_HOOK_TIMEOUT_MS;
@@ -295,7 +320,7 @@ export class AgentHookInstaller {
   }
 
   private jsonState(
-    cliId: Exclude<AgentHookCliId, 'codex' | 'antigravity' | 'grok'>,
+    cliId: Exclude<AgentHookCliId, 'antigravity' | 'grok'>,
     configPath: string,
   ): { state: AgentHookInstallState; detail?: string } {
     if (!existsSync(configPath)) return { state: 'not-installed' };
@@ -332,7 +357,7 @@ export class AgentHookInstaller {
     return { state: 'outdated', detail: '已安装的 hook 与当前版本不一致，重新安装即可更新' };
   }
 
-  private installJson(cliId: Exclude<AgentHookCliId, 'codex' | 'antigravity' | 'grok'>, configPath: string): void {
+  private installJson(cliId: Exclude<AgentHookCliId, 'antigravity' | 'grok'>, configPath: string): void {
     const exists = existsSync(configPath);
     const settings = exists ? readJsonSettings(configPath) : {};
     if (settings.hooks !== undefined && !isRecord(settings.hooks)) {
@@ -561,59 +586,73 @@ export class AgentHookInstaller {
     writeAtomic(configPath, `${JSON.stringify(next, null, 2)}\n`);
   }
 
-  // ---- Codex config.toml `notify` ----
+  // ---- Codex (~/.codex/hooks.json, with cleanup of legacy config.toml `notify`) ----
 
-  private codexNotifyLine(): string {
-    const argv = [this.nodeCommand, this.relayArgPath(), 'codex'];
-    return `notify = [${argv.map((a) => JSON.stringify(a)).join(', ')}] ${CODEX_MARKER}`;
+  private hasLegacyCodexNotify(): boolean {
+    const legacyPath = this.codexLegacyConfigPath();
+    if (!existsSync(legacyPath)) return false;
+    try {
+      const { lines, notifyIndex } = parseCodexTopLevel(readFileSync(legacyPath, 'utf8'));
+      return notifyIndex >= 0 && lines[notifyIndex]!.includes(RELAY_FILE_NAME);
+    } catch {
+      return false;
+    }
+  }
+
+  private stripLegacyCodexNotify(): void {
+    const legacyPath = this.codexLegacyConfigPath();
+    if (!existsSync(legacyPath)) return;
+    const raw = readFileSync(legacyPath, 'utf8');
+    const eol = raw.includes('\r\n') ? '\r\n' : '\n';
+    const { lines, notifyIndex } = parseCodexTopLevel(raw);
+    if (notifyIndex < 0 || !lines[notifyIndex]!.includes(RELAY_FILE_NAME)) return;
+    lines.splice(notifyIndex, 1);
+    backupOnce(legacyPath);
+    writeAtomic(legacyPath, lines.length ? `${lines.join(eol)}${eol}` : '');
   }
 
   private codexState(configPath: string): { state: AgentHookInstallState; detail?: string } {
-    if (!existsSync(configPath)) return { state: 'not-installed' };
-    const { lines, notifyIndex } = parseCodexTopLevel(readFileSync(configPath, 'utf8'));
-    if (notifyIndex < 0) return { state: 'not-installed' };
-    const line = lines[notifyIndex];
-    if (!line.includes(RELAY_FILE_NAME)) {
+    const jsonStatus = this.jsonState('codex', configPath);
+    const hasLegacy = this.hasLegacyCodexNotify();
+    if (jsonStatus.state === 'installed' && hasLegacy) {
       return {
-        state: 'conflict',
-        detail: 'config.toml 已配置了其他 notify 命令；为避免覆盖，请先手动移除或合并',
+        state: 'outdated',
+        detail: '检测到旧版 config.toml notify，重新安装即可清理并完全迁移至 hooks.json',
       };
     }
-    return line.trim() === this.codexNotifyLine()
-      ? { state: 'installed' }
-      : { state: 'outdated', detail: '已安装的 notify 与当前版本不一致，重新安装即可更新' };
+    if (jsonStatus.state === 'not-installed' && hasLegacy) {
+      return {
+        state: 'outdated',
+        detail: '当前使用旧版 config.toml notify，重新安装即可升级为无冲突的 hooks.json',
+      };
+    }
+    return jsonStatus;
   }
 
   private installCodex(configPath: string): void {
-    const exists = existsSync(configPath);
-    const raw = exists ? readFileSync(configPath, 'utf8') : '';
-    const eol = raw.includes('\r\n') ? '\r\n' : '\n';
-    const { lines, notifyIndex } = parseCodexTopLevel(raw);
-    const nextLine = this.codexNotifyLine();
-    if (notifyIndex >= 0) {
-      if (!lines[notifyIndex].includes(RELAY_FILE_NAME)) {
-        throw new Error('Codex config.toml 已配置了其他 notify 命令，未做修改');
-      }
-      lines[notifyIndex] = nextLine;
-    } else {
-      // Top-level keys must precede every [table]; the file start is always top-level.
-      lines.unshift(nextLine);
-    }
-    if (exists) backupOnce(configPath);
-    mkdirSync(dirname(configPath), { recursive: true });
-    let text = lines.join(eol);
-    if (!text.endsWith(eol)) text += eol;
-    writeAtomic(configPath, text);
+    this.installJson('codex', configPath);
+    this.stripLegacyCodexNotify();
   }
 
   private uninstallCodex(configPath: string): void {
-    const raw = readFileSync(configPath, 'utf8');
-    const eol = raw.includes('\r\n') ? '\r\n' : '\n';
-    const { lines, notifyIndex } = parseCodexTopLevel(raw);
-    if (notifyIndex < 0 || !lines[notifyIndex].includes(RELAY_FILE_NAME)) return;
-    lines.splice(notifyIndex, 1);
-    backupOnce(configPath);
-    writeAtomic(configPath, lines.length ? `${lines.join(eol)}${eol}` : '');
+    if (existsSync(configPath)) {
+      const settings = readJsonSettings(configPath);
+      if (isRecord(settings.hooks)) {
+        const hooks: Record<string, unknown> = { ...settings.hooks };
+        if (stripOurHooks(hooks, (c) => this.isOurCommand(c))) {
+          const next: Record<string, unknown> = { ...settings };
+          if (Object.keys(hooks).length === 0) delete next.hooks;
+          else next.hooks = hooks;
+          if (Object.keys(next).length === 0) {
+            rmSync(configPath, { force: true });
+          } else {
+            backupOnce(configPath);
+            writeAtomic(configPath, `${JSON.stringify(next, null, 2)}\n`);
+          }
+        }
+      }
+    }
+    this.stripLegacyCodexNotify();
   }
 }
 

@@ -51,6 +51,7 @@ function canonicalHookEventName(name: string): string {
     case 'stopcancelled':
     case 'stopcanceled': return 'StopCancelled';
     case 'stopfailure': return 'StopFailure';
+    case 'interrupt': return 'Interrupt';
     case 'postcompact': return 'PostCompact';
     default: return name;
   }
@@ -439,6 +440,7 @@ export function normalizeAgentHookPayload(
         };
 
       case 'StopCancelled':
+      case 'Interrupt':
         if (hasActiveGrokBackgroundTask(raw)) {
           return {
             ptyId,
@@ -457,6 +459,7 @@ export function normalizeAgentHookPayload(
               raw.last_assistant_message ??
               raw.reasonDetails ??
               raw.reason_details ??
+              raw.reason ??
               raw.message,
           ),
         };

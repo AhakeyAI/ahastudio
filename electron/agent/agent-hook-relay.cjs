@@ -59,7 +59,7 @@ function unavailableDecision(eventName) {
       hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason,
     } }) + '\n';
   }
-  if (provider === 'claude' || provider === 'qwen') {
+  if (provider === 'claude' || provider === 'qwen' || provider === 'codex') {
     return JSON.stringify({ hookSpecificOutput: {
       hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: reason },
     } }) + '\n';
@@ -226,8 +226,9 @@ function send(raw) {
 
 if (!/^http:\/\/127\.0\.0\.1:\d{1,5}\/hook\/?$/.test(hookUrl) || !token || !/^[A-Za-z0-9._-]{1,128}$/.test(ptyId)) {
   finish();
-} else if (provider === 'codex') {
-  // Codex `notify` passes the event JSON as the last argv entry.
+} else if (provider === 'codex' && process.argv.length >= 4 && /^\s*\{/.test(process.argv[process.argv.length - 1] || '')) {
+  // Legacy Codex `notify` passes the event JSON as the last argv entry;
+  // Codex `hooks.json` pipes JSON over stdin (handled below).
   send(process.argv[process.argv.length - 1] || '');
 } else if (process.stdin.isTTY) {
   if (eventArg) send('{}');

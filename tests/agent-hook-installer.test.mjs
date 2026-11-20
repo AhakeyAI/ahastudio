@@ -98,7 +98,7 @@ test('CLAUDE_CONFIG_DIR, CODEX_HOME, and GROK_HOME overrides are respected', (t)
     relaySourcePath: RELAY_SOURCE,
   });
   assert.equal(installer.configPath('claude'), join(home, 'cc', 'settings.json'));
-  assert.equal(installer.configPath('codex'), join(home, 'cx', 'config.toml'));
+  assert.equal(installer.configPath('codex'), join(home, 'cx', 'hooks.json'));
   assert.equal(installer.configPath('grok'), join(home, 'gk', 'hooks', 'ahastation-agent-status.json'));
 });
 
@@ -206,32 +206,58 @@ test('Hooks pointing at an older relay location are reported outdated and fixed 
   assert.equal(installer.status('claude').state, 'installed');
 });
 
-test('Codex notify is added at top level, keeps CRLF and tables, and uninstall restores the exact file', (t) => {
+test('Codex hooks install into hooks.json alongside sibling hooks and ignore foreign config.toml notify', (t) => {
   const { home, installer } = makeHome(t);
-  const path = join(home, '.codex', 'config.toml');
-  const original = '# my config\r\nmodel = "gpt-5"\r\n\r\n[mcp_servers.demo]\r\ncommand = "npx"\r\nnotify = "not-top-level"\r\n';
-  writeFile(path, original);
+  const configToml = join(home, '.codex', 'config.toml');
+  const hooksJsonPath = join(home, '.codex', 'hooks.json');
+  const originalToml = 'notify = ["codex-computer-use.exe", "turn-ended"]\r\nmodel = "gpt-5"\r\n';
+  const siblingHooks = {
+    hooks: {
+      Stop: [{ hooks: [{ type: 'command', command: 'C:/Users/demo/.orca/agent-hooks/codex-hook.cmd', timeout: 10 }] }],
+    },
+  };
+  writeFile(configToml, originalToml);
+  writeFile(hooksJsonPath, JSON.stringify(siblingHooks, null, 2));
+
   assert.equal(installer.status('codex').state, 'not-installed');
   assert.equal(installer.install('codex').state, 'installed');
-  const text = readFileSync(path, 'utf8');
-  const first = text.split('\r\n')[0];
-  assert.match(first, /^notify = \["node", ".+aha-agent-hook\.cjs", "codex"\] # managed by AhaStation/);
-  assert.ok(text.endsWith('command = "npx"\r\nnotify = "not-top-level"\r\n'));
+  assert.equal(readFileSync(configToml, 'utf8'), originalToml, 'foreign notify in config.toml untouched');
+
+  const after = JSON.parse(readFileSync(hooksJsonPath, 'utf8'));
+  assert.deepEqual(after.hooks.Stop[0], siblingHooks.hooks.Stop[0], 'sibling Stop hook preserved');
+  for (const event of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PermissionRequest', 'PostToolUse', 'SubagentStart', 'SubagentStop', 'Stop', 'Interrupt']) {
+    const ours = after.hooks[event].flatMap((g) => g.hooks).filter((h) => h.command.includes(RELAY_FILE_NAME));
+    assert.equal(ours.length, 1, `${event} has exactly one AhaStation hook`);
+    assert.match(ours[0].command, /^node ".+aha-agent-hook\.cjs" codex$/);
+  }
+  assert.equal(after.hooks.PermissionRequest[0].hooks[0].timeout, 130);
+  assert.equal(after.hooks.Interrupt[0].hooks[0].timeout, 3);
+
+  const once = readFileSync(hooksJsonPath, 'utf8');
   installer.install('codex');
-  assert.equal(readFileSync(path, 'utf8'), text, 'idempotent');
+  assert.equal(readFileSync(hooksJsonPath, 'utf8'), once, 'second install is idempotent');
+
   assert.equal(installer.uninstall('codex').state, 'not-installed');
-  assert.equal(readFileSync(path, 'utf8'), original);
+  assert.deepEqual(JSON.parse(readFileSync(hooksJsonPath, 'utf8')), siblingHooks);
+  assert.equal(readFileSync(configToml, 'utf8'), originalToml);
 });
 
-test('Codex with a foreign notify command is a conflict and is left untouched', (t) => {
+test('Codex migrates legacy AhaStation config.toml notify to hooks.json and removes empty hooks.json on uninstall', (t) => {
   const { home, installer } = makeHome(t);
-  const path = join(home, '.codex', 'config.toml');
-  const original = 'notify = ["terminal-notifier", "-title", "Codex"]\nmodel = "o3"\n';
-  writeFile(path, original);
-  assert.equal(installer.status('codex').state, 'conflict');
-  assert.throws(() => installer.install('codex'), /其他 notify/);
-  installer.uninstall('codex');
-  assert.equal(readFileSync(path, 'utf8'), original);
+  const configToml = join(home, '.codex', 'config.toml');
+  const hooksJsonPath = join(home, '.codex', 'hooks.json');
+  const legacyLine = 'notify = ["node", "C:/old/aha-agent-hook.cjs", "codex"] # managed by AhaStation (agent status hook)\r\n';
+  const restToml = '# my config\r\nmodel = "gpt-5"\r\n\r\n[mcp_servers.demo]\r\ncommand = "npx"\r\nnotify = "not-top-level"\r\n';
+  writeFile(configToml, legacyLine + restToml);
+
+  assert.equal(installer.status('codex').state, 'outdated');
+  assert.equal(installer.install('codex').state, 'installed');
+  assert.equal(readFileSync(configToml, 'utf8'), restToml, 'legacy notify stripped while keeping CRLF and tables');
+  assert.equal(existsSync(hooksJsonPath), true);
+
+  assert.equal(installer.uninstall('codex').state, 'not-installed');
+  assert.equal(existsSync(hooksJsonPath), false, 'empty hooks.json removed on uninstall');
+  assert.equal(readFileSync(configToml, 'utf8'), restToml);
 });
 
 test('Relay is silent outside AhaStation terminals and returns required Antigravity JSON replies', async () => {
@@ -338,6 +364,35 @@ test('Installed hook commands reach the loopback server end to end (Claude stdin
   status = store.get(ptyId);
   assert.equal(status.state, 'done');
   assert.equal(status.message, '完成了');
+
+  // New Codex hooks.json delivers lifecycle JSON via stdin (just like Claude Code).
+  installer.install('codex');
+  const codexPty = 'local-codex-stdin-e2e';
+  store.registerPane(codexPty);
+  const codexEnv = server.envForPane(codexPty);
+  const codexPre = await runRelay([], {
+    env: codexEnv,
+    shellCommand: installer.commandFor('codex'),
+    stdin: JSON.stringify({
+      hook_event_name: 'PreToolUse',
+      tool_name: 'exec_command',
+      tool_input: { cmd: 'git status' },
+    }),
+  });
+  assert.deepEqual(codexPre, { code: 0, stdout: '' });
+  const codexStatus = store.get(codexPty);
+  assert.equal(codexStatus.agentId, 'codex');
+  assert.equal(codexStatus.state, 'working');
+  assert.equal(codexStatus.toolName, 'exec_command');
+  assert.equal(codexStatus.toolInput, 'git status');
+
+  const codexInterrupt = await runRelay([], {
+    env: codexEnv,
+    shellCommand: installer.commandFor('codex'),
+    stdin: JSON.stringify({ hook_event_name: 'Interrupt', reason: 'user_cancelled' }),
+  });
+  assert.deepEqual(codexInterrupt, { code: 0, stdout: '' });
+  assert.equal(store.get(codexPty).state, 'done');
 
   const port = server.port;
   await server.stop();
