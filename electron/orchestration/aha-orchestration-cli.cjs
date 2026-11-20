@@ -59,7 +59,12 @@ const FREE_TEXT_FLAGS = new Set([
   'title',
   'taskTitle',
   'displayName',
+  'context',
+  'acceptance',
+  'constraint',
 ]);
+
+const REPEATABLE_FLAGS = new Set(['constraint', 'file']);
 
 function parseCliArgs(argv) {
   let args = argv.slice();
@@ -112,7 +117,13 @@ function parseCliArgs(argv) {
       if (!rawKey) continue;
       const key = toCamel(rawKey);
       const rawVal = token.slice(eqIndex + 1);
-      flags[key] = BOOLEAN_FLAGS.has(key) ? toBoolean(rawVal) : rawVal;
+      const val = BOOLEAN_FLAGS.has(key) ? toBoolean(rawVal) : rawVal;
+      if (REPEATABLE_FLAGS.has(key)) {
+        if (!Array.isArray(flags[key])) flags[key] = [];
+        flags[key].push(val);
+      } else {
+        flags[key] = val;
+      }
       continue;
     }
     const key = toCamel(token.slice(2));
@@ -124,7 +135,12 @@ function parseCliArgs(argv) {
     const acceptsDashPrefix =
       FREE_TEXT_FLAGS.has(key) || (namespace === 'worktree' && key === 'prompt');
     if (next !== undefined && (acceptsDashPrefix || !next.startsWith('--'))) {
-      flags[key] = next;
+      if (REPEATABLE_FLAGS.has(key)) {
+        if (!Array.isArray(flags[key])) flags[key] = [];
+        flags[key].push(next);
+      } else {
+        flags[key] = next;
+      }
       i += 1;
     } else {
       // PowerShell drops unquoted @name arguments (splatting); never send the string "true" instead.
@@ -158,6 +174,37 @@ function splitCsv(value) {
     .map((s) => s.trim())
     .filter(Boolean);
   return items.length > 0 ? items : undefined;
+}
+
+function extractContextPayload(flags) {
+  if (flags.context !== undefined && flags.contextFile !== undefined) {
+    throw new Error('Cannot combine --context and --context-file.');
+  }
+  const contextVal =
+    flags.contextFile !== undefined
+      ? readSpecFile(flags.contextFile)
+      : flags.context !== undefined
+        ? String(flags.context)
+        : undefined;
+  const constraints = [
+    ...(Array.isArray(flags.constraint) ? flags.constraint : flags.constraint ? [flags.constraint] : []),
+    ...(flags.constraints ? splitCsv(String(flags.constraints)) || [] : []),
+  ]
+    .map((v) => String(v).trim())
+    .filter(Boolean);
+  const files = [
+    ...(Array.isArray(flags.file) ? flags.file : flags.file ? [flags.file] : []),
+    ...(flags.files ? splitCsv(String(flags.files)) || [] : []),
+  ]
+    .map((v) => String(v).trim())
+    .filter(Boolean);
+  const acceptance = flags.acceptance !== undefined ? String(flags.acceptance).trim() : '';
+  return {
+    ...(contextVal && contextVal.trim().length > 0 ? { context: contextVal.trim() } : {}),
+    ...(constraints.length > 0 ? { constraints } : {}),
+    ...(files.length > 0 ? { files } : {}),
+    ...(acceptance ? { acceptance } : {}),
+  };
 }
 
 function parseOptionsList(value) {
@@ -540,6 +587,7 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
           ...(runId ? { runId: String(runId) } : {}),
           ...(defaultFrom ? { from: defaultFrom } : {}),
           spec: String(specText),
+          ...extractContextPayload(flags),
           ...(flags.title || flags.taskTitle
             ? { taskTitle: String(flags.title ?? flags.taskTitle) }
             : {}),
@@ -615,6 +663,7 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
           ...(runId ? { runId: String(runId) } : {}),
           ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
           ...(specVal !== undefined && String(specVal).length > 0 ? { spec: String(specVal) } : {}),
+          ...extractContextPayload(flags),
           ...(flags.title || flags.taskTitle ? { taskTitle: String(flags.title ?? flags.taskTitle) } : {}),
           ...(flags.displayName ? { displayName: String(flags.displayName) } : {}),
           ...(flags.name ? { name: String(flags.name) } : {}),

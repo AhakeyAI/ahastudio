@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 import {
   OrchestrationError,
   type OrchestrationDispatchProposal,
+  type OrchestrationTaskContext,
   type OrchestrationTaskKind,
 } from './orchestration-types.js';
+import { cloneTaskContext } from './worker-brief-context.js';
 import { normalizeWorkerCliId } from './worker-launch-catalog.js';
 
 export const DEFAULT_PROPOSAL_HOLD_TIMEOUT_MS = 120_000;
@@ -24,6 +26,7 @@ export interface CreateHeldProposalInput {
   runId: string | null;
   role: string;
   task: string;
+  taskContext?: OrchestrationTaskContext | null;
   planSummary: string;
   requestedAgent: string;
   resolvedAgent: string;
@@ -211,12 +214,14 @@ export class DispatchProposalManager {
   ): Promise<HeldProposalResolution> {
     const id = generateProposalId();
     const nowIso = new Date(this.clock()).toISOString();
+    const normalizedContext = cloneTaskContext(input.taskContext);
     const proposal: OrchestrationDispatchProposal = {
       id,
       coordinatorPaneId: input.coordinatorPaneId,
       runId: input.runId,
       role: input.role,
       task: input.task,
+      ...(normalizedContext ? { taskContext: normalizedContext } : {}),
       planSummary: input.planSummary,
       requestedAgent: input.requestedAgent,
       resolvedAgent: input.resolvedAgent,

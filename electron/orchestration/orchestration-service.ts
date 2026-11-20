@@ -44,6 +44,7 @@ import {
   type OrchestrationReportArtifacts,
   type OrchestrationRunRecord,
   type OrchestrationSnapshot,
+  type OrchestrationTaskContext,
   type OrchestrationTaskKind,
   type OrchestrationTaskRecord,
   type OrchestrationTaskShowResult,
@@ -74,7 +75,18 @@ import {
   PermissionApprovalManager,
   type PermissionHookInterceptInput,
 } from './permission-approvals.js';
-import { buildDispatchPreamble, redactDispatchCapability } from './worker-dispatch-preamble.js';
+import {
+  buildDispatchPreamble,
+  buildDispatchPreambleWithBrief,
+  redactDispatchCapability,
+} from './worker-dispatch-preamble.js';
+import {
+  normalizeTaskContext,
+  removeWorkerBriefFile,
+  type SharedRunBoardPostSummary,
+  type SharedRunContext,
+  type SharedRunPeerSummary,
+} from './worker-brief-context.js';
 import { normalizeWorkerCliId, resolveWorkerLaunchConfig } from './worker-launch-catalog.js';
 import { WorkerTurnStopMonitor } from './worker-turn-stops.js';
 import {
@@ -243,6 +255,7 @@ export interface OrchestrationServiceDependencies {
   stallWatchdogIntervalMs?: number;
   stallThresholdMs?: number;
   cliCommand?: string;
+  briefsDir?: string | null;
   maxDepth?: number;
   turnStartObserveTimeoutMs?: number;
   startConfirmationTimeoutMs?: number;
@@ -286,6 +299,7 @@ export class OrchestrationService {
   private readonly spawnedWorkerPanes = new Set<string>();
   private readonly spawnedWorkerMeta = new Map<string, { runId: string; taskId: string }>();
   private readonly cliCommand: string;
+  private readonly briefsDirOverride: string | null;
   private readonly maxDepth: number;
   private readonly turnStartObserveTimeoutMs: number;
   private readonly startConfirmationTimeoutMs: number;
@@ -333,6 +347,7 @@ export class OrchestrationService {
     this.getPeerMessagingModeDep = deps.getPeerMessagingMode;
     this.isMcpEnabledForCliDep = deps.isMcpEnabledForCli;
     this.cliCommand = deps.cliCommand ?? 'aha';
+    this.briefsDirOverride = deps.briefsDir?.trim() || null;
     this.maxDepth = deps.maxDepth ?? DEFAULT_NESTED_WORKER_MAX_DEPTH;
     this.turnStartObserveTimeoutMs = deps.turnStartObserveTimeoutMs ?? 0;
     this.startConfirmationTimeoutMs = deps.startConfirmationTimeoutMs ?? 60_000;
@@ -869,11 +884,87 @@ export class OrchestrationService {
     );
   }
 
+  private resolveBriefsDir(): string | null {
+    return this.briefsDirOverride ?? this.store.getBriefsDir?.() ?? null;
+  }
+
+  private buildSharedRunContextForDispatch(
+    run: OrchestrationRunRecord,
+    excludeDispatchId?: string | null,
+  ): SharedRunContext | null {
+    const dispatches = this.store.listDispatches({ runId: run.id });
+    const activePeers: SharedRunPeerSummary[] = [];
+    for (const d of dispatches) {
+      if (d.id === excludeDispatchId) continue;
+      if (!ACTIVE_DISPATCH_STATUSES.has(d.status)) continue;
+      const peerTask = this.store.getTask(d.taskId);
+      const role = this.resolveRoleNameForDispatch(d) || d.id;
+      activePeers.push({
+        role,
+        taskTitle: peerTask?.taskTitle || d.taskId,
+      });
+      if (activePeers.length >= 6) break;
+    }
+
+    const messages = this.store.listMessages({ runId: run.id, limit: 80 });
+    let latestBoardSeq = 0;
+    const recentBoardPosts: SharedRunBoardPostSummary[] = [];
+    for (const m of messages) {
+      if (typeof m.boardSeq !== 'number') continue;
+      if (m.boardSeq > latestBoardSeq) latestBoardSeq = m.boardSeq;
+      if (excludeDispatchId && m.toHandle === `dispatch:${excludeDispatchId}`) continue;
+      if (m.kind !== 'handoff' && m.kind !== 'answer' && m.kind !== 'brief') continue;
+      const summary =
+        (m.body || '')
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .find(
+            (line) =>
+              line.length > 0 &&
+              !line.startsWith('[Worker ') &&
+              !line.startsWith('[ORCHESTRATION ') &&
+              !line.startsWith('Workspace:') &&
+              !line.startsWith('Branch:') &&
+              !line.startsWith('Full Brief File:') &&
+              !line.startsWith('Task:') &&
+              !line.startsWith('Run:') &&
+              !line.startsWith('Worker Handle:') &&
+              !line.startsWith('Coordinator Handle:') &&
+              !line.startsWith('Dispatch Capability:') &&
+              !line.startsWith('==='),
+          ) || m.subject;
+      if (!summary) continue;
+      recentBoardPosts.push({
+        boardSeq: m.boardSeq,
+        kind: m.kind,
+        fromRole: m.fromRole || m.fromHandle || 'coordinator',
+        summary,
+      });
+    }
+
+    const trimmedObjective = run.objective?.trim() || null;
+    const latestThree = recentBoardPosts.slice(-3);
+    if (!trimmedObjective && activePeers.length === 0 && latestThree.length === 0) {
+      return null;
+    }
+    return {
+      runObjective: trimmedObjective,
+      activePeers,
+      recentBoardPosts: latestThree,
+      ...(latestBoardSeq > 0 ? { latestBoardSeq } : {}),
+    };
+  }
+
   taskCreate(input: {
     id?: string;
     runId?: string;
     from?: string;
     spec: string;
+    taskContext?: OrchestrationTaskContext | null;
+    context?: string;
+    constraints?: string[];
+    files?: string[];
+    acceptance?: string;
     taskTitle?: string;
     displayName?: string;
     deps?: string[];
@@ -881,10 +972,12 @@ export class OrchestrationService {
     worktreePath?: string;
   }): { task: OrchestrationTaskRecord } {
     const runId = this.resolveRunIdForCaller(input.runId, input.from);
+    const taskContext = normalizeTaskContext(input);
     const task = this.store.createTask({
       id: input.id,
       runId,
       spec: input.spec,
+      ...(taskContext ? { taskContext } : {}),
       taskTitle: input.taskTitle,
       displayName: input.displayName,
       deps: input.deps,
@@ -957,11 +1050,14 @@ export class OrchestrationService {
     const assignee = input.to?.trim() || '';
 
     if (input.dryRun) {
+      const dryRun = this.store.getRun(task.runId);
       const preamble = buildDispatchPreamble({
         taskId: task.id,
         dispatchId: 'ctx_dryrun',
         runId: task.runId,
         taskSpec: task.spec,
+        taskContext: task.taskContext,
+        sharedContext: dryRun ? this.buildSharedRunContextForDispatch(dryRun, null) : null,
         coordinatorHandle: `run:${task.runId}`,
         workerHandle: assignee || 'worker',
         worktreePath: task.worktreePath,
@@ -1010,11 +1106,15 @@ export class OrchestrationService {
       maxDepth: this.maxDepth,
     });
 
-    const preamble = buildDispatchPreamble({
+    const dispatchRun = this.store.getRun(task.runId);
+    const { preamble, briefFilePath } = buildDispatchPreambleWithBrief({
       taskId: task.id,
       dispatchId: ctx.id,
       runId: task.runId,
       taskSpec: task.spec,
+      taskContext: task.taskContext,
+      sharedContext: dispatchRun ? this.buildSharedRunContextForDispatch(dispatchRun, ctx.id) : null,
+      briefsDir: this.resolveBriefsDir(),
       coordinatorHandle: callerDispatch ? `dispatch:${callerDispatch.id}` : `run:${task.runId}`,
       workerHandle: assignee,
       worktreePath: task.worktreePath,
@@ -1022,6 +1122,9 @@ export class OrchestrationService {
       cliCommand: this.cliCommand,
       dispatchCapability: this.store.getDispatchCapability(ctx.id),
     });
+    if (briefFilePath) {
+      this.store.setDispatchBriefFilePath(ctx.id, briefFilePath);
+    }
 
     let injected = false;
     let updatedCtx = ctx;
@@ -1132,11 +1235,14 @@ export class OrchestrationService {
       parentForPreview && ACTIVE_DISPATCH_STATUSES.has(parentForPreview.status)
         ? `dispatch:${parentForPreview.id}`
         : `run:${task.runId}`;
+    const previewRun = this.store.getRun(task.runId);
     const preamble = buildDispatchPreamble({
       taskId: task.id,
       dispatchId: ctx?.id ?? 'ctx_preview',
       runId: task.runId,
       taskSpec: task.spec,
+      taskContext: task.taskContext,
+      sharedContext: previewRun ? this.buildSharedRunContextForDispatch(previewRun, ctx?.id ?? null) : null,
       coordinatorHandle: previewCoordinatorHandle,
       workerHandle: ctx?.assigneeHandle ?? 'worker',
       worktreePath: task.worktreePath,
@@ -2960,6 +3066,11 @@ export class OrchestrationService {
     runId?: string;
     taskId?: string;
     spec?: string;
+    taskContext?: OrchestrationTaskContext | null;
+    context?: string;
+    constraints?: string[];
+    files?: string[];
+    acceptance?: string;
     taskTitle?: string;
     displayName?: string;
     deps?: string[];
@@ -3053,6 +3164,7 @@ export class OrchestrationService {
     }
 
     // Resolve or create Run and Task.
+    const normalizedInputContext = normalizeTaskContext(input);
     let task: OrchestrationTaskRecord;
     let run: OrchestrationRunRecord;
     if (input.retryOfDispatchId?.trim()) {
@@ -3066,9 +3178,11 @@ export class OrchestrationService {
       run = this.store.requireRun(prior.runId);
       const priorTask = this.store.requireTask(prior.taskId);
       if (priorTask.status === 'completed') {
+        const retryContext = normalizedInputContext ?? priorTask.taskContext ?? null;
         task = this.store.createTask({
           runId: run.id,
           spec: input.spec?.trim() || priorTask.spec,
+          ...(retryContext ? { taskContext: retryContext } : {}),
           taskTitle: input.taskTitle ?? `Retry: ${priorTask.taskTitle}`,
           displayName: input.displayName,
           priority: input.priority ?? priorTask.priority,
@@ -3109,6 +3223,7 @@ export class OrchestrationService {
       task = this.store.createTask({
         runId: run.id,
         spec: input.spec.trim(),
+        ...(normalizedInputContext ? { taskContext: normalizedInputContext } : {}),
         taskTitle: input.taskTitle,
         displayName: input.displayName,
         deps: input.deps,
@@ -3255,11 +3370,15 @@ export class OrchestrationService {
       input.mcpEnabled ?? this.isMcpEnabledForCliDep?.(launchConfig.cliId) ?? false;
     const preambleRole =
       (input.role ?? input.displayName)?.trim().replace(/^@+/, '') || null;
-    const preamble = buildDispatchPreamble({
+    const effectiveTaskContext = task.taskContext ?? normalizedInputContext;
+    const { preamble, briefFilePath } = buildDispatchPreambleWithBrief({
       taskId: task.id,
       dispatchId: ctx.id,
       runId: run.id,
       taskSpec: task.spec,
+      taskContext: effectiveTaskContext,
+      sharedContext: this.buildSharedRunContextForDispatch(run, ctx.id),
+      briefsDir: this.resolveBriefsDir(),
       coordinatorHandle,
       workerHandle: ptyId,
       worktreePath: placement.worktreePath,
@@ -3270,6 +3389,9 @@ export class OrchestrationService {
       mcpEnabled: effectiveMcpEnabled,
       role: preambleRole,
     });
+    if (briefFilePath) {
+      this.store.setDispatchBriefFilePath(ctx.id, briefFilePath);
+    }
 
     const delivery = await this.deliverAndObserveDispatchTurn(ctx.id, {
       ptyId,
@@ -3279,6 +3401,7 @@ export class OrchestrationService {
 
     if (!delivery.ok) {
       const reason = delivery.error ?? `Failed to deliver worker prompt to ${ptyId}`;
+      removeWorkerBriefFile(this.resolveBriefsDir(), briefFilePath);
       this.store.failDispatch(ctx.id, reason);
       const closed = await this.rollbackWorkerResources(
         ownsPane ? ptyId : undefined,
@@ -3874,6 +3997,7 @@ export class OrchestrationService {
       removedWorktree = res.removed;
     }
 
+    removeWorkerBriefFile(this.resolveBriefsDir(), dispatch.briefFilePath);
     const released = this.store.markDispatchReleased(dispatch.id, {
       keepPane: !closedPane,
       keepWorktree: !removedWorktree,
@@ -4094,6 +4218,14 @@ export class OrchestrationService {
       this.waiters.dispose();
       this.peerPingPong.clearAll();
     }
+    if (scope === 'all' || scope === 'tasks') {
+      const briefsDir = this.resolveBriefsDir();
+      if (briefsDir) {
+        for (const dispatch of this.store.listDispatches()) {
+          removeWorkerBriefFile(briefsDir, dispatch.briefFilePath);
+        }
+      }
+    }
     const res = this.store.reset(scope);
     this.emitChanged(`orchestration:reset-${scope}`);
     return res;
@@ -4246,6 +4378,11 @@ export class OrchestrationService {
       from?: string;
       role?: string;
       task: string;
+      taskContext?: OrchestrationTaskContext | null;
+      context?: string;
+      constraints?: string[];
+      files?: string[];
+      acceptance?: string;
       agent?: string;
       taskKind?: OrchestrationTaskKind;
       worktree?: boolean;
@@ -4264,6 +4401,7 @@ export class OrchestrationService {
     if (!taskText) {
       throw new OrchestrationError('invalid_argument', 'Missing task specification.');
     }
+    const normalizedTaskContext = normalizeTaskContext(input);
 
     const from = input.from?.trim() || 'coordinator';
     const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
@@ -4363,6 +4501,7 @@ export class OrchestrationService {
             runId: inferredRunId,
             role,
             task: taskText,
+            ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
             planSummary,
             requestedAgent,
             resolvedAgent,
@@ -4390,6 +4529,7 @@ export class OrchestrationService {
             runId: inferredRunId,
             role,
             task: taskText,
+            ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
             planSummary,
             requestedAgent,
             resolvedAgent,
@@ -4471,6 +4611,7 @@ export class OrchestrationService {
           from,
           runId: input.runId,
           ...(reusableTaskId ? { taskId: reusableTaskId } : { spec: taskText }),
+          ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
           taskTitle,
           displayName,
           name: role || undefined,

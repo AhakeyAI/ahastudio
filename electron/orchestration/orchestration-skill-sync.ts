@@ -20,6 +20,7 @@ Use native AhaStation MCP tools when available, or fall back to \`aha orchestrat
 - Coordinator tools: \`list_coding_agents\`, \`delegate_task\`, \`team_status\`, \`team_wait\`, \`message_worker\`, \`manage_worker\`.
 - Worker tools: \`ask_coordinator\`, \`report_done\` (plus \`delegate_task\` / \`team_wait\` when sub-workers are permitted).
 - In \`chat-and-guard\` mode, use the 2-step confirmation flow: first call \`delegate_task\` with \`confirmed: false\` to register the dispatch plan without spawning, confirm role, Coding Agent, task, and worktree isolation with the user in one short sentence, then after the user replies call \`delegate_task\` with \`confirmed: true\` (parallel batch calls in that confirmed turn all pass).
+- **Provide curated coordinator context** when calling \`delegate_task\` (or \`worker-start\`): workers start with a blank conversation and cannot see your prior chat. Populate \`context\` (goal, confirmed decisions, pitfalls), \`constraints\` (boundaries/files not to touch), \`files\` (already-located paths or design docs), and \`acceptance\` (verification commands). Long briefs are automatically persisted to an external brief file so nothing is lost.
 
 ## Core Coordinator Loop (CLI)
 

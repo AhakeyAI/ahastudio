@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { AtomicSnapshotWriter } from '../persistence/atomic-snapshot-writer.js';
+import { cloneTaskContext, normalizeTaskContext } from './worker-brief-context.js';
 import {
   ACTIVE_DISPATCH_STATUSES,
   assertDispatchTransition,
@@ -34,6 +35,7 @@ import {
   type OrchestrationRunRecord,
   type OrchestrationSnapshot,
   type OrchestrationStartObservation,
+  type OrchestrationTaskContext,
   type OrchestrationTaskRecord,
   type OrchestrationTaskStatus,
   type OrchestrationTaskWithDispatch,
@@ -85,6 +87,15 @@ function cloneMessageRecord(msg: OrchestrationMessageRecord): OrchestrationMessa
           },
         }
       : {}),
+  };
+}
+
+function cloneTaskRecord(task: OrchestrationTaskRecord): OrchestrationTaskRecord {
+  const clonedContext = cloneTaskContext(task.taskContext);
+  return {
+    ...task,
+    deps: [...task.deps],
+    ...(clonedContext ? { taskContext: clonedContext } : {}),
   };
 }
 
@@ -154,6 +165,11 @@ export class OrchestrationStore {
 
   hasCustomClock(): boolean {
     return this.customClock;
+  }
+
+  getBriefsDir(): string | null {
+    const filePath = this.resolveFile?.();
+    return filePath ? join(dirname(filePath), 'orchestration-briefs') : null;
   }
 
   getClockMs(): number {
@@ -261,7 +277,12 @@ export class OrchestrationStore {
     this.tasks.clear();
     for (const task of parsed.tasks ?? []) {
       if (task && typeof task.id === 'string') {
-        this.tasks.set(task.id, { ...task, deps: [...(task.deps ?? [])] });
+        const normalizedContext = cloneTaskContext(task.taskContext);
+        this.tasks.set(task.id, {
+          ...task,
+          deps: [...(task.deps ?? [])],
+          ...(normalizedContext ? { taskContext: normalizedContext } : {}),
+        });
       }
     }
 
@@ -835,6 +856,7 @@ export class OrchestrationStore {
     id?: string;
     runId: string;
     spec: string;
+    taskContext?: OrchestrationTaskContext | null;
     taskTitle?: string | null;
     displayName?: string | null;
     deps?: string[];
@@ -879,11 +901,13 @@ export class OrchestrationStore {
       taskTitle: input.taskTitle,
       displayName: input.displayName,
     });
+    const normalizedContext = normalizeTaskContext({ taskContext: input.taskContext });
     const now = this.now();
     const task: OrchestrationTaskRecord = {
       id,
       runId: input.runId,
       spec: input.spec,
+      ...(normalizedContext ? { taskContext: normalizedContext } : {}),
       taskTitle: display.taskTitle,
       displayName: display.displayName,
       deps: dedupedDeps,
@@ -895,7 +919,7 @@ export class OrchestrationStore {
     };
     this.tasks.set(task.id, task);
     this.persist();
-    return { ...task, deps: [...task.deps] };
+    return cloneTaskRecord(task);
   }
 
   private wouldIntroduceCycle(newTaskId: string, newDeps: readonly string[]): boolean {
@@ -927,7 +951,7 @@ export class OrchestrationStore {
 
   getTask(taskId: string): OrchestrationTaskRecord | undefined {
     const task = this.tasks.get(taskId);
-    return task ? { ...task, deps: [...task.deps] } : undefined;
+    return task ? cloneTaskRecord(task) : undefined;
   }
 
   requireTask(taskId: string): OrchestrationTaskRecord {
@@ -951,7 +975,7 @@ export class OrchestrationStore {
         return true;
       })
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-      .map((t) => ({ ...t, deps: [...t.deps] }));
+      .map((t) => cloneTaskRecord(t));
   }
 
   listTasksWithDispatch(filter?: {
@@ -1498,6 +1522,15 @@ export class OrchestrationStore {
     task.updatedAt = now;
     this.persist();
     return { ...task, deps: [...task.deps] };
+  }
+
+  setDispatchBriefFilePath(dispatchId: string, briefFilePath: string | null): OrchestrationDispatchRecord | null {
+    const dispatch = this.dispatches.get(dispatchId);
+    if (!dispatch) return null;
+    dispatch.briefFilePath = briefFilePath;
+    dispatch.updatedAt = this.now();
+    this.persist();
+    return { ...dispatch };
   }
 
   updateDispatchObservation(

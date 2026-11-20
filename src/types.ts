@@ -587,6 +587,13 @@ export interface OrchestrationRunRecord {
   endedAt: string | null;
 }
 
+export interface OrchestrationTaskContext {
+  background?: string;
+  constraints?: string[];
+  files?: string[];
+  acceptance?: string;
+}
+
 export interface OrchestrationDispatchRecord {
   id: string;
   taskId: string;
@@ -601,6 +608,7 @@ export interface OrchestrationDispatchRecord {
   processIncarnation: string | null;
   worktreePath?: string | null;
   branch?: string | null;
+  briefFilePath?: string | null;
   ownsWorktree?: boolean;
   ownsPane?: boolean;
   cliId?: string | null;
@@ -634,6 +642,7 @@ export interface OrchestrationTaskRecord {
   id: string;
   runId: string;
   spec: string;
+  taskContext?: OrchestrationTaskContext | null;
   taskTitle: string;
   displayName: string;
   deps: string[];
@@ -849,6 +858,7 @@ export interface OrchestrationDispatchProposal {
   runId: string | null;
   role: string;
   task: string;
+  taskContext?: OrchestrationTaskContext | null;
   planSummary: string;
   requestedAgent: string;
   resolvedAgent: string;

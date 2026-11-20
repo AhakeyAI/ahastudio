@@ -42,11 +42,27 @@ const runShowSchema = z.object({
   id: z.string().trim().min(1),
 });
 
+const taskContextSchema = z.object({
+  background: z.string().trim().max(16_000).optional(),
+  constraints: z.array(z.string().trim().min(1).max(400)).max(20).optional(),
+  files: z.array(z.string().trim().min(1).max(400)).max(30).optional(),
+  acceptance: z.string().trim().max(4_000).optional(),
+});
+
+const taskContextFields = {
+  taskContext: taskContextSchema.optional(),
+  context: z.string().trim().max(16_000).optional(),
+  constraints: z.array(z.string().trim().min(1).max(400)).max(20).optional(),
+  files: z.array(z.string().trim().min(1).max(400)).max(30).optional(),
+  acceptance: z.string().trim().max(4_000).optional(),
+};
+
 const taskCreateSchema = z.object({
   id: z.string().trim().min(1).optional(),
   runId: z.string().trim().min(1).optional(),
   from: z.string().trim().min(1).optional(),
   spec: z.string().trim().min(1),
+  ...taskContextFields,
   taskTitle: z.string().trim().min(1).optional(),
   displayName: z.string().trim().min(1).optional(),
   deps: z.array(z.string().trim().min(1)).optional(),
@@ -130,6 +146,7 @@ const workerStartSchema = z.object({
   runId: z.string().trim().min(1).optional(),
   taskId: z.string().trim().min(1).optional(),
   spec: z.string().trim().min(1).optional(),
+  ...taskContextFields,
   taskTitle: z.string().trim().min(1).optional(),
   displayName: z.string().trim().min(1).optional(),
   deps: z.array(z.string().trim().min(1)).optional(),
@@ -285,6 +302,7 @@ const delegateTaskSchema = z.object({
   from: z.string().trim().min(1).optional(),
   role: z.string().trim().max(120).optional(),
   task: z.string().trim().min(1),
+  ...taskContextFields,
   agent: z.string().trim().min(1).optional(),
   taskKind: taskKindEnum.optional(),
   worktree: z.boolean().optional(),

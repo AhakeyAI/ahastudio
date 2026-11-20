@@ -1,7 +1,18 @@
+import type { OrchestrationTaskContext } from './orchestration-types.js';
+import {
+  clipUtf8Bytes,
+  formatStructuredTaskBody,
+  writeWorkerBriefFile,
+  type SharedRunContext,
+} from './worker-brief-context.js';
+
 export interface BuildDispatchPreambleInput {
   taskId: string;
   dispatchId: string;
   taskSpec: string;
+  taskContext?: OrchestrationTaskContext | null;
+  sharedContext?: SharedRunContext | null;
+  briefsDir?: string | null;
   coordinatorHandle: string;
   workerHandle: string;
   runId?: string;
@@ -17,26 +28,16 @@ export interface BuildDispatchPreambleInput {
   role?: string | null;
 }
 
+export interface BuildDispatchPreambleResult {
+  preamble: string;
+  briefFilePath: string | null;
+}
+
 /**
- * Prompt delivery rejects writes over 8 KiB, so long specs are clipped inline and the worker
- * reads the full text through the CLI.
+ * Prompt delivery rejects writes over 8 KiB, so long specs are clipped inline and persisted to a
+ * brief file (outside the user's git worktree) or read through the CLI.
  */
 export const INLINE_SPEC_MAX_BYTES = 4_096;
-
-function clipUtf8(text: string, maxBytes: number): string {
-  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
-  let lo = 0;
-  let hi = text.length;
-  while (lo < hi) {
-    const mid = Math.ceil((lo + hi) / 2);
-    if (Buffer.byteLength(text.slice(0, mid), 'utf8') <= maxBytes) lo = mid;
-    else hi = mid - 1;
-  }
-  let end = lo;
-  // Do not split a surrogate pair.
-  if (end > 0 && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end -= 1;
-  return text.slice(0, end);
-}
 
 /**
  * Audit messages and previews are readable by other workers and the renderer, so they must never
@@ -49,10 +50,36 @@ export function redactDispatchCapability(text: string, capability?: string | nul
   return text.split(capability).join('<redacted>');
 }
 
-export function buildDispatchPreamble(input: BuildDispatchPreambleInput): string {
+export function buildDispatchPreambleWithBrief(
+  input: BuildDispatchPreambleInput,
+): BuildDispatchPreambleResult {
   const cli = input.cliCommand?.trim() || 'aha';
-  const spec = input.taskSpec.trim();
-  const clipped = clipUtf8(spec, INLINE_SPEC_MAX_BYTES);
+  const fullBody = formatStructuredTaskBody({
+    taskSpec: input.taskSpec,
+    taskContext: input.taskContext,
+    sharedContext: input.isFollowUp ? null : input.sharedContext,
+    mcpEnabled: input.mcpEnabled,
+    cliCommand: cli,
+  });
+  const clipped = clipUtf8Bytes(fullBody, INLINE_SPEC_MAX_BYTES);
+  let briefFilePath: string | null = null;
+
+  if (clipped !== fullBody && input.briefsDir) {
+    const fileLines: string[] = [
+      `# Worker Task Brief (${input.taskId})`,
+      ...(input.role ? [`- Role: @${input.role.trim().replace(/^@+/, '')}`] : []),
+      ...(input.runId ? [`- Run: ${input.runId}`] : []),
+      ...(input.worktreePath ? [`- Workspace: ${input.worktreePath}`] : []),
+      ...(input.branch ? [`- Branch: ${input.branch}`] : []),
+      '',
+      fullBody,
+    ];
+    try {
+      briefFilePath = writeWorkerBriefFile(input.briefsDir, input.dispatchId, fileLines.join('\n'));
+    } catch {
+      briefFilePath = null;
+    }
+  }
 
   if (input.mcpEnabled) {
     const cleanRole = input.role?.trim().replace(/^@+/, '') || '';
@@ -64,17 +91,20 @@ export function buildDispatchPreamble(input: BuildDispatchPreambleInput): string
         ? `[Worker ${input.dispatchId} · Follow-Up]`
         : `[Worker ${input.dispatchId}]`;
     const mcpSpecLines =
-      clipped === spec
-        ? [spec]
+      clipped === fullBody
+        ? [fullBody]
         : [
             clipped.trimEnd(),
             '…',
-            `[Specification truncated (${input.taskId}); ask coordinator if details are missing.]`,
+            briefFilePath
+              ? `[Brief truncated inline. Read full context file first: ${briefFilePath}]`
+              : `[Specification truncated (${input.taskId}); ask coordinator if details are missing.]`,
           ];
     const lines: string[] = [
       header,
       ...(input.worktreePath ? [`Workspace: ${input.worktreePath}`] : []),
       ...(input.branch ? [`Branch: ${input.branch}`] : []),
+      ...(briefFilePath ? [`Full Brief File: ${briefFilePath}`] : []),
       '',
       ...mcpSpecLines,
       '',
@@ -84,18 +114,20 @@ export function buildDispatchPreamble(input: BuildDispatchPreambleInput): string
         ? [`- Sub-tasks permitted: use MCP tools \`delegate_task\` and \`team_wait\` if needed.`]
         : []),
     ];
-    return lines.join('\n');
+    return { preamble: lines.join('\n'), briefFilePath };
   }
 
   const fromFlag = `--from ${input.workerHandle}`;
   const capabilityFlag = input.dispatchCapability ? ` --capability ${input.dispatchCapability}` : '';
   const specLines =
-    clipped === spec
-      ? [spec]
+    clipped === fullBody
+      ? [fullBody]
       : [
           clipped.trimEnd(),
           '…',
-          `[Specification truncated. Read the full text with: ${cli} orchestration task-show --id ${input.taskId} --json]`,
+          briefFilePath
+            ? `[Brief truncated inline. Read full context file first: ${briefFilePath}]`
+            : `[Specification truncated. Read the full text with: ${cli} orchestration task-show --id ${input.taskId} --json]`,
         ];
 
   const headerTitle = input.isFollowUp
@@ -112,6 +144,7 @@ export function buildDispatchPreamble(input: BuildDispatchPreambleInput): string
     ...(input.dispatchCapability ? [`Dispatch Capability: ${input.dispatchCapability}`] : []),
     ...(input.worktreePath ? [`Workspace CWD: ${input.worktreePath}`] : []),
     ...(input.branch ? [`Git Branch: ${input.branch}`] : []),
+    ...(briefFilePath ? [`Full Brief File: ${briefFilePath}`] : []),
     '',
     input.isFollowUp ? '=== FOLLOW-UP INSTRUCTIONS ===' : '=== TASK SPECIFICATION ===',
     ...specLines,
@@ -141,5 +174,9 @@ export function buildDispatchPreamble(input: BuildDispatchPreambleInput): string
   }
 
   lines.push('Begin working on the task now.');
-  return lines.join('\n');
+  return { preamble: lines.join('\n'), briefFilePath };
+}
+
+export function buildDispatchPreamble(input: BuildDispatchPreambleInput): string {
+  return buildDispatchPreambleWithBrief(input).preamble;
 }

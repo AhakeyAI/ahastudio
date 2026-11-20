@@ -176,7 +176,30 @@ function buildDelegateTaskTool(ctx) {
         },
         task: {
           type: 'string',
-          description: 'Clear, self-contained task specification for the worker.',
+          description:
+            'Clear, self-contained task specification for the worker (workers start with a blank context and cannot see your prior chat).',
+        },
+        context: {
+          type: 'string',
+          description:
+            'Curated background from the coordinator: user goal, already-confirmed decisions, and pitfalls to avoid.',
+        },
+        constraints: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Explicit boundaries and guardrails (e.g. files not to touch, platform/API requirements).',
+        },
+        files: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Key file paths, symbols, or design doc paths already located by the coordinator so the worker can jump straight in.',
+        },
+        acceptance: {
+          type: 'string',
+          description:
+            'Definition of done and verification commands/checks expected before calling report_done.',
         },
         agent: {
           type: 'string',
@@ -708,9 +731,21 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       const effort = nonEmptyStr(args.effort);
       const terminal = nonEmptyStr(args.terminal);
       const planSummary = nonEmptyStr(args.planSummary ?? args.plan_summary);
+      const context = nonEmptyStr(args.context ?? args.background);
+      const acceptance = nonEmptyStr(args.acceptance);
+      const constraints = Array.isArray(args.constraints)
+        ? args.constraints.map((v) => nonEmptyStr(v)).filter(Boolean)
+        : undefined;
+      const files = Array.isArray(args.files)
+        ? args.files.map((v) => nonEmptyStr(v)).filter(Boolean)
+        : undefined;
       const payload = {
         ...(role ? { role } : {}),
         task: typeof args.task === 'string' ? args.task : '',
+        ...(context ? { context } : {}),
+        ...(constraints && constraints.length > 0 ? { constraints } : {}),
+        ...(files && files.length > 0 ? { files } : {}),
+        ...(acceptance ? { acceptance } : {}),
         ...(agent ? { agent } : {}),
         ...(taskKind ? { taskKind } : {}),
         ...(typeof args.worktree === 'boolean' ? { worktree: args.worktree } : {}),

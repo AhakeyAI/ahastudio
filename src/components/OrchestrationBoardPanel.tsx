@@ -881,6 +881,38 @@ export function OrchestrationBoardPanel({
           <p className="obp-inline-card-text" title={proposal.task}>
             {proposal.planSummary?.trim() || proposal.task}
           </p>
+          {proposal.taskContext && (
+            <div className="obp-proposal-context">
+              {proposal.taskContext.background && (
+                <div className="obp-proposal-context-row">
+                  <span className="obp-proposal-context-label">背景</span>
+                  <span className="obp-proposal-context-val">{proposal.taskContext.background}</span>
+                </div>
+              )}
+              {proposal.taskContext.constraints && proposal.taskContext.constraints.length > 0 && (
+                <div className="obp-proposal-context-row">
+                  <span className="obp-proposal-context-label">约束</span>
+                  <span className="obp-proposal-context-val">
+                    {proposal.taskContext.constraints.join(' · ')}
+                  </span>
+                </div>
+              )}
+              {proposal.taskContext.files && proposal.taskContext.files.length > 0 && (
+                <div className="obp-proposal-context-row">
+                  <span className="obp-proposal-context-label">文件</span>
+                  <span className="obp-proposal-context-val is-mono">
+                    {proposal.taskContext.files.join(', ')}
+                  </span>
+                </div>
+              )}
+              {proposal.taskContext.acceptance && (
+                <div className="obp-proposal-context-row">
+                  <span className="obp-proposal-context-label">验收</span>
+                  <span className="obp-proposal-context-val">{proposal.taskContext.acceptance}</span>
+                </div>
+              )}
+            </div>
+          )}
           <div className="obp-inline-card-controls">
             <select
               className="obp-select"
