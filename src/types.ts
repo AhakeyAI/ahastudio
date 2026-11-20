@@ -594,6 +594,15 @@ export interface OrchestrationTaskContext {
   acceptance?: string;
 }
 
+interface OrchestrationTaskContextInput {
+  taskContext?: OrchestrationTaskContext | null;
+  context?: string;
+  background?: string;
+  constraints?: string[];
+  files?: string[];
+  acceptance?: string;
+}
+
 export interface OrchestrationDispatchRecord {
   id: string;
   taskId: string;
@@ -979,7 +988,7 @@ export interface OrchestrationApi {
       gates: OrchestrationGateRecord[];
     }>
   >;
-  taskCreate: (opts: {
+  taskCreate: (opts: OrchestrationTaskContextInput & {
     id?: string;
     runId?: string;
     from?: string;
@@ -1078,7 +1087,7 @@ export interface OrchestrationApi {
       dispatch: OrchestrationDispatchRecord;
     }>
   >;
-  workerStart?: (opts: {
+  workerStart?: (opts: OrchestrationTaskContextInput & {
     from?: string;
     runId?: string;
     taskId?: string;
@@ -1324,7 +1333,8 @@ export interface OrchestrationApi {
   listAgents?: (opts?: {
     callerPaneId?: string;
   }) => Promise<OrchestrationResult<{ agents: OrchestrationAgentRosterEntry[] }>>;
-  delegateTask?: (opts: {
+  delegateTask?: (opts: OrchestrationTaskContextInput & {
+    proposalId?: string;
     from?: string;
     runId?: string;
     role?: string;

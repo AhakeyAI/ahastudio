@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { AtomicSnapshotWriter } from '../persistence/atomic-snapshot-writer.js';
-import { cloneTaskContext, normalizeTaskContext } from './worker-brief-context.js';
+import { cloneTaskContext, listWorkerBriefFiles, mergeTaskContext, normalizeTaskContext, removeWorkerBriefFile } from './worker-brief-context.js';
 import {
   ACTIVE_DISPATCH_STATUSES,
   assertDispatchTransition,
@@ -105,6 +105,7 @@ function generatePrefixedId(prefix: string): string {
 
 export interface OrchestrationStoreOptions {
   resolveFile?: () => string;
+  briefsDir?: string;
   now?: () => string;
   maxMessagesPerRun?: number;
   maxMessages?: number;
@@ -116,11 +117,16 @@ const DEFAULT_MAX_MESSAGES_PER_RUN = 200;
 const DEFAULT_MAX_MESSAGES = 1000;
 const DEFAULT_MAX_DELIVERIES = 500;
 const DEFAULT_MAX_RUNS = 50;
+const DISPATCH_CREDENTIAL_PREFIX = 'aha_dispatch_';
+const DEFERRED_CREDENTIAL_SLOT = '<aha-dispatch-credential>';
+const PREFIXED_CREDENTIAL_RE = /aha_dispatch_[0-9a-f-]{36}\b/gi;
+const LABELLED_LEGACY_CREDENTIAL_RE = /(\bDispatch Capability:\s*|--capability(?:=|\s+)["']?)([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\b/gi;
 
 export class OrchestrationStore {
   private readonly customClock: boolean;
   private now: () => string;
   private readonly resolveFile: (() => string) | undefined;
+  private briefsDirOverride: string | null = null;
   private readonly writer: AtomicSnapshotWriter | null;
   private readonly maxMessagesPerRun: number;
   private readonly maxMessages: number;
@@ -151,6 +157,7 @@ export class OrchestrationStore {
     this.customClock = typeof options.now === 'function';
     this.now = options.now ?? (() => new Date().toISOString());
     this.resolveFile = options.resolveFile;
+    this.briefsDirOverride = options.briefsDir?.trim() || null;
     this.maxMessagesPerRun = Math.max(0, Math.floor(options.maxMessagesPerRun ?? DEFAULT_MAX_MESSAGES_PER_RUN));
     this.maxMessages = Math.max(0, Math.floor(options.maxMessages ?? DEFAULT_MAX_MESSAGES));
     this.maxDeliveries = Math.max(0, Math.floor(options.maxDeliveries ?? DEFAULT_MAX_DELIVERIES));
@@ -169,7 +176,56 @@ export class OrchestrationStore {
 
   getBriefsDir(): string | null {
     const filePath = this.resolveFile?.();
-    return filePath ? join(dirname(filePath), 'orchestration-briefs') : null;
+    return this.briefsDirOverride ?? (filePath ? join(dirname(filePath), 'orchestration-briefs') : null);
+  }
+
+  configureBriefsDir(directory: string): void {
+    this.briefsDirOverride = directory;
+    this.reconcileBriefFiles();
+  }
+
+  reconcileBriefFiles(): void {
+    const directory = this.getBriefsDir();
+    const files = listWorkerBriefFiles(directory);
+    if (!files) return;
+    const existing = new Map<string, string>();
+    const unsafe = new Set<string>();
+    const temporary = new Set<string>();
+    for (const file of files) {
+      if (file.temporary) temporary.add(file.dispatchId);
+      else if (file.regularFile) existing.set(file.dispatchId, file.path);
+      else unsafe.add(file.dispatchId);
+    }
+    const failedRemovals = new Set<string>();
+    const fileOwners = new Set([...existing.keys(), ...temporary, ...unsafe]);
+    for (const id of fileOwners) {
+      const dispatch = this.dispatches.get(id);
+      const keep = dispatch?.briefFilePath && !dispatch.releasedAt && !unsafe.has(id) &&
+        dispatch.status !== 'failed' && dispatch.status !== 'circuit_broken';
+      if (keep) {
+        if (temporary.has(id)) removeWorkerBriefFile(directory, id, true);
+      } else {
+        if (!removeWorkerBriefFile(directory, id)) failedRemovals.add(id);
+        existing.delete(id);
+      }
+    }
+    let changed = false;
+    for (const dispatch of this.dispatches.values()) {
+      if (!dispatch.briefFilePath || failedRemovals.has(dispatch.id)) continue;
+      const path = existing.get(dispatch.id) ?? null;
+      if (path === dispatch.briefFilePath) continue;
+      dispatch.briefFilePath = path;
+      changed = true;
+    }
+    if (changed) this.persist();
+  }
+
+  cleanupDispatchBrief(dispatchId: string): void {
+    const dispatch = this.dispatches.get(dispatchId);
+    if (dispatch?.briefFilePath && removeWorkerBriefFile(this.getBriefsDir(), dispatchId)) {
+      dispatch.briefFilePath = null;
+      this.persist();
+    }
   }
 
   getClockMs(): number {
@@ -230,6 +286,7 @@ export class OrchestrationStore {
           this.writer?.primeCommittedContent(null);
           this.flushSync();
         }
+        this.reconcileBriefFiles();
         return;
       } catch (error) {
         console.warn(`[orchestration] failed to parse ${candidate}:`, error);
@@ -241,6 +298,7 @@ export class OrchestrationStore {
       console.warn(`[orchestration] ${this.lastLoadRecovery}; state was not loaded`);
       this.quarantineUnreadablePrimary(filePath);
     }
+    this.reconcileBriefFiles();
   }
 
   private quarantineUnreadablePrimary(filePath: string): void {
@@ -457,13 +515,16 @@ export class OrchestrationStore {
         this.dispatchCapabilities.set(dispatchId, capability);
       }
     }
+    for (const dispatch of this.dispatches.values()) {
+      if (dispatch.archivedOutput) dispatch.archivedOutput = this.redactDispatchCredentials(dispatch.archivedOutput);
+    }
     this.deferredPrompts.clear();
     for (const [id, prompt] of Object.entries(parsed.deferredDispatchPrompts ?? {})) {
       const dispatch = this.dispatches.get(id);
       if (dispatch && ACTIVE_DISPATCH_STATUSES.has(dispatch.status) &&
           prompt && typeof prompt.prompt === 'string' && typeof prompt.submit === 'boolean' &&
           (dispatch.assigneePaneId ?? dispatch.assigneeHandle) === prompt.ptyId) {
-        this.deferredPrompts.set(id, prompt);
+        this.deferredPrompts.set(id, { ...prompt, prompt: this.storePromptTemplate(id, prompt.prompt) });
       }
     }
     for (const dispatch of this.dispatches.values()) {
@@ -646,10 +707,20 @@ export class OrchestrationStore {
     });
   }
 
+  private storePromptTemplate(id: string, prompt: string): string {
+    const capability = this.dispatchCapabilities.get(id);
+    const template = capability ? prompt.split(capability).join(DEFERRED_CREDENTIAL_SLOT) : prompt;
+    return this.redactDispatchCredentials(template);
+  }
+
+  restoreDeferredDispatchPrompt(id: string, template: string): string {
+    return template.replaceAll(DEFERRED_CREDENTIAL_SLOT, this.dispatchCapabilities.get(id) ?? '<redacted>');
+  }
+
   saveDeferredDispatchPrompt(id: string, prompt: { ptyId: string; prompt: string; submit: boolean }): void {
     const dispatch = this.dispatches.get(id);
     if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
-    this.deferredPrompts.set(id, prompt);
+    this.deferredPrompts.set(id, { ...prompt, prompt: this.storePromptTemplate(id, prompt.prompt) });
     this.updateDispatchObservation(id, 'permission', { refreshHeartbeat: true });
     this.persist();
   }
@@ -906,7 +977,7 @@ export class OrchestrationStore {
     const task: OrchestrationTaskRecord = {
       id,
       runId: input.runId,
-      spec: input.spec,
+      spec: this.redactDispatchCredentials(input.spec),
       ...(normalizedContext ? { taskContext: normalizedContext } : {}),
       taskTitle: display.taskTitle,
       displayName: display.displayName,
@@ -1006,6 +1077,15 @@ export class OrchestrationStore {
       this.persist();
     }
     return promoted;
+  }
+
+  mergeTaskContext(taskId: string, override: OrchestrationTaskContext): OrchestrationTaskRecord {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new OrchestrationError('task_not_found', 'Task not found: ' + taskId);
+    task.taskContext = mergeTaskContext(task.taskContext, override);
+    task.updatedAt = this.now();
+    this.persist();
+    return cloneTaskRecord(task);
   }
 
   updateTaskStatus(taskId: string, status: OrchestrationTaskStatus): OrchestrationTaskRecord {
@@ -1254,7 +1334,7 @@ export class OrchestrationStore {
     task.status = 'dispatched';
     task.updatedAt = now;
     this.dispatches.set(ctx.id, ctx);
-    this.dispatchCapabilities.set(ctx.id, randomUUID());
+    this.dispatchCapabilities.set(ctx.id, DISPATCH_CREDENTIAL_PREFIX + randomUUID());
     this.persist();
     return { ...ctx };
   }
@@ -1262,6 +1342,14 @@ export class OrchestrationStore {
   /** Token the assignee must present for worker_done/heartbeat/ask; undefined for legacy dispatches. */
   getDispatchCapability(dispatchId: string): string | undefined {
     return this.dispatchCapabilities.get(dispatchId);
+  }
+
+  redactDispatchCredentials(text: string): string {
+    let redacted = text;
+    for (const capability of this.dispatchCapabilities.values()) {
+      redacted = redacted.replaceAll(capability, '<redacted>');
+    }
+    return redacted.replace(PREFIXED_CREDENTIAL_RE, '<redacted>').replace(LABELLED_LEGACY_CREDENTIAL_RE, '$1<redacted>');
   }
 
   assertDispatchCapability(dispatchId: string, capability: string | undefined): void {
@@ -1397,6 +1485,16 @@ export class OrchestrationStore {
     return { ...current };
   }
 
+  listDispatchAncestorIds(dispatchId: string): string[] {
+    const ids = new Set<string>();
+    let cursor: string | null = dispatchId;
+    while (cursor && !ids.has(cursor)) {
+      ids.add(cursor);
+      cursor = this.dispatches.get(cursor)?.followUpOfDispatchId ?? null;
+    }
+    return [...ids];
+  }
+
   transferCustodyToFollowUp(prevDispatchId: string, nextDispatchId: string): void {
     const prev = this.dispatches.get(prevDispatchId);
     const next = this.dispatches.get(nextDispatchId);
@@ -1431,7 +1529,7 @@ export class OrchestrationStore {
   archiveDispatchOutput(dispatchId: string, output: string): void {
     const ctx = this.dispatches.get(dispatchId);
     if (!ctx || !output) return;
-    ctx.archivedOutput = output;
+    ctx.archivedOutput = this.redactDispatchCredentials(output);
     ctx.updatedAt = this.now();
     this.persist();
   }
@@ -1696,6 +1794,7 @@ export class OrchestrationStore {
       d.completedAt = now;
       d.updatedAt = now;
       if (targetStatus === 'failed') {
+        this.cleanupDispatchBrief(d.id);
         d.lastFailureReason = reason;
         d.failureSummary = reason;
       }
@@ -1729,6 +1828,7 @@ export class OrchestrationStore {
     ctx.failureSummary = options?.summary ?? reason;
     ctx.status = targetDispatchStatus;
     ctx.stage = reason === 'worker_stopped' ? 'stopped' : 'failed';
+    this.cleanupDispatchBrief(ctx.id);
     ctx.completedAt = now;
     ctx.updatedAt = now;
     this.refreshParentDispatchHeartbeat(ctx, now);
@@ -2297,8 +2397,8 @@ export class OrchestrationStore {
       ...(cleanRefs && cleanRefs.length > 0 ? { refs: cleanRefs } : {}),
       ...(input.kind ? { kind: input.kind } : {}),
       ...(input.artifacts !== undefined ? { artifacts: input.artifacts } : {}),
-      subject: input.subject,
-      body: input.body ?? '',
+      subject: this.redactDispatchCredentials(input.subject),
+      body: this.redactDispatchCredentials(input.body ?? ''),
       payload: input.payload ?? null,
       threadId: input.threadId ?? null,
       deliveredAt: isHeartbeat ? now : null,
@@ -3229,6 +3329,7 @@ export class OrchestrationStore {
         }
         for (const [id, d] of this.dispatches.entries()) {
           if (deletedRunIds.has(d.runId)) {
+            this.cleanupDispatchBrief(id);
             this.dispatches.delete(id);
             this.dispatchCapabilities.delete(id);
           }
@@ -3274,6 +3375,9 @@ export class OrchestrationStore {
       messages: 0,
     };
 
+    if (scope !== 'messages') {
+      for (const id of this.dispatches.keys()) this.cleanupDispatchBrief(id);
+    }
     if (scope === 'all') {
       removed.runs = [...this.runs.keys()].filter((id) => id !== UNBOUND_RUN_ID).length;
       removed.tasks = this.tasks.size;
@@ -3320,6 +3424,7 @@ export class OrchestrationStore {
       this.memberCursorsByRun.clear();
     }
 
+    if (scope !== 'messages') this.reconcileBriefFiles();
     this.persist();
     return { reset: scope, removed };
   }

@@ -1,3 +1,4 @@
+import type { BuildDispatchPreambleInput } from './worker-dispatch-preamble.js';
 import type {
   OrchestrationStartObservation,
   OrchestrationTaskRecord,
@@ -10,6 +11,7 @@ export interface WorkerPaneCandidate {
 }
 
 export interface CoordinatorRuntime {
+  buildDispatchBrief?: (input: BuildDispatchPreambleInput) => string;
   cliCommand?: string;
   maxDepth?: number;
   listWorkerCandidates: (excludePaneIds: ReadonlySet<string>) => WorkerPaneCandidate[];

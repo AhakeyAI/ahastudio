@@ -5,7 +5,7 @@ import {
   type OrchestrationTaskContext,
   type OrchestrationTaskKind,
 } from './orchestration-types.js';
-import { cloneTaskContext } from './worker-brief-context.js';
+import { cloneTaskContext, mergeTaskContext } from './worker-brief-context.js';
 import { normalizeWorkerCliId } from './worker-launch-catalog.js';
 
 export const DEFAULT_PROPOSAL_HOLD_TIMEOUT_MS = 120_000;
@@ -45,8 +45,8 @@ export interface HeldProposalResolution {
 }
 
 export type ChatGuardEvaluation =
-  | { allowed: true; currentTurn: number }
-  | { allowed: false; proposalId: string; currentTurn: number };
+  | { allowed: true; proposal: OrchestrationDispatchProposal; taskContext: OrchestrationTaskContext | null }
+  | { allowed: false; proposal: OrchestrationDispatchProposal; changed: boolean };
 
 export interface DispatchProposalManagerOptions {
   onChanged?: (reason: string, runId?: string) => void;
@@ -60,9 +60,13 @@ interface PaneTurnState {
   userTurn: number;
   lastTurnAt: number;
   lastUnpairedSource: UserTurnSource | null;
-  pendingProposalTurn: number | null;
-  pendingProposalAt: number | null;
-  approvedLeaseTurn: number | null;
+  chatProposals: Map<string, ChatProposal>;
+}
+
+interface ChatProposal {
+  proposal: OrchestrationDispatchProposal;
+  turn: number;
+  createdAt: number;
 }
 
 interface HeldProposalEntry {
@@ -110,9 +114,7 @@ export class DispatchProposalManager {
         userTurn: 0,
         lastTurnAt: Number.NEGATIVE_INFINITY,
         lastUnpairedSource: null,
-        pendingProposalTurn: null,
-        pendingProposalAt: null,
-        approvedLeaseTurn: null,
+        chatProposals: new Map(),
       };
       this.paneStates.set(ptyId, state);
     }
@@ -125,9 +127,9 @@ export class DispatchProposalManager {
 
   hasPendingChatProposalForCurrentTurn(ptyId: string): boolean {
     const state = this.paneStates.get(ptyId.trim());
-    return Boolean(
-      state && state.pendingProposalTurn !== null && state.pendingProposalTurn === state.userTurn
-    );
+    return Boolean(state && [...state.chatProposals.values()].some((entry) => (
+      entry.turn === state.userTurn && this.clock() - entry.createdAt <= this.proposalTtlMs
+    )));
   }
 
   /**
@@ -150,41 +152,65 @@ export class DispatchProposalManager {
     }
 
     state.userTurn += 1;
+    for (const [id, entry] of state.chatProposals) {
+      if (entry.turn < state.userTurn - 1) state.chatProposals.delete(id);
+    }
     state.lastTurnAt = now;
     state.lastUnpairedSource = source;
     return state.userTurn;
   }
 
-  evaluateChatGuard(coordinatorPaneId: string, confirmed: boolean): ChatGuardEvaluation {
-    const cleanId = coordinatorPaneId.trim() || 'coordinator';
+  evaluateChatGuard(
+    input: CreateHeldProposalInput,
+    confirmed: boolean,
+    proposalId?: string,
+    explicitRunId?: string,
+  ): ChatGuardEvaluation {
+    const state = this.getOrCreatePaneState(input.coordinatorPaneId);
     const now = this.clock();
-    const state = this.getOrCreatePaneState(cleanId);
-    const currentTurn = state.userTurn;
-
-    const hasActiveLease = state.approvedLeaseTurn === currentTurn;
-    const hasConfirmedReplyAfterProposal =
-      state.pendingProposalTurn !== null &&
-      currentTurn > state.pendingProposalTurn &&
-      state.pendingProposalAt !== null &&
-      state.lastTurnAt >= state.pendingProposalAt &&
-      now - state.pendingProposalAt <= this.proposalTtlMs;
-
-    if (confirmed && (hasActiveLease || hasConfirmedReplyAfterProposal)) {
-      state.approvedLeaseTurn = currentTurn;
-      state.pendingProposalTurn = null;
-      state.pendingProposalAt = null;
-      return { allowed: true, currentTurn };
+    for (const [id, entry] of state.chatProposals) {
+      if (now - entry.createdAt > this.proposalTtlMs) state.chatProposals.delete(id);
+    }
+    const sameRole = (proposal: OrchestrationDispatchProposal) => (
+      proposal.role.toLowerCase() === input.role.toLowerCase()
+    );
+    const eligible = [...state.chatProposals.values()].filter((entry) => entry.turn === state.userTurn - 1);
+    const match = proposalId
+      ? eligible.find((entry) => entry.proposal.id === proposalId)
+      : eligible.find((entry) => sameRole(entry.proposal) && entry.proposal.task === input.task);
+    const prior = match?.proposal;
+    const merged = mergeTaskContext(prior?.taskContext, input.taskContext);
+    const samePlan = prior && sameRole(prior) && prior.task === input.task &&
+      (!explicitRunId || explicitRunId === prior.runId) &&
+      prior.resolvedAgent === input.resolvedAgent &&
+      prior.taskKind === input.taskKind &&
+      prior.worktree === input.worktree &&
+      prior.model === input.model &&
+      prior.effort === input.effort &&
+      prior.terminal === input.terminal &&
+      JSON.stringify(cloneTaskContext(prior.taskContext)) === JSON.stringify(merged);
+    if (confirmed && prior && samePlan && state.lastTurnAt >= match.createdAt) {
+      state.chatProposals.delete(prior.id);
+      return { allowed: true, proposal: prior, taskContext: merged };
     }
 
-    state.pendingProposalTurn = currentTurn;
-    state.pendingProposalAt = now;
-    state.lastUnpairedSource = null;
-    state.approvedLeaseTurn = null;
-    return {
-      allowed: false,
-      proposalId: generateProposalId(),
-      currentTurn,
+    const proposal: OrchestrationDispatchProposal = {
+      ...input,
+      taskContext: confirmed && prior ? merged : cloneTaskContext(input.taskContext),
+      id: generateProposalId(),
+      status: 'pending',
+      createdAt: new Date(now).toISOString(),
+      resolvedAt: null,
+      reason: null,
     };
+    for (const [id, entry] of state.chatProposals) {
+      if (entry.turn === state.userTurn && sameRole(entry.proposal) && entry.proposal.task === input.task) {
+        state.chatProposals.delete(id);
+      }
+    }
+    state.chatProposals.set(proposal.id, { proposal, turn: state.userTurn, createdAt: now });
+    state.lastUnpairedSource = null;
+    return { allowed: false, proposal, changed: confirmed && Boolean(prior || proposalId || eligible.some((entry) => sameRole(entry.proposal))) };
   }
 
   listPendingProposals(filter?: {
@@ -344,6 +370,7 @@ export class DispatchProposalManager {
   }
 
   cancelAllPendingProposals(reason = 'Orchestration state reset'): number {
+    for (const state of this.paneStates.values()) state.chatProposals.clear();
     let count = 0;
     for (const entry of [...this.openById.values()]) {
       this.expireProposal(entry.proposal.id, reason);

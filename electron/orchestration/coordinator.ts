@@ -12,7 +12,7 @@ import {
   type OrchestrationStartObservation,
   type OrchestrationTaskRecord,
 } from './orchestration-types.js';
-import { buildDispatchPreamble, redactDispatchCapability } from './worker-dispatch-preamble.js';
+import { buildDispatchPreamble } from './worker-dispatch-preamble.js';
 
 const PRIORITY_RANK: Record<OrchestrationMessagePriority, number> = {
   urgent: 0,
@@ -561,11 +561,14 @@ export class Coordinator {
         });
         ctxId = ctx.id;
 
-        const preamble = buildDispatchPreamble({
+        const buildBrief = this.runtime.buildDispatchBrief ?? buildDispatchPreamble;
+        const preamble = buildBrief({
           taskId: task.id,
           dispatchId: ctx.id,
           runId,
           taskSpec: task.spec,
+          taskContext: task.taskContext,
+          redactText: (text) => this.store.redactDispatchCredentials(text),
           coordinatorHandle: `run:${runId}`,
           workerHandle: chosen.ptyId,
           worktreePath: task.worktreePath,
@@ -602,7 +605,7 @@ export class Coordinator {
           to: `dispatch:${ctx.id}`,
           type: 'dispatch',
           subject: `Dispatched task ${task.id}`,
-          body: redactDispatchCapability(preamble, this.store.getDispatchCapability(ctx.id)),
+          body: this.store.redactDispatchCredentials(preamble),
         });
         this.store.markAsReadAndDelivered([dispatchAuditMsg.id]);
       } catch (err) {

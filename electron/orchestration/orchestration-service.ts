@@ -78,11 +78,11 @@ import {
 import {
   buildDispatchPreamble,
   buildDispatchPreambleWithBrief,
-  redactDispatchCapability,
+  type BuildDispatchPreambleInput,
 } from './worker-dispatch-preamble.js';
 import {
+  mergeTaskContext,
   normalizeTaskContext,
-  removeWorkerBriefFile,
   type SharedRunBoardPostSummary,
   type SharedRunContext,
   type SharedRunPeerSummary,
@@ -299,7 +299,6 @@ export class OrchestrationService {
   private readonly spawnedWorkerPanes = new Set<string>();
   private readonly spawnedWorkerMeta = new Map<string, { runId: string; taskId: string }>();
   private readonly cliCommand: string;
-  private readonly briefsDirOverride: string | null;
   private readonly maxDepth: number;
   private readonly turnStartObserveTimeoutMs: number;
   private readonly startConfirmationTimeoutMs: number;
@@ -347,7 +346,7 @@ export class OrchestrationService {
     this.getPeerMessagingModeDep = deps.getPeerMessagingMode;
     this.isMcpEnabledForCliDep = deps.isMcpEnabledForCli;
     this.cliCommand = deps.cliCommand ?? 'aha';
-    this.briefsDirOverride = deps.briefsDir?.trim() || null;
+    if (deps.briefsDir?.trim()) this.store.configureBriefsDir(deps.briefsDir.trim());
     this.maxDepth = deps.maxDepth ?? DEFAULT_NESTED_WORKER_MAX_DEPTH;
     this.turnStartObserveTimeoutMs = deps.turnStartObserveTimeoutMs ?? 0;
     this.startConfirmationTimeoutMs = deps.startConfirmationTimeoutMs ?? 60_000;
@@ -513,6 +512,7 @@ export class OrchestrationService {
     for (const [dispatchId, deferred] of this.store.listDeferredDispatchPrompts()) {
       if (deferred.ptyId === ptyId) {
         this.store.deleteDeferredDispatchPrompt(dispatchId);
+        this.store.cleanupDispatchBrief(dispatchId);
       }
     }
     for (const dispatch of this.store.listDispatches()) {
@@ -528,6 +528,7 @@ export class OrchestrationService {
         ACTIVE_DISPATCH_STATUSES.has(dispatch.status) &&
         (dispatch.assigneePaneId === ptyId || dispatch.assigneeHandle === ptyId)
       ) {
+        this.store.cleanupDispatchBrief(dispatch.id);
         this.waiters.cancel(`dispatch:${dispatch.id}`);
         this.waiters.notifyPrefix(`question:${dispatch.id}:`, 'status');
       }
@@ -688,6 +689,10 @@ export class OrchestrationService {
     return { run };
   }
 
+  authorizeRunAccess(runId: string | undefined, callerPaneId: string): string {
+    return this.resolveBoardCallerContext({ from: callerPaneId, runId }).runId;
+  }
+
   assertRunCoordinator(runId: string, callerPaneId: string): void {
     const run = this.store.requireRun(runId);
     if (run.coordinatorPaneId !== callerPaneId) {
@@ -837,11 +842,12 @@ export class OrchestrationService {
     return { runs, count: runs.length };
   }
 
-  runShow(id: string): {
+  runShow(id: string, callerPaneId?: string): {
     run: OrchestrationRunRecord;
     tasks: OrchestrationTaskWithDispatch[];
     gates: OrchestrationGateRecord[];
   } {
+    if (callerPaneId !== undefined) this.authorizeRunAccess(id, callerPaneId);
     const run = this.store.requireRun(id);
     const tasks = this.store.listTasksWithDispatch({ runId: run.id });
     const gates = this.store.listGates({ runId: run.id });
@@ -884,8 +890,18 @@ export class OrchestrationService {
     );
   }
 
-  private resolveBriefsDir(): string | null {
-    return this.briefsDirOverride ?? this.store.getBriefsDir?.() ?? null;
+  private buildWorkerDispatchBrief(input: BuildDispatchPreambleInput): string {
+    const run = input.runId ? this.store.getRun(input.runId) : undefined;
+    const { preamble, briefFilePath } = buildDispatchPreambleWithBrief({
+      ...input,
+      sharedContext: run && !input.isFollowUp ? this.buildSharedRunContextForDispatch(run, input.dispatchId) : null,
+      briefsDir: this.store.getBriefsDir(),
+      cliCommand: this.cliCommand,
+      dispatchCapability: this.store.getDispatchCapability(input.dispatchId),
+      redactText: (text) => this.store.redactDispatchCredentials(text),
+    });
+    if (briefFilePath) this.store.setDispatchBriefFilePath(input.dispatchId, briefFilePath);
+    return preamble;
   }
 
   private buildSharedRunContextForDispatch(
@@ -900,22 +916,22 @@ export class OrchestrationService {
       const peerTask = this.store.getTask(d.taskId);
       const role = this.resolveRoleNameForDispatch(d) || d.id;
       activePeers.push({
-        role,
-        taskTitle: peerTask?.taskTitle || d.taskId,
+        role: this.store.redactDispatchCredentials(role),
+        taskTitle: this.store.redactDispatchCredentials(peerTask?.taskTitle || d.taskId),
       });
       if (activePeers.length >= 6) break;
     }
 
-    const messages = this.store.listMessages({ runId: run.id, limit: 80 });
-    let latestBoardSeq = 0;
+    const redact = (text: string) => this.store.redactDispatchCredentials(text);
+    const messages = this.store.listBoardPosts(run.id, { limit: 80 });
+    const latestBoardSeq = this.store.getHeadBoardSeq(run.id);
     const recentBoardPosts: SharedRunBoardPostSummary[] = [];
     for (const m of messages) {
       if (typeof m.boardSeq !== 'number') continue;
-      if (m.boardSeq > latestBoardSeq) latestBoardSeq = m.boardSeq;
       if (excludeDispatchId && m.toHandle === `dispatch:${excludeDispatchId}`) continue;
       if (m.kind !== 'handoff' && m.kind !== 'answer' && m.kind !== 'brief') continue;
       const summary =
-        (m.body || '')
+        redact(m.body || '')
           .split(/\r?\n/)
           .map((line) => line.trim())
           .find(
@@ -924,7 +940,13 @@ export class OrchestrationService {
               !line.startsWith('[Worker ') &&
               !line.startsWith('[ORCHESTRATION ') &&
               !line.startsWith('Workspace:') &&
+              !line.startsWith('Workspace CWD:') &&
               !line.startsWith('Branch:') &&
+              !line.startsWith('Git Branch:') &&
+              !line.startsWith('Previous Dispatch:') &&
+              !line.startsWith('Read full context file first.') &&
+              !line.startsWith('[Specification truncated') &&
+              !line.startsWith('[Section truncated.') &&
               !line.startsWith('Full Brief File:') &&
               !line.startsWith('Task:') &&
               !line.startsWith('Run:') &&
@@ -937,13 +959,13 @@ export class OrchestrationService {
       recentBoardPosts.push({
         boardSeq: m.boardSeq,
         kind: m.kind,
-        fromRole: m.fromRole || m.fromHandle || 'coordinator',
-        summary,
+        fromRole: redact(m.fromRole || m.fromHandle || 'coordinator'),
+        summary: redact(summary),
       });
     }
 
-    const trimmedObjective = run.objective?.trim() || null;
-    const latestThree = recentBoardPosts.slice(-3);
+    const trimmedObjective = run.objective ? redact(run.objective).trim() || null : null;
+    const latestThree = recentBoardPosts.sort((a, b) => a.boardSeq - b.boardSeq).slice(-3);
     if (!trimmedObjective && activePeers.length === 0 && latestThree.length === 0) {
       return null;
     }
@@ -955,6 +977,16 @@ export class OrchestrationService {
     };
   }
 
+  private redactTaskContext(context: OrchestrationTaskContext | null): OrchestrationTaskContext | null {
+    const redact = (value: string) => this.store.redactDispatchCredentials(value);
+    return normalizeTaskContext({
+      background: context?.background && redact(context.background),
+      constraints: context?.constraints?.map(redact),
+      files: context?.files?.map(redact),
+      acceptance: context?.acceptance && redact(context.acceptance),
+    });
+  }
+
   taskCreate(input: {
     id?: string;
     runId?: string;
@@ -962,6 +994,7 @@ export class OrchestrationService {
     spec: string;
     taskContext?: OrchestrationTaskContext | null;
     context?: string;
+    background?: string;
     constraints?: string[];
     files?: string[];
     acceptance?: string;
@@ -972,7 +1005,7 @@ export class OrchestrationService {
     worktreePath?: string;
   }): { task: OrchestrationTaskRecord } {
     const runId = this.resolveRunIdForCaller(input.runId, input.from);
-    const taskContext = normalizeTaskContext(input);
+    const taskContext = this.redactTaskContext(normalizeTaskContext(input));
     const task = this.store.createTask({
       id: input.id,
       runId,
@@ -1001,9 +1034,10 @@ export class OrchestrationService {
     return { tasks, count: tasks.length };
   }
 
-  taskShow(input: string | { id: string }): OrchestrationTaskShowResult {
+  taskShow(input: string | { id: string }, callerPaneId?: string): OrchestrationTaskShowResult {
     const taskId = typeof input === 'string' ? input.trim() : input.id.trim();
     const task = this.store.requireTask(taskId);
+    if (callerPaneId !== undefined) this.authorizeRunAccess(task.runId, callerPaneId);
     const latestDispatch = this.store.getLatestDispatchForTask(task.id) ?? null;
     const dispatches = this.store.listDispatches({ taskId: task.id });
     const gates = this.store.listGates({ taskId: task.id });
@@ -1035,6 +1069,7 @@ export class OrchestrationService {
 
   async dispatchTask(input: {
     taskId: string;
+    callerPaneId?: string;
     to?: string;
     from?: string;
     inject?: boolean;
@@ -1046,7 +1081,8 @@ export class OrchestrationService {
     preamble?: string;
   }> {
     const task = this.store.requireTask(input.taskId);
-    const from = input.from?.trim() || 'coordinator';
+    if (input.callerPaneId !== undefined) this.authorizeRunAccess(task.runId, input.callerPaneId);
+    const from = input.callerPaneId ?? (input.from?.trim() || 'coordinator');
     const assignee = input.to?.trim() || '';
 
     if (input.dryRun) {
@@ -1064,7 +1100,7 @@ export class OrchestrationService {
         canDispatchSubWorkers: true,
         cliCommand: this.cliCommand,
       });
-      return { dispatch: null, injected: false, dryRun: true, preamble };
+      return { dispatch: null, injected: false, dryRun: true, preamble: this.store.redactDispatchCredentials(preamble) };
     }
 
     if (!assignee) {
@@ -1106,28 +1142,20 @@ export class OrchestrationService {
       maxDepth: this.maxDepth,
     });
 
-    const dispatchRun = this.store.getRun(task.runId);
-    const { preamble, briefFilePath } = buildDispatchPreambleWithBrief({
+    const preamble = this.buildWorkerDispatchBrief({
       taskId: task.id,
       dispatchId: ctx.id,
       runId: task.runId,
       taskSpec: task.spec,
       taskContext: task.taskContext,
-      sharedContext: dispatchRun ? this.buildSharedRunContextForDispatch(dispatchRun, ctx.id) : null,
-      briefsDir: this.resolveBriefsDir(),
       coordinatorHandle: callerDispatch ? `dispatch:${callerDispatch.id}` : `run:${task.runId}`,
       workerHandle: assignee,
       worktreePath: task.worktreePath,
       canDispatchSubWorkers: ctx.depth < this.maxDepth,
-      cliCommand: this.cliCommand,
-      dispatchCapability: this.store.getDispatchCapability(ctx.id),
     });
-    if (briefFilePath) {
-      this.store.setDispatchBriefFilePath(ctx.id, briefFilePath);
-    }
 
     let injected = false;
-    let updatedCtx = ctx;
+    let updatedCtx = this.store.getDispatchContext(ctx.id) ?? ctx;
     let delivered = false;
     if (inject) {
       try {
@@ -1197,11 +1225,12 @@ export class OrchestrationService {
         to: `dispatch:${ctx.id}`,
         type: 'dispatch',
         subject: `Dispatched task ${task.id}`,
-        body: redactDispatchCapability(preamble, this.store.getDispatchCapability(ctx.id)),
+        body: this.store.redactDispatchCredentials(preamble),
       });
       this.store.markAsReadAndDelivered([dispatchAuditMsg.id]);
     } catch (error) {
       if (!delivered) {
+        this.store.failDispatch(ctx.id, 'Could not record dispatch audit');
         throw error;
       }
       console.warn(`[orchestration] dispatch ${ctx.id} audit message failed after delivery:`, error);
@@ -1214,15 +1243,16 @@ export class OrchestrationService {
     return {
       dispatch: updatedCtx,
       injected,
-      preamble: redactDispatchCapability(preamble, this.store.getDispatchCapability(ctx.id)),
+      preamble: this.store.redactDispatchCredentials(preamble),
     };
   }
 
-  dispatchShow(input: { taskId: string; preamble?: boolean }): {
+  dispatchShow(input: { taskId: string; preamble?: boolean; callerPaneId?: string }): {
     dispatch: OrchestrationDispatchRecord | null;
     preamble?: string;
   } {
     const task = this.store.requireTask(input.taskId);
+    if (input.callerPaneId !== undefined) this.authorizeRunAccess(task.runId, input.callerPaneId);
     const ctx = this.store.getLatestDispatchForTask(task.id) ?? null;
     if (!input.preamble) {
       return { dispatch: ctx };
@@ -1248,11 +1278,11 @@ export class OrchestrationService {
       worktreePath: task.worktreePath,
       canDispatchSubWorkers: (ctx?.depth ?? 1) < this.maxDepth,
       cliCommand: this.cliCommand,
-      dispatchCapability: ctx ? this.store.getDispatchCapability(ctx.id) : null,
+      redactText: (text) => this.store.redactDispatchCredentials(text),
     });
     return {
       dispatch: ctx,
-      preamble: redactDispatchCapability(preamble, ctx ? this.store.getDispatchCapability(ctx.id) : null),
+      preamble: this.store.redactDispatchCredentials(preamble),
     };
   }
 
@@ -1320,6 +1350,7 @@ export class OrchestrationService {
         : undefined,
       isPaneAlive: (ptyId) => this.isPaneAlive(ptyId),
       hasPaneExited: (ptyId) => this.exitedPanes.has(ptyId),
+      buildDispatchBrief: (input) => this.buildWorkerDispatchBrief(input),
       sendTurn: async (turn) => {
         const matchingActive = this.store
           .listDispatches()
@@ -3063,11 +3094,13 @@ export class OrchestrationService {
 
   async workerStart(input: {
     from?: string;
+    callerPaneId?: string;
     runId?: string;
     taskId?: string;
     spec?: string;
     taskContext?: OrchestrationTaskContext | null;
     context?: string;
+    background?: string;
     constraints?: string[];
     files?: string[];
     acceptance?: string;
@@ -3164,7 +3197,7 @@ export class OrchestrationService {
     }
 
     // Resolve or create Run and Task.
-    const normalizedInputContext = normalizeTaskContext(input);
+    const normalizedInputContext = this.redactTaskContext(normalizeTaskContext(input));
     let task: OrchestrationTaskRecord;
     let run: OrchestrationRunRecord;
     if (input.retryOfDispatchId?.trim()) {
@@ -3176,9 +3209,10 @@ export class OrchestrationService {
         );
       }
       run = this.store.requireRun(prior.runId);
+      if (input.callerPaneId !== undefined) this.resolveBoardCallerContext({ from: input.callerPaneId, runId: run.id });
       const priorTask = this.store.requireTask(prior.taskId);
       if (priorTask.status === 'completed') {
-        const retryContext = normalizedInputContext ?? priorTask.taskContext ?? null;
+        const retryContext = mergeTaskContext(priorTask.taskContext, normalizedInputContext);
         task = this.store.createTask({
           runId: run.id,
           spec: input.spec?.trim() || priorTask.spec,
@@ -3191,12 +3225,19 @@ export class OrchestrationService {
         task = this.store.requeueTaskForRetry(priorTask.id);
       }
     } else if (input.taskId?.trim()) {
-      this.store.promoteReadyTasks();
-      task = this.store.requireTask(input.taskId.trim());
-      run = this.store.requireRun(task.runId);
+      const existingTask = this.store.requireTask(input.taskId.trim());
+      run = this.store.requireRun(existingTask.runId);
+      if (input.callerPaneId !== undefined) this.resolveBoardCallerContext({ from: input.callerPaneId, runId: run.id });
+      this.store.promoteReadyTasks(run.id);
+      task = this.store.requireTask(existingTask.id);
     } else if (input.spec?.trim()) {
       const explicitRunId = input.runId?.trim();
-      let inferredRunId = explicitRunId || this.inferRunIdOptional(from);
+      if (explicitRunId && input.callerPaneId !== undefined) {
+        this.resolveBoardCallerContext({ from: input.callerPaneId, runId: explicitRunId });
+      }
+      let inferredRunId = explicitRunId || (input.callerPaneId === undefined
+        ? this.inferRunIdOptional(from)
+        : this.resolveBoardMemberForPane(from)?.runId);
       if (!explicitRunId && inferredRunId && !callerDispatch && from !== 'coordinator') {
         const candidateRun = this.store.getRun(inferredRunId);
         if (
@@ -3370,28 +3411,23 @@ export class OrchestrationService {
       input.mcpEnabled ?? this.isMcpEnabledForCliDep?.(launchConfig.cliId) ?? false;
     const preambleRole =
       (input.role ?? input.displayName)?.trim().replace(/^@+/, '') || null;
-    const effectiveTaskContext = task.taskContext ?? normalizedInputContext;
-    const { preamble, briefFilePath } = buildDispatchPreambleWithBrief({
+    if (normalizedInputContext && (input.taskId || input.retryOfDispatchId)) {
+      task = this.store.mergeTaskContext(task.id, normalizedInputContext);
+    }
+    const preamble = this.buildWorkerDispatchBrief({
       taskId: task.id,
       dispatchId: ctx.id,
       runId: run.id,
       taskSpec: task.spec,
-      taskContext: effectiveTaskContext,
-      sharedContext: this.buildSharedRunContextForDispatch(run, ctx.id),
-      briefsDir: this.resolveBriefsDir(),
+      taskContext: task.taskContext,
       coordinatorHandle,
       workerHandle: ptyId,
       worktreePath: placement.worktreePath,
       branch: placement.branch,
       canDispatchSubWorkers: ctx.depth < this.maxDepth,
-      cliCommand: this.cliCommand,
-      dispatchCapability: this.store.getDispatchCapability(ctx.id),
       mcpEnabled: effectiveMcpEnabled,
       role: preambleRole,
     });
-    if (briefFilePath) {
-      this.store.setDispatchBriefFilePath(ctx.id, briefFilePath);
-    }
 
     const delivery = await this.deliverAndObserveDispatchTurn(ctx.id, {
       ptyId,
@@ -3401,7 +3437,6 @@ export class OrchestrationService {
 
     if (!delivery.ok) {
       const reason = delivery.error ?? `Failed to deliver worker prompt to ${ptyId}`;
-      removeWorkerBriefFile(this.resolveBriefsDir(), briefFilePath);
       this.store.failDispatch(ctx.id, reason);
       const closed = await this.rollbackWorkerResources(
         ownsPane ? ptyId : undefined,
@@ -3441,7 +3476,7 @@ export class OrchestrationService {
       to: `dispatch:${ctx.id}`,
       type: 'dispatch',
       subject: `Started worker for ${task.id}`,
-      body: redactDispatchCapability(preamble, this.store.getDispatchCapability(ctx.id)),
+      body: this.store.redactDispatchCredentials(preamble),
       fromRole: briefFromRole,
       mentions: briefWorkerRole ? [briefWorkerRole] : undefined,
       kind: 'brief',
@@ -3522,14 +3557,6 @@ export class OrchestrationService {
       ...(input.body?.trim() ? ['', input.body.trim()] : []),
     ].join('\n');
 
-    const followUpTask = this.store.createTask({
-      runId: settledDispatch.runId,
-      spec: followUpInstructions,
-      taskTitle: `Follow-up: ${input.subject.slice(0, 80)}`,
-      priority: input.priority ?? prevTask?.priority ?? 'normal',
-      worktreePath: settledDispatch.worktreePath ?? prevTask?.worktreePath ?? null,
-    });
-
     const existingPaneId = settledDispatch.assigneePaneId ?? settledDispatch.assigneeHandle;
     if (this.retiringPanes.has(existingPaneId)) {
       throw new OrchestrationError('operation_rejected', 'This worker terminal is still closing. Retry once it exits.');
@@ -3538,6 +3565,21 @@ export class OrchestrationService {
       Boolean(existingPaneId) &&
       this.isPaneAlive(existingPaneId) &&
       !this.store.getActiveDispatchForIdentity(existingPaneId, existingPaneId);
+
+    const originalDispatchId = this.store.listDispatchAncestorIds(settledDispatch.id).at(-1);
+    const originalDispatch = originalDispatchId ? this.store.getDispatchContext(originalDispatchId) : undefined;
+    const originalTask = originalDispatch ? this.store.getTask(originalDispatch.taskId) : prevTask;
+    const followUpSpec = !canReuseLivePane && originalTask
+      ? ['### Follow-up Instructions', followUpInstructions, '### Original Task', originalTask.spec].join('\n\n')
+      : followUpInstructions;
+    const followUpTask = this.store.createTask({
+      runId: settledDispatch.runId,
+      spec: followUpSpec,
+      taskContext: prevTask?.taskContext ?? originalTask?.taskContext,
+      taskTitle: 'Follow-up: ' + input.subject.slice(0, 80),
+      priority: input.priority ?? prevTask?.priority ?? 'normal',
+      worktreePath: settledDispatch.worktreePath ?? prevTask?.worktreePath ?? null,
+    });
 
     let targetPtyId: string;
     let reusedPane = false;
@@ -3673,19 +3715,18 @@ export class OrchestrationService {
     const followUpMcpEnabled = nextCtx.cliId
       ? (this.isMcpEnabledForCliDep?.(nextCtx.cliId) ?? false)
       : false;
-    const preamble = buildDispatchPreamble({
+    const preamble = this.buildWorkerDispatchBrief({
       taskId: followUpTask.id,
       dispatchId: nextCtx.id,
       runId: settledDispatch.runId,
-      taskSpec: followUpInstructions,
+      taskSpec: followUpTask.spec,
+      taskContext: reusedPane ? null : followUpTask.taskContext,
       coordinatorHandle,
       workerHandle: targetPtyId,
       worktreePath: nextCtx.worktreePath,
       branch: nextCtx.branch,
       canDispatchSubWorkers: nextCtx.depth < this.maxDepth,
-      cliCommand: this.cliCommand,
-      dispatchCapability: this.store.getDispatchCapability(nextCtx.id),
-      isFollowUp: true,
+      isFollowUp: reusedPane,
       previousDispatchId: settledDispatch.id,
       mcpEnabled: followUpMcpEnabled,
       role: followUpRole,
@@ -3762,8 +3803,9 @@ export class OrchestrationService {
     dispatchId?: string;
     worker?: string;
     taskId?: string;
-  }): OrchestrationWorkerSummary {
+  }, callerPaneId?: string): OrchestrationWorkerSummary {
     const dispatch = this.resolveTargetDispatch(input);
+    if (callerPaneId !== undefined) this.authorizeRunAccess(dispatch.runId, callerPaneId);
     return this.toWorkerSummary(dispatch);
   }
 
@@ -3774,10 +3816,10 @@ export class OrchestrationService {
     cursor?: number;
     limit?: number;
     screen?: boolean;
-  }): TerminalReadResult & { dispatchId: string; archived: boolean } {
+  }, callerPaneId?: string): TerminalReadResult & { dispatchId: string; archived: boolean } {
     const dispatch = this.resolveTargetDispatch(input);
+    if (callerPaneId !== undefined) this.authorizeRunAccess(dispatch.runId, callerPaneId);
     const paneId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
-    const capability = this.store.getDispatchCapability(dispatch.id);
 
     if (paneId && this.terminalTracker) {
       const liveRead = this.terminalTracker.readOutput(paneId, {
@@ -3788,14 +3830,14 @@ export class OrchestrationService {
       if (liveRead && (liveRead.alive || !dispatch.archivedOutput)) {
         return {
           ...liveRead,
-          text: redactDispatchCapability(liveRead.text, capability),
+          text: this.store.redactDispatchCredentials(liveRead.text),
           dispatchId: dispatch.id,
           archived: !liveRead.alive || Boolean(dispatch.releasedAt),
         };
       }
     }
 
-    const archived = redactDispatchCapability(dispatch.archivedOutput ?? '', capability);
+    const archived = this.store.redactDispatchCredentials(dispatch.archivedOutput ?? '');
     if (input.screen) {
       return {
         ptyId: paneId ?? dispatch.id,
@@ -3997,7 +4039,7 @@ export class OrchestrationService {
       removedWorktree = res.removed;
     }
 
-    removeWorkerBriefFile(this.resolveBriefsDir(), dispatch.briefFilePath);
+    for (const id of this.store.listDispatchAncestorIds(dispatch.id)) this.store.cleanupDispatchBrief(id);
     const released = this.store.markDispatchReleased(dispatch.id, {
       keepPane: !closedPane,
       keepWorktree: !removedWorktree,
@@ -4038,12 +4080,7 @@ export class OrchestrationService {
     visitedDispatchIds.add(dispatch.id);
     const paneId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
 
-    const lineageIds = new Set<string>([dispatch.id]);
-    let prevId = dispatch.followUpOfDispatchId ?? null;
-    while (prevId && !lineageIds.has(prevId)) {
-      lineageIds.add(prevId);
-      prevId = this.store.getDispatchContext(prevId)?.followUpOfDispatchId ?? null;
-    }
+    const lineageIds = new Set(this.store.listDispatchAncestorIds(dispatch.id));
 
     const stoppedHelperIds: string[] = [];
     const childSeedDispatches = this.store
@@ -4126,6 +4163,7 @@ export class OrchestrationService {
       removedWorktree = res.removed;
     }
 
+    for (const id of lineageIds) this.store.cleanupDispatchBrief(id);
     this.emitChanged('worker:stopped', settled.runId);
     return {
       dispatch: this.store.getDispatchContext(settled.id) ?? settled,
@@ -4217,14 +4255,6 @@ export class OrchestrationService {
     if (scope === 'all' || scope === 'messages') {
       this.waiters.dispose();
       this.peerPingPong.clearAll();
-    }
-    if (scope === 'all' || scope === 'tasks') {
-      const briefsDir = this.resolveBriefsDir();
-      if (briefsDir) {
-        for (const dispatch of this.store.listDispatches()) {
-          removeWorkerBriefFile(briefsDir, dispatch.briefFilePath);
-        }
-      }
     }
     const res = this.store.reset(scope);
     this.emitChanged(`orchestration:reset-${scope}`);
@@ -4379,6 +4409,9 @@ export class OrchestrationService {
       role?: string;
       task: string;
       taskContext?: OrchestrationTaskContext | null;
+      background?: string;
+      proposalId?: string;
+      callerPaneId?: string;
       context?: string;
       constraints?: string[];
       files?: string[];
@@ -4397,11 +4430,11 @@ export class OrchestrationService {
     },
     signal?: AbortSignal
   ): Promise<OrchestrationDelegateTaskResult> {
-    const taskText = input.task?.trim() ?? '';
+    const taskText = this.store.redactDispatchCredentials(input.task?.trim() ?? '');
     if (!taskText) {
       throw new OrchestrationError('invalid_argument', 'Missing task specification.');
     }
-    const normalizedTaskContext = normalizeTaskContext(input);
+    let normalizedTaskContext = this.redactTaskContext(normalizeTaskContext(input));
 
     const from = input.from?.trim() || 'coordinator';
     const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
@@ -4413,7 +4446,7 @@ export class OrchestrationService {
         { depth: nextDepth, maxDepth: this.maxDepth }
       );
     }
-    const role = (input.role ?? '').trim().replace(/^@+/, '');
+    const role = this.store.redactDispatchCredentials((input.role ?? '').trim().replace(/^@+/, ''));
     const firstLine =
       taskText
         .split(/\r?\n/)
@@ -4487,60 +4520,53 @@ export class OrchestrationService {
     const planSummary =
       input.planSummary?.trim() ||
       (role ? `@${role} (${resolvedAgent}): ${firstLine}` : `${resolvedAgent}: ${firstLine}`);
-    const inferredRunId = input.runId?.trim() || this.inferRunIdOptional(from) || null;
+    const explicitRunId = input.runId?.trim();
+    const inferredRunId = explicitRunId || (input.callerPaneId === undefined
+      ? this.inferRunIdOptional(from)
+      : this.resolveBoardMemberForPane(from)?.runId) || null;
+    let dispatchRunId = explicitRunId;
+    if (explicitRunId && input.callerPaneId !== undefined) {
+      this.resolveBoardCallerContext({ from: input.callerPaneId, runId: explicitRunId });
+    }
+    const proposalInput = {
+      coordinatorPaneId: from,
+      runId: inferredRunId,
+      role,
+      task: taskText,
+      ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
+      planSummary: this.store.redactDispatchCredentials(planSummary),
+      requestedAgent,
+      resolvedAgent,
+      taskKind: input.taskKind ?? null,
+      worktree,
+      model: resolvedModel ?? null,
+      effort: resolvedEffort ?? null,
+      terminal: input.terminal?.trim() || null,
+    };
     const confirmMode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
     const bypassGate = input.userInitiated === true || confirmMode === 'auto';
 
     if (!bypassGate) {
       if (confirmMode === 'chat-and-guard') {
-        const guard = this.proposals.evaluateChatGuard(from, Boolean(input.confirmed));
+        const guard = this.proposals.evaluateChatGuard(
+          proposalInput,
+          Boolean(input.confirmed),
+          input.proposalId,
+          explicitRunId,
+        );
         if (!guard.allowed) {
-          const proposal: OrchestrationDispatchProposal = {
-            id: guard.proposalId,
-            coordinatorPaneId: from,
-            runId: inferredRunId,
-            role,
-            task: taskText,
-            ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
-            planSummary,
-            requestedAgent,
-            resolvedAgent,
-            taskKind: input.taskKind ?? null,
-            worktree,
-            model: resolvedModel ?? null,
-            effort: resolvedEffort ?? null,
-            terminal: input.terminal?.trim() || null,
-            status: 'pending',
-            createdAt: new Date(this.clock()).toISOString(),
-            resolvedAt: null,
-            reason: null,
-          };
           return {
             status: 'confirmation_required',
-            proposal,
-            message:
-              '尚未经用户确认派发。请先用一句简短人话向用户确认拟派角色、Coding Agent、任务与是否使用独立 worktree，待用户回复后再带 confirmed=true 调用 delegate_task。',
+            proposal: guard.proposal,
+            message: guard.changed
+              ? '派发内容与待确认方案不一致，请让用户重新确认后再派发。'
+              : '尚未经用户确认派发。请先向用户确认拟派角色、Agent、任务、约束与 worktree，待用户回复后带 confirmed=true 和 proposalId 调用 delegate_task。',
           };
         }
+        normalizedTaskContext = guard.taskContext;
+        dispatchRunId = guard.proposal.runId ?? undefined;
       } else if (confirmMode === 'always-ui') {
-        const held = await this.proposals.createHeldProposal(
-          {
-            coordinatorPaneId: from,
-            runId: inferredRunId,
-            role,
-            task: taskText,
-            ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
-            planSummary,
-            requestedAgent,
-            resolvedAgent,
-            taskKind: input.taskKind ?? null,
-            worktree,
-            model: resolvedModel ?? null,
-            effort: resolvedEffort ?? null,
-            terminal: input.terminal?.trim() || null,
-          },
-          signal
-        );
+        const held = await this.proposals.createHeldProposal(proposalInput, signal);
         if (held.decision !== 'approved') {
           return {
             status: 'rejected',
@@ -4609,7 +4635,8 @@ export class OrchestrationService {
       try {
         const started = await this.workerStart({
           from,
-          runId: input.runId,
+          runId: dispatchRunId,
+          callerPaneId: input.callerPaneId,
           ...(reusableTaskId ? { taskId: reusableTaskId } : { spec: taskText }),
           ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
           taskTitle,
@@ -5986,13 +6013,25 @@ export class OrchestrationService {
 
   // ==================== Snapshot & Agent Text Views ====================
 
-  getSnapshot(runId?: string): OrchestrationSnapshot {
-    const base = this.store.getSnapshot(runId);
+  getSnapshot(runId?: string, callerPaneId?: string): OrchestrationSnapshot {
+    const scope = callerPaneId === undefined
+      ? runId
+      : this.authorizeRunAccess(runId, callerPaneId);
+    const base = this.store.getSnapshot(scope);
+    if (callerPaneId !== undefined) {
+      base.runs = base.runs.filter((run) => run.id === scope);
+      base.currentRunByConsumer = Object.fromEntries(
+        Object.entries(base.currentRunByConsumer).filter(([, id]) => id === scope),
+      );
+      if (base.activeCoordinatorRun?.runId !== scope) base.activeCoordinatorRun = null;
+    }
     return {
       ...base,
-      openApprovals: this.approvals.listOpenApprovals(runId ? { runId } : undefined),
-      pendingProposals: this.proposals.listPendingProposals(runId ? { runId } : undefined),
-      orchestrationModePanes: [...this.orchestrationModePanes],
+      openApprovals: this.approvals.listOpenApprovals(scope ? { runId: scope } : undefined),
+      pendingProposals: this.proposals.listPendingProposals(scope ? { runId: scope } : undefined),
+      orchestrationModePanes: callerPaneId === undefined
+        ? [...this.orchestrationModePanes]
+        : [...this.orchestrationModePanes].filter((pane) => pane === callerPaneId),
     };
   }
 
@@ -6390,7 +6429,8 @@ export class OrchestrationService {
       void this.store.waitForPendingWrite().then(() => {
         const latest = this.store.getDispatchContext(dispatchId);
         if (!latest || !ACTIVE_DISPATCH_STATUSES.has(latest.status)) return null;
-        return this.deliverAndObserveDispatchTurn(dispatchId, deferred);
+        const prompt = this.store.restoreDeferredDispatchPrompt(dispatchId, deferred.prompt);
+        return this.deliverAndObserveDispatchTurn(dispatchId, { ...deferred, prompt });
       })
         .then((res) => {
           if (!res) return;

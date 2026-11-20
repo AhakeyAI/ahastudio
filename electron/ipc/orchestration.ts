@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { taskContextFields } from '../orchestration/task-context-schema.js';
 import {
   ORCHESTRATION_BOARD_POST_KINDS,
   ORCHESTRATION_MESSAGE_TYPES,
@@ -59,6 +60,7 @@ const taskCreateSchema = z
     runId: nonEmptyId.optional(),
     from: nonEmptyId.optional(),
     spec: z.string().trim().min(1).max(64_000),
+    ...taskContextFields,
     taskTitle: z.string().trim().min(1).max(200).optional(),
     displayName: z.string().trim().min(1).max(200).optional(),
     deps: z.array(nonEmptyId).max(100).optional(),
@@ -171,6 +173,7 @@ const workerStartSchema = z
     runId: nonEmptyId.optional(),
     taskId: nonEmptyId.optional(),
     spec: z.string().trim().min(1).max(64_000).optional(),
+    ...taskContextFields,
     taskTitle: z.string().trim().min(1).max(200).optional(),
     displayName: z.string().trim().min(1).max(200).optional(),
     deps: z.array(nonEmptyId).max(100).optional(),
@@ -392,6 +395,8 @@ const delegateTaskSchema = z
     from: nonEmptyId.optional(),
     role: z.string().trim().max(120).optional(),
     task: z.string().trim().min(1).max(64_000),
+    ...taskContextFields,
+    proposalId: z.string().trim().min(1).max(128).optional(),
     agent: nonEmptyId.optional(),
     taskKind: taskKindEnum.optional(),
     worktree: z.boolean().optional(),

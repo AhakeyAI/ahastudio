@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { OrchestrationService } from './orchestration-service.js';
+import { taskContextFields } from './task-context-schema.js';
 import {
   ORCHESTRATION_BOARD_POST_KINDS,
   ORCHESTRATION_MESSAGE_TYPES,
@@ -41,21 +42,6 @@ const runListSchema = z.object({
 const runShowSchema = z.object({
   id: z.string().trim().min(1),
 });
-
-const taskContextSchema = z.object({
-  background: z.string().trim().max(16_000).optional(),
-  constraints: z.array(z.string().trim().min(1).max(400)).max(20).optional(),
-  files: z.array(z.string().trim().min(1).max(400)).max(30).optional(),
-  acceptance: z.string().trim().max(4_000).optional(),
-});
-
-const taskContextFields = {
-  taskContext: taskContextSchema.optional(),
-  context: z.string().trim().max(16_000).optional(),
-  constraints: z.array(z.string().trim().min(1).max(400)).max(20).optional(),
-  files: z.array(z.string().trim().min(1).max(400)).max(30).optional(),
-  acceptance: z.string().trim().max(4_000).optional(),
-};
 
 const taskCreateSchema = z.object({
   id: z.string().trim().min(1).optional(),
@@ -310,6 +296,7 @@ const delegateTaskSchema = z.object({
   effort: z.string().trim().min(1).optional(),
   terminal: z.string().trim().min(1).optional(),
   confirmed: z.boolean().optional(),
+  proposalId: z.string().trim().min(1).max(128).optional(),
   planSummary: z.string().trim().max(1_000).optional(),
   runId: z.string().trim().min(1).optional(),
   callerCwd: z.string().trim().min(1).optional(),
@@ -444,6 +431,11 @@ export async function dispatchOrchestrationHttpAction(
     }
     return context.callerPaneId;
   };
+  const httpCallerPane = (): string | undefined => context.callerPaneId === undefined ? undefined : requireCallerPane();
+  const scopedRunId = (runId?: string): string | undefined => {
+    const pane = httpCallerPane();
+    return pane === undefined ? runId : service.authorizeRunAccess(runId, pane);
+  };
   const assertWorkerTarget = (target?: string): void => {
     if (target && context.callerPaneId !== undefined && service.isCoordinatorTerminal(target)) {
       throw new OrchestrationError('terminal_is_coordinator', 'Choose a worker terminal. This pane coordinates a run.');
@@ -473,16 +465,20 @@ export async function dispatchOrchestrationHttpAction(
         result = service.runList(runListSchema.parse(payload));
         break;
       case 'run-show':
-        result = service.runShow(runShowSchema.parse(payload).id);
+        result = service.runShow(runShowSchema.parse(payload).id, httpCallerPane());
         break;
-      case 'task-create':
-        result = service.taskCreate(taskCreateSchema.parse(payload));
+      case 'task-create': {
+        const parsed = taskCreateSchema.parse(payload);
+        result = service.taskCreate({ ...parsed, runId: scopedRunId(parsed.runId) });
         break;
-      case 'task-list':
-        result = service.taskList(taskListSchema.parse(payload));
+      }
+      case 'task-list': {
+        const parsed = taskListSchema.parse(payload);
+        result = service.taskList({ ...parsed, runId: scopedRunId(parsed.runId) });
         break;
+      }
       case 'task-show':
-        result = service.taskShow(taskShowSchema.parse(payload));
+        result = service.taskShow(taskShowSchema.parse(payload), httpCallerPane());
         break;
       case 'task-update': {
         const parsed = taskUpdateSchema.parse(payload);
@@ -495,15 +491,17 @@ export async function dispatchOrchestrationHttpAction(
       case 'dispatch': {
         const parsed = dispatchSchema.parse(payload);
         if (!parsed.dryRun && parsed.inject !== false) assertWorkerTarget(parsed.to);
-        result = await service.dispatchTask(
-          context.callerPaneId !== undefined && context.callerPaneId !== null
-            ? { ...parsed, from: context.callerPaneId }
-            : parsed
-        );
+        result = await service.dispatchTask({
+          ...parsed,
+          ...(context.callerPaneId !== undefined ? { callerPaneId: requireCallerPane() } : {}),
+        });
         break;
       }
       case 'dispatch-show':
-        result = service.dispatchShow(dispatchShowSchema.parse(payload));
+        result = service.dispatchShow({
+          ...dispatchShowSchema.parse(payload),
+          ...(context.callerPaneId !== undefined ? { callerPaneId: requireCallerPane() } : {}),
+        });
         break;
       case 'coordinator-start':
         result = service.coordinatorStart(coordinatorStartSchema.parse(payload));
@@ -535,21 +533,20 @@ export async function dispatchOrchestrationHttpAction(
       case 'worker-start': {
         const parsed = workerStartSchema.parse(payload);
         assertWorkerTarget(parsed.terminal);
-        result = await service.workerStart(
-          context.callerPaneId !== undefined && context.callerPaneId !== null
-            ? { ...parsed, from: context.callerPaneId }
-            : parsed
-        );
+        const pane = httpCallerPane();
+        result = await service.workerStart(pane === undefined ? parsed : { ...parsed, from: pane, callerPaneId: pane });
         break;
       }
-      case 'worker-list':
-        result = service.workerList(workerListSchema.parse(payload));
+      case 'worker-list': {
+        const parsed = workerListSchema.parse(payload);
+        result = service.workerList({ ...parsed, runId: scopedRunId(parsed.runId) });
         break;
+      }
       case 'worker-show':
-        result = service.workerShow(workerTargetSchema.parse(payload));
+        result = service.workerShow(workerTargetSchema.parse(payload), httpCallerPane());
         break;
       case 'worker-read':
-        result = service.workerRead(workerReadSchema.parse(payload));
+        result = service.workerRead(workerReadSchema.parse(payload), httpCallerPane());
         break;
       case 'worker-keep-open':
       case 'worker-retain': {
@@ -634,7 +631,10 @@ export async function dispatchOrchestrationHttpAction(
         result = service.gateList(gateListSchema.parse(payload));
         break;
       case 'snapshot':
-        result = service.getSnapshot(snapshotSchema.parse(payload).runId);
+        result = service.getSnapshot(
+          snapshotSchema.parse(payload).runId,
+          httpCallerPane(),
+        );
         break;
       case 'agents': {
         const parsed = agentsSchema.parse(payload);
@@ -663,6 +663,7 @@ export async function dispatchOrchestrationHttpAction(
           {
             ...parsed,
             from: caller,
+            callerPaneId: context.callerPaneId ?? undefined,
             userInitiated: false,
           },
           context.signal

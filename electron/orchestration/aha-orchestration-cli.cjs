@@ -59,12 +59,11 @@ const FREE_TEXT_FLAGS = new Set([
   'title',
   'taskTitle',
   'displayName',
-  'context',
-  'acceptance',
-  'constraint',
 ]);
 
 const REPEATABLE_FLAGS = new Set(['constraint', 'file']);
+const CONTEXT_TEXT_FLAGS = new Set(['context', 'background', 'acceptance', 'constraint']);
+const CONTEXT_FILE_MAX_BYTES = 64 * 1024;
 
 function parseCliArgs(argv) {
   let args = argv.slice();
@@ -143,6 +142,9 @@ function parseCliArgs(argv) {
       }
       i += 1;
     } else {
+      if (CONTEXT_TEXT_FLAGS.has(key)) {
+        throw new Error('Missing value for ' + token + '. Use ' + token + '=value for text starting with --.');
+      }
       // PowerShell drops unquoted @name arguments (splatting); never send the string "true" instead.
       throw new Error(
         `Missing value for --${token.slice(2)}${key === 'to' ? " (in PowerShell quote mailbox names, e.g. --to '@all')" : ''}`
@@ -177,14 +179,15 @@ function splitCsv(value) {
 }
 
 function extractContextPayload(flags) {
-  if (flags.context !== undefined && flags.contextFile !== undefined) {
+  const inlineContext = flags.context ?? flags.background;
+  if (inlineContext !== undefined && flags.contextFile !== undefined) {
     throw new Error('Cannot combine --context and --context-file.');
   }
   const contextVal =
     flags.contextFile !== undefined
-      ? readSpecFile(flags.contextFile)
-      : flags.context !== undefined
-        ? String(flags.context)
+      ? readContextFile(flags.contextFile)
+      : inlineContext !== undefined
+        ? String(inlineContext)
         : undefined;
   const constraints = [
     ...(Array.isArray(flags.constraint) ? flags.constraint : flags.constraint ? [flags.constraint] : []),
@@ -222,6 +225,26 @@ function parseOptionsList(value) {
     }
   }
   return splitCsv(value);
+}
+
+function readContextFile(filePath) {
+  const target = String(filePath);
+  const fd = target === '-' ? 0 : fs.openSync(target, 'r');
+  try {
+    const buffer = Buffer.alloc(CONTEXT_FILE_MAX_BYTES + 1);
+    let bytes = 0;
+    while (bytes < buffer.length) {
+      const count = fs.readSync(fd, buffer, bytes, buffer.length - bytes, null);
+      if (count === 0) break;
+      bytes += count;
+    }
+    if (bytes > CONTEXT_FILE_MAX_BYTES) {
+      throw new Error('Context file exceeds the 64 KiB read limit.');
+    }
+    return buffer.toString('utf8', 0, bytes);
+  } finally {
+    if (target !== '-') fs.closeSync(fd);
+  }
 }
 
 function readSpecFile(filePath) {

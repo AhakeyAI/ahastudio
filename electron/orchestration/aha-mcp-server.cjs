@@ -156,7 +156,7 @@ function buildDelegateTaskTool(ctx) {
   const confirmMode = (ctx && ctx.confirmMode) || 'chat-and-guard';
   if (confirmMode === 'chat-and-guard') {
     descParts.push(
-      'Confirmation rule (2-step): before spawning workers on a new user request, first call delegate_task with confirmed=false to register the dispatch plan without spawning (returns resolved agent & worktree), then briefly ask the user in one natural sentence to confirm the role, Coding Agent, task, and worktree isolation; after the user replies to confirm, call delegate_task with confirmed=true (parallel batch calls in the confirmed turn all pass without re-confirming).'
+      'Confirmation rule (2-step): before spawning workers on a new user request, first call delegate_task with confirmed=false to register the dispatch plan without spawning (returns resolved agent & worktree), then briefly ask the user in one natural sentence to confirm the role, Coding Agent, task, and worktree isolation; after the user replies to confirm, call delegate_task with confirmed=true with the original proposalId. Register each proposed worker before asking for batch confirmation. Matching plans can start in parallel in the confirmed turn.'
     );
   } else if (confirmMode === 'always-ui') {
     descParts.push(
@@ -181,25 +181,44 @@ function buildDelegateTaskTool(ctx) {
         },
         context: {
           type: 'string',
+          maxLength: 16000,
           description:
             'Curated background from the coordinator: user goal, already-confirmed decisions, and pitfalls to avoid.',
         },
         constraints: {
           type: 'array',
-          items: { type: 'string' },
+          maxItems: 20,
+          items: { type: 'string', minLength: 1, maxLength: 400 },
           description:
             'Explicit boundaries and guardrails (e.g. files not to touch, platform/API requirements).',
         },
         files: {
           type: 'array',
-          items: { type: 'string' },
+          maxItems: 30,
+          items: { type: 'string', minLength: 1, maxLength: 400 },
           description:
             'Key file paths, symbols, or design doc paths already located by the coordinator so the worker can jump straight in.',
         },
         acceptance: {
           type: 'string',
+          maxLength: 4000,
           description:
             'Definition of done and verification commands/checks expected before calling report_done.',
+        },
+        background: { type: 'string', maxLength: 16000, description: 'Alias for context.' },
+        taskContext: {
+          type: 'object',
+          properties: {
+            background: { type: 'string', maxLength: 16000 },
+            constraints: { type: 'array', maxItems: 20, items: { type: 'string', minLength: 1, maxLength: 400 } },
+            files: { type: 'array', maxItems: 30, items: { type: 'string', minLength: 1, maxLength: 400 } },
+            acceptance: { type: 'string', maxLength: 4000 },
+          },
+        },
+        proposalId: {
+          type: 'string',
+          maxLength: 128,
+          description: 'Return the Proposal ID after the user confirms that plan.',
         },
         agent: {
           type: 'string',
@@ -731,21 +750,19 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       const effort = nonEmptyStr(args.effort);
       const terminal = nonEmptyStr(args.terminal);
       const planSummary = nonEmptyStr(args.planSummary ?? args.plan_summary);
-      const context = nonEmptyStr(args.context ?? args.background);
-      const acceptance = nonEmptyStr(args.acceptance);
-      const constraints = Array.isArray(args.constraints)
-        ? args.constraints.map((v) => nonEmptyStr(v)).filter(Boolean)
-        : undefined;
-      const files = Array.isArray(args.files)
-        ? args.files.map((v) => nonEmptyStr(v)).filter(Boolean)
-        : undefined;
+      const context = nonEmptyStr(args.context) || nonEmptyStr(args.background);
+      const proposalId = nonEmptyStr(args.proposalId);
+      const taskContext = args.taskContext;
+
       const payload = {
         ...(role ? { role } : {}),
         task: typeof args.task === 'string' ? args.task : '',
         ...(context ? { context } : {}),
-        ...(constraints && constraints.length > 0 ? { constraints } : {}),
-        ...(files && files.length > 0 ? { files } : {}),
-        ...(acceptance ? { acceptance } : {}),
+        ...(taskContext !== undefined ? { taskContext } : {}),
+        ...(proposalId ? { proposalId } : {}),
+        ...(args.constraints !== undefined ? { constraints: args.constraints } : {}),
+        ...(args.files !== undefined ? { files: args.files } : {}),
+        ...(args.acceptance !== undefined ? { acceptance: args.acceptance } : {}),
         ...(agent ? { agent } : {}),
         ...(taskKind ? { taskKind } : {}),
         ...(typeof args.worktree === 'boolean' ? { worktree: args.worktree } : {}),

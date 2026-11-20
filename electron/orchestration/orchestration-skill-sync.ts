@@ -19,8 +19,8 @@ Use native AhaStation MCP tools when available, or fall back to \`aha orchestrat
 
 - Coordinator tools: \`list_coding_agents\`, \`delegate_task\`, \`team_status\`, \`team_wait\`, \`message_worker\`, \`manage_worker\`.
 - Worker tools: \`ask_coordinator\`, \`report_done\` (plus \`delegate_task\` / \`team_wait\` when sub-workers are permitted).
-- In \`chat-and-guard\` mode, use the 2-step confirmation flow: first call \`delegate_task\` with \`confirmed: false\` to register the dispatch plan without spawning, confirm role, Coding Agent, task, and worktree isolation with the user in one short sentence, then after the user replies call \`delegate_task\` with \`confirmed: true\` (parallel batch calls in that confirmed turn all pass).
-- **Provide curated coordinator context** when calling \`delegate_task\` (or \`worker-start\`): workers start with a blank conversation and cannot see your prior chat. Populate \`context\` (goal, confirmed decisions, pitfalls), \`constraints\` (boundaries/files not to touch), \`files\` (already-located paths or design docs), and \`acceptance\` (verification commands). Long briefs are automatically persisted to an external brief file so nothing is lost.
+- In \`chat-and-guard\` mode, use the 2-step confirmation flow: first call \`delegate_task\` with \`confirmed: false\` to register the dispatch plan without spawning, confirm role, Coding Agent, task, and worktree isolation with the user in one short sentence, then after the user replies call \`delegate_task\` with \`confirmed: true\` with the original proposal ID. Register each worker's plan before asking for batch confirmation. In the confirmed turn, matching plans can start in parallel and omitted context fields are inherited.
+- **Provide curated coordinator context** when calling \`delegate_task\` (or \`worker-start\`): workers start with a blank conversation and cannot see your prior chat. Populate \`context\` (goal, confirmed decisions, pitfalls), \`constraints\` (boundaries/files not to touch), \`files\` (already-located paths or design docs), and \`acceptance\` (verification commands). Long briefs use a brief file outside the worktree. If marked as truncated, retrieve the full task with the CLI or ask the coordinator.
 
 ## Core Coordinator Loop (CLI)
 
@@ -35,7 +35,10 @@ Use native AhaStation MCP tools when available, or fall back to \`aha orchestrat
    # Optional model/effort & placement flags:
    aha orchestration worker-start --spec "<spec>" --agent codex --model gpt-5.4 --effort high
    aha orchestration worker-start --spec "<spec>" --agent gemini --no-worktree
+   aha orchestration worker-start --spec "<spec>" --context "Decision already agreed" --constraint "Keep the API" --file src/main.ts --acceptance "Run npm test"
+   aha orchestration worker-start --spec "<spec>" --context-file ./background.md --constraint "Keep the API" --constraint "Preserve Windows support"
    \`\`\`
+   Use either --context or --context-file (64 KiB read limit). The value - reads from stdin. Repeat --constraint and --file for multiple items.
 
 2. **Wait reactively for worker events** (never poll in a \`sleep\` loop):
    \`\`\`bash

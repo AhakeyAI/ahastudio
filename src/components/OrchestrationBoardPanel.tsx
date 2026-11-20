@@ -870,6 +870,10 @@ export function OrchestrationBoardPanel({
       const draft = getProposalDraft(proposal);
       const roleLabel = proposal.role?.trim().replace(/^@+/, '') || 'worker';
       const hasSelected = availableAgents.some((a) => a.cliId === draft.agent);
+      const context = proposal.taskContext;
+      const contextPreview = [context?.background, context?.constraints?.[0], context?.files?.[0], context?.acceptance]
+        .filter(Boolean)
+        .join(' · ');
       return (
         <div key={proposal.id} className="obp-inline-card is-warn">
           <div className="obp-inline-card-head">
@@ -881,37 +885,44 @@ export function OrchestrationBoardPanel({
           <p className="obp-inline-card-text" title={proposal.task}>
             {proposal.planSummary?.trim() || proposal.task}
           </p>
-          {proposal.taskContext && (
-            <div className="obp-proposal-context">
-              {proposal.taskContext.background && (
-                <div className="obp-proposal-context-row">
-                  <span className="obp-proposal-context-label">背景</span>
-                  <span className="obp-proposal-context-val">{proposal.taskContext.background}</span>
-                </div>
-              )}
-              {proposal.taskContext.constraints && proposal.taskContext.constraints.length > 0 && (
-                <div className="obp-proposal-context-row">
-                  <span className="obp-proposal-context-label">约束</span>
-                  <span className="obp-proposal-context-val">
-                    {proposal.taskContext.constraints.join(' · ')}
-                  </span>
-                </div>
-              )}
-              {proposal.taskContext.files && proposal.taskContext.files.length > 0 && (
-                <div className="obp-proposal-context-row">
-                  <span className="obp-proposal-context-label">文件</span>
-                  <span className="obp-proposal-context-val is-mono">
-                    {proposal.taskContext.files.join(', ')}
-                  </span>
-                </div>
-              )}
-              {proposal.taskContext.acceptance && (
-                <div className="obp-proposal-context-row">
-                  <span className="obp-proposal-context-label">验收</span>
-                  <span className="obp-proposal-context-val">{proposal.taskContext.acceptance}</span>
-                </div>
-              )}
-            </div>
+          {context && (
+            <details className="obp-proposal-context">
+              <summary className="obp-proposal-context-toggle">
+                <span className="obp-proposal-context-open">展开上下文</span>
+                <span className="obp-proposal-context-close">收起上下文</span>
+                {contextPreview && <span className="obp-proposal-context-preview">{contextPreview}</span>}
+              </summary>
+              <dl className="obp-proposal-context-content">
+                {context.background && (
+                  <>
+                    <dt>背景</dt>
+                    <dd>{context.background}</dd>
+                  </>
+                )}
+                {context.constraints && context.constraints.length > 0 && (
+                  <>
+                    <dt>约束</dt>
+                    <dd>
+                      <ul>{context.constraints.map((constraint) => <li key={constraint}>{constraint}</li>)}</ul>
+                    </dd>
+                  </>
+                )}
+                {context.files && context.files.length > 0 && (
+                  <>
+                    <dt>文件</dt>
+                    <dd>
+                      <ul>{context.files.map((file) => <li key={file}><code>{file}</code></li>)}</ul>
+                    </dd>
+                  </>
+                )}
+                {context.acceptance && (
+                  <>
+                    <dt>验收</dt>
+                    <dd>{context.acceptance}</dd>
+                  </>
+                )}
+              </dl>
+            </details>
           )}
           <div className="obp-inline-card-controls">
             <select

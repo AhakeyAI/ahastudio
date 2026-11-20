@@ -305,6 +305,15 @@ test('DispatchProposalManager deduplicates pty+hook turns and enforces chat-and-
   assert.equal(blocked2.status, 'confirmation_required');
   assert.equal(spawnCount, 0);
 
+  // Register both plans in the same turn before seeking batch confirmation.
+  for (const plan of [
+    { role: 'reviewer', task: 'Review diff A', agent: 'codex' },
+    { role: 'tester', task: 'Run tests B', agent: 'grok' },
+  ]) {
+    const result = await service.delegateTask({ ...plan, from: 'local-coord', worktree: false, confirmed: false });
+    assert.equal(result.status, 'confirmation_required');
+  }
+
   // User replies on Turn 11 (paired pty + hook -> advances to 11 once).
   clock += 3_000;
   service.recordUserPromptTurn('local-coord', 'pty');
@@ -801,6 +810,8 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
       agent: '',
       task_kind: 'review',
       plan_summary: 'Codex reviews auth middleware',
+      background: 'Review the existing middleware contract',
+      taskContext: { constraints: ['Read-only audit'] },
       model: '',
       effort: '   ',
       terminal: '',
@@ -831,6 +842,11 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   assert.equal(startedCall.result.isError, undefined);
   assert.match(startedCall.result.content[0].text, /Worker started \(@reviewer\)/);
   const workerPtyId = 'local-mcp-w1';
+  const firstWorker = service.store.getActiveDispatchForIdentity(workerPtyId, workerPtyId);
+  assert.deepEqual(service.store.getTask(firstWorker.taskId).taskContext, {
+    background: 'Review the existing middleware contract',
+    constraints: ['Read-only audit'],
+  });
 
   // Coordinator team_status lists @reviewer (including snake_case include_settled).
   const statusCall = await coordClient.request('tools/call', {

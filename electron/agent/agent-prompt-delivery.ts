@@ -17,9 +17,9 @@ const DEFAULT_MAX_HELD_SUBMIT_RETRIES = 3;
 const PASTED_CONTENT_PLACEHOLDER_RE = /\[Pasted Content (\d+) chars\](?: #\d+)?/gi;
 const INK_PASTED_LINES_PLACEHOLDER_RE = /\[Pasted text #\d+(?: \+\d+ lines)?\]/i;
 
-// Strip ESC (0x1b), C1 CSI (0x9b), NUL, and control chars except TAB and LF.
+// Strip C0 and C1 controls except TAB and LF.
 // eslint-disable-next-line no-control-regex
-const UNSAFE_PASTE_CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f\u009b]/g;
+const UNSAFE_PASTE_CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
 
 export interface AgentPromptPayloadOptions {
   prompt: string;

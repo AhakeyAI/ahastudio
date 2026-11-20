@@ -1,6 +1,9 @@
+import { formatAgentPromptPayload, sanitizeBracketedPasteText } from '../agent/agent-prompt-delivery.js';
+import { PTY_INPUT_MAX_BYTES } from '../pty-input-limiter.js';
 import type { OrchestrationTaskContext } from './orchestration-types.js';
 import {
-  clipUtf8Bytes,
+  BRIEF_FILE_MAX_BYTES,
+  clipMarkdown,
   formatStructuredTaskBody,
   writeWorkerBriefFile,
   type SharedRunContext,
@@ -24,6 +27,7 @@ export interface BuildDispatchPreambleInput {
   dispatchCapability?: string | null;
   isFollowUp?: boolean;
   previousDispatchId?: string | null;
+  redactText?: (text: string) => string;
   mcpEnabled?: boolean;
   role?: string | null;
 }
@@ -51,34 +55,96 @@ export function redactDispatchCapability(text: string, capability?: string | nul
 }
 
 export function buildDispatchPreambleWithBrief(
-  input: BuildDispatchPreambleInput,
+  raw: BuildDispatchPreambleInput,
 ): BuildDispatchPreambleResult {
-  const cli = input.cliCommand?.trim() || 'aha';
-  const fullBody = formatStructuredTaskBody({
+  const redact = raw.redactText ?? ((value: string) => redactDispatchCapability(value, raw.dispatchCapability));
+  const clean = (text: string) => redact(sanitizeBracketedPasteText(text));
+  const cleanLabel = (text: string) => clean(text).replace(/\n/g, ' ');
+  const input: BuildDispatchPreambleInput = {
+    ...raw,
+    taskId: cleanLabel(raw.taskId),
+    dispatchId: cleanLabel(raw.dispatchId),
+    runId: raw.runId && cleanLabel(raw.runId),
+    workerHandle: cleanLabel(raw.workerHandle),
+    coordinatorHandle: cleanLabel(raw.coordinatorHandle),
+    worktreePath: raw.worktreePath && cleanLabel(raw.worktreePath),
+    branch: raw.branch && cleanLabel(raw.branch),
+    role: raw.role && cleanLabel(raw.role),
+    previousDispatchId: raw.previousDispatchId && cleanLabel(raw.previousDispatchId),
+  };
+  const cli = cleanLabel(raw.cliCommand ?? '').trim() || 'aha';
+  const bodyInput = {
     taskSpec: input.taskSpec,
     taskContext: input.taskContext,
     sharedContext: input.isFollowUp ? null : input.sharedContext,
     mcpEnabled: input.mcpEnabled,
     cliCommand: cli,
-  });
-  const clipped = clipUtf8Bytes(fullBody, INLINE_SPEC_MAX_BYTES);
-  let briefFilePath: string | null = null;
+    sanitizeText: clean,
+  };
+  const fullBody = formatStructuredTaskBody(bodyInput);
+  const measure = (prompt: string) => Buffer.byteLength(formatAgentPromptPayload({ prompt }), 'utf8');
+  const frameBudget = PTY_INPUT_MAX_BYTES - 64;
+  if (Buffer.byteLength(fullBody, 'utf8') <= INLINE_SPEC_MAX_BYTES) {
+    const inline = renderDispatchPreamble(input, cli, fullBody, '', null, false);
+    if (measure(inline) <= frameBudget) return { preamble: inline, briefFilePath: null };
+  }
 
-  if (clipped !== fullBody && input.briefsDir) {
-    const fileLines: string[] = [
-      `# Worker Task Brief (${input.taskId})`,
-      ...(input.role ? [`- Role: @${input.role.trim().replace(/^@+/, '')}`] : []),
-      ...(input.runId ? [`- Run: ${input.runId}`] : []),
-      ...(input.worktreePath ? [`- Workspace: ${input.worktreePath}`] : []),
-      ...(input.branch ? [`- Branch: ${input.branch}`] : []),
-      '',
-      fullBody,
-    ];
+  let briefFilePath: string | null = null;
+  if (input.briefsDir) {
     try {
-      briefFilePath = writeWorkerBriefFile(input.briefsDir, input.dispatchId, fileLines.join('\n'));
+      const title = clean('# Worker Task Brief (' + input.taskId + ')');
+      const heading = clipMarkdown(title, 512);
+      const fileBody = formatStructuredTaskBody({
+        ...bodyInput,
+        maxFileBodyBytes: BRIEF_FILE_MAX_BYTES - Buffer.byteLength(heading, 'utf8') - 3,
+      });
+      briefFilePath = writeWorkerBriefFile(input.briefsDir, raw.dispatchId, heading + '\n\n' + fileBody);
     } catch {
-      briefFilePath = null;
+      // The inline retrieval hint still works when the brief directory is unavailable.
     }
+  }
+
+  let pointer = briefFilePath;
+  const fallback = input.mcpEnabled
+    ? '[Specification truncated (' + input.taskId + '); ask coordinator if details are missing.]'
+    : '[Specification truncated. Read the full text with: ' + cli + ' orchestration task-show --id ' + input.taskId + ' --json]';
+  let notice = pointer ? '' : fallback;
+  let skeleton = renderDispatchPreamble(input, cli, '', notice, pointer, false);
+  const compact = measure(skeleton) > frameBudget - 512;
+  if (compact) {
+    skeleton = renderDispatchPreamble(input, cli, '', notice, pointer, true);
+    if (measure(skeleton) > frameBudget - 256) {
+      notice = '[Specification truncated. Retrieve the full task or ask the coordinator.]';
+      pointer = null;
+      skeleton = renderDispatchPreamble(input, cli, '', notice, pointer, true);
+    }
+  }
+  const byteBudget = Math.min(INLINE_SPEC_MAX_BYTES, frameBudget - measure(skeleton) - 2);
+  const preview = clipMarkdown(fullBody, byteBudget);
+  const preamble = renderDispatchPreamble(input, cli, preview, notice, pointer, compact);
+  return { preamble: measure(preamble) <= frameBudget ? preamble : skeleton, briefFilePath };
+}
+
+function renderDispatchPreamble(
+  input: BuildDispatchPreambleInput,
+  cli: string,
+  body: string,
+  notice: string,
+  briefFilePath: string | null,
+  compact: boolean,
+): string {
+  const pointerLines = briefFilePath ? ['Full Brief File: ' + briefFilePath, 'Read full context file first.'] : [];
+  if (compact) {
+    const capability = input.dispatchCapability ? 'Dispatch Capability: ' + input.dispatchCapability : '';
+    return [
+      input.isFollowUp ? '[Worker follow-up]' : '[Worker dispatch]',
+      ...pointerLines,
+      body,
+      notice,
+      ...(input.mcpEnabled
+        ? ['Use MCP ask_coordinator or report_done.']
+        : [capability, 'Use aha orchestration worker-done with --capability to report completion.']),
+    ].filter(Boolean).join('\n');
   }
 
   if (input.mcpEnabled) {
@@ -90,23 +156,14 @@ export function buildDispatchPreambleWithBrief(
       : input.isFollowUp
         ? `[Worker ${input.dispatchId} · Follow-Up]`
         : `[Worker ${input.dispatchId}]`;
-    const mcpSpecLines =
-      clipped === fullBody
-        ? [fullBody]
-        : [
-            clipped.trimEnd(),
-            '…',
-            briefFilePath
-              ? `[Brief truncated inline. Read full context file first: ${briefFilePath}]`
-              : `[Specification truncated (${input.taskId}); ask coordinator if details are missing.]`,
-          ];
     const lines: string[] = [
       header,
       ...(input.worktreePath ? [`Workspace: ${input.worktreePath}`] : []),
       ...(input.branch ? [`Branch: ${input.branch}`] : []),
-      ...(briefFilePath ? [`Full Brief File: ${briefFilePath}`] : []),
+      ...pointerLines,
       '',
-      ...mcpSpecLines,
+      body,
+      ...(notice ? [notice] : []),
       '',
       `- Need clarification or blocked? Call MCP tool \`ask_coordinator\` (wait=true).`,
       `- When finished or blocked, call MCP tool \`report_done\` with outcome & brief summary.`,
@@ -114,22 +171,11 @@ export function buildDispatchPreambleWithBrief(
         ? [`- Sub-tasks permitted: use MCP tools \`delegate_task\` and \`team_wait\` if needed.`]
         : []),
     ];
-    return { preamble: lines.join('\n'), briefFilePath };
+    return lines.join('\n');
   }
 
   const fromFlag = `--from ${input.workerHandle}`;
   const capabilityFlag = input.dispatchCapability ? ` --capability ${input.dispatchCapability}` : '';
-  const specLines =
-    clipped === fullBody
-      ? [fullBody]
-      : [
-          clipped.trimEnd(),
-          '…',
-          briefFilePath
-            ? `[Brief truncated inline. Read full context file first: ${briefFilePath}]`
-            : `[Specification truncated. Read the full text with: ${cli} orchestration task-show --id ${input.taskId} --json]`,
-        ];
-
   const headerTitle = input.isFollowUp
     ? `[ORCHESTRATION FOLLOW-UP DISPATCH ${input.dispatchId}]`
     : `[ORCHESTRATION DISPATCH ${input.dispatchId}]`;
@@ -144,10 +190,11 @@ export function buildDispatchPreambleWithBrief(
     ...(input.dispatchCapability ? [`Dispatch Capability: ${input.dispatchCapability}`] : []),
     ...(input.worktreePath ? [`Workspace CWD: ${input.worktreePath}`] : []),
     ...(input.branch ? [`Git Branch: ${input.branch}`] : []),
-    ...(briefFilePath ? [`Full Brief File: ${briefFilePath}`] : []),
+    ...pointerLines,
     '',
     input.isFollowUp ? '=== FOLLOW-UP INSTRUCTIONS ===' : '=== TASK SPECIFICATION ===',
-    ...specLines,
+    body,
+    ...(notice ? [notice] : []),
     input.isFollowUp ? '=== END FOLLOW-UP INSTRUCTIONS ===' : '=== END TASK SPECIFICATION ===',
     '',
     '=== ORCHESTRATION PROTOCOL ===',
@@ -174,7 +221,7 @@ export function buildDispatchPreambleWithBrief(
   }
 
   lines.push('Begin working on the task now.');
-  return { preamble: lines.join('\n'), briefFilePath };
+  return lines.join('\n');
 }
 
 export function buildDispatchPreamble(input: BuildDispatchPreambleInput): string {
