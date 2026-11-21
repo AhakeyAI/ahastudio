@@ -1,3 +1,4 @@
+import { CODEX_WORKER_ID } from './codex-app-server-pilot.js';
 import { z } from 'zod';
 import { OrchestrationService } from './orchestration-service.js';
 import { taskContextFields } from './task-context-schema.js';
@@ -157,6 +158,7 @@ const workerStartSchema = z.object({
   model: z.string().trim().min(1).optional(),
   effort: z.string().trim().min(1).optional(),
   terminal: z.string().trim().min(1).optional(),
+  readOnly: z.boolean().optional(),
   worktree: z.union([z.string().trim(), z.boolean()]).optional(),
   noWorktree: z.boolean().optional(),
   branch: z.string().trim().min(1).optional(),
@@ -451,6 +453,29 @@ export function isLongPollOrchestrationAction(action: string): boolean {
 }
 
 /** Reads skip the durability barrier; every mutation is fsynced before its receipt is returned. */
+// Worker MCP tools, scoped reads, and mailbox operations. check handles acknowledgments
+// and send handles heartbeats without exposing the Coordinator's management actions.
+const CODEX_WORKER_ACTIONS = new Set([
+  'mcp-context',
+  'worker-done-self',
+  'ask-self',
+  'board-post',
+  'board-read',
+  'board-wait',
+  'check',
+  'inbox',
+  'send',
+  'run-current',
+  'run-show',
+  'task-list',
+  'task-show',
+  'dispatch-show',
+  'worker-list',
+  'worker-show',
+  'worker-read',
+  'worker-diff',
+]);
+
 const READ_ONLY_ORCHESTRATION_ACTIONS = new Set([
   'run-current',
   'run-list',
@@ -483,11 +508,13 @@ export async function dispatchOrchestrationHttpAction(
       : {};
   const formatReceipt = payload.receiptText === true;
   const full = payload.full === true;
+  const codexCaller = context.callerPaneId && CODEX_WORKER_ID.test(context.callerPaneId)
+    ? context.callerPaneId : null;
   const requireCallerPane = (): string => {
-    if (!context.callerPaneId) {
+    if (!context.callerPaneId || !service.isAuthenticatedCallerActive(context.callerPaneId, action === 'mcp-context')) {
       throw new OrchestrationError(
         'operation_rejected',
-        'This action requires an authenticated AhaStation terminal. Reopen older terminals or use the application UI.'
+        'This action requires an authenticated AhaStation terminal or an active headless Worker.'
       );
     }
     return context.callerPaneId;
@@ -504,6 +531,12 @@ export async function dispatchOrchestrationHttpAction(
   };
 
   try {
+    if (codexCaller) {
+      requireCallerPane();
+      if (!CODEX_WORKER_ACTIONS.has(action)) {
+        throw new OrchestrationError('operation_rejected', 'This action is unavailable to headless read-only Workers.');
+      }
+    }
     let result: unknown;
     switch (action) {
       case 'run-create': {
@@ -520,7 +553,7 @@ export async function dispatchOrchestrationHttpAction(
         break;
       }
       case 'run-current':
-        result = service.runCurrent(runCurrentSchema.parse(payload));
+        result = service.runCurrent(codexCaller ? { from: codexCaller } : runCurrentSchema.parse(payload));
         break;
       case 'run-list':
         result = service.runList(runListSchema.parse(payload));
@@ -582,9 +615,11 @@ export async function dispatchOrchestrationHttpAction(
       case 'coordinator-status':
         result = service.coordinatorStatus(coordinatorStatusSchema.parse(payload));
         break;
-      case 'send':
-        result = await service.send(sendSchema.parse(payload));
+      case 'send': {
+        const parsed = sendSchema.parse(payload);
+        result = codexCaller ? service.sendFromCodexWorker(codexCaller, parsed) : await service.send(parsed);
         break;
+      }
       case 'worker-done':
         result = await service.workerDoneWithArtifacts(workerDoneSchema.parse(payload));
         break;

@@ -1,0 +1,535 @@
+import assert from 'node:assert/strict';
+import { execFileSync, spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { createInterface } from 'node:readline';
+import { setTimeout as delay } from 'node:timers/promises';
+import test from 'node:test';
+import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
+import { AgentHookServer } from '../dist-electron/agent/agent-hook-server.js';
+import { CodexAppServerPilot, enabledCodexPilot } from '../dist-electron/orchestration/codex-app-server-pilot.js';
+import { OrchestrationService } from '../dist-electron/orchestration/orchestration-service.js';
+import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
+import { spawnWindowsCodexJob } from '../dist-electron/orchestration/windows-codex-job.js';
+import { dispatchOrchestrationHttpAction } from '../dist-electron/orchestration/orchestration-http-router.js';
+
+const cwd = process.cwd();
+const stderrSecret = 'pilot-stderr-credential-example';
+
+function fakeCodexChild() {
+  const child = new EventEmitter();
+  Object.assign(child, {
+    stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    exitCode: null, signalCode: null, kill: () => true,
+  });
+  return child;
+}
+
+function recordCodexExit(exits) {
+  return {
+    onTurnStarted() {}, onTurnCompleted() {}, onApproval: async () => false,
+    onExit: (reason, code) => exits.push({ reason, code }),
+  };
+}
+
+async function until(read, timeout = 4_000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const value = read();
+    if (value) return value;
+    await delay(20);
+  }
+  assert.fail('Expected pilot state did not appear');
+}
+
+async function setup(t, scenario = 'normal', enabled = true) {
+  const dir = mkdtempSync(join(cwd, '.codex-pilot-test-'));
+  const trace = join(dir, 'rpc.jsonl');
+  const agentStatusStore = new AgentStatusStore();
+  const statePath = join(dir, 'state.json');
+  const store = new OrchestrationStore({ resolveFile: () => statePath });
+  const hook = new AgentHookServer(agentStatusStore);
+  const workers = new Map();
+  const children = [];
+  const exits = [];
+  const writes = [];
+  let ptyStarts = 0;
+  let codexStarts = 0;
+  const service = new OrchestrationService({
+    store, agentStatusStore, getDefaultCwd: () => cwd,
+    settleDelayMs: 0, turnStartObserveTimeoutMs: 250, turnStopSettleMs: 10_000,
+    writePty: async (id, data) => {
+      writes.push({ id, data });
+      agentStatusStore.ingestHookEvent({ ptyId: id, agentId: 'codex', state: 'working' });
+      return { ok: true };
+    },
+    spawnWorkerPty: async () => {
+      ptyStarts++;
+      agentStatusStore.registerPane('fallback-pane', { agentId: 'codex' });
+      return { ptyId: 'fallback-pane' };
+    },
+    isPtyAlive: (id) => id === 'fallback-pane' || id === 'coordinator-pane',
+    codexPilot: {
+      enabled: () => enabled,
+      launch(workerId, workdir, events) {
+        codexStarts++;
+        workers.set(workerId, hook.envForWorker(workerId));
+        const child = scenario === 'spawn-error'
+          ? fakeCodexChild()
+          : spawn(process.execPath, ['tests/fixtures/mock-codex-app-server.mjs', scenario, trace], {
+            cwd: workdir, stdio: 'pipe', windowsHide: true,
+          });
+        if (scenario === 'spawn-error') {
+          setImmediate(() => child.emit('error', new Error('spawn codex ENOENT')));
+        }
+        children.push(child);
+        return new CodexAppServerPilot(child, {
+          ...events,
+          onExit(reason, code) {
+            exits.push({ reason, code });
+            events.onExit(reason, code);
+          },
+        }, 850, [stderrSecret]);
+      },
+    },
+  });
+  hook.setOrchestrationHandler((action, payload, context) => dispatchOrchestrationHttpAction(service, action, payload, context));
+  await hook.start();
+  t.after(async () => {
+    await hook.stop();
+    await service.stopCodexWorkers();
+    service.dispose();
+    await service.waitForPendingWrites();
+    rmSync(dir, { force: true, recursive: true });
+  });
+  const { run } = service.runCreate({ from: 'coordinator-pane', paneId: 'coordinator-pane', objective: 'Test pilot' });
+
+  const start = (spec, overrides = {}) => service.workerStart({
+    runId: run.id, from: 'coordinator-pane', cliId: 'codex', spec, readOnly: true, noWorktree: true,
+    ...overrides,
+  });
+  const getTrace = () => readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse);
+  const workerHttp = async (id, action, body, token = workers.get(id).AHA_WORKER_TOKEN) => {
+    const env = workers.get(id);
+    const response = await fetch(env.AHA_ORCHESTRATION_URL + '/' + action, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-aha-agent-hook-token': env.AHA_AGENT_HOOK_TOKEN,
+        'x-aha-worker-id': id, 'x-aha-worker-token': token,
+      },
+      body: JSON.stringify(body),
+    });
+    return response.json();
+  };
+  return {
+    service, store, statePath, start, run, getTrace, writes, workers, workerHttp, children, exits,
+    ptyStarts: () => ptyStarts, codexStarts: () => codexStarts,
+  };
+}
+
+async function reportDone(env, summary) {
+  const child = spawn(process.execPath, ['electron/orchestration/aha-mcp-server.cjs'], {
+    env: { ...process.env, ...env }, stdio: 'pipe', windowsHide: true,
+  });
+  const closed = new Promise((resolve) => child.once('close', resolve));
+  const lines = createInterface({ input: child.stdout });
+  try {
+    const answer = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      lines.on('line', (line) => {
+        const message = JSON.parse(line);
+        if (message.id === 1) resolve(message.result);
+      });
+      child.once('close', () => reject(new Error('MCP worker exited before responding')));
+    });
+    child.stdin.write(JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'report_done', arguments: { outcome: 'completed', summary } },
+    }) + '\n');
+    return await answer;
+  } finally {
+    child.stdin.end();
+    child.kill();
+    await closed;
+  }
+}
+
+test('pilot opt-in is Windows-only and inactive by default', () => {
+  assert.equal(enabledCodexPilot('win32', false), false);
+  assert.equal(enabledCodexPilot('win32', false, '1'), true);
+  assert.equal(enabledCodexPilot('win32', true, '0'), false);
+  assert.equal(enabledCodexPilot('linux', true, '1'), false);
+});
+
+test('independent Worker auth, long stdin input, pending turn and same-thread report/follow-up', async (t) => {
+  const app = await setup(t);
+  const spec = '第一段\n\n' + '这是只读验收数据。'.repeat(2_000) + '\n末尾唯一标记。';
+  const first = await app.start(spec);
+  const id = first.dispatch.assigneeHandle;
+  const sessionId = first.dispatch.providerSessionId;
+  assert.equal(first.ptyId, null);
+  assert.equal(first.dispatch.assigneePaneId, null);
+  assert.equal(first.dispatch.ownsPane, false);
+  assert.equal(first.dispatch.executionMode, 'codex-app-server');
+  assert.equal(app.ptyStarts(), 0);
+  assert.deepEqual(app.writes, []);
+  const turn = await until(() => app.store.getDispatchContext(first.dispatch.id)?.codexTurn);
+  assert.equal(turn.stopReason, 'completed');
+  assert.deepEqual(turn.usage, { inputTokens: 23, outputTokens: 7 });
+  assert.equal(app.store.getDispatchContext(first.dispatch.id).status, 'dispatched');
+  assert.equal(app.service.workerShow({ dispatchId: first.dispatch.id }).stage, 'awaiting_review');
+  const submitted = app.getTrace().filter((message) => message.method === 'turn/start');
+  assert.equal(submitted.length, 1);
+  assert.ok(submitted[0].params.input[0].text.includes(spec));
+  const read = app.service.workerRead({ dispatchId: first.dispatch.id, limit: 3 });
+  assert.equal(read.text, '模拟输');
+  assert.equal(read.nextCursor, 3);
+  assert.equal(read.hasMore, true);
+  const fake = await app.workerHttp(id, 'worker-done-self', { summary: 'forged' }, 'bad-token');
+  assert.equal(fake.ok, false);
+  assert.equal(app.store.getDispatchContext(first.dispatch.id).status, 'dispatched');
+  const actual = await reportDone(app.workers.get(id), 'authenticated MCP report');
+  assert.equal(actual.isError, undefined);
+  assert.equal(app.store.getDispatchContext(first.dispatch.id).status, 'completed');
+  assert.equal(app.service.isPaneAlive(id), true);
+
+  const follow = await app.service.send({
+    from: 'coordinator-pane', to: 'dispatch:' + first.dispatch.id, runId: app.run.id,
+    type: 'status', subject: 'Follow up', body: 'Check another readonly path',
+  });
+  const second = follow.followUp.dispatch;
+  assert.equal(second.assigneeHandle, id);
+  assert.equal(second.assigneePaneId, null);
+  assert.equal(second.providerSessionId, sessionId);
+  assert.equal(app.codexStarts(), 1);
+  const secondTurn = await until(() => app.store.getDispatchContext(second.id)?.codexTurn);
+  assert.deepEqual(secondTurn.usage, { inputTokens: 23, outputTokens: 7 });
+  await app.service.waitForPendingWrites();
+  const restored = new OrchestrationStore({ resolveFile: () => app.statePath });
+  restored.load();
+  assert.equal(restored.getDispatchContext(first.dispatch.id)?.providerSessionId, sessionId);
+  assert.equal(restored.getDispatchContext(first.dispatch.id)?.archivedOutput.trim(), '模拟输出 1');
+  assert.equal(app.getTrace().filter((message) => message.method === 'thread/start').length, 1);
+  assert.equal(app.getTrace().filter((message) => message.method === 'turn/start').length, 2);
+  assert.match(app.service.workerRead({ dispatchId: first.dispatch.id, screen: true }).text, /模拟输出 1/);
+});
+
+test('authenticated catalog discovery before dispatch exposes the Worker role only', async (t) => {
+  const app = await setup(t, 'catalog-wait');
+  const pending = app.start('Check catalog registration');
+  const id = await until(() => app.workers.keys().next().value);
+  const catalogContext = await app.workerHttp(id, 'mcp-context', {});
+  assert.equal(catalogContext.result.role, 'worker');
+  assert.equal(catalogContext.result.canDelegate, false);
+  assert.equal(catalogContext.result.activeDispatch, null);
+  const premature = await app.workerHttp(id, 'worker-done-self', { summary: 'not yet assigned' });
+  assert.equal(premature.ok, false);
+  await pending;
+});
+
+test('Codex MCP form confirmation uses the Coordinator approval response', async (t) => {
+  const app = await setup(t);
+  const { dispatch } = await app.start('ASK_FOR_MCP_CONFIRMATION');
+  const approval = await until(() => app.service.workerShow({ dispatchId: dispatch.id }).openApprovals[0]);
+  assert.equal(approval.eventName, 'mcpServer/elicitation/request');
+  assert.equal(JSON.parse(approval.toolInput).server, 'aha');
+  app.service.approve({ id: approval.approvalId }, 'coordinator-pane');
+  const turn = await until(() => app.store.getDispatchContext(dispatch.id)?.codexTurn);
+  assert.equal(turn.finalText, 'approval decision: accept');
+  assert.deepEqual(app.getTrace().find((message) => message.id === 'mcp-approval-1').result,
+    { action: 'accept', content: {}, _meta: null });
+});
+
+test('spawn error without close releases the session and falls back once', { timeout: 6_000 }, async (t) => {
+  const app = await setup(t, 'spawn-error');
+  const result = await app.start('Launch after ENOENT');
+  assert.equal(result.ptyId, 'fallback-pane');
+  assert.equal(app.ptyStarts(), 1);
+  assert.equal(app.service.hasCodexWorkers(), false);
+  assert.match(app.exits[0].reason, /ENOENT/);
+});
+
+test('close reuses a bounded wait when neither child error nor close arrives', { timeout: 7_000 }, async () => {
+  const child = fakeCodexChild();
+  child.pid = 1;
+  const exits = [];
+  let signals = 0;
+  child.kill = (signal) => {
+    assert.equal(signal, 'SIGKILL');
+    signals++;
+    return true;
+  };
+  const session = new CodexAppServerPilot(child, recordCodexExit(exits));
+  const closing = session.close();
+  assert.equal(session.close(true), closing);
+  await closing;
+  assert.equal(signals, 1);
+  assert.equal(session.alive, false);
+  assert.equal(child.stderr.destroyed, true);
+  assert.match(exits[0].reason, /Timed out waiting for Codex app-server to close/);
+});
+
+test('bounded stderr is included and redacted on startup failure and process exit', async () => {
+  const child = fakeCodexChild();
+  const exits = [];
+  const session = new CodexAppServerPilot(child, recordCodexExit(exits), 850, [stderrSecret]);
+  const opening = session.open(cwd, null);
+  child.stderr.write(Buffer.from('discarded-prefix ' + 'a'.repeat(5_000)));
+  child.stderr.write(Buffer.from('\nTOML denied credential=' + stderrSecret.slice(0, 10)));
+  child.stderr.write(Buffer.from(stderrSecret.slice(10) + '\n末尾'));
+  child.stdout.write(JSON.stringify({
+    id: 1, error: { code: -32602, message: 'initialization rejected: ' + stderrSecret },
+  }) + '\n');
+  const checkSummary = (summary) => {
+    assert.doesNotMatch(summary, /discarded-prefix|pilot-stderr-credential-example/);
+    assert.match(summary, /TOML denied credential=<redacted>\n末尾/);
+    assert.ok(Buffer.byteLength(summary.split('Codex stderr:\n')[1]) <= 4_096);
+    return true;
+  };
+  await assert.rejects(opening, (error) => checkSummary(error.message));
+  assert.equal(session.alive, true);
+  child.exitCode = 1;
+  child.emit('close', 1, null);
+  await session.close();
+  assert.equal(exits.length, 1);
+  assert.equal(exits[0].code, 1);
+  checkSummary(exits[0].reason);
+});
+
+test('CLI defaults to the Worker identity in orchestration and companion payloads', () => {
+  const workerId = 'codex-worker-00000000-0000-0000-0000-000000000001';
+  const stdout = execFileSync(process.execPath, ['-e', `
+    const { buildPayload } = require('./electron/orchestration/aha-orchestration-cli.cjs');
+    console.log(JSON.stringify([
+      buildPayload('check', {}, []).payload.from,
+      buildPayload('send', { id: 'other-pane', text: 'test' }, [], 'terminal').payload.from,
+    ]));
+  `], { cwd, encoding: 'utf8', env: { ...process.env, AHA_WORKER_ID: workerId, AHA_TERMINAL_ID: 'old-pane' } });
+  assert.deepEqual(JSON.parse(stdout), [workerId, workerId]);
+});
+
+test('headless HTTP permits scoped Worker operations and rejects control actions and auth bypasses', async (t) => {
+  const app = await setup(t);
+  const { dispatch } = await app.start('Check Worker HTTP scope');
+  const id = dispatch.assigneeHandle;
+  for (const action of [
+    'worker-stop', 'worker-release', 'worker-abandon', 'worker-start', 'delegate-task', 'worker-integrate',
+    'run-create', 'run-use', 'run-stop', 'coordinator-start', 'approve', 'deny', 'reset', 'role-manage',
+  ]) {
+    const reply = await app.workerHttp(id, action, {});
+    assert.equal(reply.code, 'operation_rejected', action);
+  }
+  const foreign = app.service.runCreate({ objective: 'Unrelated run' }).run;
+  const current = await app.workerHttp(id, 'run-current', { from: foreign.coordinatorHandle });
+  assert.equal(current.result.run.id, app.run.id);
+  const task = await app.workerHttp(id, 'task-show', { id: dispatch.taskId });
+  assert.equal(task.ok, true);
+  assert.equal((await app.workerHttp(id, 'board-read', { runId: app.run.id })).ok, true);
+  assert.equal((await app.workerHttp(id, 'check', { peek: true })).ok, true);
+
+  const mail = await app.workerHttp(id, 'send', {
+    from: 'coordinator-pane', to: 'coordinator', type: 'status', subject: 'A Worker update',
+  });
+  assert.equal(mail.result.message.fromHandle, id);
+  const heartbeat = await app.workerHttp(id, 'send', {
+    type: 'heartbeat', subject: 'alive', payload: { dispatchId: 'forged-dispatch' },
+  });
+  assert.equal(heartbeat.result.lifecycle.action, 'heartbeat');
+  assert.equal(JSON.parse(heartbeat.result.message.payload).dispatchId, dispatch.id);
+  assert.equal((await app.workerHttp(id, 'send', {
+    to: 'run:' + foreign.id, subject: 'Wrong run',
+  })).code, 'operation_rejected');
+  assert.equal((await app.workerHttp(id, 'send', {
+    type: 'worker_done', subject: 'Fake completion',
+  })).code, 'operation_rejected');
+
+  const env = app.workers.get(id);
+  const origin = new URL(env.AHA_ORCHESTRATION_URL).origin;
+  for (const [path, workerHeaders] of [
+    ['/orchestration/run-create', {}],
+    ['/terminal/send', { 'x-aha-worker-id': id, 'x-aha-worker-token': env.AHA_WORKER_TOKEN }],
+  ]) {
+    const response = await fetch(origin + path, {
+      method: 'POST',
+      headers: { 'x-aha-agent-hook-token': env.AHA_AGENT_HOOK_TOKEN, ...workerHeaders },
+      body: JSON.stringify({ objective: 'Bypass guard' }),
+    });
+    assert.equal(response.status, 403);
+  }
+  assert.equal(app.store.getDispatchContext(dispatch.id).status, 'dispatched');
+});
+
+for (const scenario of ['initialize-error', 'rejected']) {
+  test(scenario + ' permits one PTY fallback', async (t) => {
+    const app = await setup(t, scenario);
+    const started = await app.start('Check fallback');
+    assert.equal(started.ptyId, 'fallback-pane');
+    assert.equal(started.dispatch.executionMode, undefined);
+    assert.equal(app.ptyStarts(), 1);
+    assert.ok(app.writes.length);
+  });
+}
+
+for (const scenario of ['timeout', 'disconnect', 'started-then-error']) {
+  test(scenario + ' never resubmits to a PTY', async (t) => {
+    const app = await setup(t, scenario);
+    await assert.rejects(app.start('Only submit me once'), (error) => error.data?.acceptance === 'unknown_acceptance');
+    assert.equal(app.ptyStarts(), 0);
+    assert.deepEqual(app.writes, []);
+    const [dispatch] = app.store.listDispatches();
+    assert.equal(dispatch.status, 'failed');
+    assert.equal(dispatch.codexDeliveryFailure, 'unknown_acceptance');
+    assert.equal(app.service.isPaneAlive(dispatch.assigneeHandle), false);
+  });
+}
+
+test('PTY remains default, including selected Codex when not read-only', async (t) => {
+  const app = await setup(t, 'normal', false);
+  const started = await app.start('Return from the unchanged PTY path');
+  assert.equal(started.ptyId, 'fallback-pane');
+  assert.equal(app.codexStarts(), 0);
+});
+
+test('approval denial, mailbox turn, interrupt, and archive', async (t) => {
+  const app = await setup(t);
+  const { dispatch } = await app.start('ASK_FOR_APPROVAL');
+  const approval = await until(() => app.service.workerShow({ dispatchId: dispatch.id }).openApprovals[0]);
+  app.service.deny({ id: approval.approvalId, reason: 'test decline' }, 'coordinator-pane');
+  const turn = await until(() => app.store.getDispatchContext(dispatch.id)?.codexTurn);
+  assert.equal(turn.finalText, 'approval decision: decline');
+  assert.equal(app.getTrace().find((message) => message.id === 'approval-1').result.decision, 'decline');
+  const before = app.getTrace().filter((message) => message.method === 'turn/start').length;
+  await app.service.send({
+    from: 'coordinator-pane', to: 'dispatch:' + dispatch.id, runId: app.run.id,
+    type: 'status', subject: 'Mailbox follow-up', body: 'Read the next detail.',
+  });
+  await until(() => app.getTrace().filter((message) => message.method === 'turn/start').length > before);
+  await until(() => app.store.getDispatchContext(dispatch.id)?.codexTurn?.turnId === 'mock-turn-2');
+  const stopped = await app.service.workerStop({ dispatchId: dispatch.id });
+  assert.equal(stopped.dispatch.status, 'failed');
+  assert.equal(app.service.isPaneAlive(dispatch.assigneeHandle), false);
+  const archived = app.service.workerRead({ dispatchId: dispatch.id, screen: true });
+  assert.equal(archived.archived, true);
+  assert.match(archived.text, /approval decision: decline/);
+  assert.equal(app.service.workerShow({ dispatchId: dispatch.id }).openApprovals.length, 0);
+});
+
+test('workerAbandon archives output and interrupts the headless process', async (t) => {
+  const app = await setup(t);
+  const { dispatch } = await app.start('WAIT_FOR_INTERRUPT');
+  await until(() => app.service.workerRead({ dispatchId: dispatch.id }).text);
+  const result = app.service.workerAbandon({ dispatchId: dispatch.id });
+  assert.equal(result.dispatch.lastFailureReason, 'abandoned');
+  assert.equal(app.service.isPaneAlive(dispatch.assigneeHandle), false);
+  assert.match(result.dispatch.archivedOutput, /output before cancel/);
+  await until(() => app.exits[0]);
+  assert.ok(app.getTrace().some((message) => message.method === 'turn/interrupt'));
+  assert.equal(app.service.hasCodexWorkers(), false);
+  assert.equal(app.service.workerRead({ dispatchId: dispatch.id }).archived, true);
+});
+
+for (const terminalStatus of ['completed', 'failed']) {
+  test('coordinator convergence reaps idle headless Workers in a ' + terminalStatus + ' run', async (t) => {
+    const app = await setup(t);
+    const { dispatch } = await app.start('Check terminal-run retirement');
+    await until(() => app.store.getDispatchContext(dispatch.id).codexTurn);
+    const report = await app.workerHttp(dispatch.assigneeHandle, 'worker-done-self', {
+      summary: 'Convergence check', outcome: terminalStatus,
+    });
+    assert.equal(report.ok, true);
+    assert.equal(app.service.isPaneAlive(dispatch.assigneeHandle), true);
+    if (terminalStatus === 'failed') app.service.taskUpdate({ id: dispatch.taskId, status: 'failed' });
+    app.service.coordinatorStart({ runId: app.run.id, coordinatorPaneId: 'coordinator-pane' });
+    await until(() => app.store.getRun(app.run.id).status === terminalStatus);
+    await until(() => app.exits[0]);
+    const read = app.service.workerRead({ dispatchId: dispatch.id });
+    assert.equal(read.archived, true);
+    assert.match(read.text, /模拟输出 1/);
+    assert.equal(app.service.isPaneAlive(dispatch.assigneeHandle), false);
+  });
+}
+
+test('stopping a run spares active or retained headless Workers until eligible', async (t) => {
+  const app = await setup(t);
+  const idle = (await app.start('Idle Worker')).dispatch;
+  const retained = (await app.start('Retained Worker', { keepOpen: true })).dispatch;
+  const active = (await app.start('WAIT_FOR_INTERRUPT')).dispatch;
+  for (const dispatch of [idle, retained]) {
+    const report = await app.workerHttp(dispatch.assigneeHandle, 'worker-done-self', { summary: 'Idle now' });
+    assert.equal(report.ok, true);
+  }
+  app.service.coordinatorStart({ runId: app.run.id, coordinatorPaneId: 'coordinator-pane' });
+  app.service.coordinatorStop();
+  assert.equal(app.store.getRun(app.run.id).status, 'stopped');
+  assert.equal(app.service.isPaneAlive(idle.assigneeHandle), false);
+  assert.equal(app.service.isPaneAlive(retained.assigneeHandle), true);
+  assert.equal(app.service.isPaneAlive(active.assigneeHandle), true);
+  const report = await app.workerHttp(active.assigneeHandle, 'worker-done-self', { summary: 'Finished after stop' });
+  assert.equal(report.ok, true);
+  await until(() => app.exits.length === 2);
+  assert.equal(app.service.isPaneAlive(active.assigneeHandle), false);
+  assert.equal(app.service.isPaneAlive(retained.assigneeHandle), true);
+  for (const dispatch of [idle, active]) {
+    const read = app.service.workerRead({ dispatchId: dispatch.id });
+    assert.equal(read.archived, true);
+    assert.ok(read.text.length);
+  }
+});
+
+test('Windows closes the complete Codex job when its application process crashes', {
+  skip: process.platform !== 'win32', timeout: 20_000,
+}, async () => {
+  const program = [
+    "const { spawn } = require('node:child_process');",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });",
+    "console.log(JSON.stringify({ parent: process.pid, child: child.pid }));",
+    "process.stdin.once('data', () => process.exit(19));",
+  ].join(' ');
+  const job = spawnWindowsCodexJob(process.execPath, ['-e', program], cwd, process.env);
+  const closed = new Promise((resolve) => job.once('close', resolve));
+  const dead = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error) {
+      if (error.code !== 'ESRCH') throw error;
+      return true;
+    }
+  };
+  const lines = createInterface({ input: job.stdout });
+  let stderr = '';
+  job.stderr.on('data', (data) => { stderr += data; });
+  try {
+    const pids = await Promise.race([
+      new Promise((resolve) => lines.once('line', (line) => resolve(JSON.parse(line)))),
+      closed.then(() => assert.fail(stderr || 'Windows job exited before the child launched')),
+    ]);
+    assert.equal(dead(pids.parent), false);
+    assert.equal(dead(pids.child), false);
+    job.stdin.write('crash\n');
+    assert.equal(await closed, 19);
+    await until(() => dead(pids.parent) && dead(pids.child));
+  } finally {
+    if (job.exitCode === null) job.kill();
+    await closed;
+  }
+});
+
+test('active interrupt and unexpected exit both reap the mock and archive live output', async (t) => {
+  const app = await setup(t);
+  const stopped = await app.start('WAIT_FOR_INTERRUPT');
+  await until(() => app.service.workerRead({ dispatchId: stopped.dispatch.id }).text);
+  await app.service.workerStop({ dispatchId: stopped.dispatch.id });
+  assert.ok(app.getTrace().some((message) => message.method === 'turn/interrupt'));
+  assert.match(app.service.workerRead({ dispatchId: stopped.dispatch.id }).text, /output before cancel/);
+  assert.ok(app.children[0].exitCode !== null || app.children[0].signalCode !== null);
+
+  const crashed = await app.start('CRASH_LATER');
+  await until(() => app.store.getDispatchContext(crashed.dispatch.id)?.status === 'failed');
+  assert.equal(app.service.isPaneAlive(crashed.dispatch.assigneeHandle), false);
+  assert.match(app.service.workerRead({ dispatchId: crashed.dispatch.id }).text, /output before process crash/);
+  assert.equal(app.ptyStarts(), 0);
+});

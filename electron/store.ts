@@ -52,6 +52,7 @@ export interface OrchestrationSettings {
   confirmBeforeDispatch: OrchestrationConfirmMode;
   defaultWorktree: boolean;
   peerMessagingMode: OrchestrationPeerMessagingMode;
+  codexAppServerPilot?: boolean;
   agentProfiles: Record<string, OrchestrationAgentProfile>;
 }
 
@@ -132,6 +133,7 @@ export function normalizeOrchestrationSettings(
     confirmBeforeDispatch,
     defaultWorktree,
     peerMessagingMode,
+    ...(typeof raw.codexAppServerPilot === 'boolean' ? { codexAppServerPilot: raw.codexAppServerPilot } : {}),
     agentProfiles,
   };
 }

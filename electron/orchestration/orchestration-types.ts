@@ -312,7 +312,20 @@ export interface OrchestrationTaskRecord {
   updatedAt: string;
 }
 
+export interface CodexPilotTurnRecord {
+  turnId: string;
+  stopReason: string;
+  finalText: string;
+  diff: string | null;
+  usage: Record<string, number> | null;
+  error: string | null;
+}
+
 export interface OrchestrationDispatchRecord {
+  executionMode?: 'codex-app-server';
+  providerSessionId?: string;
+  codexTurn?: CodexPilotTurnRecord;
+  codexDeliveryFailure?: 'unknown_acceptance' | 'not_accepted';
   id: string;
   taskId: string;
   runId: string;

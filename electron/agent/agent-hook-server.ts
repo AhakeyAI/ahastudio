@@ -9,6 +9,7 @@ import {
   type AgentWaitKind,
   type NormalizedAgentHookEvent,
 } from './agent-status-store.js';
+import { CODEX_WORKER_ID } from '../orchestration/codex-app-server-pilot.js';
 import { isProgramStatusKind, normalizeAgentId } from './program-status-osc.js';
 
 const PTY_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
@@ -744,6 +745,7 @@ function readBoundedJsonBody(req: IncomingMessage, maxBytes: number): Promise<un
 export class AgentHookServer {
   private readonly token = randomBytes(32).toString('hex');
   private paneKey = randomBytes(32);
+  private readonly workerKey = randomBytes(32);
   private server: Server | null = null;
   private boundPort: number | null = null;
   private orchestrationHandler: OrchestrationHttpHandler | null = null;
@@ -771,10 +773,40 @@ export class AgentHookServer {
     return createHmac('sha256', this.paneKey).update(ptyId).digest('hex');
   }
 
-  private authenticatedPane(req: IncomingMessage): string | null {
+  private workerToken(workerId: string, purpose: 'identity' | 'transport'): string {
+    return createHmac('sha256', this.workerKey).update(`${purpose}:${workerId}`).digest('hex');
+  }
+
+  envForWorker(workerId: string): Record<string, string> {
+    if (this.boundPort === null || !CODEX_WORKER_ID.test(workerId)) {
+      throw new Error('Cannot configure authentication for the headless Worker');
+    }
+    return {
+      AHA_WORKER_ID: workerId,
+      AHA_WORKER_TOKEN: this.workerToken(workerId, 'identity'),
+      AHA_ORCHESTRATION_URL: `http://127.0.0.1:${this.boundPort}/orchestration`,
+      AHA_AGENT_HOOK_TOKEN: this.workerToken(workerId, 'transport'),
+    };
+  }
+
+  private authenticatedCaller(req: IncomingMessage, url: string): string | null | undefined {
+    const candidate = extractBearerOrHookToken(req);
+    if (!candidate) return undefined;
+
+    const workerId = req.headers['x-aha-worker-id'];
+    const workerToken = req.headers['x-aha-worker-token'];
+    if (workerId !== undefined || workerToken !== undefined) {
+      // A Worker must not be able to use its transport token with the identity headers removed.
+      return url.startsWith('/orchestration/') && typeof workerId === 'string' && CODEX_WORKER_ID.test(workerId) &&
+        typeof workerToken === 'string' && tokensEqual(this.workerToken(workerId, 'identity'), workerToken) &&
+        tokensEqual(this.workerToken(workerId, 'transport'), candidate)
+        ? workerId : undefined;
+    }
+    if (!tokensEqual(this.token, candidate)) return undefined;
+
     const ptyId = req.headers['x-aha-pty-id'];
     const credential = req.headers['x-aha-pane-token'];
-    return typeof ptyId === 'string' && PTY_ID_RE.test(ptyId) &&
+    return typeof ptyId === 'string' && PTY_ID_RE.test(ptyId) && !CODEX_WORKER_ID.test(ptyId) &&
       typeof credential === 'string' && tokensEqual(this.paneToken(ptyId), credential)
       ? ptyId : null;
   }
@@ -923,14 +955,13 @@ export class AgentHookServer {
     }
 
     // Authenticate before reading any request body.
-    const candidate = extractBearerOrHookToken(req);
-    if (!candidate || !tokensEqual(this.token, candidate)) {
+    const rawUrl = (req.url ?? '/').split('?')[0] ?? '/';
+    const callerPaneId = this.authenticatedCaller(req, rawUrl);
+    if (callerPaneId === undefined) {
       sendJson(res, 403, { ok: false, error: 'Unauthorized' }, true);
       req.resume();
       return;
     }
-
-    const rawUrl = (req.url ?? '/').split('?')[0] ?? '/';
     const companionMatch = /^\/(terminal|worktree|skills)\/([^/]+)$/.exec(rawUrl);
     if (companionMatch) {
       const namespace = companionMatch[1] as 'terminal' | 'worktree' | 'skills';
@@ -959,7 +990,7 @@ export class AgentHookServer {
       try {
         const result = await this.companionHandler(namespace, action, payload, {
           signal: abortController.signal,
-          callerPaneId: this.authenticatedPane(req),
+          callerPaneId,
         });
         if (!res.writableEnded) {
           sendJson(res, result.status, result.body, true);
@@ -1017,7 +1048,7 @@ export class AgentHookServer {
       try {
         const result = await this.orchestrationHandler(action, payload, {
           signal: abortController.signal,
-          callerPaneId: this.authenticatedPane(req),
+          callerPaneId,
         });
         if (!res.writableEnded) {
           sendJson(res, result.status, result.body, true);

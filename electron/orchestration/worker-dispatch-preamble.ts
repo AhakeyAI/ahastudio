@@ -29,6 +29,7 @@ export interface BuildDispatchPreambleInput {
   previousDispatchId?: string | null;
   redactText?: (text: string) => string;
   mcpEnabled?: boolean;
+  headless?: boolean;
   role?: string | null;
 }
 
@@ -58,7 +59,7 @@ export function buildDispatchPreambleWithBrief(
   raw: BuildDispatchPreambleInput,
 ): BuildDispatchPreambleResult {
   const redact = raw.redactText ?? ((value: string) => redactDispatchCapability(value, raw.dispatchCapability));
-  const clean = (text: string) => redact(sanitizeBracketedPasteText(text));
+  const clean = (text: string) => redact(raw.headless ? text : sanitizeBracketedPasteText(text));
   const cleanLabel = (text: string) => clean(text).replace(/\n/g, ' ');
   const input: BuildDispatchPreambleInput = {
     ...raw,
@@ -82,6 +83,7 @@ export function buildDispatchPreambleWithBrief(
     sanitizeText: clean,
   };
   const fullBody = formatStructuredTaskBody(bodyInput);
+  if (input.headless) return { preamble: renderDispatchPreamble(input, cli, fullBody, '', null, false), briefFilePath: null };
   const measure = (prompt: string) => Buffer.byteLength(formatAgentPromptPayload({ prompt }), 'utf8');
   const frameBudget = PTY_INPUT_MAX_BYTES - 64;
   if (Buffer.byteLength(fullBody, 'utf8') <= INLINE_SPEC_MAX_BYTES) {

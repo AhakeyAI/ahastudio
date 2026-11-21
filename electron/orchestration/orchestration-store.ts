@@ -1284,6 +1284,7 @@ export class OrchestrationStore {
 
   createDispatchContext(input: {
     taskId: string;
+    providerSessionId?: string;
     assigneeHandle: string;
     assigneePaneId?: string | null;
     processIncarnation?: string | null;
@@ -1402,6 +1403,10 @@ export class OrchestrationStore {
       parentPaneId: input.parentPaneId ?? null,
       depth,
       assigneeHandle: input.assigneeHandle,
+      ...(input.providerSessionId ? {
+        executionMode: 'codex-app-server' as const,
+        providerSessionId: input.providerSessionId,
+      } : {}),
       assigneePaneId: input.assigneePaneId ?? null,
       processIncarnation: input.processIncarnation ?? null,
       worktreePath: resolvedWorktreePath,
@@ -1650,6 +1655,48 @@ export class OrchestrationStore {
     ctx.updatedAt = this.now();
     this.persist();
     return { ...ctx };
+  }
+
+  switchUnacceptedCodexDispatchToPane(dispatchId: string, ptyId: string): OrchestrationDispatchRecord {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx || ctx.executionMode !== 'codex-app-server' || ctx.startObservation !== 'pending' ||
+        !ACTIVE_DISPATCH_STATUSES.has(ctx.status) || this.getActiveDispatchForIdentity(ptyId, ptyId)) {
+      throw new OrchestrationError('operation_rejected', 'Cannot rebind this Codex dispatch to a terminal.');
+    }
+    ctx.assigneeHandle = ptyId;
+    ctx.assigneePaneId = ptyId;
+    ctx.ownsPane = true;
+    delete ctx.executionMode;
+    delete ctx.providerSessionId;
+    ctx.updatedAt = this.now();
+    this.persist();
+    return { ...ctx };
+  }
+
+  recordCodexTurn(
+    dispatchId: string,
+    result: NonNullable<OrchestrationDispatchRecord['codexTurn']>,
+    awaitingReview = true,
+  ): void {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx || ctx.executionMode !== 'codex-app-server') return;
+    ctx.codexTurn = {
+      ...result,
+      finalText: this.redactDispatchCredentials(result.finalText),
+      diff: result.diff === null ? null : this.redactDispatchCredentials(result.diff),
+      error: result.error === null ? null : this.redactDispatchCredentials(result.error),
+    };
+    if (awaitingReview && ACTIVE_DISPATCH_STATUSES.has(ctx.status)) ctx.stage = 'awaiting_review';
+    ctx.updatedAt = this.now();
+    this.persist();
+  }
+
+  recordCodexDeliveryFailure(dispatchId: string, failure: NonNullable<OrchestrationDispatchRecord['codexDeliveryFailure']>): void {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx || !ACTIVE_DISPATCH_STATUSES.has(ctx.status)) return;
+    ctx.codexDeliveryFailure = failure;
+    ctx.updatedAt = this.now();
+    this.persist();
   }
 
   archiveDispatchOutput(dispatchId: string, output: string): void {

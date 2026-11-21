@@ -86,6 +86,8 @@ let disposeAgentIpc: (() => void) | null = null;
 let disposeAgentHooks: (() => void) | null = null;
 let disposeAgentMcp: (() => void) | null = null;
 let disposeOrchestration: (() => void) | null = null;
+let stopCodexWorkersOnQuit: (() => Promise<void> | null) | null = null;
+let waitingForCodexShutdown = false;
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -345,6 +347,7 @@ app.whenReady().then(async () => {
 
   const hookInstaller = new AgentHookInstaller();
   const mcpCliIdSet = new Set<string>(AGENT_MCP_CLI_IDS);
+  const { enabledCodexPilot, launchCodexPilot } = await import('./orchestration/codex-app-server-pilot.js');
   const orchestrationStore = OrchestrationStore.forUserDataDir(() => app.getPath('userData'));
   const orchestrationService = new OrchestrationService({
     store: orchestrationStore,
@@ -362,6 +365,18 @@ app.whenReady().then(async () => {
         appearance: nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
         waitForReady: { quietMs: 1_500, maxMs: 20_000 },
       });
+    },
+    codexPilot: {
+      enabled: () => enabledCodexPilot(
+        process.platform,
+        normalizeOrchestrationSettings(getSettings().orchestration).codexAppServerPilot ?? false,
+        process.env.AHA_CODEX_APP_SERVER_PILOT,
+      ),
+      launch: (workerId, cwd, events) => {
+        const mcpServerPath = resolveActiveMcpServerPath();
+        if (!agentHookServer || !mcpServerPath) throw new Error('Aha MCP Server is unavailable');
+        return launchCodexPilot({ cwd, events, mcpServerPath, mcpEnv: agentHookServer.envForWorker(workerId) });
+      },
     },
     closeWorkerPty: (ptyId) => shellPtyCtrl.closePty(ptyId),
     isPtyAlive: shellPtyCtrl.isPtyAlive,
@@ -526,6 +541,9 @@ app.whenReady().then(async () => {
   const offPtyExit = shellPtyCtrl.onPtyExit((ptyId) => {
     orchestrationService.markPtyExited(ptyId);
   });
+  stopCodexWorkersOnQuit = () => orchestrationService.hasCodexWorkers()
+    ? orchestrationService.stopCodexWorkers().then(() => orchestrationService.waitForPendingWrites())
+    : null;
   disposeOrchestration = () => {
     offPtyExit();
     orchestrationIpc.dispose();
@@ -561,7 +579,24 @@ app.whenReady().then(async () => {
   });
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  if (waitingForCodexShutdown) {
+    event.preventDefault();
+    return;
+  }
+  const close = stopCodexWorkersOnQuit?.();
+  stopCodexWorkersOnQuit = null;
+  if (close) {
+    event.preventDefault();
+    waitingForCodexShutdown = true;
+    void close.catch((error) => {
+      console.warn('[orchestration] Codex shutdown did not complete:', error);
+    }).finally(() => {
+      waitingForCodexShutdown = false;
+      app.quit();
+    });
+    return;
+  }
   try {
     disposeOrchestration?.();
     disposeOrchestration = null;

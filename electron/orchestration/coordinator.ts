@@ -150,10 +150,16 @@ export function reconcileExitedDispatches(
       (options.hasPaneExited(dispatch.assigneePaneId!) ||
         !options.isPaneAlive(dispatch.assigneePaneId!));
     const handleExited =
-      Boolean(dispatch.assigneeHandle) && options.hasPaneExited(dispatch.assigneeHandle);
+      Boolean(dispatch.assigneeHandle) && (options.hasPaneExited(dispatch.assigneeHandle) ||
+        (dispatch.executionMode === 'codex-app-server' && dispatch.stage !== 'awaiting_review' &&
+          !options.isPaneAlive(dispatch.assigneeHandle)));
     if (paneGone || handleExited) {
       const label = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
-      store.failDispatch(dispatch.id, `Worker pane ${label} exited before worker_done`);
+      if (dispatch.executionMode === 'codex-app-server') {
+        store.failDispatch(dispatch.id, `Codex Worker ${label} exited before report_done`, { forceFailTask: true });
+      } else {
+        store.failDispatch(dispatch.id, `Worker pane ${label} exited before worker_done`);
+      }
       options.onEvent?.('coordinator:worker-exited', runId);
     }
   }

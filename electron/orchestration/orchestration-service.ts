@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { resolve as resolveFsPath } from 'node:path';
+import { runGitCommand } from '../git/git-exec.js';
+import {
+  CODEX_WORKER_ID, type CodexAppServerPilot, type CodexPilotEvents, type CodexTurnResult,
+} from './codex-app-server-pilot.js';
 import type { PtyWriteFn } from '../agent/agent-prompt-delivery.js';
 import type { AgentPaneStatus, AgentStatusStore } from '../agent/agent-status-store.js';
 import { getGitStatus } from '../git/git-service.js';
@@ -223,7 +227,7 @@ export type OrchestrationDelegateTaskResult =
       dispatch: OrchestrationDispatchRecord;
       task: OrchestrationTaskRecord;
       run: OrchestrationRunRecord;
-      ptyId: string;
+      ptyId: string | null;
       worktreePath: string | null;
       branch: string | null;
       briefBoardSeq?: number;
@@ -267,6 +271,10 @@ export interface OrchestrationServiceDependencies {
     cwd?: string;
     extraArgs?: string[];
   }) => Promise<WorkerPaneCandidate | null>;
+  codexPilot?: {
+    enabled: () => boolean;
+    launch: (workerId: string, cwd: string, events: CodexPilotEvents) => CodexAppServerPilot;
+  };
   closeWorkerPty?: (ptyId: string) => Promise<unknown> | unknown;
   isPtyAlive?: (ptyId: string) => boolean;
   /** Whether an id names an agent CLI (not a plain shell); auto-spawned workers must be agents. */
@@ -324,6 +332,11 @@ export class OrchestrationService {
   private readonly agentStatusStore: AgentStatusStore;
   private readonly writePty: PtyWriteFn;
   private readonly spawnWorkerPty?: OrchestrationServiceDependencies['spawnWorkerPty'];
+  private readonly codexPilot?: OrchestrationServiceDependencies['codexPilot'];
+  private readonly codexWorkers = new Map<string, CodexAppServerPilot>();
+  private readonly codexSubmitting = new Set<string>();
+  private readonly codexMailbox = new Set<string>();
+  private disposed = false;
   private readonly closeWorkerPty?: OrchestrationServiceDependencies['closeWorkerPty'];
   private readonly externalIsPtyAlive?: (ptyId: string) => boolean;
   private readonly isAgentCliId?: (cliId: string) => boolean;
@@ -377,6 +390,7 @@ export class OrchestrationService {
     this.agentStatusStore = deps.agentStatusStore;
     this.writePty = deps.writePty;
     this.spawnWorkerPty = deps.spawnWorkerPty;
+    this.codexPilot = deps.codexPilot;
     this.closeWorkerPty = deps.closeWorkerPty;
     this.externalIsPtyAlive = deps.isPtyAlive;
     this.isAgentCliId = deps.isAgentCliId;
@@ -581,7 +595,13 @@ export class OrchestrationService {
     }
   }
 
+  isAuthenticatedCallerActive(id: string, discoverTools = false): boolean {
+    return !CODEX_WORKER_ID.test(id) ||
+      (this.isPaneAlive(id) && (discoverTools || Boolean(this.store.getActiveDispatchForIdentity(id, null))));
+  }
+
   isPaneAlive(ptyId: string): boolean {
+    if (CODEX_WORKER_ID.test(ptyId)) return this.codexWorkers.get(ptyId)?.alive ?? false;
     if (this.exitedPanes.has(ptyId)) {
       return false;
     }
@@ -645,7 +665,20 @@ export class OrchestrationService {
     }
   }
 
+  private retireFinishedCodexWorkers(runId?: string): void {
+    for (const [workerId, codex] of this.codexWorkers) {
+      if (!codex.alive || !codex.latestDispatchId || this.store.getActiveDispatchForIdentity(workerId, null)) continue;
+      const dispatch = this.store.getDispatchContext(codex.latestDispatchId);
+      if (!dispatch || dispatch.retained || (runId && dispatch.runId !== runId)) continue;
+      const run = this.store.getRun(dispatch.runId);
+      if (run?.status === 'active') continue;
+      this.archiveCodexOutput(codex, dispatch.id);
+      void codex.close(true);
+    }
+  }
+
   private retireFinishedSpawnedWorkers(runId?: string): void {
+    this.retireFinishedCodexWorkers(runId);
     if (this.spawnedWorkerPanes.size === 0) {
       return;
     }
@@ -1432,7 +1465,9 @@ export class OrchestrationService {
 
   runCurrent(input: { from?: string } = {}): { run: OrchestrationRunRecord | null } {
     const handle = input.from?.trim() || 'coordinator';
-    const run = this.store.getCurrentRunForConsumer(handle) ?? null;
+    const dispatch = CODEX_WORKER_ID.test(handle)
+      ? this.store.getActiveDispatchForIdentity(handle, null) : undefined;
+    const run = (dispatch ? this.store.getRun(dispatch.runId) : this.store.getCurrentRunForConsumer(handle)) ?? null;
     return { run };
   }
 
@@ -2260,7 +2295,16 @@ export class OrchestrationService {
     messageType: OrchestrationMessageType
   ): void {
     this.waiters.notify(toHandle, messageType);
-    this.pointerDelivery.notifyMessageArrived(toHandle);
+    const codexTarget = toHandle.startsWith('dispatch:')
+      ? this.store.getDispatchContext(toHandle.slice('dispatch:'.length))?.assigneeHandle : toHandle;
+    if (codexTarget && CODEX_WORKER_ID.test(codexTarget)) {
+      if (this.codexWorkers.has(codexTarget)) {
+        this.codexMailbox.add(codexTarget);
+        this.deliverCodexMailbox(codexTarget);
+      }
+    } else {
+      this.pointerDelivery.notifyMessageArrived(toHandle);
+    }
 
     if (toHandle.startsWith('run:')) {
       const runId = toHandle.slice('run:'.length);
@@ -2529,6 +2573,35 @@ export class OrchestrationService {
     return this.sendMailSync({ ...input, to: rawTo });
   }
 
+  sendFromCodexWorker(workerId: string, input: Parameters<OrchestrationService['send']>[0]): OrchestrationSendResult {
+    const dispatch = this.store.getActiveDispatchForIdentity(workerId, null);
+    if (!dispatch || dispatch.executionMode !== 'codex-app-server') {
+      throw new OrchestrationError('operation_rejected', 'An active headless Worker dispatch is required.');
+    }
+    const runId = this.authorizeRunAccess(input.runId, workerId);
+    if (input.type === 'heartbeat') {
+      return this.sendMailSync({
+        from: workerId, runId, type: 'heartbeat', subject: input.subject,
+        payload: { dispatchId: dispatch.id },
+        capability: this.store.getDispatchCapability(dispatch.id),
+      });
+    }
+    if (input.type && !['status', 'handoff', 'escalation', 'question'].includes(input.type)) {
+      throw new OrchestrationError('operation_rejected', 'Headless Workers cannot send this message type.');
+    }
+    const to = this.normalizeRecipientHandle(input.to ?? '');
+    const run = this.store.requireRun(runId);
+    const target = to.startsWith('dispatch:')
+      ? this.store.getDispatchContext(to.slice('dispatch:'.length))
+      : this.store.getActiveDispatchForIdentity(to, to);
+    if (to !== 'coordinator' && to !== `run:${runId}` &&
+        to !== run.coordinatorPaneId && to !== run.coordinatorHandle && target?.runId !== runId) {
+      throw new OrchestrationError('operation_rejected', 'Headless Workers can only send mail within their run.');
+    }
+    // Mail to a settled dispatch is still mail. Only the Coordinator can reactivate it.
+    return this.sendMailSync({ ...input, from: workerId, to, runId });
+  }
+
   private sendMailSync(input: {
     from?: string;
     to?: string;
@@ -2629,7 +2702,9 @@ export class OrchestrationService {
 
     if (resolvedTo.startsWith('dispatch:')) {
       const activeId = resolvedTo.slice('dispatch:'.length);
-      this.store.bumpDispatchGenerationForSteering(activeId);
+      if (this.store.getDispatchContext(activeId)?.executionMode !== 'codex-app-server') {
+        this.store.bumpDispatchGenerationForSteering(activeId);
+      }
     }
 
     const msg = this.store.insertMessage({
@@ -3923,6 +3998,7 @@ export class OrchestrationService {
     if (this.store.listQuestions({ dispatchId: dispatch.id, status: 'pending' }).length > 0) {
       return 'waiting_input';
     }
+    if (dispatch.executionMode === 'codex-app-server') return dispatch.stage ?? 'starting';
     const gen = dispatch.processGeneration ?? 1;
     if (dispatch.turnStopReportedGeneration === gen && status?.state !== 'working') {
       return 'awaiting_review';
@@ -3994,7 +4070,8 @@ export class OrchestrationService {
       dispatchId: dispatch.id,
       status: 'pending',
     });
-    const terminal = paneId ? (this.terminalTracker?.getTerminal(paneId) ?? null) : null;
+    const terminal = dispatch.executionMode !== 'codex-app-server' && paneId
+      ? this.terminalTracker?.getTerminal(paneId) ?? null : null;
     return {
       dispatch: { ...dispatch, stage },
       task,
@@ -4028,6 +4105,7 @@ export class OrchestrationService {
     reviewOf?: string;
     reviewRun?: boolean | string;
     reviewFocus?: string;
+    readOnly?: boolean;
     cliId?: string;
     agent?: string;
     model?: string;
@@ -4047,7 +4125,7 @@ export class OrchestrationService {
     dispatch: OrchestrationDispatchRecord;
     task: OrchestrationTaskRecord;
     run: OrchestrationRunRecord;
-    ptyId: string;
+    ptyId: string | null;
     worktreePath: string | null;
     branch: string | null;
     ownsWorktree: boolean;
@@ -4059,6 +4137,7 @@ export class OrchestrationService {
     briefBoardSeq?: number;
   }> {
     const from = input.from?.trim() || 'coordinator';
+    if (CODEX_WORKER_ID.test(from)) throw new OrchestrationError('operation_rejected', 'Headless read-only Workers cannot start other Workers.');
     const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
     const nextDepth = this.store.resolveChildDispatchDepth(callerDispatch?.id ?? null);
     if (nextDepth > this.maxDepth) {
@@ -4102,7 +4181,7 @@ export class OrchestrationService {
         `Terminal ${reusingTerminal} is the caller's own terminal. Choose a different worker terminal.`
       );
     }
-    if (reusingTerminal && !this.isPaneAlive(reusingTerminal)) {
+    if (reusingTerminal && (CODEX_WORKER_ID.test(reusingTerminal) || !this.isPaneAlive(reusingTerminal))) {
       throw new OrchestrationError(
         'terminal_unavailable',
         `Target terminal ${reusingTerminal} is not alive.`
@@ -4554,19 +4633,22 @@ export class OrchestrationService {
           reusingTerminalCwd,
         });
 
-    let ptyId: string;
-    let ownsPane = false;
-    if (reusingTerminal) {
-      ptyId = reusingTerminal;
-      ownsPane = false;
-    } else {
+    const usePilot = !reusingTerminal && launchConfig.cliId === 'codex' &&
+      (input.readOnly === true || Boolean(reviewTarget)) && this.codexPilot?.enabled();
+    const pilot = usePilot
+      ? await this.openCodexWorker(placement.cwd ?? process.cwd(), launchConfig.model)
+      : null;
+
+    const spawnPane = async (): Promise<string> => {
       try {
         const spawned = await this.spawnWorkerPty!({
           runId: run.id,
           task,
           cliId: launchConfig.cliId,
           cwd: placement.cwd,
-          extraArgs: launchConfig.extraArgs,
+          extraArgs: usePilot
+            ? [...launchConfig.extraArgs, '--sandbox', 'read-only', '--ask-for-approval', 'on-request']
+            : launchConfig.extraArgs,
         });
         if (!spawned) {
           throw new OrchestrationError(
@@ -4575,9 +4657,8 @@ export class OrchestrationService {
             { taskId: task.id, cliId: launchConfig.cliId }
           );
         }
-        ptyId = spawned.ptyId;
-        ownsPane = true;
-        this.exitedPanes.delete(ptyId);
+        this.exitedPanes.delete(spawned.ptyId);
+        return spawned.ptyId;
       } catch (err) {
         if (placement.ownsWorktree && placement.worktreePath) {
           await this.rollbackWorkerResources(undefined, placement.worktreePath);
@@ -4598,14 +4679,17 @@ export class OrchestrationService {
           { taskId: task.id, cliId: launchConfig.cliId }
         );
       }
-    }
+    };
 
+    let ptyId = pilot ? null : reusingTerminal ?? await spawnPane();
+    let ownsPane = !pilot && !reusingTerminal;
     let ctx: OrchestrationDispatchRecord;
     try {
       ctx = this.store.createDispatchContext({
         taskId: task.id,
-        assigneeHandle: ptyId,
+        assigneeHandle: pilot?.id ?? ptyId!,
         assigneePaneId: ptyId,
+        ...(pilot ? { providerSessionId: pilot.sessionId } : {}),
         creator: from,
         creatorRunId: run.id,
         creatorDispatchId: callerDispatch?.id ?? null,
@@ -4651,16 +4735,17 @@ export class OrchestrationService {
         });
       }
     } catch (err) {
+      if (pilot) await pilot.session.close();
       await this.rollbackWorkerResources(
-        ownsPane ? ptyId : undefined,
+        ownsPane ? ptyId ?? undefined : undefined,
         placement.ownsWorktree ? placement.worktreePath : null,
       );
       throw err;
     }
 
-    if (ownsPane) {
+    const announcePane = (id: string) => {
       this.emitPaneSpawned({
-        ptyId,
+        ptyId: id,
         runId: run.id,
         taskId: task.id,
         dispatchId: ctx.id,
@@ -4674,7 +4759,8 @@ export class OrchestrationService {
         displayName: task.displayName ?? null,
         taskTitle: task.taskTitle,
       });
-    }
+    };
+    if (ownsPane && ptyId) announcePane(ptyId);
 
     const coordinatorHandle = callerDispatch ? `dispatch:${callerDispatch.id}` : `run:${run.id}`;
     const effectiveMcpEnabled =
@@ -4684,28 +4770,58 @@ export class OrchestrationService {
     if (normalizedInputContext && (input.taskId || input.retryOfDispatchId)) {
       task = this.store.mergeTaskContext(task.id, normalizedInputContext);
     }
-    const preamble = this.buildWorkerDispatchBrief({
+    const makePreamble = () => this.buildWorkerDispatchBrief({
       taskId: task.id,
       dispatchId: ctx.id,
       runId: run.id,
       taskSpec: task.spec,
       taskContext: task.taskContext,
       coordinatorHandle,
-      workerHandle: ptyId,
+      workerHandle: ctx.assigneeHandle,
       worktreePath: placement.worktreePath,
       branch: placement.branch,
-      canDispatchSubWorkers: ctx.depth < this.maxDepth,
-      mcpEnabled: effectiveMcpEnabled,
+      canDispatchSubWorkers: ctx.executionMode !== 'codex-app-server' && ctx.depth < this.maxDepth,
+      mcpEnabled: ctx.executionMode === 'codex-app-server' || effectiveMcpEnabled,
+      headless: ctx.executionMode === 'codex-app-server',
       role: preambleRole,
     });
 
-    const delivery = await this.deliverAndObserveDispatchTurn(ctx.id, {
-      ptyId,
+    let preamble = makePreamble();
+    let acceptedByCodex = false;
+    if (pilot) {
+      const outcome = await this.submitCodexTurn(ctx, pilot.session, preamble);
+      if (outcome.status === 'not_accepted') {
+        await pilot.session.close();
+        if (this.disposed) throw new OrchestrationError('operation_rejected', 'Orchestration is closing.');
+        try {
+          ptyId = await spawnPane();
+          ctx = this.store.switchUnacceptedCodexDispatchToPane(ctx.id, ptyId);
+        } catch (error) {
+          if (ptyId) await this.rollbackWorkerResources(ptyId);
+          this.failCodexDispatch(ctx.id, 'not_accepted', outcome.reason);
+          throw error;
+        }
+        ownsPane = true;
+        this.store.cleanupDispatchBrief(ctx.id);
+        preamble = makePreamble();
+        announcePane(ptyId);
+      } else if (outcome.status === 'unknown_acceptance') {
+        await pilot.session.close();
+        throw new OrchestrationError('prompt_delivery_failed', 'Codex turn acceptance is unknown. Check Worker output before retrying.', {
+          dispatchId: ctx.id, taskId: task.id, acceptance: outcome.status,
+        });
+      } else {
+        acceptedByCodex = true;
+      }
+    }
+
+    const delivery = acceptedByCodex ? null : await this.deliverAndObserveDispatchTurn(ctx.id, {
+      ptyId: ptyId!,
       prompt: preamble,
       submit: true,
     });
 
-    if (!delivery.ok) {
+    if (delivery && !delivery.ok) {
       const reason = delivery.error ?? `Failed to deliver worker prompt to ${ptyId}`;
       this.store.failDispatch(ctx.id, reason);
       if (ctx.reviewOfDispatchId || ctx.reviewOfRunId) {
@@ -4716,10 +4832,10 @@ export class OrchestrationService {
         });
       }
       const closed = await this.rollbackWorkerResources(
-        ownsPane ? ptyId : undefined,
+        ownsPane ? ptyId ?? undefined : undefined,
         placement.ownsWorktree ? placement.worktreePath : null,
       );
-      if (closed && ownsPane) {
+      if (closed && ownsPane && ptyId) {
         this.emitPaneClosed({ ptyId, runId: run.id, taskId: task.id, dispatchId: ctx.id });
       }
       this.emitChanged('dispatch:failed', run.id);
@@ -4730,15 +4846,16 @@ export class OrchestrationService {
       });
     }
 
-    const updatedCtx =
-      this.store.updateDispatchObservation(ctx.id, delivery.startObservation, {
+    const updatedCtx = delivery
+      ? this.store.updateDispatchObservation(ctx.id, delivery.startObservation, {
         reason: delivery.observationReason ?? null,
         refreshHeartbeat:
           delivery.startObservation === 'observed' ||
           delivery.startObservation === 'queued' ||
           delivery.startObservation === 'permission',
         ...(delivery.promptDeferred ? {} : { promptSent: true }),
-      }) ?? ctx;
+      }) ?? ctx
+      : ctx;
 
     const briefFromRole = callerDispatch
       ? this.resolveRoleNameForDispatch(callerDispatch).toLowerCase() || 'worker'
@@ -4790,6 +4907,158 @@ export class OrchestrationService {
     };
   }
 
+  private async openCodexWorker(cwd: string, model: string | null) {
+    if (this.disposed || !this.codexPilot) return null;
+    const id = `codex-worker-${randomUUID()}`;
+    let session: CodexAppServerPilot | undefined;
+    try {
+      session = this.codexPilot.launch(id, cwd, {
+        onTurnStarted: (dispatchId) => {
+          const waiting = this.approvals.hasOpenApprovalForDispatch(dispatchId);
+          const updated = this.store.updateDispatchObservation(dispatchId, waiting ? 'permission' : 'observed', {
+            promptSent: true, refreshHeartbeat: true,
+          });
+          if (updated && !waiting) this.store.updateDispatchStage(dispatchId, 'working');
+        },
+        onTurnCompleted: (dispatchId, result) => this.completeCodexTurn(id, cwd, dispatchId, result),
+        onApproval: (dispatchId, request) => {
+          const dispatch = this.store.getDispatchContext(dispatchId);
+          return dispatch?.assigneeHandle === id
+            ? this.approvals.holdCodexRequest(dispatch, request)
+            : Promise.resolve(false);
+        },
+        onExit: (reason, exitCode) => {
+          const dispatchId = session?.latestDispatchId;
+          if (session && dispatchId) this.archiveCodexOutput(session, dispatchId);
+          this.codexWorkers.delete(id);
+          this.codexMailbox.delete(id);
+          this.approvals.cancelForPane(id, reason);
+          this.waiters.cancel(id);
+          this.waiters.cancelConsumer(id);
+          if (dispatchId && !this.codexSubmitting.has(dispatchId)) {
+            this.handleCodexExit(dispatchId, reason, exitCode);
+          }
+        },
+      });
+      this.codexWorkers.set(id, session);
+      const sessionId = await session.open(cwd, model);
+      if (!session.alive || this.disposed) throw new Error('Codex app-server closed during initialization');
+      return { id, session, sessionId };
+    } catch (error) {
+      // No turn was sent, so PTY fallback can safely proceed after process teardown.
+      console.warn('[orchestration] Codex pilot startup failed:', error instanceof Error ? error.message : String(error));
+      await session?.close();
+      return null;
+    }
+  }
+
+  private archiveCodexOutput(session: CodexAppServerPilot, dispatchId: string): void {
+    const result = session.read(dispatchId, 0, undefined, true);
+    if (result) this.store.archiveDispatchOutput(dispatchId, result.text);
+  }
+
+  private publishCodexStatus(
+    dispatch: OrchestrationDispatchRecord, subject: string, body: string, payload: Record<string, unknown>,
+  ): void {
+    const to = this.resolveActiveParentMailbox(dispatch);
+    this.store.insertMessage({
+      runId: dispatch.runId, from: `dispatch:${dispatch.id}`, to,
+      type: 'status', subject, body: this.store.redactDispatchCredentials(body),
+      payload: this.store.redactDispatchCredentials(JSON.stringify({ dispatchId: dispatch.id, ...payload })),
+      mentions: ['coordinator'], kind: 'post',
+    });
+    this.notifyTargetAndAliases(to, 'status');
+    this.emitChanged('dispatch:codex-status', dispatch.runId);
+  }
+
+  private completeCodexTurn(workerId: string, cwd: string, dispatchId: string, result: CodexTurnResult): void {
+    const session = this.codexWorkers.get(workerId);
+    if (session) this.archiveCodexOutput(session, dispatchId);
+    this.approvals.cancelForDispatch(dispatchId, 'Codex turn ended');
+    this.store.recordCodexTurn(dispatchId, result);
+    const dispatch = this.store.getDispatchContext(dispatchId);
+    if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
+    const announce = (diff: string | null) => {
+      const current = this.store.getDispatchContext(dispatchId);
+      if (!current || !ACTIVE_DISPATCH_STATUSES.has(current.status) || current.codexTurn?.turnId !== result.turnId) return;
+      if (diff !== result.diff) this.store.recordCodexTurn(dispatchId, { ...result, diff }, false);
+      this.publishCodexStatus(current, 'Codex turn ended; result pending confirmation',
+        `Codex turn ${result.stopReason} without a recorded report_done. Read the Worker output and diff evidence before deciding what to do.\n\n${result.finalText.slice(0, 4_000)}`,
+        { turnId: result.turnId, stopReason: result.stopReason, error: result.error, usage: result.usage, diff });
+      this.deliverCodexMailbox(workerId);
+    };
+    if (result.diff !== null) {
+      announce(result.diff);
+    } else {
+      void runGitCommand(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], {
+        cwd, readOnly: true, maxBytes: 128 * 1024, timeoutMs: 3_000,
+      }).then((git) => announce(git.exitCode === 0 ? git.stdout : null), () => announce(null));
+    }
+  }
+
+  private failCodexDispatch(dispatchId: string, failure: 'not_accepted' | 'unknown_acceptance', reason: string): void {
+    const dispatch = this.store.getDispatchContext(dispatchId);
+    if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
+    this.store.recordCodexDeliveryFailure(dispatchId, failure);
+    this.store.failDispatch(dispatchId, `Codex ${failure}`, {
+      forceFailTask: true, summary: this.store.redactDispatchCredentials(reason),
+    });
+    this.cleanupCodexDispatch(dispatch, `Codex delivery ${failure}`);
+    this.publishCodexStatus(dispatch, `Codex delivery: ${failure}`, reason, { acceptance: failure });
+  }
+
+  private cleanupCodexDispatch(dispatch: OrchestrationDispatchRecord, reason: string): void {
+    this.approvals.cancelForDispatch(dispatch.id, reason);
+    this.waiters.cancel(`dispatch:${dispatch.id}`);
+    this.waiters.notifyPrefix(`question:${dispatch.id}:`, 'status');
+    this.store.cleanupDispatchBrief(dispatch.id);
+    if (dispatch.reviewOfDispatchId) {
+      this.store.updateDispatchReviewState(dispatch.id, { reviewStatus: 'rejected' });
+      this.reconcileTargetReviewBatch(dispatch.id, { overrideVerdict: 'reject', failedReason: reason });
+    }
+  }
+
+  private handleCodexExit(dispatchId: string, reason: string, exitCode: number | null): void {
+    const dispatch = this.store.getDispatchContext(dispatchId);
+    if (!dispatch?.promptSentAt || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
+    if (exitCode === 0 && dispatch.stage === 'awaiting_review') return;
+    this.store.failDispatch(dispatch.id, 'Codex app-server exited', { forceFailTask: true, summary: reason });
+    this.cleanupCodexDispatch(dispatch, reason);
+    this.publishCodexStatus(dispatch, 'Codex Worker exited before report_done', reason, { exitCode });
+  }
+
+  private async submitCodexTurn(dispatch: OrchestrationDispatchRecord, session: CodexAppServerPilot, prompt: string) {
+    this.codexSubmitting.add(dispatch.id);
+    try {
+      const result = await session.startTurn(dispatch.id, prompt, dispatch.effort ?? null);
+      if (result.status === 'unknown_acceptance') this.failCodexDispatch(dispatch.id, result.status, result.reason);
+      if (result.status === 'accepted' && !session.alive) {
+        this.handleCodexExit(dispatch.id, 'Codex disconnected after accepting the turn', null);
+      }
+      return result;
+    } finally {
+      this.codexSubmitting.delete(dispatch.id);
+    }
+  }
+
+  private deliverCodexMailbox(workerId: string): void {
+    const session = this.codexWorkers.get(workerId);
+    if (!session?.alive || session.busy || !this.codexMailbox.delete(workerId)) return;
+    const dispatch = this.store.getActiveDispatchForIdentity(workerId, null);
+    if (!dispatch || this.codexSubmitting.has(dispatch.id)) {
+      if (dispatch) this.codexMailbox.add(workerId);
+      return;
+    }
+    void this.submitCodexTurn(dispatch, session,
+      'You have a new message from AhaStation. Use the Aha read_board tool to read unread messages for your role, then continue the current assignment.'
+    ).then(async (outcome) => {
+      if (outcome.status !== 'accepted') {
+        this.failCodexDispatch(dispatch.id, outcome.status, outcome.reason);
+        await session.close();
+      }
+    }).catch((error) => console.warn('[orchestration] Codex mailbox delivery failed:', error));
+  }
+
   private async followUpSettledWorker(
     settledDispatch: OrchestrationDispatchRecord,
     input: {
@@ -4838,6 +5107,12 @@ export class OrchestrationService {
     if (this.retiringPanes.has(existingPaneId)) {
       throw new OrchestrationError('operation_rejected', 'This worker terminal is still closing. Retry once it exits.');
     }
+    const isHeadless = settledDispatch.executionMode === 'codex-app-server';
+    const session = isHeadless ? this.codexWorkers.get(existingPaneId) : undefined;
+    if (isHeadless && (!session?.alive || !await session.waitForIdle(15_000) || !session.alive ||
+        this.store.getActiveDispatchForIdentity(existingPaneId, null))) {
+      throw new OrchestrationError('dispatch_inactive', 'Codex Worker is unavailable or still finishing its previous turn.');
+    }
     const canReuseLivePane =
       Boolean(existingPaneId) &&
       this.isPaneAlive(existingPaneId) &&
@@ -4864,7 +5139,7 @@ export class OrchestrationService {
 
     if (canReuseLivePane) {
       targetPtyId = existingPaneId;
-      reusedPane = true;
+      reusedPane = !session;
     } else {
       if (!this.spawnWorkerPty) {
         throw new OrchestrationError(
@@ -4901,7 +5176,8 @@ export class OrchestrationService {
       nextCtx = this.store.createDispatchContext({
         taskId: followUpTask.id,
         assigneeHandle: targetPtyId,
-        assigneePaneId: targetPtyId,
+        assigneePaneId: session ? null : targetPtyId,
+        ...(session?.sessionId ? { providerSessionId: session.sessionId } : {}),
         creator: from,
         creatorRunId: settledDispatch.runId,
         creatorDispatchId: settledDispatch.creatorDispatchId ?? null,
@@ -5001,17 +5277,38 @@ export class OrchestrationService {
       dispatchId: nextCtx.id,
       runId: settledDispatch.runId,
       taskSpec: followUpTask.spec,
-      taskContext: reusedPane ? null : followUpTask.taskContext,
+      taskContext: reusedPane || session ? null : followUpTask.taskContext,
       coordinatorHandle,
       workerHandle: targetPtyId,
       worktreePath: nextCtx.worktreePath,
       branch: nextCtx.branch,
-      canDispatchSubWorkers: nextCtx.depth < this.maxDepth,
-      isFollowUp: reusedPane,
+      canDispatchSubWorkers: !session && nextCtx.depth < this.maxDepth,
+      isFollowUp: reusedPane || Boolean(session),
       previousDispatchId: settledDispatch.id,
-      mcpEnabled: followUpMcpEnabled,
+      mcpEnabled: Boolean(session) || followUpMcpEnabled,
+      headless: Boolean(session),
       role: followUpRole,
     });
+
+    if (session) {
+      const outcome = await this.submitCodexTurn(nextCtx, session, preamble);
+      if (outcome.status !== 'accepted') {
+        this.failCodexDispatch(nextCtx.id, outcome.status, outcome.reason);
+        await session.close();
+        throw new OrchestrationError('prompt_delivery_failed', 'Codex follow-up delivery failed.', {
+          dispatchId: nextCtx.id, acceptance: outcome.status,
+        });
+      }
+      this.emitChanged('worker:follow-up', settledDispatch.runId);
+      return {
+        message: exposeMessage(msg),
+        followUp: {
+          reactivated: true, previousDispatchId: settledDispatch.id,
+          dispatch: this.store.getDispatchContext(nextCtx.id)!,
+          task: this.store.requireTask(followUpTask.id), reusedPane: false,
+        },
+      };
+    }
 
     const delivery = await this.deliverAndObserveDispatchTurn(nextCtx.id, {
       ptyId: targetPtyId,
@@ -5113,8 +5410,17 @@ export class OrchestrationService {
       this.assertNotFirewalledReviewRead(callerPaneId, dispatch, 'worker-read');
     }
     const paneId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
+    const codex = this.codexWorkers.get(dispatch.assigneeHandle);
+    const headlessRead = codex?.read(dispatch.id, input.cursor, input.limit, input.screen);
+    if (headlessRead) {
+      return {
+        ...headlessRead, ptyId: dispatch.assigneeHandle, dispatchId: dispatch.id,
+        text: this.store.redactDispatchCredentials(headlessRead.text),
+        archived: !headlessRead.alive || Boolean(dispatch.releasedAt),
+      };
+    }
 
-    if (paneId && this.terminalTracker) {
+    if (dispatch.executionMode !== 'codex-app-server' && paneId && this.terminalTracker) {
       const liveRead = this.terminalTracker.readOutput(paneId, {
         cursor: input.cursor,
         limit: input.limit,
@@ -5303,6 +5609,9 @@ export class OrchestrationService {
       this.getDefaultCwd?.() ??
       null;
 
+    const codex = this.codexWorkers.get(dispatch.assigneeHandle);
+    const shouldCloseCodex = codex && !input.keepPane &&
+      (!dispatch.retained || Boolean(input.force) || Boolean(integratedSnapshotOid));
     let closedPane = false;
     const shouldClosePane =
       Boolean(dispatch.ownsPane) &&
@@ -5312,9 +5621,11 @@ export class OrchestrationService {
       (!dispatch.retained || Boolean(input.force) || Boolean(integratedSnapshotOid));
     // A pane explicitly kept open continues to use its worktree.
     const worktreeToRemove = dispatch.ownsWorktree && !input.keepWorktree &&
-      (shouldClosePane || !this.isPaneAlive(paneId)) ? dispatch.worktreePath : null;
+      (shouldClosePane || shouldCloseCodex || !this.isPaneAlive(paneId)) ? dispatch.worktreePath : null;
     const forceRemoveWorktree = Boolean(input.force || dispatch.isDetachedReviewWorktree);
     if (worktreeToRemove && !forceRemoveWorktree && !integratedSnapshotOid) await assertWorkerWorktreeClean(worktreeToRemove);
+
+    if (shouldCloseCodex) await codex.close(true);
 
     if (shouldClosePane && paneId) {
       await this.confirmWorkerPaneClosed(paneId);
@@ -5462,7 +5773,8 @@ export class OrchestrationService {
       const child = this.store.resolveDispatchLineage(seed.id) ?? seed;
       if (visitedDispatchIds.has(child.id) || child.releasedAt) continue;
       if (child.retained && !input.force) continue;
-      if (!ACTIVE_DISPATCH_STATUSES.has(child.status) && !child.ownsPane) continue;
+      if (!ACTIVE_DISPATCH_STATUSES.has(child.status) && !child.ownsPane &&
+          !this.codexWorkers.has(child.assigneeHandle)) continue;
       const childStopped = await this.workerStop(
         {
           dispatchId: child.id,
@@ -5475,11 +5787,13 @@ export class OrchestrationService {
       stoppedHelperIds.push(child.id, ...childStopped.stoppedHelperIds);
     }
 
-    const shouldClosePane = Boolean(paneId && (dispatch.ownsPane || input.force));
+    const headless = dispatch.executionMode === 'codex-app-server';
+    const codex = this.codexWorkers.get(dispatch.assigneeHandle);
+    const shouldClosePane = !headless && Boolean(paneId && (dispatch.ownsPane || input.force));
     if (shouldClosePane) await this.confirmWorkerPaneClosed(paneId);
 
     this.approvals.cancelForDispatch(dispatch.id, input.reason || 'Worker stopped');
-    if (paneId) {
+    if (!headless && paneId) {
       this.turnStopMonitor.cancelForPane(paneId);
       if (this.terminalTracker) {
         const transcript = this.terminalTracker.readFullTranscript(paneId);
@@ -5509,6 +5823,8 @@ export class OrchestrationService {
       this.store.updateDispatchStage(dispatch.id, 'stopped');
       settled = this.store.getDispatchContext(dispatch.id) ?? settled;
     }
+
+    if (codex) await codex.close(true);
 
     let closedPane = false;
     if (shouldClosePane) {
@@ -5564,9 +5880,12 @@ export class OrchestrationService {
     const rawTarget = this.resolveTargetDispatch(input);
     const dispatch = this.store.resolveDispatchLineage(rawTarget.id) ?? rawTarget;
     const paneId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
+    const headless = dispatch.executionMode === 'codex-app-server';
+    const codex = headless ? this.codexWorkers.get(dispatch.assigneeHandle) : undefined;
+    if (codex) this.archiveCodexOutput(codex, dispatch.id);
 
     this.approvals.cancelForDispatch(dispatch.id, input.reason || 'Worker abandoned');
-    if (paneId) {
+    if (!headless && paneId) {
       this.turnStopMonitor.cancelForPane(paneId);
       if (this.terminalTracker) {
         const transcript = this.terminalTracker.readFullTranscript(paneId);
@@ -5593,8 +5912,10 @@ export class OrchestrationService {
         });
       }
     }
-    const warning =
-      'Dispatch abandoned in orchestration state without killing any external process; use worker-stop to terminate the PTY.';
+    if (codex) void codex.close(true);
+    const warning = headless
+      ? 'Dispatch abandoned; its headless Codex session has been retired.'
+      : 'Dispatch abandoned in orchestration state without killing any external process; use worker-stop to terminate the PTY.';
     this.emitChanged('worker:abandoned', settled.runId);
     return {
       dispatch: this.store.getDispatchContext(settled.id) ?? settled,
@@ -5634,6 +5955,7 @@ export class OrchestrationService {
         const pty = d.assigneePaneId ?? d.assigneeHandle;
         if (pty) this.turnStopMonitor.cancelForPane(pty);
       }
+      for (const codex of this.codexWorkers.values()) void codex.close(true);
       this.proposals.cancelAllPendingProposals('Orchestration state reset');
       this.inFlightObservationDispatches.clear();
     }
@@ -7094,6 +7416,7 @@ export class OrchestrationService {
           ...(reviewTargetDispatch ? { reviewOf: reviewTargetDispatch.id } : {}),
           ...(reviewRunTarget ? { reviewRun: reviewRunTarget.id } : {}),
           ...(reviewFocus ? { reviewFocus } : {}),
+          ...(effectiveTaskKind === 'review' || effectiveTaskKind === 'research' ? { readOnly: true } : {}),
           ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
           taskTitle,
           displayName,
@@ -7388,10 +7711,10 @@ export class OrchestrationService {
   getMcpContextForPane(callerPaneId: string): OrchestrationMcpContext {
     const cleanCaller = callerPaneId.trim();
     const activeDispatch = this.store.getActiveDispatchForIdentity(cleanCaller, cleanCaller) ?? null;
-    const role: 'worker' | 'coordinator' = activeDispatch ? 'worker' : 'coordinator';
+    const role: 'worker' | 'coordinator' = activeDispatch || CODEX_WORKER_ID.test(cleanCaller) ? 'worker' : 'coordinator';
     const orchestrationMode = this.isPaneOrchestrationMode(cleanCaller);
     const confirmMode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
-    const canDelegate = activeDispatch ? activeDispatch.depth < this.maxDepth : true;
+    const canDelegate = !CODEX_WORKER_ID.test(cleanCaller) && (activeDispatch ? activeDispatch.depth < this.maxDepth : true);
     const roster = this.listCodingAgents(cleanCaller);
     const managed = this.listManagedDispatchesForCaller(cleanCaller);
     const workers: OrchestrationMcpWorkerBrief[] = managed.map((d) => {
@@ -7435,6 +7758,7 @@ export class OrchestrationService {
 
   private isMcpEnabledForPane(ptyId: string): boolean {
     const clean = ptyId.trim();
+    if (CODEX_WORKER_ID.test(clean)) return this.isPaneAlive(clean);
     if (!clean || !this.isMcpEnabledForCliDep) return false;
     const cliId =
       this.agentStatusStore.get(clean)?.agentId ??
@@ -7606,7 +7930,12 @@ export class OrchestrationService {
       if (!paneId || paneId === senderPaneId) return;
       this.waiters.notify(paneId, msg.type);
       this.waiters.notify(`board-pane:${paneId}`, msg.type);
-      this.pointerDelivery.scheduleRedriveForPane(paneId);
+      if (CODEX_WORKER_ID.test(paneId)) {
+        this.codexMailbox.add(paneId);
+        this.deliverCodexMailbox(paneId);
+      } else {
+        this.pointerDelivery.scheduleRedriveForPane(paneId);
+      }
     };
 
     const wokeSet = new Set(woke);
@@ -8852,7 +9181,17 @@ export class OrchestrationService {
     return JSON.stringify(data, null, 2);
   }
 
+  hasCodexWorkers(): boolean {
+    return this.codexWorkers.size > 0;
+  }
+
+  async stopCodexWorkers(): Promise<void> {
+    this.disposed = true;
+    await Promise.all([...this.codexWorkers.values()].map((codex) => codex.close(true)));
+  }
+
   dispose(): void {
+    void this.stopCodexWorkers();
     try {
       this.activeCoordinator?.coordinator.stop();
     } catch {
@@ -9029,6 +9368,7 @@ export class OrchestrationService {
   }
 
   private isDispatchDeliberatelyWaiting(dispatch: OrchestrationDispatchRecord): boolean {
+    if (dispatch.executionMode === 'codex-app-server' && this.isPaneAlive(dispatch.assigneeHandle)) return true;
     if (this.approvals.hasOpenApprovalForDispatch(dispatch.id)) {
       return true;
     }
@@ -9084,5 +9424,6 @@ export class OrchestrationService {
       }
       this.retireFinishedSpawnedWorkers(runId);
     }
+    this.retireFinishedCodexWorkers();
   }
 }

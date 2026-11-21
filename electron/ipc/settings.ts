@@ -37,6 +37,7 @@ export interface OrchestrationSettingsPatch {
   confirmBeforeDispatch?: OrchestrationConfirmMode;
   defaultWorktree?: boolean;
   peerMessagingMode?: OrchestrationPeerMessagingMode;
+  codexAppServerPilot?: boolean;
   agentProfiles?: Record<string, OrchestrationAgentProfile | null>;
 }
 
@@ -44,6 +45,7 @@ const ORCHESTRATION_SETTING_KEYS = new Set([
   'confirmBeforeDispatch',
   'defaultWorktree',
   'peerMessagingMode',
+  'codexAppServerPilot',
   'agentProfiles',
 ]);
 
@@ -85,6 +87,13 @@ export function buildOrchestrationSettingsUpdate(
       return { ok: false, error: 'defaultWorktree must be a boolean' };
     }
     next.defaultWorktree = patchObj.defaultWorktree;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patchObj, 'codexAppServerPilot')) {
+    if (typeof patchObj.codexAppServerPilot !== 'boolean') {
+      return { ok: false, error: 'codexAppServerPilot must be a boolean' };
+    }
+    next.codexAppServerPilot = patchObj.codexAppServerPilot;
   }
 
   if (Object.prototype.hasOwnProperty.call(patchObj, 'peerMessagingMode')) {

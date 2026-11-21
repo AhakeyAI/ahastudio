@@ -380,7 +380,9 @@ function postJson(urlStr, token, bodyObj) {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(bodyText),
           ...(token ? { 'x-aha-agent-hook-token': token } : {}),
-          ...(process.env.AHA_TERMINAL_ID && process.env.AHA_ORCHESTRATION_PANE_TOKEN
+          ...(process.env.AHA_WORKER_ID
+            ? { 'x-aha-worker-id': process.env.AHA_WORKER_ID, 'x-aha-worker-token': process.env.AHA_WORKER_TOKEN || '' }
+            : process.env.AHA_TERMINAL_ID && process.env.AHA_ORCHESTRATION_PANE_TOKEN
             ? {
                 'x-aha-pty-id': process.env.AHA_TERMINAL_ID,
                 'x-aha-pane-token': process.env.AHA_ORCHESTRATION_PANE_TOKEN,
@@ -426,7 +428,7 @@ function postJson(urlStr, token, bodyObj) {
 
 function buildCompanionPayload(namespace, verb, flags, positional) {
   const defaultFrom =
-    typeof flags.from === 'string' ? flags.from : process.env.AHA_TERMINAL_ID || undefined;
+    typeof flags.from === 'string' ? flags.from : process.env.AHA_WORKER_ID || process.env.AHA_TERMINAL_ID || undefined;
   const wantJson = flags.json === true;
 
   if (namespace === 'terminal') {
@@ -574,7 +576,7 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
   }
 
   const defaultFrom =
-    typeof flags.from === 'string' ? flags.from : process.env.AHA_TERMINAL_ID || undefined;
+    typeof flags.from === 'string' ? flags.from : process.env.AHA_WORKER_ID || process.env.AHA_TERMINAL_ID || undefined;
   const explicitCap = flags.capability ?? flags.dispatchCapability;
   const capability =
     typeof explicitCap === 'string' ? explicitCap : process.env.AHA_DISPATCH_CAPABILITY || undefined;
@@ -756,6 +758,7 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
             : {}),
           ...(flags.reviewFocus ? { reviewFocus: String(flags.reviewFocus) } : {}),
           ...(workerCli ? { cliId: String(workerCli) } : {}),
+          ...(flags.readOnly === true ? { readOnly: true } : {}),
           ...(flags.model ? { model: String(flags.model) } : {}),
           ...(flags.effort ? { effort: String(flags.effort) } : {}),
           ...(flags.terminal ? { terminal: String(flags.terminal) } : {}),

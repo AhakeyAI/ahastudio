@@ -86,11 +86,12 @@ function postOrchestrationAction(action, payload, activeRequests) {
     if (endpoint.token) {
       headers['x-aha-agent-hook-token'] = endpoint.token;
     }
-    if (process.env.AHA_TERMINAL_ID) {
-      headers['x-aha-pty-id'] = process.env.AHA_TERMINAL_ID;
-    }
-    if (process.env.AHA_ORCHESTRATION_PANE_TOKEN) {
-      headers['x-aha-pane-token'] = process.env.AHA_ORCHESTRATION_PANE_TOKEN;
+    if (process.env.AHA_WORKER_ID) {
+      headers['x-aha-worker-id'] = process.env.AHA_WORKER_ID;
+      headers['x-aha-worker-token'] = process.env.AHA_WORKER_TOKEN || '';
+    } else {
+      if (process.env.AHA_TERMINAL_ID) headers['x-aha-pty-id'] = process.env.AHA_TERMINAL_ID;
+      if (process.env.AHA_ORCHESTRATION_PANE_TOKEN) headers['x-aha-pane-token'] = process.env.AHA_ORCHESTRATION_PANE_TOKEN;
     }
 
     const req = client.request(
@@ -891,7 +892,7 @@ function positiveIntArray(value) {
 }
 
 async function handleToolCall(name, rawArgs, activeRequests) {
-  if (!process.env.AHA_TERMINAL_ID) {
+  if (!process.env.AHA_WORKER_ID && !process.env.AHA_TERMINAL_ID) {
     return toolText(
       'AhaStation orchestration tools are only available inside an AhaStation terminal.',
       true
@@ -1030,7 +1031,7 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       if (!res.ok) {
         if (name === 'team_wait' && res.code === 'run_not_found') {
           const fallback = await callAction('check', {
-            from: process.env.AHA_TERMINAL_ID,
+            from: process.env.AHA_WORKER_ID || process.env.AHA_TERMINAL_ID,
             wait: true,
             peek: false,
             format: true,
@@ -1416,7 +1417,7 @@ function runMcpServer(options = {}) {
       }
 
       if (method === 'tools/list') {
-        if (!process.env.AHA_TERMINAL_ID) {
+        if (!process.env.AHA_WORKER_ID && !process.env.AHA_TERMINAL_ID) {
           writeResponse({ jsonrpc: '2.0', id, result: { tools: [] } }, framing);
           return;
         }

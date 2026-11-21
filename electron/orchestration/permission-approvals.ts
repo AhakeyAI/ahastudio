@@ -14,7 +14,7 @@ export const DEFAULT_APPROVAL_HOLD_TIMEOUT_MS = 115_000;
 
 interface HeldApprovalEntry {
   payload: WorkerApprovalPayload;
-  resolveHook: (reply: { hookStdout?: string }) => void;
+  resolveDecision: (allow: boolean, reason?: string, updatedInput?: Record<string, unknown>) => void;
   timer: ReturnType<typeof setTimeout>;
   cleanupSignal?: () => void;
 }
@@ -197,6 +197,34 @@ export class PermissionApprovalManager {
       dispatch.cliId ||
       this.deps.agentStatusStore.get(input.ptyId)?.agentId ||
       'claude';
+    const decision = await this.holdRequest(dispatch, input, provider);
+    const hookStdout = buildProviderDecisionStdout(
+      provider, input.eventName, decision.allow ? 'allow' : 'deny', decision.reason, decision.updatedInput,
+    );
+    return { held: true, ...(hookStdout ? { hookStdout } : {}) };
+  }
+
+  async holdCodexRequest(
+    dispatch: OrchestrationDispatchRecord,
+    input: { method: string; toolInput: string; message?: string; signal: AbortSignal },
+  ): Promise<boolean> {
+    if (input.signal.aborted || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return false;
+    const decision = await this.holdRequest(dispatch, {
+      ptyId: dispatch.assigneeHandle,
+      eventName: input.method,
+      toolName: input.method.split('/')[1],
+      toolInput: input.toolInput,
+      message: input.message,
+      signal: input.signal,
+    }, 'codex');
+    return decision.allow;
+  }
+
+  private holdRequest(
+    dispatch: OrchestrationDispatchRecord,
+    input: Omit<PermissionHookInterceptInput, 'rawPayload'>,
+    provider: string,
+  ): Promise<{ allow: boolean; reason?: string; updatedInput?: Record<string, unknown> }> {
     const approvalId = `perm_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
     const nowIso = new Date(this.clock()).toISOString();
     const toolName = input.toolName || 'tool';
@@ -273,25 +301,25 @@ export class PermissionApprovalManager {
       kind: 'approval',
     });
 
-    const hookPromise = new Promise<{ hookStdout?: string }>((resolve) => {
+    const decision = new Promise<{ allow: boolean; reason?: string; updatedInput?: Record<string, unknown> }>((resolve) => {
       const timer = setTimeout(() => {
         this.expireApproval(approvalId, 'Approval hold timed out');
       }, this.holdTimeoutMs);
       timer.unref?.();
 
       const onAbort = () => {
-        this.expireApproval(approvalId, 'Worker hook connection closed');
+        this.expireApproval(approvalId, 'Worker approval connection closed');
       };
       if (input.signal.aborted) {
         clearTimeout(timer);
-        resolve({});
+        resolve({ allow: false });
         return;
       }
       input.signal.addEventListener('abort', onAbort, { once: true });
 
       const entry: HeldApprovalEntry = {
         payload,
-        resolveHook: resolve,
+        resolveDecision: (allow, reason, updatedInput) => resolve({ allow, reason, updatedInput }),
         timer,
         cleanupSignal: () => input.signal.removeEventListener('abort', onAbort),
       };
@@ -302,8 +330,7 @@ export class PermissionApprovalManager {
     this.deps.notifyMailbox(parentMailbox, 'escalation');
     this.deps.onChanged?.('approval:requested', dispatch.runId);
 
-    const reply = await hookPromise;
-    return { held: true, ...(reply.hookStdout ? { hookStdout: reply.hookStdout } : {}) };
+    return decision;
   }
 
   approve(input: {
@@ -325,18 +352,11 @@ export class PermissionApprovalManager {
     entry.payload.reason = input.reason?.trim() || null;
     this.historyByApprovalId.set(entry.payload.approvalId, { ...entry.payload });
 
-    const hookStdout = buildProviderDecisionStdout(
-      entry.payload.provider,
-      entry.payload.eventName,
-      'allow',
-      undefined,
-      input.updatedInput
-    );
-    entry.resolveHook({ hookStdout });
+    entry.resolveDecision(true, undefined, input.updatedInput);
 
     const nextPending = this.listOpenApprovals({ dispatchId: entry.payload.dispatchId })[0];
     if (nextPending) {
-      this.deps.agentStatusStore.ingestHookEvent({
+      if (!entry.payload.eventName.includes('/')) this.deps.agentStatusStore.ingestHookEvent({
         ptyId: entry.payload.ptyId,
         agentId: entry.payload.provider,
         state: 'waiting',
@@ -346,7 +366,7 @@ export class PermissionApprovalManager {
       });
       this.deps.store.updateDispatchStage(entry.payload.dispatchId, 'waiting_permission');
     } else {
-      this.deps.agentStatusStore.ingestHookEvent({
+      if (!entry.payload.eventName.includes('/')) this.deps.agentStatusStore.ingestHookEvent({
         ptyId: entry.payload.ptyId,
         agentId: entry.payload.provider,
         state: 'working',
@@ -382,17 +402,11 @@ export class PermissionApprovalManager {
     entry.payload.reason = reason;
     this.historyByApprovalId.set(entry.payload.approvalId, { ...entry.payload });
 
-    const hookStdout = buildProviderDecisionStdout(
-      entry.payload.provider,
-      entry.payload.eventName,
-      'deny',
-      reason
-    );
-    entry.resolveHook({ hookStdout });
+    entry.resolveDecision(false, reason);
 
     const nextPending = this.listOpenApprovals({ dispatchId: entry.payload.dispatchId })[0];
     if (nextPending) {
-      this.deps.agentStatusStore.ingestHookEvent({
+      if (!entry.payload.eventName.includes('/')) this.deps.agentStatusStore.ingestHookEvent({
         ptyId: entry.payload.ptyId,
         agentId: entry.payload.provider,
         state: 'waiting',
@@ -403,7 +417,7 @@ export class PermissionApprovalManager {
       });
       this.deps.store.updateDispatchStage(entry.payload.dispatchId, 'waiting_permission');
     } else {
-      this.deps.agentStatusStore.ingestHookEvent({
+      if (!entry.payload.eventName.includes('/')) this.deps.agentStatusStore.ingestHookEvent({
         ptyId: entry.payload.ptyId,
         agentId: entry.payload.provider,
         state: 'working',
@@ -531,9 +545,7 @@ export class PermissionApprovalManager {
     entry.payload.resolvedAt = new Date(this.clock()).toISOString();
     entry.payload.reason = reason;
     this.historyByApprovalId.set(approvalId, { ...entry.payload });
-    entry.resolveHook({
-      hookStdout: buildProviderDecisionStdout(entry.payload.provider, entry.payload.eventName, 'deny', reason),
-    });
+    entry.resolveDecision(false, reason);
     if (!this.hasOpenApprovalForDispatch(entry.payload.dispatchId)) {
       const dispatch = this.deps.store.getDispatchContext(entry.payload.dispatchId);
       if (

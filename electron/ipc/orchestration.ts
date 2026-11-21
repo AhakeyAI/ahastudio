@@ -184,6 +184,7 @@ const workerStartSchema = z
     model: nonEmptyId.optional(),
     effort: nonEmptyId.optional(),
     terminal: nonEmptyId.optional(),
+    readOnly: z.boolean().optional(),
     worktree: z.union([z.string().trim().max(1024), z.boolean()]).optional(),
     noWorktree: z.boolean().optional(),
     branch: nonEmptyId.optional(),

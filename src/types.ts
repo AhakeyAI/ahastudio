@@ -633,6 +633,17 @@ interface OrchestrationTaskContextInput {
 }
 
 export interface OrchestrationDispatchRecord {
+  executionMode?: 'codex-app-server';
+  providerSessionId?: string;
+  codexTurn?: {
+    turnId: string;
+    stopReason: string;
+    finalText: string;
+    diff: string | null;
+    usage: Record<string, number> | null;
+    error: string | null;
+  };
+  codexDeliveryFailure?: 'unknown_acceptance' | 'not_accepted';
   id: string;
   taskId: string;
   runId: string;
@@ -864,6 +875,7 @@ export interface OrchestrationSettings {
   confirmBeforeDispatch: OrchestrationConfirmMode;
   defaultWorktree: boolean;
   peerMessagingMode?: OrchestrationPeerMessagingMode;
+  codexAppServerPilot?: boolean;
   agentProfiles: Record<string, OrchestrationAgentProfile>;
 }
 
@@ -871,6 +883,7 @@ export interface OrchestrationSettingsPatch {
   confirmBeforeDispatch?: OrchestrationConfirmMode;
   defaultWorktree?: boolean;
   peerMessagingMode?: OrchestrationPeerMessagingMode;
+  codexAppServerPilot?: boolean;
   agentProfiles?: Record<string, OrchestrationAgentProfile | null>;
 }
 
@@ -1155,6 +1168,7 @@ export interface OrchestrationApi {
     model?: string;
     effort?: string;
     terminal?: string;
+    readOnly?: boolean;
     worktree?: string | boolean;
     noWorktree?: boolean;
     branch?: string;
@@ -1168,7 +1182,7 @@ export interface OrchestrationApi {
       dispatch: OrchestrationDispatchRecord;
       task: OrchestrationTaskRecord;
       run: OrchestrationRunRecord;
-      ptyId: string;
+      ptyId: string | null;
       worktreePath: string | null;
       branch: string | null;
       ownsWorktree: boolean;
@@ -1420,7 +1434,7 @@ export interface OrchestrationApi {
       dispatch?: OrchestrationDispatchRecord;
       task?: OrchestrationTaskRecord;
       run?: OrchestrationRunRecord;
-      ptyId?: string;
+      ptyId?: string | null;
       worktreePath?: string | null;
       branch?: string | null;
       proposal?: OrchestrationDispatchProposal;

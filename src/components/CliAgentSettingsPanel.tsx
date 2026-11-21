@@ -252,6 +252,17 @@ export function CliAgentSettingsPanel() {
               />
               <span>默认使用独立 Git worktree（避免多 Agent 并行改乱同一工作区）</span>
             </label>
+            <label className="settings-checkbox-row">
+              <input
+                type="checkbox"
+                disabled={orchSaving}
+                checked={orchSettings.codexAppServerPilot ?? false}
+                onChange={(e) =>
+                  void persistOrchestrationPatch({ codexAppServerPilot: e.target.checked })
+                }
+              />
+              <span>Windows Codex 只读无头 Worker（试点）</span>
+            </label>
           </div>
         </section>
       )}
