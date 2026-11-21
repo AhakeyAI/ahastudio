@@ -42,6 +42,7 @@ import {
 } from '../lib/orchestration-board-model';
 import { isMacSearchPlatform } from '../lib/terminal-search-options';
 import { dispatchFocusOrchestrationTarget } from '../lib/terminal-links/orchestration-terminal-links';
+import { headlessDispatchForTarget } from '../lib/orchestration-view';
 import { useAgentStatuses } from './AgentStatusBadge';
 import type { AgentPromptTarget } from './PanelPreview';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
@@ -299,11 +300,16 @@ export function OrchestrationBoardPanel({
   const focusRole = useCallback(
     (role: string): boolean => {
       const target = roleLookup.get(role.toLowerCase());
-      if (!target?.ptyId) return false;
+      if (!target) return false;
+      const headless = headlessDispatchForTarget(snapshot, {
+        ptyId: target.ptyId,
+        dispatchId: target.dispatchId ?? null,
+      });
+      if (!target.ptyId && !headless) return false;
       dispatchFocusOrchestrationTarget({
         kind: 'dispatch',
         label: target.label,
-        ptyId: target.ptyId,
+        ptyId: target.ptyId ?? headless?.assigneeHandle ?? null,
         dispatchId: target.dispatchId ?? null,
         taskId: target.taskId ?? null,
         cwd: target.cwd ?? null,
@@ -311,7 +317,7 @@ export function OrchestrationBoardPanel({
       });
       return true;
     },
-    [roleLookup],
+    [roleLookup, snapshot],
   );
 
   const handleMentionClick = useCallback(

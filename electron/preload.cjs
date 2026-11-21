@@ -196,6 +196,8 @@ const api = {
     workerList: (opts) => ipcRenderer.invoke('orchestration:worker-list', opts),
     workerShow: (opts) => ipcRenderer.invoke('orchestration:worker-show', opts),
     workerRead: (opts) => ipcRenderer.invoke('orchestration:worker-read', opts),
+    workerTimelineGet: (opts) => ipcRenderer.invoke('orchestration:worker-timeline-get', opts),
+    workerInterrupt: (opts) => ipcRenderer.invoke('orchestration:worker-interrupt', opts),
     workerKeepOpen: (opts) => ipcRenderer.invoke('orchestration:worker-keep-open', opts),
     workerRelease: (opts) => ipcRenderer.invoke('orchestration:worker-release', opts),
     workerStop: (opts) => ipcRenderer.invoke('orchestration:worker-stop', opts),
@@ -237,6 +239,11 @@ const api = {
       const listener = (_, event) => cb(event);
       ipcRenderer.on('orchestration:pane-closed', listener);
       return () => ipcRenderer.removeListener('orchestration:pane-closed', listener);
+    },
+    onWorkerTimelinePatch: (cb) => {
+      const listener = (_, patch) => cb(patch);
+      ipcRenderer.on('orchestration:worker-timeline-patch', listener);
+      return () => ipcRenderer.removeListener('orchestration:worker-timeline-patch', listener);
     },
   },
 };

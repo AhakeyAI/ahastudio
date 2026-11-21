@@ -4,6 +4,9 @@ import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { augmentedPath, resolveBinaryFromPath } from '../bin-resolve.js';
 import { spawnWindowsCodexJob } from './windows-codex-job.js';
+import type {
+  WorkerTimelineEvent, WorkerTimelineFileChange, WorkerTimelineItemStatus, WorkerTimelineItemUpdate,
+} from './worker-timeline.js';
 
 export const CODEX_WORKER_ID = /^codex-worker-[a-f0-9-]{36}$/;
 const APPROVALS = { approvalPolicy: 'on-request', approvalsReviewer: 'user' };
@@ -49,6 +52,8 @@ export interface CodexPilotEvents {
   onTurnCompleted: (dispatchId: string, result: CodexTurnResult) => void;
   onApproval: (dispatchId: string, request: CodexApproval) => Promise<boolean>;
   onExit: (reason: string, exitCode: number | null) => void;
+  /** Normalized process events for the active turn; text is already pilot-redacted. */
+  onTimeline?: (dispatchId: string, event: WorkerTimelineEvent) => void;
 }
 
 class RpcRejection extends Error {}
@@ -66,6 +71,166 @@ function numericFields(value: unknown): Record<string, number> {
     .filter((entry): entry is [string, number] => typeof entry[1] === 'number'));
 }
 
+function codexStatus(value: unknown): WorkerTimelineItemStatus {
+  if (value === 'completed') return 'completed';
+  if (value === 'failed') return 'failed';
+  if (value === 'declined') return 'declined';
+  return 'running';
+}
+
+function textParts(value: unknown): string {
+  if (!Array.isArray(value)) return '';
+  return value.map(object).map((part) => string(part.text) ?? '').filter(Boolean).join('\n');
+}
+
+function summarize(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '';
+  }
+}
+
+function codexFileChanges(value: unknown): WorkerTimelineFileChange[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(object).map((change) => {
+    const kind = object(change.kind);
+    const type = string(kind.type) ?? string(change.kind);
+    return {
+      path: string(change.path) ?? '',
+      change: type === 'add' || type === 'delete' ? type : 'update',
+      movePath: string(kind.move_path) ?? string(kind.movePath) ?? null,
+      diff: string(change.diff) ?? '',
+      added: 0, removed: 0, truncated: false,
+    };
+  });
+}
+
+/** Translates a Codex ThreadItem into a protocol-agnostic timeline item update. */
+export function codexItemUpdate(raw: unknown, completedAt?: number): WorkerTimelineItemUpdate | null {
+  const item = object(raw);
+  const id = string(item.id);
+  if (!id) return null;
+  const done = completedAt !== undefined ? { completedAt } : {};
+  switch (item.type) {
+    case 'agentMessage':
+      return { id, kind: 'message', role: 'assistant', ...(typeof item.text === 'string' && item.text ? { text: item.text } : {}),
+        ...(completedAt !== undefined ? { status: 'completed' as const } : {}), ...done };
+    case 'reasoning': {
+      const summary = Array.isArray(item.summary) ? item.summary.filter((s): s is string => typeof s === 'string').join('\n\n') : '';
+      const content = Array.isArray(item.content) ? item.content.filter((s): s is string => typeof s === 'string').join('\n\n') : '';
+      return { id, kind: 'reasoning', ...(summary ? { summary } : {}), ...(content ? { text: content } : {}),
+        ...(completedAt !== undefined ? { status: 'completed' as const } : {}), ...done };
+    }
+    case 'plan':
+      return { id, kind: 'plan', ...(typeof item.text === 'string' && item.text ? { text: item.text } : {}),
+        ...(completedAt !== undefined ? { status: 'completed' as const } : {}), ...done };
+    case 'commandExecution':
+      return {
+        id, kind: 'command', command: string(item.command) ?? '', cwd: string(item.cwd) ?? null,
+        status: codexStatus(item.status),
+        ...(typeof item.aggregatedOutput === 'string' ? { output: item.aggregatedOutput } : {}),
+        ...(typeof item.exitCode === 'number' ? { exitCode: item.exitCode } : {}),
+        ...(typeof item.durationMs === 'number' ? { durationMs: item.durationMs } : {}),
+        ...done,
+      };
+    case 'fileChange':
+      return { id, kind: 'file_change', status: codexStatus(item.status), files: codexFileChanges(item.changes), ...done };
+    case 'mcpToolCall': {
+      const result = object(item.result);
+      return {
+        id, kind: 'tool_call', toolType: 'mcp', server: string(item.server) ?? null, tool: string(item.tool) ?? 'tool',
+        args: summarize(item.arguments), status: codexStatus(item.status),
+        ...(item.result ? { output: textParts(result.content) || summarize(result.structuredContent) } : {}),
+        error: string(object(item.error).message) ?? null,
+        ...(typeof item.durationMs === 'number' ? { durationMs: item.durationMs } : {}),
+        ...done,
+      };
+    }
+    case 'dynamicToolCall':
+      return {
+        id, kind: 'tool_call', toolType: 'tool', server: string(item.namespace) ?? null, tool: string(item.tool) ?? 'tool',
+        args: summarize(item.arguments), status: codexStatus(item.status),
+        ...(Array.isArray(item.contentItems) ? { output: textParts(item.contentItems) } : {}),
+        ...(item.success === false ? { error: 'Tool reported failure' } : {}),
+        ...(typeof item.durationMs === 'number' ? { durationMs: item.durationMs } : {}),
+        ...done,
+      };
+    case 'webSearch':
+      return {
+        id, kind: 'tool_call', toolType: 'search', server: null, tool: 'web_search', args: string(item.query) ?? '',
+        status: completedAt !== undefined ? 'completed' : 'running', ...done,
+      };
+    case 'contextCompaction':
+      return completedAt !== undefined ? { id, kind: 'notice', level: 'info', text: 'Context compacted', ...done } : null;
+    case 'userMessage':
+      return null;
+    default: {
+      const type = string(item.type);
+      if (!type) return null;
+      return {
+        id, kind: 'tool_call', toolType: 'tool', server: null, tool: type, args: '',
+        status: completedAt !== undefined ? codexStatus(item.status ?? 'completed') : 'running', ...done,
+      };
+    }
+  }
+}
+
+/** Maps one Codex app-server notification (already scoped to the active turn) to timeline events. */
+export function codexTimelineEvents(method: string, params: Obj): WorkerTimelineEvent[] {
+  const itemId = string(params.itemId) ?? '';
+  const delta = string(params.delta) ?? '';
+  switch (method) {
+    case 'item/started': {
+      const update = codexItemUpdate(params.item);
+      return update ? [{ type: 'item', item: update }] : [];
+    }
+    case 'item/completed': {
+      const at = typeof params.completedAtMs === 'number' ? params.completedAtMs : Date.now();
+      const update = codexItemUpdate(params.item, at);
+      return update ? [{ type: 'item', item: update }] : [];
+    }
+    case 'item/agentMessage/delta':
+      return itemId ? [{ type: 'delta', id: itemId, kind: 'message', field: 'text', delta }] : [];
+    case 'item/reasoning/textDelta':
+      return itemId ? [{ type: 'delta', id: itemId, kind: 'reasoning', field: 'text', delta }] : [];
+    case 'item/reasoning/summaryTextDelta':
+      return itemId ? [{ type: 'delta', id: itemId, kind: 'reasoning', field: 'summary', delta }] : [];
+    case 'item/reasoning/summaryPartAdded':
+      return itemId && typeof params.summaryIndex === 'number' && params.summaryIndex > 0
+        ? [{ type: 'delta', id: itemId, kind: 'reasoning', field: 'summary', delta: '\n\n' }] : [];
+    case 'item/commandExecution/outputDelta':
+      return itemId ? [{ type: 'delta', id: itemId, kind: 'command', field: 'output', delta }] : [];
+    case 'item/plan/delta':
+      return itemId ? [{ type: 'delta', id: itemId, kind: 'plan', field: 'text', delta }] : [];
+    case 'item/mcpToolCall/progress':
+      return itemId ? [{ type: 'item', item: { id: itemId, kind: 'tool_call', progress: string(params.message) ?? null } }] : [];
+    case 'item/fileChange/patchUpdated':
+      return itemId ? [{ type: 'item', item: { id: itemId, kind: 'file_change', files: codexFileChanges(params.changes) } }] : [];
+    case 'turn/plan/updated': {
+      const turnId = string(params.turnId) ?? 'turn';
+      const steps = (Array.isArray(params.plan) ? params.plan : []).map(object).map((entry) => ({
+        step: string(entry.step) ?? '',
+        status: entry.status === 'completed' ? 'completed' as const
+          : entry.status === 'inProgress' ? 'in_progress' as const : 'pending' as const,
+      }));
+      const done = steps.length > 0 && steps.every((step) => step.status === 'completed');
+      return [{
+        type: 'item',
+        item: { id: `plan:${turnId}`, kind: 'plan', explanation: string(params.explanation) ?? null, steps,
+          status: done ? 'completed' : 'running' },
+      }];
+    }
+    case 'error': {
+      const message = string(object(params.error).message) ?? 'Codex reported an error';
+      return [{ type: 'notice', level: params.willRetry ? 'warning' : 'error', text: message }];
+    }
+    default:
+      return [];
+  }
+}
 export function enabledCodexPilot(platform: NodeJS.Platform, setting: boolean, override?: string): boolean {
   return platform === 'win32' && (override === '1' || (override !== '0' && setting));
 }
@@ -172,6 +337,7 @@ export class CodexAppServerPilot {
   get alive(): boolean { return !this.disconnected && !this.stopping; }
   get sessionId(): string | null { return this.threadId; }
   get busy(): boolean { return this.active !== null; }
+  get closing(): boolean { return this.stopping; }
   get latestDispatchId(): string | null { return this.outputDispatchId; }
 
   async open(cwd: string, model: string | null): Promise<string> {
@@ -265,6 +431,18 @@ export class CodexAppServerPilot {
       hasMore: start + text.length < this.offset + this.output.length,
       alive: this.alive, exitCode: this.child.exitCode,
     };
+  }
+
+  /** Asks Codex to interrupt the running turn; the turn then completes as interrupted. */
+  async interrupt(): Promise<boolean> {
+    const active = this.active;
+    if (!this.alive || !active?.id || !this.threadId) return false;
+    try {
+      await this.request('turn/interrupt', { threadId: this.threadId, turnId: active.id }, 5_000);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   close(interrupt = false): Promise<void> {
@@ -368,6 +546,7 @@ export class CodexAppServerPilot {
     const turnId = string(reportedTurn.id ?? params.turnId);
     if (turn.id && turnId !== turn.id) return;
     if (method === 'turn/started' && turnId) this.observeStart(turn, turnId);
+    this.emitTimeline(turn, method, params);
     if (method === 'item/agentMessage/delta' && typeof params.delta === 'string') {
       const itemId = string(params.itemId) ?? '';
       turn.messages.set(itemId, (turn.messages.get(itemId) ?? '') + params.delta);
@@ -397,6 +576,7 @@ export class CodexAppServerPilot {
         }),
       );
       if (Object.keys(total).length > 0) this.tokenTotal = total;
+      if (turn.usage) this.timeline(turn, { type: 'usage', usage: turn.usage });
     }
     if (method === 'turn/diff/updated') turn.diff = string(params.diff) ?? null;
     if (method === 'turn/completed' && turnId) {
@@ -423,7 +603,35 @@ export class CodexAppServerPilot {
   private observeStart(turn: ActiveTurn, id: string): void {
     if (turn.id) return;
     turn.id = id;
+    this.timeline(turn, { type: 'turn_started', turnId: id });
     this.events.onTurnStarted(turn.dispatchId);
+  }
+
+  private emitTimeline(turn: ActiveTurn, method: string, params: Obj): void {
+    if (!this.events.onTimeline) return;
+    for (const event of codexTimelineEvents(method, params)) this.timeline(turn, event);
+  }
+
+  private timeline(turn: ActiveTurn, event: WorkerTimelineEvent): void {
+    if (!this.events.onTimeline) return;
+    try {
+      this.events.onTimeline(turn.dispatchId, this.redactEvent(event));
+    } catch (error) {
+      console.warn('[orchestration] Codex timeline listener failed:', error);
+    }
+  }
+
+  private redactEvent(event: WorkerTimelineEvent): WorkerTimelineEvent {
+    if (this.secrets.length === 0) return event;
+    const walk = (value: unknown): unknown => {
+      if (typeof value === 'string') return this.redact(value);
+      if (Array.isArray(value)) return value.map(walk);
+      if (value && typeof value === 'object') {
+        return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, walk(entry)]));
+      }
+      return value;
+    };
+    return walk(event) as WorkerTimelineEvent;
   }
 
   private finishTurn(turn: ActiveTurn): void {
@@ -437,6 +645,10 @@ export class CodexAppServerPilot {
     const tail = Buffer.from(this.redact(this.stderrTail.toString('utf8')))
       .subarray(-STDERR_LIMIT).toString('utf8').trim();
     return tail ? `${safeReason}\nCodex stderr:\n${tail}` : safeReason;
+  }
+
+  redactText(text: string): string {
+    return this.redact(text);
   }
 
   private redact(text: string): string {

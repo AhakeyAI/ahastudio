@@ -77,9 +77,10 @@ const persistedPaneMetaSchema = z.object({
 
 const persistedStageWindowSchema = z.object({
   id: z.string().regex(PTY_ID_RE),
-  type: z.enum(['activity', 'terminal', 'file', 'browser']),
+  type: z.enum(['activity', 'terminal', 'file', 'browser', 'agent-session']),
   title: z.string().max(256),
   workerId: z.string().max(128).optional(),
+  dispatchId: z.string().max(200).optional(),
   localCliId: z.string().max(128).optional(),
   shellId: z.string().max(128).optional(),
   cwd: z.string().max(1024).optional(),

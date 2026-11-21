@@ -488,3 +488,29 @@ export function mergeRunSnapshot(
     currentRunByConsumer: incoming.currentRunByConsumer,
   };
 }
+
+export function isHeadlessDispatch(dispatch: Pick<OrchestrationDispatchRecord, 'executionMode'> | null | undefined): boolean {
+  return dispatch?.executionMode === 'codex-app-server';
+}
+
+/**
+ * The newest headless dispatch a focus target points at (by worker handle or dispatch id),
+ * so clicks on app-server Workers open their Agent session instead of a terminal.
+ */
+export function headlessDispatchForTarget(
+  snapshot: Pick<OrchestrationSnapshot, 'dispatches'>,
+  target: { ptyId: string | null; dispatchId: string | null },
+): OrchestrationDispatchRecord | null {
+  const seedId = target.dispatchId?.replace(/^dispatch:/, '');
+  const seed = seedId ? snapshot.dispatches.find((d) => d.id === seedId) : undefined;
+  const handle = seed && isHeadlessDispatch(seed)
+    ? seed.assigneeHandle
+    : target.ptyId && snapshot.dispatches.some((d) => d.assigneeHandle === target.ptyId && isHeadlessDispatch(d))
+      ? target.ptyId
+      : null;
+  if (!handle) return null;
+  return snapshot.dispatches
+    .filter((d) => d.assigneeHandle === handle && isHeadlessDispatch(d))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    .at(-1) ?? null;
+}

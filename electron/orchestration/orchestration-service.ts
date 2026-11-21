@@ -5,6 +5,9 @@ import { runGitCommand } from '../git/git-exec.js';
 import {
   CODEX_WORKER_ID, type CodexAppServerPilot, type CodexPilotEvents, type CodexTurnResult,
 } from './codex-app-server-pilot.js';
+import {
+  WorkerTimeline, type WorkerTimelineChange, type WorkerTimelineSnapshot, type WorkerTimelineTurnStatus,
+} from './worker-timeline.js';
 import type { PtyWriteFn } from '../agent/agent-prompt-delivery.js';
 import type { AgentPaneStatus, AgentStatusStore } from '../agent/agent-status-store.js';
 import { getGitStatus } from '../git/git-service.js';
@@ -163,6 +166,8 @@ export interface OrchestrationPaneSpawnedEvent {
   ownsPane?: boolean;
   displayName?: string | null;
   taskTitle?: string;
+  /** Set for app-server Workers: ptyId is the headless worker handle, not a terminal. */
+  headless?: boolean;
 }
 
 export interface OrchestrationPaneClosedEvent {
@@ -336,6 +341,8 @@ export class OrchestrationService {
   private readonly codexWorkers = new Map<string, CodexAppServerPilot>();
   private readonly codexSubmitting = new Set<string>();
   private readonly codexMailbox = new Set<string>();
+  private readonly workerTimelines = new Map<string, WorkerTimeline>();
+  private readonly timelineListeners = new Set<(change: WorkerTimelineChange) => void>();
   private disposed = false;
   private readonly closeWorkerPty?: OrchestrationServiceDependencies['closeWorkerPty'];
   private readonly externalIsPtyAlive?: (ptyId: string) => boolean;
@@ -454,6 +461,7 @@ export class OrchestrationService {
       agentStatusStore: this.agentStatusStore,
       notifyMailbox: (mailbox, type) => this.notifyTargetAndAliases(mailbox, type),
       onChanged: (reason, runId) => this.emitChanged(reason, runId),
+      onApprovalChanged: (approval) => this.timelineApproval(approval),
       resolveRoleName: (dispatch) => this.resolveRoleNameForDispatch(dispatch) || null,
       cliCommand: this.cliCommand,
       holdTimeoutMs: deps.approvalHoldTimeoutMs,
@@ -621,6 +629,83 @@ export class OrchestrationService {
     return () => this.paneSpawnedListeners.delete(listener);
   }
 
+  onWorkerTimelineChange(listener: (change: WorkerTimelineChange) => void): () => void {
+    this.timelineListeners.add(listener);
+    return () => this.timelineListeners.delete(listener);
+  }
+
+  /** Live timeline for a running headless Worker, else the archived copy on its dispatch. */
+  getWorkerTimeline(input: { dispatchId?: string; workerHandle?: string }): WorkerTimelineSnapshot | null {
+    const rawId = input.dispatchId?.trim().replace(/^dispatch:/, '');
+    if (rawId) {
+      const dispatch = this.store.getDispatchContext(rawId);
+      if (!dispatch) throw new OrchestrationError('dispatch_not_found', `Dispatch not found: ${rawId}`);
+      const live = this.workerTimelines.get(dispatch.assigneeHandle);
+      if (live) return live.snapshot();
+      const latest = this.store.resolveDispatchLineage(dispatch.id);
+      return (latest ? this.store.getArchivedTimeline(latest.id) : null) ?? this.store.getArchivedTimeline(dispatch.id);
+    }
+    const handle = input.workerHandle?.trim();
+    if (!handle) throw new OrchestrationError('invalid_argument', 'dispatchId or workerHandle is required.');
+    const live = this.workerTimelines.get(handle);
+    if (live) return live.snapshot();
+    const archived = this.store.listDispatches()
+      .filter((dispatch) => dispatch.assigneeHandle === handle && dispatch.archivedTimeline)
+      .at(-1);
+    return archived ? this.store.getArchivedTimeline(archived.id) : null;
+  }
+
+  async workerInterrupt(input: { dispatchId?: string; worker?: string; taskId?: string }): Promise<{
+    dispatch: OrchestrationDispatchRecord; interrupted: boolean;
+  }> {
+    const dispatch = this.resolveTargetDispatch(input);
+    const session = dispatch.executionMode === 'codex-app-server'
+      ? this.codexWorkers.get(dispatch.assigneeHandle) : undefined;
+    if (!session?.alive) {
+      throw new OrchestrationError('dispatch_inactive', 'Only a live headless Worker turn can be interrupted.');
+    }
+    const interrupted = await session.interrupt();
+    return { dispatch: this.store.getDispatchContext(dispatch.id) ?? dispatch, interrupted };
+  }
+
+  private createWorkerTimeline(workerId: string, model: string | null, redact: (text: string) => string): WorkerTimeline {
+    const timeline = new WorkerTimeline({
+      workerHandle: workerId, cliId: 'codex', model, readOnly: true,
+      redact: (text) => this.store.redactDispatchCredentials(redact(text)),
+      now: this.clock,
+      onPatch: (change) => {
+        for (const listener of this.timelineListeners) {
+          try {
+            listener(change);
+          } catch (error) {
+            console.warn('[orchestration] worker timeline listener failed:', error);
+          }
+        }
+      },
+    });
+    this.workerTimelines.set(workerId, timeline);
+    return timeline;
+  }
+
+  private archiveWorkerTimeline(workerId: string, dispatchId: string | null | undefined): void {
+    const timeline = this.workerTimelines.get(workerId);
+    if (timeline && dispatchId) this.store.archiveDispatchTimeline(dispatchId, timeline.archive());
+  }
+
+  private timelineApproval(approval: WorkerApprovalPayload): void {
+    const timeline = this.workerTimelines.get(approval.workerHandle);
+    if (!timeline) return;
+    timeline.upsertApproval({
+      approvalId: approval.approvalId,
+      dispatchId: approval.dispatchId,
+      method: approval.eventName,
+      tool: approval.toolName,
+      input: approval.toolInput,
+      reason: approval.message ?? null,
+      status: approval.status,
+      resolution: approval.status === 'pending' ? null : approval.reason,
+    });
+  }
   onPaneClosed(listener: (event: OrchestrationPaneClosedEvent) => void): () => void {
     this.paneClosedListeners.add(listener);
     return () => this.paneClosedListeners.delete(listener);
@@ -673,6 +758,7 @@ export class OrchestrationService {
       const run = this.store.getRun(dispatch.runId);
       if (run?.status === 'active') continue;
       this.archiveCodexOutput(codex, dispatch.id);
+      this.archiveWorkerTimeline(workerId, dispatch.id);
       void codex.close(true);
     }
   }
@@ -2982,6 +3068,19 @@ export class OrchestrationService {
       artifacts: effectiveArtifacts,
     }, settleReview);
 
+    const timeline = resolvedDispatch.executionMode === 'codex-app-server'
+      ? this.workerTimelines.get(resolvedDispatch.assigneeHandle) : undefined;
+    if (timeline && sent.lifecycle?.action !== 'duplicate') {
+      timeline.addSettlement(resolvedDispatch.id, {
+        settlement: 'report_done', stopReason: null, outcome,
+        verdict: effectiveArtifacts?.reviewVerdict ?? input.verdict ?? null,
+        findings: (effectiveArtifacts?.reviewFindings ?? normalizedFindings).map((finding) =>
+          [finding.severity, finding.location, finding.title].filter(Boolean).join(' · ')),
+        summary, diff: null, diffSource: null,
+      });
+      this.archiveWorkerTimeline(resolvedDispatch.assigneeHandle, resolvedDispatch.id);
+    }
+
     if (workerRole && typeof sent.message.boardSeq === 'number') {
       this.store.advanceMemberCursor(resolvedDispatch.runId, workerRole, {
         lastPostSeq: sent.message.boardSeq,
@@ -4812,6 +4911,12 @@ export class OrchestrationService {
         });
       } else {
         acceptedByCodex = true;
+        this.emitPaneSpawned({
+          ptyId: pilot.id, runId: run.id, taskId: task.id, dispatchId: ctx.id, parentPaneId,
+          cwd: placement.cwd, worktreePath: placement.worktreePath, branch: placement.branch,
+          cliId: launchConfig.cliId, ownsWorktree: placement.ownsWorktree, ownsPane: false,
+          displayName: task.displayName ?? null, taskTitle: task.taskTitle, headless: true,
+        });
       }
     }
 
@@ -4911,8 +5016,12 @@ export class OrchestrationService {
     if (this.disposed || !this.codexPilot) return null;
     const id = `codex-worker-${randomUUID()}`;
     let session: CodexAppServerPilot | undefined;
+    const timeline = this.createWorkerTimeline(id, model, (text) => session?.redactText(text) ?? text);
     try {
       session = this.codexPilot.launch(id, cwd, {
+        onTimeline: (dispatchId, event) => {
+          if (timeline.activeTurn?.dispatchId === dispatchId) timeline.apply(event);
+        },
         onTurnStarted: (dispatchId) => {
           const waiting = this.approvals.hasOpenApprovalForDispatch(dispatchId);
           const updated = this.store.updateDispatchObservation(dispatchId, waiting ? 'permission' : 'observed', {
@@ -4930,6 +5039,10 @@ export class OrchestrationService {
         onExit: (reason, exitCode) => {
           const dispatchId = session?.latestDispatchId;
           if (session && dispatchId) this.archiveCodexOutput(session, dispatchId);
+          timeline.endActiveTurn(session?.closing ? 'interrupted' : 'failed', reason);
+          timeline.setMeta({ alive: false });
+          this.archiveWorkerTimeline(id, dispatchId);
+          this.workerTimelines.delete(id);
           this.codexWorkers.delete(id);
           this.codexMailbox.delete(id);
           this.approvals.cancelForPane(id, reason);
@@ -4943,11 +5056,13 @@ export class OrchestrationService {
       this.codexWorkers.set(id, session);
       const sessionId = await session.open(cwd, model);
       if (!session.alive || this.disposed) throw new Error('Codex app-server closed during initialization');
+      timeline.setMeta({ providerSessionId: sessionId });
       return { id, session, sessionId };
     } catch (error) {
       // No turn was sent, so PTY fallback can safely proceed after process teardown.
       console.warn('[orchestration] Codex pilot startup failed:', error instanceof Error ? error.message : String(error));
       await session?.close();
+      this.workerTimelines.delete(id);
       return null;
     }
   }
@@ -4975,13 +5090,27 @@ export class OrchestrationService {
     const session = this.codexWorkers.get(workerId);
     if (session) this.archiveCodexOutput(session, dispatchId);
     this.approvals.cancelForDispatch(dispatchId, 'Codex turn ended');
+    const timeline = this.workerTimelines.get(workerId);
+    const status: WorkerTimelineTurnStatus = result.stopReason === 'completed' ? 'completed'
+      : result.stopReason === 'interrupted' ? 'interrupted' : 'failed';
+    timeline?.completeTurn({
+      turnId: result.turnId, status, stopReason: result.stopReason, usage: result.usage, error: result.error,
+    });
     this.store.recordCodexTurn(dispatchId, result);
+    this.archiveWorkerTimeline(workerId, dispatchId);
     const dispatch = this.store.getDispatchContext(dispatchId);
     if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
     const announce = (diff: string | null) => {
       const current = this.store.getDispatchContext(dispatchId);
       if (!current || !ACTIVE_DISPATCH_STATUSES.has(current.status) || current.codexTurn?.turnId !== result.turnId) return;
       if (diff !== result.diff) this.store.recordCodexTurn(dispatchId, { ...result, diff }, false);
+      const liveTimeline = this.workerTimelines.get(workerId);
+      liveTimeline?.addSettlement(dispatchId, {
+        settlement: 'turn_pending_confirmation', stopReason: result.stopReason, outcome: null, verdict: null,
+        findings: [], summary: result.finalText.slice(0, 4_000), diff,
+        diffSource: diff === null ? null : result.diff !== null ? 'provider' : 'git',
+      });
+      this.archiveWorkerTimeline(workerId, dispatchId);
       this.publishCodexStatus(current, 'Codex turn ended; result pending confirmation',
         `Codex turn ${result.stopReason} without a recorded report_done. Read the Worker output and diff evidence before deciding what to do.\n\n${result.finalText.slice(0, 4_000)}`,
         { turnId: result.turnId, stopReason: result.stopReason, error: result.error, usage: result.usage, diff });
@@ -5029,8 +5158,11 @@ export class OrchestrationService {
 
   private async submitCodexTurn(dispatch: OrchestrationDispatchRecord, session: CodexAppServerPilot, prompt: string) {
     this.codexSubmitting.add(dispatch.id);
+    const timeline = this.workerTimelines.get(dispatch.assigneeHandle);
+    timeline?.beginTurn({ dispatchId: dispatch.id, prompt });
     try {
       const result = await session.startTurn(dispatch.id, prompt, dispatch.effort ?? null);
+      if (result.status !== 'accepted') timeline?.endActiveTurn('failed', result.reason);
       if (result.status === 'unknown_acceptance') this.failCodexDispatch(dispatch.id, result.status, result.reason);
       if (result.status === 'accepted' && !session.alive) {
         this.handleCodexExit(dispatch.id, 'Codex disconnected after accepting the turn', null);
@@ -5824,7 +5956,10 @@ export class OrchestrationService {
       settled = this.store.getDispatchContext(dispatch.id) ?? settled;
     }
 
-    if (codex) await codex.close(true);
+    if (codex) {
+      this.archiveWorkerTimeline(dispatch.assigneeHandle, dispatch.id);
+      await codex.close(true);
+    }
 
     let closedPane = false;
     if (shouldClosePane) {
@@ -5885,6 +6020,7 @@ export class OrchestrationService {
     if (codex) this.archiveCodexOutput(codex, dispatch.id);
 
     this.approvals.cancelForDispatch(dispatch.id, input.reason || 'Worker abandoned');
+    if (codex) this.archiveWorkerTimeline(dispatch.assigneeHandle, dispatch.id);
     if (!headless && paneId) {
       this.turnStopMonitor.cancelForPane(paneId);
       if (this.terminalTracker) {

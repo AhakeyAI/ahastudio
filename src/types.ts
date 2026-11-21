@@ -686,6 +686,7 @@ export interface OrchestrationDispatchRecord {
   retained?: boolean;
   releasedAt?: string | null;
   archivedOutput?: string | null;
+  hasArchivedTimeline?: boolean;
   status: OrchestrationDispatchStatus;
   failureCount: number;
   lastFailureReason: string | null;
@@ -987,6 +988,8 @@ export interface OrchestrationPaneSpawnedEvent {
   cliId?: string;
   ownsWorktree?: boolean;
   ownsPane?: boolean;
+  /** Set for app-server Workers: ptyId is the headless worker handle, not a terminal. */
+  headless?: boolean;
 }
 
 export interface OrchestrationPaneClosedEvent {
@@ -994,6 +997,117 @@ export interface OrchestrationPaneClosedEvent {
   runId?: string;
   taskId?: string;
   dispatchId?: string;
+}
+
+// Mirrors electron/orchestration/worker-timeline.ts.
+export type WorkerTimelineTurnStatus = 'running' | 'completed' | 'interrupted' | 'failed';
+export type WorkerTimelineItemStatus = 'running' | 'completed' | 'failed' | 'declined';
+export type WorkerTimelineApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired';
+
+interface WorkerTimelineItemBase {
+  id: string;
+  startedAt: number | null;
+  completedAt: number | null;
+}
+
+export interface WorkerTimelineFileChange {
+  path: string;
+  change: 'add' | 'delete' | 'update';
+  movePath: string | null;
+  diff: string;
+  added: number;
+  removed: number;
+  truncated: boolean;
+}
+
+export type WorkerTimelineItem =
+  | (WorkerTimelineItemBase & { kind: 'reasoning'; status: WorkerTimelineItemStatus; summary: string; text: string })
+  | (WorkerTimelineItemBase & {
+      kind: 'plan';
+      status: WorkerTimelineItemStatus;
+      explanation: string | null;
+      steps: Array<{ step: string; status: 'pending' | 'in_progress' | 'completed' }>;
+      text: string;
+    })
+  | (WorkerTimelineItemBase & {
+      kind: 'command';
+      status: WorkerTimelineItemStatus;
+      command: string;
+      cwd: string | null;
+      output: string;
+      outputTruncated: boolean;
+      exitCode: number | null;
+      durationMs: number | null;
+    })
+  | (WorkerTimelineItemBase & { kind: 'file_change'; status: WorkerTimelineItemStatus; files: WorkerTimelineFileChange[] })
+  | (WorkerTimelineItemBase & {
+      kind: 'tool_call';
+      status: WorkerTimelineItemStatus;
+      toolType: 'mcp' | 'search' | 'tool';
+      server: string | null;
+      tool: string;
+      args: string;
+      progress: string | null;
+      output: string;
+      error: string | null;
+      durationMs: number | null;
+    })
+  | (WorkerTimelineItemBase & {
+      kind: 'approval';
+      approvalId: string;
+      method: string;
+      tool: string;
+      input: string;
+      reason: string | null;
+      status: WorkerTimelineApprovalStatus;
+      resolution: string | null;
+    })
+  | (WorkerTimelineItemBase & { kind: 'message'; status: WorkerTimelineItemStatus; role: 'assistant' | 'user'; text: string })
+  | (WorkerTimelineItemBase & { kind: 'notice'; level: 'info' | 'warning' | 'error'; text: string })
+  | (WorkerTimelineItemBase & {
+      kind: 'settlement';
+      settlement: 'turn_pending_confirmation' | 'report_done';
+      stopReason: string | null;
+      outcome: string | null;
+      verdict: string | null;
+      findings: string[];
+      summary: string;
+      diff: string | null;
+      diffSource: 'provider' | 'git' | null;
+    });
+
+export interface WorkerTimelineTurn {
+  key: string;
+  dispatchId: string;
+  turnId: string | null;
+  generation: number;
+  prompt: string;
+  startedAt: number;
+  completedAt: number | null;
+  status: WorkerTimelineTurnStatus;
+  stopReason: string | null;
+  usage: Record<string, number> | null;
+  error: string | null;
+  itemsTrimmed?: boolean;
+  items: WorkerTimelineItem[];
+}
+
+export interface WorkerTimelineSnapshot {
+  workerHandle: string;
+  providerSessionId: string | null;
+  cliId: string;
+  model: string | null;
+  readOnly: boolean;
+  alive: boolean;
+  seq: number;
+  turns: WorkerTimelineTurn[];
+}
+
+export interface WorkerTimelinePatch {
+  workerHandle: string;
+  seq: number;
+  header: Omit<WorkerTimelineSnapshot, 'turns'>;
+  turns: WorkerTimelineTurn[];
 }
 
 export type OrchestrationTaskShowResult = {
@@ -1228,6 +1342,15 @@ export interface OrchestrationApi {
       archived: boolean;
     }>
   >;
+  workerTimelineGet?: (opts: {
+    dispatchId?: string;
+    workerHandle?: string;
+  }) => Promise<OrchestrationResult<{ timeline: WorkerTimelineSnapshot | null }>>;
+  workerInterrupt?: (opts: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+  }) => Promise<OrchestrationResult<{ dispatch: OrchestrationDispatchRecord; interrupted: boolean }>>;
   workerKeepOpen?: (opts: {
     dispatchId?: string;
     worker?: string;
@@ -1581,6 +1704,7 @@ export interface OrchestrationApi {
   onEvent: (cb: (event: OrchestrationEvent) => void) => () => void;
   onPaneSpawned: (cb: (event: OrchestrationPaneSpawnedEvent) => void) => () => void;
   onPaneClosed: (cb: (event: OrchestrationPaneClosedEvent) => void) => () => void;
+  onWorkerTimelinePatch?: (cb: (patch: WorkerTimelinePatch) => void) => () => void;
 }
 
 export interface TerminalRestoreEvent {
@@ -1629,9 +1753,10 @@ export interface PersistedWorkspaceState {
   version: 1;
   windows: Array<{
     id: string;
-    type: 'activity' | 'terminal' | 'file' | 'browser';
+    type: 'activity' | 'terminal' | 'file' | 'browser' | 'agent-session';
     title: string;
     workerId?: string;
+    dispatchId?: string;
     localCliId?: string;
     shellId?: string;
     cwd?: string;

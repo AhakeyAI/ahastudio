@@ -35,6 +35,8 @@ export interface PermissionApprovalManagerDependencies {
   agentStatusStore: AgentStatusStore;
   notifyMailbox: (mailboxHandle: string, type: OrchestrationMessageType) => void;
   onChanged?: (reason: string, runId: string) => void;
+  /** Receives a copy of the approval each time it is created or resolved. */
+  onApprovalChanged?: (approval: WorkerApprovalPayload) => void;
   resolveRoleName?: (dispatch: OrchestrationDispatchRecord) => string | null;
   cliCommand?: string;
   holdTimeoutMs?: number;
@@ -328,6 +330,7 @@ export class PermissionApprovalManager {
     });
 
     this.deps.notifyMailbox(parentMailbox, 'escalation');
+    this.notifyApproval(payload);
     this.deps.onChanged?.('approval:requested', dispatch.runId);
 
     return decision;
@@ -378,6 +381,7 @@ export class PermissionApprovalManager {
       });
       this.deps.store.updateDispatchStage(entry.payload.dispatchId, 'working');
     }
+    this.notifyApproval(entry.payload);
     this.deps.onChanged?.('approval:approved', entry.payload.runId);
 
     return { approval: { ...entry.payload } };
@@ -429,6 +433,7 @@ export class PermissionApprovalManager {
       });
       this.deps.store.updateDispatchStage(entry.payload.dispatchId, 'working');
     }
+    this.notifyApproval(entry.payload);
     this.deps.onChanged?.('approval:denied', entry.payload.runId);
 
     return { approval: { ...entry.payload } };
@@ -566,7 +571,17 @@ export class PermissionApprovalManager {
         this.deps.store.updateDispatchObservation(dispatch.id, 'observed', { reason, refreshHeartbeat: true });
       }
     }
+    this.notifyApproval(entry.payload);
     this.deps.onChanged?.('approval:expired', entry.payload.runId);
+  }
+
+  private notifyApproval(payload: WorkerApprovalPayload): void {
+    if (!this.deps.onApprovalChanged) return;
+    try {
+      this.deps.onApprovalChanged({ ...payload });
+    } catch (error) {
+      console.warn('[orchestration] approval listener failed:', error);
+    }
   }
 
   private removeOpenEntry(entry: HeldApprovalEntry): void {

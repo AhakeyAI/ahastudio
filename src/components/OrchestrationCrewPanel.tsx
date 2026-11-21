@@ -29,6 +29,7 @@ import {
 } from '../lib/orchestration-crew-model';
 import { isMacSearchPlatform } from '../lib/terminal-search-options';
 import { dispatchFocusOrchestrationTarget } from '../lib/terminal-links/orchestration-terminal-links';
+import { headlessDispatchForTarget } from '../lib/orchestration-view';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
 import './orchestration-crew-panel.css';
 
@@ -174,14 +175,18 @@ export function OrchestrationCrewPanel({
       cwd?: string | null;
       cliId?: string | null;
     }) => {
-      if (!entry.ptyId) {
+      const headless = headlessDispatchForTarget(orchestrationClient.getSnapshot(), {
+        ptyId: entry.ptyId,
+        dispatchId: entry.dispatchId ?? null,
+      });
+      if (!entry.ptyId && !headless) {
         onNotify?.(`${entry.label} 没有关联的活跃终端`);
         return;
       }
       dispatchFocusOrchestrationTarget({
         kind: 'dispatch',
         label: entry.label,
-        ptyId: entry.ptyId,
+        ptyId: entry.ptyId ?? headless?.assigneeHandle ?? null,
         dispatchId: entry.dispatchId ?? null,
         taskId: entry.taskId ?? null,
         cwd: entry.cwd ?? null,

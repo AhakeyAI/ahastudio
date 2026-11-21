@@ -638,6 +638,9 @@ export function buildSidebarWindowLineage<TWin extends { id: string; cwd?: strin
     for (const leafId of getWindowLeafIds(win.id)) {
       ptyToWindow.set(`local-${leafId}`, win);
     }
+    // Headless Worker sessions have no terminal leaf; their worker handle is the assignee.
+    const session = win as { type?: string; workerId?: string };
+    if (session.type === 'agent-session' && session.workerId) ptyToWindow.set(session.workerId, win);
   }
 
   const collapsed = collapseFollowUpLineages(snapshot.dispatches);

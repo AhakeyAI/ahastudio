@@ -14,6 +14,9 @@ import { OrchestrationService } from '../dist-electron/orchestration/orchestrati
 import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
 import { spawnWindowsCodexJob } from '../dist-electron/orchestration/windows-codex-job.js';
 import { dispatchOrchestrationHttpAction } from '../dist-electron/orchestration/orchestration-http-router.js';
+import {
+  TIMELINE_LIMITS, WorkerTimeline, WorkerTimelinePatchCoalescer, trimTimelineSnapshot,
+} from '../dist-electron/orchestration/worker-timeline.js';
 
 const cwd = process.cwd();
 const stderrSecret = 'pilot-stderr-credential-example';
@@ -532,4 +535,204 @@ test('active interrupt and unexpected exit both reap the mock and archive live o
   assert.equal(app.service.isPaneAlive(crashed.dispatch.assigneeHandle), false);
   assert.match(app.service.workerRead({ dispatchId: crashed.dispatch.id }).text, /output before process crash/);
   assert.equal(app.ptyStarts(), 0);
+});
+
+const timelineItems = (snapshot, turn = 0) => Object.fromEntries(snapshot.turns[turn].items.map((item) => [item.id, item]));
+
+test('headless timeline captures every process step in place, redacts secrets, and archives on stop', async (t) => {
+  const app = await setup(t);
+  const changes = [];
+  app.service.onWorkerTimelineChange((change) => changes.push(change));
+  const { dispatch } = await app.start('RICH_TIMELINE');
+  await until(() => app.store.getDispatchContext(dispatch.id)?.codexTurn);
+  const live = await until(() => {
+    const snapshot = app.service.getWorkerTimeline({ dispatchId: dispatch.id });
+    return snapshot?.turns[0]?.items.some((item) => item.kind === 'settlement') ? snapshot : null;
+  });
+  assert.equal(live.workerHandle, dispatch.assigneeHandle);
+  assert.equal(live.cliId, 'codex');
+  assert.equal(live.readOnly, true);
+  assert.equal(live.alive, true);
+  assert.equal(live.providerSessionId, dispatch.providerSessionId);
+  assert.deepEqual(app.service.getWorkerTimeline({ workerHandle: dispatch.assigneeHandle }).turns.length, 1);
+  const [turn] = live.turns;
+  assert.equal(turn.status, 'completed');
+  assert.equal(turn.turnId, 'mock-turn-1');
+  assert.equal(turn.dispatchId, dispatch.id);
+  assert.deepEqual(turn.usage, { inputTokens: 23, outputTokens: 7 });
+  assert.match(turn.prompt, /RICH_TIMELINE/);
+  assert.deepEqual(turn.items.map((item) => item.kind),
+    ['reasoning', 'plan', 'command', 'file_change', 'tool_call', 'message', 'settlement']);
+  const items = timelineItems(live);
+  assert.equal(items.think.summary, 'Inspecting the workspace');
+  assert.equal(items.think.status, 'completed');
+  assert.deepEqual(items['plan:mock-turn-1'].steps, [
+    { step: 'List files', status: 'completed' }, { step: 'Summarize', status: 'in_progress' },
+  ]);
+  assert.equal(items['plan:mock-turn-1'].explanation, 'Two steps');
+  assert.equal(items.cmd.command, 'Get-ChildItem');
+  assert.equal(items.cmd.exitCode, 0);
+  assert.equal(items.cmd.durationMs, 120);
+  assert.equal(items.cmd.status, 'completed');
+  assert.match(items.cmd.output, /^README\.md\ntoken=<redacted>/);
+  assert.equal(items.patch.files.length, 1);
+  assert.deepEqual(
+    { path: items.patch.files[0].path, change: items.patch.files[0].change,
+      added: items.patch.files[0].added, removed: items.patch.files[0].removed },
+    { path: 'src/demo.ts', change: 'update', added: 2, removed: 1 },
+  );
+  assert.match(items.patch.files[0].diff, /\+extra line/);
+  assert.equal(items.mcp.toolType, 'mcp');
+  assert.equal(`${items.mcp.server}/${items.mcp.tool}`, 'aha/read_board');
+  assert.equal(items.mcp.args, '{"limit":5}');
+  assert.equal(items.mcp.progress, 'reading board');
+  assert.equal(items.mcp.output, 'board ok');
+  assert.equal(items.answer.text, 'Rich **timeline** done');
+  assert.equal(items.answer.status, 'completed');
+  const settlement = turn.items.at(-1);
+  assert.equal(settlement.settlement, 'turn_pending_confirmation');
+  assert.equal(settlement.stopReason, 'completed');
+  assert.doesNotMatch(JSON.stringify(live), new RegExp(stderrSecret));
+  assert.ok(changes.length > 0);
+  assert.ok(changes.every((change) => change.timeline.workerHandle === dispatch.assigneeHandle));
+
+  const view = app.service.getSnapshot(app.run.id).dispatches.find((entry) => entry.id === dispatch.id);
+  assert.equal(view.hasArchivedTimeline, true);
+  assert.equal(view.archivedTimeline, undefined, 'renderer snapshots never carry the archive itself');
+
+  await app.service.workerStop({ dispatchId: dispatch.id });
+  const archived = await until(() => {
+    const value = app.store.getArchivedTimeline(dispatch.id);
+    return value?.alive === false ? value : null;
+  });
+  assert.deepEqual(archived.turns[0].items.map((item) => item.id), turn.items.map((item) => item.id));
+  const fallback = app.service.getWorkerTimeline({ dispatchId: dispatch.id });
+  assert.equal(fallback.alive, false);
+  assert.equal(fallback.turns[0].key, turn.key);
+  await app.service.waitForPendingWrites();
+  const persisted = JSON.parse(readFileSync(app.statePath, 'utf8')).dispatches.find((entry) => entry.id === dispatch.id);
+  assert.equal(persisted.archivedTimeline.turns[0].key, turn.key);
+  assert.doesNotMatch(JSON.stringify(persisted.archivedTimeline), new RegExp(stderrSecret));
+  const restored = new OrchestrationStore({ resolveFile: () => app.statePath });
+  restored.load();
+  assert.equal(restored.getArchivedTimeline(dispatch.id).turns[0].items.length, turn.items.length);
+});
+
+test('timeline shows inline approvals with their resolution and a follow-up as a second turn', async (t) => {
+  const app = await setup(t);
+  const { dispatch } = await app.start('ASK_FOR_APPROVAL');
+  const pending = await until(() => app.service.getWorkerTimeline({ dispatchId: dispatch.id })
+    ?.turns[0]?.items.find((item) => item.kind === 'approval'));
+  assert.equal(pending.status, 'pending');
+  assert.equal(pending.method, 'item/commandExecution/requestApproval');
+  assert.match(pending.input, /Get-Location/);
+  app.service.deny({ id: pending.approvalId, reason: 'test decline' }, 'coordinator-pane');
+  const resolved = await until(() => {
+    const item = app.service.getWorkerTimeline({ dispatchId: dispatch.id }).turns[0].items
+      .find((entry) => entry.kind === 'approval');
+    return item.status === 'denied' ? item : null;
+  });
+  assert.equal(resolved.resolution, 'test decline');
+  await until(() => app.store.getDispatchContext(dispatch.id)?.codexTurn);
+  await app.service.send({
+    from: 'coordinator-pane', to: 'dispatch:' + dispatch.id, runId: app.run.id,
+    type: 'status', subject: 'Mailbox follow-up', body: 'Read the next detail.',
+  });
+  const two = await until(() => {
+    const snapshot = app.service.getWorkerTimeline({ workerHandle: dispatch.assigneeHandle });
+    return snapshot.turns.length === 2 && snapshot.turns[1].status === 'completed' ? snapshot : null;
+  });
+  assert.notEqual(two.turns[0].key, two.turns[1].key);
+  assert.equal(two.turns[1].turnId, 'mock-turn-2');
+  assert.equal(timelineItems(two, 0).answer.text, 'approval decision: decline');
+  assert.equal(timelineItems(two, 1).answer.text, '模拟输出 2', 'repeated provider item ids stay in their own turn');
+});
+
+test('timeline interrupt keeps the Worker alive and a crash archives a failed turn', async (t) => {
+  const app = await setup(t);
+  const waiting = (await app.start('WAIT_FOR_INTERRUPT')).dispatch;
+  await until(() => app.service.getWorkerTimeline({ dispatchId: waiting.id })?.turns[0]?.turnId);
+  const result = await app.service.workerInterrupt({ dispatchId: waiting.id });
+  assert.equal(result.interrupted, true);
+  const interrupted = await until(() => {
+    const snapshot = app.service.getWorkerTimeline({ dispatchId: waiting.id });
+    return snapshot.turns[0].status === 'interrupted' ? snapshot : null;
+  });
+  assert.equal(interrupted.alive, true);
+  assert.equal(timelineItems(interrupted).answer.text, 'output before cancel');
+  assert.ok(app.getTrace().some((message) => message.method === 'turn/interrupt'));
+  assert.equal(app.service.isPaneAlive(waiting.assigneeHandle), true);
+
+  const crashed = (await app.start('CRASH_LATER')).dispatch;
+  const archived = await until(() => {
+    const value = app.store.getArchivedTimeline(crashed.id);
+    return value?.alive === false ? value : null;
+  });
+  assert.equal(archived.turns[0].status, 'failed');
+  assert.match(archived.turns[0].error, /exited/);
+  assert.equal(timelineItems(archived).answer.text, 'output before process crash');
+  assert.equal(app.service.getWorkerTimeline({ dispatchId: crashed.id }).alive, false);
+  await assert.rejects(app.service.workerInterrupt({ dispatchId: crashed.id }), (error) => error.code === 'dispatch_inactive');
+});
+
+test('timeline redacts secrets split across deltas and caps oversized output', () => {
+  const timeline = new WorkerTimeline({
+    workerHandle: 'w', cliId: 'codex', model: null, readOnly: true,
+    redact: (text) => text.replaceAll(stderrSecret, '<redacted>'),
+  });
+  timeline.beginTurn({ dispatchId: 'd1', prompt: 'prompt with ' + stderrSecret });
+  timeline.apply({ type: 'turn_started', turnId: 't1' });
+  timeline.apply({ type: 'item', item: { id: 'c', kind: 'command', command: 'echo' } });
+  timeline.apply({ type: 'delta', id: 'c', kind: 'command', field: 'output', delta: stderrSecret.slice(0, 9) });
+  timeline.apply({ type: 'delta', id: 'c', kind: 'command', field: 'output', delta: stderrSecret.slice(9) + '\n' });
+  let snapshot = timeline.snapshot();
+  assert.equal(snapshot.turns[0].prompt, 'prompt with <redacted>');
+  assert.equal(snapshot.turns[0].items[0].output, '<redacted>\n');
+  timeline.apply({ type: 'delta', id: 'c', kind: 'command', field: 'output', delta: 'x'.repeat(TIMELINE_LIMITS.output + 10) + 'TAIL' });
+  snapshot = timeline.snapshot();
+  const command = snapshot.turns[0].items[0];
+  assert.equal(command.outputTruncated, true);
+  assert.ok(command.output.endsWith('TAIL'));
+  assert.ok(command.output.length <= TIMELINE_LIMITS.output + 20);
+  timeline.completeTurn({ turnId: 't1', status: 'completed' });
+  assert.equal(timeline.snapshot().turns[0].items[0].status, 'completed');
+  const archived = timeline.archive(8 * 1024);
+  assert.ok(Buffer.byteLength(JSON.stringify(archived)) <= 8 * 1024);
+  assert.equal(archived.turns[0].itemsTrimmed, true);
+  const tiny = trimTimelineSnapshot(timeline.snapshot(), 1024);
+  assert.ok(tiny.turns.length >= 1);
+});
+
+test('timeline patch coalescer merges streamed deltas into one patch per 30ms window', async () => {
+  const sent = [];
+  const coalescer = new WorkerTimelinePatchCoalescer((patch) => sent.push(patch), 30);
+  const timeline = new WorkerTimeline({
+    workerHandle: 'w', cliId: 'codex', model: 'gpt', readOnly: true, onPatch: (change) => coalescer.push(change),
+  });
+  timeline.beginTurn({ dispatchId: 'd1', prompt: 'go' });
+  for (let i = 0; i < 200; i++) {
+    timeline.apply({ type: 'delta', id: 'm', kind: 'message', field: 'text', delta: String(i % 10) });
+  }
+  timeline.apply({ type: 'delta', id: 'r', kind: 'reasoning', field: 'summary', delta: 'think' });
+  assert.equal(sent.length, 0, 'nothing is sent synchronously');
+  await delay(10);
+  assert.equal(sent.length, 0, 'nothing is sent before the window closes');
+  await delay(60);
+  assert.equal(sent.length, 1);
+  const [patch] = sent;
+  assert.equal(patch.workerHandle, 'w');
+  assert.equal(patch.seq, timeline.getHeader().seq);
+  assert.equal(patch.turns.length, 1);
+  assert.equal(patch.turns[0].key, 'd1#1');
+  assert.deepEqual(patch.turns[0].items.map((item) => item.id), ['m', 'r']);
+  assert.equal(patch.turns[0].items[0].text.length, 200);
+  timeline.apply({ type: 'delta', id: 'm', kind: 'message', field: 'text', delta: '!' });
+  patch.turns[0].items[0].text = 'mutated';
+  assert.equal(timeline.snapshot().turns[0].items[0].text.length, 201, 'patches are detached copies');
+  coalescer.dispose();
+  await delay(60);
+  assert.equal(sent.length, 1, 'dispose drops the pending patch and its timer');
+  timeline.apply({ type: 'delta', id: 'm', kind: 'message', field: 'text', delta: '?' });
+  await delay(60);
+  assert.equal(sent.length, 1);
 });

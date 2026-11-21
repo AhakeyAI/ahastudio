@@ -11,6 +11,7 @@ import {
   reportCorrectsUnresponsiveWorker,
 } from './orchestration-lifecycle-graph.js';
 import { buildOrchestrationTaskDisplayMetadata } from './orchestration-task-display.js';
+import { mapTimelineStrings, trimTimelineSnapshot, TIMELINE_LIMITS, type WorkerTimelineSnapshot } from './worker-timeline.js';
 import {
   AGENT_PROMPT_STALLED_ERROR,
   DEFAULT_NESTED_WORKER_MAX_DEPTH,
@@ -530,6 +531,10 @@ export class OrchestrationStore {
     }
     for (const dispatch of this.dispatches.values()) {
       if (dispatch.archivedOutput) dispatch.archivedOutput = this.redactDispatchCredentials(dispatch.archivedOutput);
+      if (dispatch.archivedTimeline) {
+        dispatch.archivedTimeline = mapTimelineStrings(dispatch.archivedTimeline, (text) => this.redactDispatchCredentials(text));
+      }
+      delete dispatch.hasArchivedTimeline;
     }
     this.deferredPrompts.clear();
     for (const [id, prompt] of Object.entries(parsed.deferredDispatchPrompts ?? {})) {
@@ -1705,6 +1710,20 @@ export class OrchestrationStore {
     ctx.archivedOutput = this.redactDispatchCredentials(output);
     ctx.updatedAt = this.now();
     this.persist();
+  }
+
+  archiveDispatchTimeline(dispatchId: string, timeline: WorkerTimelineSnapshot): void {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx || ctx.executionMode !== 'codex-app-server') return;
+    const redacted = mapTimelineStrings(timeline, (text) => this.redactDispatchCredentials(text));
+    ctx.archivedTimeline = trimTimelineSnapshot(redacted, TIMELINE_LIMITS.archiveBytes);
+    ctx.updatedAt = this.now();
+    this.persist();
+  }
+
+  getArchivedTimeline(dispatchId: string): WorkerTimelineSnapshot | null {
+    const timeline = this.dispatches.get(dispatchId)?.archivedTimeline;
+    return timeline ? structuredClone(timeline) : null;
   }
 
   markDispatchPaneClosed(dispatchId: string): OrchestrationDispatchRecord | null {
@@ -3492,7 +3511,11 @@ export class OrchestrationStore {
   getSnapshot(runId?: string): OrchestrationSnapshot {
     const tasks = this.listTasksWithDispatch(runId ? { runId } : undefined);
     const runs = this.listRuns();
-    const dispatches = this.listDispatches(runId ? { runId } : undefined);
+    const dispatches = this.listDispatches(runId ? { runId } : undefined).map((dispatch) => {
+      if (!dispatch.archivedTimeline) return dispatch;
+      const { archivedTimeline: _timeline, ...rest } = dispatch;
+      return { ...rest, hasArchivedTimeline: true };
+    });
     const gates = this.listGates(runId ? { runId } : undefined);
     const messages = this.listMessages(runId ? { runId, limit: 200 } : { limit: 200 });
     const questions = this.listQuestions(runId ? { runId } : undefined);

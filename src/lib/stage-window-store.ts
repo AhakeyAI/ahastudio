@@ -7,10 +7,12 @@ import { terminalSessionStore } from './terminal-session-store';
 import type { PersistedWorkspaceState } from '../types';
 import { collectLayoutLeafIdsInOrder, equalizePaneTree, findLeafInLayout, findNeighborLeafId, removeLeafFromLayout, setSplitRatioAtPath, splitLeafInLayout, type PaneLayoutNode, type PaneNavigateDirection, type SplitDirection, type SplitNodePath } from './terminal-pane-tree';
 
-export type StageWindowType = 'activity' | 'browser' | 'terminal' | 'file';
+export type StageWindowType = 'activity' | 'browser' | 'terminal' | 'file' | 'agent-session';
 
 export interface StageWindowOptions {
   workerId?: string;
+  /** Agent session only: the dispatch whose timeline to show (latest follow-up wins). */
+  dispatchId?: string;
   title?: string;
   /** Manual local terminal; 'shell' starts the default interactive shell. */
   localCliId?: string;
@@ -36,8 +38,9 @@ export interface StageWindow {
   title: string;
   browserTabId?: string;
   filePath?: string;
-  /** For terminal windows: the worker id whose activity should be displayed */
+  /** Terminal: worker whose activity is displayed. Agent session: headless worker handle. */
   workerId?: string;
+  dispatchId?: string;
   localCliId?: string;
   shellId?: string;
   cwd?: string;
@@ -117,6 +120,7 @@ class StageWindowStore {
         .filter((w) =>
           w.type === 'activity' ||
           (w.type === 'terminal' && Boolean(w.localCliId || w.shellId)) ||
+          (w.type === 'agent-session' && Boolean(w.workerId || w.dispatchId)) ||
           (w.type === 'file' && Boolean(w.filePath))
         )
         .map((w) => ensureTerminalWindowLayout(w as StageWindow));
@@ -155,6 +159,7 @@ class StageWindowStore {
       .filter((w) =>
         w.type === 'activity' ||
         (w.type === 'terminal' && Boolean(w.localCliId || w.shellId)) ||
+        (w.type === 'agent-session' && Boolean(w.workerId || w.dispatchId)) ||
         (w.type === 'file' && Boolean(w.filePath))
       )
       .map((w) => ({
@@ -162,6 +167,7 @@ class StageWindowStore {
         type: w.type,
         title: w.title,
         ...(w.workerId !== undefined ? { workerId: w.workerId } : {}),
+        ...(w.dispatchId !== undefined ? { dispatchId: w.dispatchId } : {}),
         ...(w.localCliId !== undefined ? { localCliId: w.localCliId } : {}),
         ...(w.shellId !== undefined ? { shellId: w.shellId } : {}),
         ...(w.cwd !== undefined ? { cwd: w.cwd } : {}),
@@ -299,6 +305,38 @@ class StageWindowStore {
         windows: [...this.state.windows, window],
         activeWindowId: id,
       });
+    } else if (type === 'agent-session') {
+      const workerId = opts?.workerId;
+      const dispatchId = opts?.dispatchId;
+      if (!workerId && !dispatchId) return;
+      const existing = this.findAgentSession(workerId, dispatchId);
+      if (existing) {
+        if (dispatchId && existing.dispatchId !== dispatchId) {
+          this.update({
+            windows: this.state.windows.map((w) => (w.id === existing.id ? { ...w, dispatchId } : w)),
+          });
+        }
+        if (opts?.activate !== false) await this.setActiveWindow(existing.id);
+        return;
+      }
+      const window: StageWindow = {
+        id,
+        type: 'agent-session',
+        title: opts?.title ?? 'Agent 会话',
+        workerId,
+        dispatchId,
+        localCliId: opts?.localCliId ?? 'codex',
+        cwd: opts?.cwd,
+      };
+      if (opts?.activate === false) {
+        this.update({ windows: [...this.state.windows, window] });
+        return;
+      }
+      await browserStore.setVisible(false);
+      this.update({
+        windows: [...this.state.windows, window],
+        activeWindowId: id,
+      });
     } else {
       const title = '文件';
       const window: StageWindow = { id, type, title };
@@ -307,6 +345,15 @@ class StageWindowStore {
         activeWindowId: id,
       });
     }
+  }
+
+  findAgentSession(workerId?: string, dispatchId?: string): StageWindow | undefined {
+    return this.state.windows.find(
+      (w) =>
+        w.type === 'agent-session' &&
+        ((workerId !== undefined && w.workerId === workerId) ||
+          (dispatchId !== undefined && w.dispatchId === dispatchId)),
+    );
   }
 
   splitPane(

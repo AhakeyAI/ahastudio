@@ -6,6 +6,7 @@ import {
   ORCHESTRATION_TASK_KINDS,
   OrchestrationError,
 } from '../orchestration/orchestration-types.js';
+import { WorkerTimelinePatchCoalescer } from '../orchestration/worker-timeline.js';
 import type { IpcContext } from './context.js';
 import { handleSecure, mainWindowSenderPolicy } from './validators.js';
 
@@ -213,6 +214,16 @@ const workerTargetSchema = z
     taskId: nonEmptyId.optional(),
   })
   .strict();
+
+const workerTimelineGetSchema = z
+  .object({
+    dispatchId: nonEmptyId.optional(),
+    workerHandle: nonEmptyId.optional(),
+  })
+  .strict()
+  .refine((value) => Boolean(value.dispatchId || value.workerHandle), {
+    message: 'dispatchId or workerHandle is required',
+  });
 
 const workerReadSchema = z
   .object({
@@ -748,6 +759,20 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     handler: (payload) => runAction(() => ({ ...requireService().workerRead(payload) })),
   });
 
+  handleSecure('orchestration:worker-timeline-get', {
+    schema: workerTimelineGetSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => runAction(() => ({ timeline: requireService().getWorkerTimeline(payload) })),
+  });
+
+  handleSecure('orchestration:worker-interrupt', {
+    schema: workerTargetSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => runAction(() => requireService().workerInterrupt(payload)),
+  });
+
   handleSecure('orchestration:worker-keep-open', {
     schema: workerKeepOpenSchema,
     authorize,
@@ -1000,6 +1025,18 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     ctx.liveWindow()?.webContents.send('orchestration:pane-closed', event);
   });
 
+  const timelinePatches = new WorkerTimelinePatchCoalescer((patch) => {
+    const win = ctx.liveWindow();
+    if (!win || win.isDestroyed() || win.webContents.isDestroyed()) {
+      timelinePatches.clear();
+      return;
+    }
+    win.webContents.send('orchestration:worker-timeline-patch', patch);
+  }, 40);
+  const offTimeline = service.onWorkerTimelineChange((change) => {
+    if (ctx.liveWindow()) timelinePatches.push(change);
+  });
+
   return {
     dispose: () => {
       for (const ctrl of inFlightWaits.values()) {
@@ -1009,6 +1046,8 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
       offEvent();
       offSpawned();
       offClosed();
+      offTimeline();
+      timelinePatches.dispose();
     },
   };
 }

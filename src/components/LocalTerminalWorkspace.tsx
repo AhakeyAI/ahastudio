@@ -47,6 +47,8 @@ import {
   newPendingProposals,
   newUrgentMessages,
   taskTitle,
+  headlessDispatchForTarget,
+  isHeadlessDispatch,
   workerTabTitle,
   workerWindowTarget,
 } from '../lib/orchestration-view';
@@ -68,6 +70,7 @@ import { formatCommandDuration, SplitPaneContainer } from './SplitPaneContainer'
 import { StageTabBar } from './StageTabBar';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
 import { AgentStatusBadge, useAgentStatuses } from './AgentStatusBadge';
+import { AgentSessionView } from './AgentSessionView';
 import type { WorktreeHostActions } from './GitWorktreesPanel';
 import type { AgentPromptTarget } from './PanelPreview';
 import { clampRightPanelWidth, WorkspaceRightPanel, type RightPanelTab } from './WorkspaceRightPanel';
@@ -176,8 +179,10 @@ export function LocalTerminalWorkspace({
     folderWindows.find((win) => win.id === stage.activeWindowId) ??
     folderWindows.find((win) => win.id === rememberedId) ??
     folderWindows.at(-1);
-  const activeLeafId = active ? stage.getActiveLeafId(active) : undefined;
-  const activeLeafIds = active ? stage.getWindowLeafIds(active.id) : [];
+  const activeIsSession = active?.type === 'agent-session';
+  // Agent sessions have no terminal leaves; leaving these unset keeps PTY-only controls away from them.
+  const activeLeafId = active && !activeIsSession ? stage.getActiveLeafId(active) : undefined;
+  const activeLeafIds = active && !activeIsSession ? stage.getWindowLeafIds(active.id) : [];
   const activeLeafState = activeLeafId ? terminalSessionStore.getState(activeLeafId) : undefined;
   const pendingLeafState = pendingClosePane
     ? terminalSessionStore.getState(pendingClosePane.leafId)
@@ -365,6 +370,22 @@ export function LocalTerminalWorkspace({
     return true;
   };
 
+  const seenHeadlessWorkers = useRef(new Set<string>());
+  const openAgentSession = (
+    target: { workerId: string; dispatchId?: string; cliId?: string; cwd?: string; title: string },
+    activate: boolean,
+  ) => {
+    seenHeadlessWorkers.current.add(target.workerId);
+    void stageWindowStore.createWindow('agent-session', {
+      workerId: target.workerId,
+      dispatchId: target.dispatchId,
+      localCliId: target.cliId ?? 'codex',
+      cwd: target.cwd,
+      title: target.title,
+      activate,
+    });
+  };
+
   const closeWorkerPane = (ptyId: string) => {
     seenWorkerPanes.current?.delete(ptyId);
     const hit = findLeafByPtyId(ptyId);
@@ -381,6 +402,9 @@ export function LocalTerminalWorkspace({
       taskTitle?: string;
       cwd?: string;
       cliId?: string;
+      dispatchId?: string;
+      worktreePath?: string | null;
+      headless?: boolean;
     }) => void;
     closed: (event: { ptyId: string }) => void;
     changed: Parameters<typeof orchestrationClient.onChange>[0];
@@ -401,6 +425,14 @@ export function LocalTerminalWorkspace({
       const title = workerTabTitle(effectiveTask, event.taskId);
       const role = effectiveTask?.displayName?.trim().replace(/^@+/, '');
       const name = role ? `@${role}` : effectiveTask ? taskTitle(effectiveTask) : event.taskId;
+      if (event.headless) {
+        openAgentSession(
+          { workerId: event.ptyId, dispatchId: event.dispatchId, cliId: event.cliId, cwd: event.worktreePath ?? event.cwd, title },
+          false,
+        );
+        setToast(`编排：已为「${name}」启动无头 Worker 会话`);
+        return;
+      }
       if (openWorkerPane({ ...event, title }, false)) {
         setToast(`编排：已为「${name}」启动 Worker`);
       }
@@ -410,6 +442,26 @@ export function LocalTerminalWorkspace({
     },
     changed: (prev, next) => {
       // Workers spawned while this window was not listening (e.g. after a reload) still get a tab, once.
+      for (const dispatch of next.dispatches) {
+        if (!isHeadlessDispatch(dispatch)) continue;
+        if (dispatch.status !== 'pending' && dispatch.status !== 'dispatched') continue;
+        if (seenHeadlessWorkers.current.has(dispatch.assigneeHandle)) continue;
+        if (stageWindowStore.findAgentSession(dispatch.assigneeHandle)) {
+          seenHeadlessWorkers.current.add(dispatch.assigneeHandle);
+          continue;
+        }
+        const task = next.tasks.find((item) => item.id === dispatch.taskId);
+        openAgentSession(
+          {
+            workerId: dispatch.assigneeHandle,
+            dispatchId: dispatch.id,
+            cliId: dispatch.cliId ?? undefined,
+            cwd: dispatch.worktreePath ?? task?.worktreePath ?? undefined,
+            title: workerTabTitle(task, dispatch.taskId),
+          },
+          false,
+        );
+      }
       for (const dispatch of next.dispatches) {
         const ptyId = dispatch.assigneePaneId;
         if (!ptyId) continue;
@@ -485,6 +537,25 @@ export function LocalTerminalWorkspace({
 
   const focusOrchestrationTargetRef = useRef<(target: ResolvedOrchestrationLinkTarget) => void>();
   focusOrchestrationTargetRef.current = (target) => {
+    const headless = headlessDispatchForTarget(orchestrationClient.getSnapshot(), target);
+    if (headless) {
+      const task = orchestrationClient.getSnapshot().tasks.find((item) => item.id === headless.taskId);
+      const folder = headless.worktreePath ?? undefined;
+      openAgentSession(
+        {
+          workerId: headless.assigneeHandle,
+          dispatchId: headless.id,
+          cliId: headless.cliId ?? undefined,
+          cwd: folder,
+          title: workerTabTitle(task, headless.taskId),
+        },
+        true,
+      );
+      const win = stageWindowStore.findAgentSession(headless.assigneeHandle);
+      const winFolder = win ? windowFolder(win) : undefined;
+      if (winFolder) selectFolder(winFolder);
+      return;
+    }
     if (!target.ptyId) {
       setToast(`${target.label} 没有活跃终端`);
       return;
@@ -898,9 +969,13 @@ export function LocalTerminalWorkspace({
                     ? matchingLineage
                     : lineageItems
                   ).map(({ win, depth, dispatch }) => {
+                    const isSession = win.type === 'agent-session';
                     const winLeafId = stage.getActiveLeafId(win);
                     const winLeafCount = stage.getWindowLeafIds(win.id).length;
                     const state = terminalSessionStore.getState(winLeafId);
+                    const sessionDispatch = isSession
+                      ? (dispatch ?? orchestration.dispatches.find((d) => d.id === win.dispatchId))
+                      : undefined;
                     return (
                       <button
                         type="button"
@@ -914,7 +989,7 @@ export function LocalTerminalWorkspace({
                         }
                         onClick={() => selectTab(win.id)}
                         title={
-                          state.error ??
+                          (isSession ? undefined : state.error) ??
                           (dispatch?.branch
                             ? `${win.title} (${dispatch.branch})`
                             : win.title)
@@ -931,6 +1006,10 @@ export function LocalTerminalWorkspace({
                         />
                         <span>{win.title}</span>
                         {(() => {
+                          if (isSession) {
+                            const live = sessionDispatch?.status === 'pending' || sessionDispatch?.status === 'dispatched';
+                            return <small className={live ? 'is-agent' : undefined}>{live ? '无头会话 · 运行中' : '无头会话'}</small>;
+                          }
                           const agentStatus = windowAgentStatus(win);
                           if (isAgentStatusVisible(agentStatus) && state.phase === 'running' && !state.error) {
                             return (
@@ -1058,7 +1137,9 @@ export function LocalTerminalWorkspace({
       )}
 
       <main className="local-terminal-body">
-        {active && activeLeafId ? (
+        {active && activeIsSession ? (
+          <AgentSessionView key={active.id} win={active} onNotify={handleNotify} />
+        ) : active && activeLeafId ? (
           <SplitPaneContainer
             node={active.splitTree ?? { type: 'leaf', id: active.id }}
             activeLeafId={activeLeafId}

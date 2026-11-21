@@ -1,3 +1,5 @@
+import type { WorkerTimelineSnapshot } from './worker-timeline.js';
+
 export const ORCHESTRATION_MESSAGE_TYPES = [
   'status',
   'dispatch',
@@ -369,6 +371,10 @@ export interface OrchestrationDispatchRecord {
   retained?: boolean;
   releasedAt?: string | null;
   archivedOutput?: string | null;
+  /** Redacted, size-capped process timeline of a headless Worker; omitted from renderer snapshots. */
+  archivedTimeline?: WorkerTimelineSnapshot | null;
+  /** Renderer snapshots carry this flag instead of the archived timeline itself. */
+  hasArchivedTimeline?: boolean;
   status: OrchestrationDispatchStatus;
   failureCount: number;
   lastFailureReason: string | null;

@@ -2,6 +2,8 @@ import type {
   OrchestrationPaneClosedEvent,
   OrchestrationPaneSpawnedEvent,
   OrchestrationSnapshot,
+  WorkerTimelinePatch,
+  WorkerTimelineSnapshot,
 } from '../types';
 import { EMPTY_SNAPSHOT, mergeRunSnapshot } from './orchestration-view';
 
@@ -29,6 +31,8 @@ const spawnListeners = new Set<SpawnListener>();
 const closedListeners = new Set<ClosedListener>();
 const pendingSpawns: OrchestrationPaneSpawnedEvent[] = [];
 const pendingCloses: OrchestrationPaneClosedEvent[] = [];
+const timelinePatchListeners = new Set<(patch: WorkerTimelinePatch) => void>();
+let timelinePatchUnsub: (() => void) | null = null;
 
 function emit() {
   for (const listener of listeners) {
@@ -163,5 +167,40 @@ export const orchestrationClient = {
     return () => {
       closedListeners.delete(listener);
     };
+  },
+  /** Streams coalesced headless Worker timeline patches; one IPC subscription serves all views. */
+  onWorkerTimelinePatch(listener: (patch: WorkerTimelinePatch) => void) {
+    timelinePatchListeners.add(listener);
+    const api = typeof window !== 'undefined' ? window.vibeMeet?.orchestration : undefined;
+    if (!timelinePatchUnsub && api?.onWorkerTimelinePatch) {
+      timelinePatchUnsub = api.onWorkerTimelinePatch((patch) => {
+        for (const fn of timelinePatchListeners) {
+          try {
+            fn(patch);
+          } catch {
+            /* ignore */
+          }
+        }
+      });
+    }
+    return () => {
+      timelinePatchListeners.delete(listener);
+      if (timelinePatchListeners.size === 0 && timelinePatchUnsub) {
+        timelinePatchUnsub();
+        timelinePatchUnsub = null;
+      }
+    };
+  },
+  async getWorkerTimeline(opts: { dispatchId?: string; workerHandle?: string }): Promise<
+    { ok: true; timeline: WorkerTimelineSnapshot | null } | { ok: false; error: string }
+  > {
+    const api = typeof window !== 'undefined' ? window.vibeMeet?.orchestration : undefined;
+    if (!api?.workerTimelineGet) return { ok: false, error: '会话接口不可用' };
+    try {
+      const res = await api.workerTimelineGet(opts);
+      return res.ok ? { ok: true, timeline: res.timeline } : { ok: false, error: res.error };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
   },
 };

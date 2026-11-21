@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useSyncExternalStore, type ReactNode } from 'react';
-import { Activity, Globe, Terminal, FileText, X, Plus, SquareArrowOutUpRight } from 'lucide-react';
+import { Activity, Globe, Terminal, FileText, X, Plus, SquareArrowOutUpRight, MessagesSquare } from 'lucide-react';
 import type { StageWindow, StageWindowType, StageWindowOptions } from '../lib/stage-window-store';
 import { requestHideBrowser } from '../lib/browser-store';
 import type { LocalCliInfo } from '../types';
@@ -26,6 +26,7 @@ const ICON_MAP: Record<StageWindowType, typeof Globe> = {
   browser: Globe,
   terminal: Terminal,
   file: FileText,
+  'agent-session': MessagesSquare,
 };
 
 export function StageTabBar({
@@ -115,7 +116,8 @@ export function StageTabBar({
         {windows.map((win) => {
           const Icon = ICON_MAP[win.type];
           const isActivity = win.id === ACTIVITY_TAB_ID;
-          const state = win.localCliId ? terminalSessionStore.getState(win.id) : null;
+          const isSession = win.type === 'agent-session';
+          const state = win.localCliId && !isSession ? terminalSessionStore.getState(win.id) : null;
           return (
             <div
               key={win.id}
@@ -136,6 +138,7 @@ export function StageTabBar({
               </span>
               <span className="stage-tab-title">{win.title}</span>
               {renderTabBadge?.(win)}
+              {isSession && <span className="stage-tab-status is-session" title="无头 Worker 会话">会话</span>}
               {state && <span className={`stage-tab-status is-${state.error ? 'error' : state.phase}`}
                 aria-label={state.error ? '错误' : PHASE_LABELS[state.phase]}
                 title={state.error ?? (state.phase === 'exited' ? `退出码：${state.exitCode ?? '未知'}` : PHASE_LABELS[state.phase])}>

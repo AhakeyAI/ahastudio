@@ -25,6 +25,33 @@ const completed = (status, text) => {
   notify('turn/completed', { turn: { id: turnId, status, error: null, items: [] } });
 };
 
+// Streams every timeline-relevant notification kind; the command output splits a secret across deltas.
+const richTimeline = () => {
+  const item = (phase, value) => notify('item/' + phase, { turnId, item: value });
+  item('started', { id: 'think', type: 'reasoning', summary: [], content: [] });
+  notify('item/reasoning/summaryTextDelta', { turnId, itemId: 'think', delta: 'Inspecting the ' });
+  notify('item/reasoning/summaryTextDelta', { turnId, itemId: 'think', delta: 'workspace' });
+  item('completed', { id: 'think', type: 'reasoning', summary: [], content: [] });
+  notify('turn/plan/updated', {
+    turnId, explanation: 'Two steps',
+    plan: [{ step: 'List files', status: 'completed' }, { step: 'Summarize', status: 'inProgress' }],
+  });
+  item('started', { id: 'cmd', type: 'commandExecution', command: 'Get-ChildItem', cwd: process.cwd(), status: 'inProgress' });
+  notify('item/commandExecution/outputDelta', { turnId, itemId: 'cmd', delta: 'README.md\ntoken=pilot-stderr-' });
+  notify('item/commandExecution/outputDelta', { turnId, itemId: 'cmd', delta: 'credential-example\n' });
+  item('completed', { id: 'cmd', type: 'commandExecution', command: 'Get-ChildItem', cwd: process.cwd(), status: 'completed', exitCode: 0, durationMs: 120 });
+  const changes = [{ path: 'src/demo.ts', kind: { type: 'update', move_path: null }, diff: '@@ -1 +1,2 @@\n-old line\n+new line\n+extra line\n' }];
+  item('started', { id: 'patch', type: 'fileChange', status: 'inProgress', changes: [] });
+  notify('item/fileChange/patchUpdated', { turnId, itemId: 'patch', changes });
+  item('completed', { id: 'patch', type: 'fileChange', status: 'completed', changes });
+  item('started', { id: 'mcp', type: 'mcpToolCall', server: 'aha', tool: 'read_board', arguments: { limit: 5 }, status: 'inProgress' });
+  notify('item/mcpToolCall/progress', { turnId, itemId: 'mcp', message: 'reading board' });
+  item('completed', {
+    id: 'mcp', type: 'mcpToolCall', server: 'aha', tool: 'read_board', arguments: { limit: 5 }, status: 'completed',
+    result: { content: [{ type: 'text', text: 'board ok' }] }, durationMs: 15,
+  });
+  completed('completed', 'Rich **timeline** done');
+};
 for await (const line of history) {
   const { id, method, params, result } = JSON.parse(line);
   if (trace) appendFileSync(trace, JSON.stringify({ id, method, params, result }) + '\n');
@@ -64,6 +91,8 @@ for await (const line of history) {
       setTimeout(() => process.exit(19), 120);
     } else if (prompt.includes('WAIT_FOR_INTERRUPT')) {
       notify('item/agentMessage/delta', { turnId, itemId: 'answer', delta: 'output before cancel' });
+    } else if (prompt.includes('RICH_TIMELINE')) {
+      richTimeline();
     } else if (prompt.includes('ASK_FOR_MCP_CONFIRMATION')) {
       approvalId = 'mcp-approval-' + turnNumber;
       send({
