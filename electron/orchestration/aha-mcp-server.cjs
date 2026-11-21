@@ -156,7 +156,7 @@ function buildDelegateTaskTool(ctx) {
   const confirmMode = (ctx && ctx.confirmMode) || 'chat-and-guard';
   if (confirmMode === 'chat-and-guard') {
     descParts.push(
-      'Confirmation rule (2-step): before spawning workers on a new user request, first call delegate_task with confirmed=false to register the dispatch plan without spawning (returns resolved agent & worktree), then briefly ask the user in one natural sentence to confirm the role, Coding Agent, task, and worktree isolation; after the user replies to confirm, call delegate_task with confirmed=true with the original proposalId. Register each proposed worker before asking for batch confirmation. Matching plans can start in parallel in the confirmed turn.'
+      'Confirmation rule (2-step): before spawning workers on a new user request, first call delegate_task with confirmed=false (and authorizeReviews=true when you plan to review completed work) to register the dispatch plan without spawning, then briefly ask the user in one natural sentence to confirm the role, Coding Agent, task, worktree isolation, and automatic post-work heterogeneous review; after the user replies to confirm, call delegate_task with confirmed=true and the original proposalId. Once confirmed with authorizeReviews=true (or after confirming one review in this Run), subsequent reviewOf / reviewRun dispatches in the same Run start without re-prompting the user.'
     );
   } else if (confirmMode === 'always-ui') {
     descParts.push(
@@ -266,6 +266,11 @@ function buildDelegateTaskTool(ctx) {
         confirmed: {
           type: 'boolean',
           description: 'Set to true only after the user has explicitly confirmed dispatch in chat.',
+        },
+        authorizeReviews: {
+          type: 'boolean',
+          description:
+            'When true on a confirmed proposal, pre-authorizes subsequent isolated heterogeneous reviews (reviewOf / reviewRun) in the same Run so the user is not prompted repeatedly.',
         },
         planSummary: {
           type: 'string',
@@ -583,7 +588,7 @@ function buildToolsForContext(ctx) {
     {
       name: 'integrate_worker',
       description:
-        'Safely check or integrate a settled worker changes into the main workspace or the Run integration branch aha/run/<runId> (default mode="squash" for one clean commit per worker, releaseAfter=true to release panes and clean up verified worktrees and safely deletable aha/worker/* branches). Aborts cleanly on conflict and refuses to overwrite a dirty main workspace unless targetBranch="integration" or "auto" routes to aha/run/<runId>.',
+        'Safely check or integrate a settled worker changes into the main workspace or the Run integration branch aha/run/<runId> (default mode="squash", targetBranch="auto", releaseAfter=true). When main is clean, integrates directly into main; when main has uncommitted user edits, seamlessly routes into aha/run/<runId> without touching dirty files in main. Pass targetBranch="main" to require direct integration into main.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -599,7 +604,7 @@ function buildToolsForContext(ctx) {
           targetBranch: {
             type: 'string',
             enum: ['main', 'integration', 'auto'],
-            description: 'Target branch strategy: "main" (default unless a Run integration branch is already active), "integration" (use aha/run/<runId> in an isolated worktree even when main has dirty edits), or "auto" (use main if clean, otherwise aha/run/<runId>).',
+            description: 'Target branch strategy: "auto" (default: use main if clean, otherwise seamlessly route to aha/run/<runId>, or continue active aha/run/<runId>), "integration" (always use aha/run/<runId>), or "main" (require clean main branch).',
           },
           expectedSnapshotOid: {
             type: 'string',
@@ -949,6 +954,9 @@ async function handleToolCall(name, rawArgs, activeRequests) {
         ...(effort ? { effort } : {}),
         ...(terminal ? { terminal } : {}),
         ...(typeof args.confirmed === 'boolean' ? { confirmed: args.confirmed } : {}),
+        ...(typeof (args.authorizeReviews ?? args.authorize_reviews) === 'boolean'
+          ? { authorizeReviews: Boolean(args.authorizeReviews ?? args.authorize_reviews) }
+          : {}),
         ...(planSummary ? { planSummary } : {}),
         callerCwd: process.cwd(),
       };

@@ -342,6 +342,7 @@ const delegateTaskSchema = z.object({
   reviewOf: z.string().trim().min(1).max(128).optional(),
   reviewRun: z.union([z.boolean(), z.string().trim().min(1).max(128)]).optional(),
   reviewFocus: z.string().trim().min(1).max(400).optional(),
+  authorizeReviews: z.boolean().optional(),
   ...taskContextFields,
   agent: z.string().trim().min(1).optional(),
   taskKind: taskKindEnum.optional(),

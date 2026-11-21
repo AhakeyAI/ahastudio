@@ -1246,3 +1246,54 @@
   font-family: var(--wrp-mono);
   font-size: 10px;
 }
+
+.obp-header-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.obp-auto-review-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--wrp-border);
+  background: var(--wrp-surface-subtle);
+  color: var(--wrp-muted);
+  font-size: 10.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.obp-auto-review-pill:hover:not(:disabled) {
+  border-color: var(--wrp-accent);
+  color: var(--wrp-ink-strong);
+}
+
+.obp-auto-review-pill.is-enabled {
+  border-color: color-mix(in srgb, var(--wrp-accent) 45%, transparent);
+  background: var(--wrp-accent-soft);
+  color: var(--wrp-accent-ink);
+}
+
+.obp-member-workflow-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px 8px 46px;
+}
+
+.obp-member-workflow-bar .obp-btn-sm {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  padding: 2px 8px;
+  height: 22px;
+}

@@ -151,6 +151,9 @@ export interface OrchestrationReportArtifacts {
   uncommittedCount?: number;
   changedFiles?: string[];
   changedFileCount?: number;
+  reviewTier?: 'L0' | 'L1' | 'L2';
+  reviewTierReason?: string;
+  recommendedNextStep?: string;
   reviewVerdict?: OrchestrationReviewVerdict;
   reviewFindings?: OrchestrationReviewFinding[];
 }
@@ -213,6 +216,7 @@ export interface OrchestrationDispatchProposal {
   model: string | null;
   effort: string | null;
   terminal: string | null;
+  authorizeReviews?: boolean;
   status: OrchestrationDispatchProposalStatus;
   createdAt: string;
   resolvedAt: string | null;
@@ -290,6 +294,7 @@ export interface OrchestrationRunRecord {
   runReviewStatus?: OrchestrationReviewStatus;
   runReviewRound?: number;
   runReviewFindings?: OrchestrationReviewFinding[];
+  reviewAutoAuthorized?: boolean;
 }
 
 export interface OrchestrationTaskRecord {

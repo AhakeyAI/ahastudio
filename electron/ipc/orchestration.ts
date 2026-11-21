@@ -394,7 +394,11 @@ const delegateTaskSchema = z
   .object({
     from: nonEmptyId.optional(),
     role: z.string().trim().max(120).optional(),
-    task: z.string().trim().min(1).max(64_000),
+    task: z.string().trim().min(1).max(64_000).optional(),
+    reviewOf: z.string().trim().min(1).max(128).optional(),
+    reviewRun: z.union([z.boolean(), z.string().trim().min(1).max(128)]).optional(),
+    reviewFocus: z.string().trim().max(400).optional(),
+    authorizeReviews: z.boolean().optional(),
     ...taskContextFields,
     proposalId: z.string().trim().min(1).max(128).optional(),
     agent: nonEmptyId.optional(),
@@ -409,7 +413,10 @@ const delegateTaskSchema = z
     runId: nonEmptyId.optional(),
     requestId: nonEmptyId.optional(),
   })
-  .strict();
+  .strict()
+  .refine((val) => Boolean(val.task || val.reviewOf || val.reviewRun), {
+    message: 'Either task, reviewOf, or reviewRun is required.',
+  });
 
 const proposalApproveSchema = z
   .object({
@@ -418,6 +425,63 @@ const proposalApproveSchema = z
     worktree: z.boolean().optional(),
     model: z.union([nonEmptyId, z.null()]).optional(),
     effort: z.union([nonEmptyId, z.null()]).optional(),
+    authorizeReviews: z.boolean().optional(),
+  })
+  .strict();
+
+const workerDiffSchema = z
+  .object({
+    dispatchId: nonEmptyId.optional(),
+    worker: nonEmptyId.optional(),
+    taskId: nonEmptyId.optional(),
+    files: z.array(z.string().trim().min(1).max(400)).max(30).optional(),
+    maxDiffBytes: z.number().int().min(1024).max(131_072).optional(),
+  })
+  .strict();
+
+const workerIntegrateSchema = z
+  .object({
+    dispatchId: nonEmptyId.optional(),
+    worker: nonEmptyId.optional(),
+    taskId: nonEmptyId.optional(),
+    mode: z.enum(['check', 'squash', 'merge']).optional(),
+    targetBranch: z.enum(['main', 'integration', 'auto']).optional(),
+    expectedSnapshotOid: z.string().trim().min(7).max(64).optional(),
+    commitMessage: z.string().trim().min(1).max(500).optional(),
+    releaseAfter: z.boolean().optional(),
+    deleteBranch: z.boolean().optional(),
+    force: z.boolean().optional(),
+  })
+  .strict();
+
+const runDiffSchema = optionalSchema(
+  z
+    .object({
+      runId: nonEmptyId.optional(),
+      files: z.array(z.string().trim().min(1).max(400)).max(30).optional(),
+      maxDiffBytes: z.number().int().min(1024).max(131_072).optional(),
+    })
+    .strict(),
+);
+
+const runFinalizeSchema = optionalSchema(
+  z
+    .object({
+      runId: nonEmptyId.optional(),
+      mode: z.enum(['check', 'squash', 'merge']).optional(),
+      expectedSnapshotOid: z.string().trim().min(7).max(64).optional(),
+      commitMessage: z.string().trim().min(1).max(500).optional(),
+      deleteBranch: z.boolean().optional(),
+      keepWorktree: z.boolean().optional(),
+      force: z.boolean().optional(),
+    })
+    .strict(),
+);
+
+const runSetAutoReviewSchema = z
+  .object({
+    runId: nonEmptyId,
+    enabled: z.boolean(),
   })
   .strict();
 
@@ -828,10 +892,51 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     schema: proposalApproveSchema,
     authorize,
     authorizeError,
-    handler: ({ id, agent, worktree, model, effort }) =>
+    handler: ({ id, agent, worktree, model, effort, authorizeReviews }) =>
       runAction(() =>
-        requireService().approveDispatchProposal(id, { agent, worktree, model, effort })
+        requireService().approveDispatchProposal(id, {
+          agent,
+          worktree,
+          model,
+          effort,
+          authorizeReviews,
+        })
       ),
+  });
+
+  handleSecure('orchestration:worker-diff', {
+    schema: workerDiffSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => runAction(async () => ({ ...(await requireService().workerDiff(payload)) })),
+  });
+
+  handleSecure('orchestration:worker-integrate', {
+    schema: workerIntegrateSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => runAction(async () => ({ ...(await requireService().workerIntegrate(payload)) })),
+  });
+
+  handleSecure('orchestration:run-diff', {
+    schema: runDiffSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => runAction(async () => ({ ...(await requireService().runDiff(payload ?? {})) })),
+  });
+
+  handleSecure('orchestration:run-finalize', {
+    schema: runFinalizeSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => runAction(async () => ({ ...(await requireService().runFinalizeIntegration(payload ?? {})) })),
+  });
+
+  handleSecure('orchestration:run-set-auto-review', {
+    schema: runSetAutoReviewSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().setRunAutoReview(payload)),
   });
 
   handleSecure('orchestration:proposal-reject', {

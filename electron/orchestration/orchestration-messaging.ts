@@ -134,6 +134,11 @@ export function formatMessageBanner(
       const parts: string[] = [];
       if (msg.artifacts.branch) parts.push(`branch=${msg.artifacts.branch}`);
       if (msg.artifacts.headCommit) parts.push(`commit=${msg.artifacts.headCommit}`);
+      if (msg.artifacts.reviewTier) {
+        parts.push(
+          `tier=${msg.artifacts.reviewTier}${msg.artifacts.reviewTierReason ? ` (${msg.artifacts.reviewTierReason})` : ''}`,
+        );
+      }
       if (typeof msg.artifacts.changedFileCount === 'number') {
         const filesList = msg.artifacts.changedFiles?.length
           ? `: ${msg.artifacts.changedFiles.slice(0, 6).join(', ')}${msg.artifacts.changedFileCount > 6 ? '…' : ''}`
@@ -150,8 +155,12 @@ export function formatMessageBanner(
       );
     } else if (options.followUp) {
       lines.push(
-        `[Worker ${senderTag} settled; mention ${senderTag} via post_message to reactivate or manage_worker(role="${cleanRole}", action="release").]`
+        msg.artifacts?.recommendedNextStep
+          ? `[Worker ${senderTag} settled; next: ${msg.artifacts.recommendedNextStep}]`
+          : `[Worker ${senderTag} settled; mention ${senderTag} via post_message to reactivate or manage_worker(role="${cleanRole}", action="release").]`
       );
+    } else if (msg.artifacts?.recommendedNextStep) {
+      lines.push(`[Next: ${msg.artifacts.recommendedNextStep}]`);
     } else if (msg.type !== 'heartbeat') {
       lines.push(`[Reply: post_message(text="${senderTag} ...")]`);
     }

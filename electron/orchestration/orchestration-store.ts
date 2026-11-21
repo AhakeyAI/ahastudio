@@ -1003,6 +1003,18 @@ export class OrchestrationStore {
     return cloneRunRecord(run);
   }
 
+  setRunAutoReviewAuthorized(
+    runId: string,
+    authorized: boolean,
+  ): OrchestrationRunRecord | null {
+    const run = this.runs.get(runId);
+    if (!run) return null;
+    run.reviewAutoAuthorized = Boolean(authorized);
+    run.updatedAt = this.now();
+    this.persist();
+    return cloneRunRecord(run);
+  }
+
   // ==================== Tasks ====================
 
   createTask(input: {

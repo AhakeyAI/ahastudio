@@ -87,6 +87,12 @@ export interface BoardMemberCard {
   retained: boolean;
   released: boolean;
   needsAttention: boolean;
+  isReviewWorker: boolean;
+  reviewStatus: 'none' | 'pending' | 'passed' | 'rejected' | 'escalated';
+  integrationStatus: 'none' | 'checked' | 'merged' | 'conflict' | 'skipped';
+  canTriggerReview: boolean;
+  canIntegrate: boolean;
+  canForceIntegrate: boolean;
   verificationBadge?: { label: string; tone: StatusTone } | null;
 }
 
@@ -97,6 +103,11 @@ export interface BoardViewModel {
   runStatusLabel: string;
   runIntegrationBadge?: { label: string; tone: StatusTone } | null;
   runReviewBadge?: { label: string; tone: StatusTone } | null;
+  reviewAutoAuthorized: boolean;
+  hasLiveIntegrationBranch: boolean;
+  canStartRunReview: boolean;
+  canFinalizeRun: boolean;
+  canForceFinalizeRun: boolean;
   hasAnyActiveRun: boolean;
   headSeq: number;
   posts: BoardPostView[];
@@ -463,6 +474,11 @@ export function buildBoardViewModel(
       run: null,
       isLive: false,
       runStatusLabel: '空闲',
+      reviewAutoAuthorized: false,
+      hasLiveIntegrationBranch: false,
+      canStartRunReview: false,
+      canFinalizeRun: false,
+      canForceFinalizeRun: false,
       hasAnyActiveRun,
       headSeq: 0,
       posts: [],
@@ -710,6 +726,29 @@ export function buildBoardViewModel(
         verificationBadge = { label: '审查通过', tone: 'ok' };
       }
 
+      const isReviewWorker = Boolean(dispatch.reviewOfDispatchId || dispatch.reviewOfRunId);
+      const reviewStatus = dispatch.reviewStatus ?? 'none';
+      const integrationStatus = dispatch.integrationStatus ?? 'none';
+      const hasIsolatedGitBranch = Boolean(dispatch.worktreePath && dispatch.ownsWorktree);
+      const canTriggerReview =
+        !isReviewWorker &&
+        isSettled &&
+        !dispatch.releasedAt &&
+        hasIsolatedGitBranch &&
+        integrationStatus !== 'merged' &&
+        integrationStatus !== 'skipped' &&
+        reviewStatus !== 'pending';
+      const canIntegrate =
+        !isReviewWorker &&
+        isSettled &&
+        !dispatch.releasedAt &&
+        hasIsolatedGitBranch &&
+        integrationStatus !== 'merged' &&
+        integrationStatus !== 'skipped' &&
+        reviewStatus !== 'pending';
+      const canForceIntegrate =
+        canIntegrate && (reviewStatus === 'escalated' || reviewStatus === 'rejected');
+
       return {
         key: dispatch.id,
         role,
@@ -737,6 +776,12 @@ export function buildBoardViewModel(
         retained: Boolean(dispatch.retained),
         released: Boolean(dispatch.releasedAt),
         needsAttention,
+        isReviewWorker,
+        reviewStatus,
+        integrationStatus,
+        canTriggerReview,
+        canIntegrate,
+        canForceIntegrate,
         verificationBadge,
       };
     })
@@ -756,6 +801,11 @@ export function buildBoardViewModel(
     openGates.length;
 
   let runIntegrationBadge: { label: string; tone: StatusTone } | null = null;
+  const hasLiveIntegrationBranch = Boolean(
+    (run.integrationStatus === 'active' || run.integrationStatus === 'conflict') &&
+      run.integrationBranch &&
+      run.integrationWorktreePath,
+  );
   if (run.integrationStatus === 'active' && run.integrationBranch) {
     runIntegrationBadge = { label: `集成分支 ${run.integrationBranch}`, tone: 'accent' };
   } else if (run.integrationStatus === 'finalized') {
@@ -782,6 +832,15 @@ export function buildBoardViewModel(
       : { label: '整体验收通过', tone: 'ok' };
   }
 
+  const hasIntegratedChanges =
+    hasLiveIntegrationBranch || Boolean(run.integrationHeadCommit || run.finalizedCommit);
+  const canStartRunReview =
+    run.status === 'active' && hasIntegratedChanges && run.runReviewStatus !== 'pending';
+  const canFinalizeRun = run.status === 'active' && hasLiveIntegrationBranch;
+  const canForceFinalizeRun =
+    canFinalizeRun &&
+    (run.runReviewStatus === 'escalated' || run.runReviewStatus === 'rejected');
+
   return {
     runs,
     run,
@@ -789,6 +848,11 @@ export function buildBoardViewModel(
     runStatusLabel: runStatusDisplayLabel(run.status),
     runIntegrationBadge,
     runReviewBadge,
+    reviewAutoAuthorized: Boolean(run.reviewAutoAuthorized),
+    hasLiveIntegrationBranch,
+    canStartRunReview,
+    canFinalizeRun,
+    canForceFinalizeRun,
     hasAnyActiveRun,
     headSeq,
     posts,

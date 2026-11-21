@@ -19,6 +19,7 @@ export interface DispatchProposalOverrides {
   worktree?: boolean;
   model?: string | null;
   effort?: string | null;
+  authorizeReviews?: boolean;
 }
 
 export interface CreateHeldProposalInput {
@@ -35,6 +36,7 @@ export interface CreateHeldProposalInput {
   model: string | null;
   effort: string | null;
   terminal: string | null;
+  authorizeReviews?: boolean;
 }
 
 export interface HeldProposalResolution {
@@ -188,6 +190,7 @@ export class DispatchProposalManager {
       prior.model === input.model &&
       prior.effort === input.effort &&
       prior.terminal === input.terminal &&
+      Boolean(prior.authorizeReviews) === Boolean(input.authorizeReviews) &&
       JSON.stringify(cloneTaskContext(prior.taskContext)) === JSON.stringify(merged);
     if (confirmed && prior && samePlan && state.lastTurnAt >= match.createdAt) {
       state.chatProposals.delete(prior.id);
@@ -256,6 +259,9 @@ export class DispatchProposalManager {
       model: input.model,
       effort: input.effort,
       terminal: input.terminal,
+      ...(typeof input.authorizeReviews === 'boolean'
+        ? { authorizeReviews: input.authorizeReviews }
+        : {}),
       status: 'pending',
       createdAt: nowIso,
       resolvedAt: null,
@@ -320,6 +326,9 @@ export class DispatchProposalManager {
     }
     if (overrides?.effort !== undefined) {
       entry.proposal.effort = overrides.effort?.trim() || null;
+    }
+    if (typeof overrides?.authorizeReviews === 'boolean') {
+      entry.proposal.authorizeReviews = overrides.authorizeReviews;
     }
 
     const snapshot = { ...entry.proposal };

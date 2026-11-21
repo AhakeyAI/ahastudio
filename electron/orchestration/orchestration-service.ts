@@ -2821,10 +2821,52 @@ export class OrchestrationService {
           summary,
           isRunReview,
         });
+        const reviewBatchPeers = resolvedDispatch.reviewBatchId
+          ? (isRunReview
+              ? this.store.listReviewDispatchesForRunBatch(
+                  resolvedDispatch.reviewOfRunId ?? resolvedDispatch.runId,
+                  resolvedDispatch.reviewBatchId,
+                )
+              : targetDispatch
+                ? this.store.listReviewDispatchesForBatch(targetDispatch.id, resolvedDispatch.reviewBatchId)
+                : []
+            ).filter((d) => d.id !== resolvedDispatch.id)
+          : [];
+        const hasPendingPeer = reviewBatchPeers.some((d) => ACTIVE_DISPATCH_STATUSES.has(d.status));
+        const hasRejectedPeer = reviewBatchPeers.some(
+          (d) => d.reviewStatus === 'rejected' || d.reviewStatus === 'escalated',
+        );
+        let reviewNextStep: string;
+        if (evaluation.effectiveVerdict === 'pass') {
+          if (hasRejectedPeer) {
+            reviewNextStep = isRunReview
+              ? 'Another parallel reviewer in this Run batch rejected; address those findings before finalizing.'
+              : `Another parallel reviewer rejected @${targetRole}; send those findings to @${targetRole} via message_worker before integrating.`;
+          } else if (hasPendingPeer) {
+            reviewNextStep = isRunReview
+              ? 'Waiting for remaining parallel Run reviewer(s) in this batch before finalizing.'
+              : `Waiting for remaining parallel reviewer(s) for @${targetRole} before integrating.`;
+          } else if (isRunReview) {
+            reviewNextStep = targetRun && this.isRunIntegrationBranchLive(targetRun)
+              ? 'Run-level review passed — call finalize_run_integration() once main workspace is clean.'
+              : 'Run-level review passed on main — ready to run final verification and report to the user.';
+          } else {
+            reviewNextStep = `Review passed for @${targetRole} — call integrate_worker(role="@${targetRole}") (defaults to mode="squash", targetBranch="auto").`;
+          }
+        } else if (escalated) {
+          reviewNextStep = isRunReview
+            ? `Run-level review reached max rounds (${reviewRound}/${MAX_ADVERSARIAL_REVIEW_ROUNDS}) and escalated — summarize remaining findings for the user to approve or direct fixes.`
+            : `Review for @${targetRole} reached max rounds (${reviewRound}/${MAX_ADVERSARIAL_REVIEW_ROUNDS}) and escalated — summarize remaining findings for the user to decide (or approve/rework from the Board panel).`;
+        } else {
+          reviewNextStep = isRunReview
+            ? `Run-level review rejected (Round ${reviewRound}/${MAX_ADVERSARIAL_REVIEW_ROUNDS}) — dispatch a fix worker for the findings, integrate it, then re-run reviewRun.`
+            : `Review rejected (Round ${reviewRound}/${MAX_ADVERSARIAL_REVIEW_ROUNDS}) — send these findings to @${targetRole} via message_worker(role="@${targetRole}", ...) to fix, then re-review.`;
+        }
         effectiveArtifacts = {
           ...(effectiveArtifacts ?? {}),
           reviewVerdict: evaluation.effectiveVerdict,
           ...(evaluation.findings.length > 0 ? { reviewFindings: evaluation.findings } : {}),
+          recommendedNextStep: reviewNextStep,
         };
       } else {
         settleReview = () => {
@@ -2917,20 +2959,87 @@ export class OrchestrationService {
           reviewVerificationFailed = mut.verificationFailed;
         }
       } else if (repoPath) {
-        const rawArtifacts = await collectWorkerReportArtifacts(
-          repoPath,
-          resolvedDispatch.branch,
-          undefined,
-          resolvedDispatch.baseCommit,
-        );
-        if (
-          rawArtifacts &&
-          (resolvedDispatch.worktreePath ||
-            rawArtifacts.branch ||
-            rawArtifacts.headCommit ||
-            rawArtifacts.changedFileCount > 0)
-        ) {
-          artifacts = rawArtifacts;
+        const normalizedOutcome =
+          input.outcome === 'succeeded' ? 'completed' : (input.outcome ?? 'completed');
+        let enrichedFromDiff = false;
+        if (normalizedOutcome === 'completed' && resolvedDispatch.ownsWorktree && resolvedDispatch.worktreePath) {
+          try {
+            const runForWorker = this.store.getRun(resolvedDispatch.runId);
+            const mainRepoRoot = await resolveMainRepoRoot(
+              repoPath,
+              resolvedDispatch.repoRootPath ?? this.getDefaultCwd?.() ?? null,
+            ).catch(() => null);
+            const wtHead = mainRepoRoot
+              ? await resolveBranchRefOid(repoPath, resolvedDispatch.branch ?? '').catch(() => null)
+              : null;
+            const effectiveBase =
+              runForWorker && mainRepoRoot && wtHead
+                ? await this.resolveEffectiveWorkerDiffBase(
+                    runForWorker,
+                    resolvedDispatch,
+                    repoPath,
+                    mainRepoRoot,
+                    wtHead,
+                  )
+                : resolvedDispatch.baseCommit;
+            const diffSummary = await inspectWorkerDiff({
+              worktreePath: repoPath,
+              baseCommit: effectiveBase,
+              maxDiffBytes: 4 * 1024,
+            });
+            if (diffSummary.isGitRepo) {
+              enrichedFromDiff = true;
+              const cleanRole = this.resolveRoleNameForDispatch(resolvedDispatch) || resolvedDispatch.id;
+              const autoAuthNote = runForWorker?.reviewAutoAuthorized
+                ? ' (review pre-authorized for this Run)'
+                : '';
+              let recommendedNextStep: string;
+              if (diffSummary.stagedDivergentFiles.length > 0) {
+                recommendedNextStep = `Staged vs working-tree divergence in ${diffSummary.stagedDivergentFiles.slice(0, 4).join(', ')} — ask @${cleanRole} to reconcile staged changes before integrating.`;
+              } else if (diffSummary.changedFiles.length === 0) {
+                recommendedNextStep = `No code diff relative to target — verify via inspect_worker_diff(role="@${cleanRole}") or release.`;
+              } else if (diffSummary.recommendedReviewTier === 'L0') {
+                recommendedNextStep = `L0 (${diffSummary.tierReason}) — can integrate directly via integrate_worker(role="@${cleanRole}") (targetBranch defaults to "auto").`;
+              } else if (diffSummary.recommendedReviewTier === 'L2') {
+                recommendedNextStep = `L2 (${diffSummary.tierReason}) — launch 1–2 parallel heterogeneous reviews via delegate_task(reviewOf="@${cleanRole}", reviewFocus="...") before integrating${autoAuthNote}.`;
+              } else {
+                recommendedNextStep = `L1 (${diffSummary.tierReason}) — launch heterogeneous review via delegate_task(reviewOf="@${cleanRole}") before integrating${autoAuthNote}.`;
+              }
+              artifacts = {
+                ...(diffSummary.branch ? { branch: diffSummary.branch } : {}),
+                worktreePath: repoPath,
+                ...(diffSummary.baseCommit ? { baseCommit: diffSummary.baseCommit } : {}),
+                ...(diffSummary.headCommit ? { headCommit: diffSummary.headCommit } : {}),
+                ...(diffSummary.snapshotOid ? { snapshotOid: diffSummary.snapshotOid } : {}),
+                commitsAhead: diffSummary.commitsAhead,
+                uncommittedCount: diffSummary.uncommittedFiles.length,
+                changedFiles: diffSummary.changedFiles.slice(0, 20),
+                changedFileCount: diffSummary.changedFiles.length,
+                reviewTier: diffSummary.recommendedReviewTier,
+                reviewTierReason: diffSummary.tierReason,
+                recommendedNextStep,
+              };
+            }
+          } catch {
+            // Non-fatal: fall back to base artifacts if diff classification cannot run.
+          }
+        }
+        if (!enrichedFromDiff) {
+          const rawArtifacts = await collectWorkerReportArtifacts(
+            repoPath,
+            resolvedDispatch.branch,
+            undefined,
+            resolvedDispatch.baseCommit,
+          );
+          if (
+            rawArtifacts &&
+            (resolvedDispatch.worktreePath ||
+              rawArtifacts.branch ||
+              rawArtifacts.headCommit ||
+              rawArtifacts.changedFileCount > 0)
+          ) {
+            artifacts = rawArtifacts;
+          }
         }
       }
     }
@@ -5801,6 +5910,7 @@ export class OrchestrationService {
     releasedReviews: number;
     releaseSkippedReason?: string;
     cleanupWarnings?: string[];
+    recommendedNextStep?: string;
   }> {
     const rawTarget = input.dispatchId?.trim() || input.worker?.trim() || input.taskId?.trim() || '';
     const dispatch = rawTarget
@@ -5918,7 +6028,8 @@ export class OrchestrationService {
           },
         );
       }
-      if (input.targetBranch === 'main' && hasActiveRunIntegrationBranch) {
+      const effectiveTargetBranch: WorkerIntegrateTargetBranch = input.targetBranch ?? 'auto';
+      if (effectiveTargetBranch === 'main' && hasActiveRunIntegrationBranch) {
         throw new OrchestrationError(
           'operation_rejected',
           `Run ${run.id} already has an active integration branch (${run.integrationBranch}). Integrate into targetBranch="integration" or finalize the Run integration branch first to avoid splitting Run changes.`,
@@ -5927,9 +6038,9 @@ export class OrchestrationService {
       }
 
       let useRunIntegrationBranch = false;
-      if (input.targetBranch === 'integration' || (!input.targetBranch && hasActiveRunIntegrationBranch)) {
+      if (effectiveTargetBranch === 'integration') {
         useRunIntegrationBranch = true;
-      } else if (input.targetBranch === 'auto') {
+      } else if (effectiveTargetBranch === 'auto') {
         if (hasActiveRunIntegrationBranch) {
           useRunIntegrationBranch = true;
         } else {
@@ -6209,6 +6320,38 @@ export class OrchestrationService {
         });
       }
 
+      const runDispatches = this.store
+        .listDispatches({ runId: latestDispatch.runId })
+        .filter((d) => !d.reviewOfDispatchId && !d.reviewOfRunId);
+      const latestByTask = new Map<string, OrchestrationDispatchRecord>();
+      for (const d of runDispatches) {
+        const prev = latestByTask.get(d.taskId);
+        if (!prev || (d.processGeneration ?? 0) >= (prev.processGeneration ?? 0)) {
+          latestByTask.set(d.taskId, d);
+        }
+      }
+      const implWorkers = [...latestByTask.values()];
+      const remainingWorkers = implWorkers.filter(
+        (d) =>
+          d.id !== latestDispatch.id &&
+          d.integrationStatus !== 'merged' &&
+          d.integrationStatus !== 'skipped' &&
+          d.status !== 'failed' &&
+          d.status !== 'circuit_broken' &&
+          !d.releasedAt,
+      );
+      const mergedCount = implWorkers.filter((d) => d.integrationStatus === 'merged').length;
+      let recommendedNextStep: string | undefined;
+      if (effectiveUsedRunBranch && result.targetBranch) {
+        recommendedNextStep =
+          remainingWorkers.length === 0
+            ? `All active workers are staged on ${result.targetBranch} (main workspace untouched). Next: inspect_run_diff(), optionally delegate_task(reviewRun=true), and call finalize_run_integration() once main is clean.`
+            : `Staged on ${result.targetBranch} (${remainingWorkers.length} other worker(s) remaining). Continue integrating remaining workers, then finalize_run_integration().`;
+      } else if (remainingWorkers.length === 0 && mergedCount >= 2) {
+        recommendedNextStep =
+          'All workers integrated into main. You may run inspect_run_diff() / delegate_task(reviewRun=true) for a combined Run-level check before reporting final results.';
+      }
+
       const boardMsg = this.store.insertMessage({
         runId: latestDispatch.runId,
         from: callerPaneId || 'coordinator',
@@ -6227,6 +6370,7 @@ export class OrchestrationService {
           snapshotOid: result.snapshotOid,
           changedFiles: result.changedFiles.slice(0, 20),
           changedFileCount: result.changedFiles.length,
+          ...(recommendedNextStep ? { recommendedNextStep } : {}),
         },
       });
       this.store.markAsReadAndDelivered([boardMsg.id]);
@@ -6301,6 +6445,7 @@ export class OrchestrationService {
         releasedReviews,
         ...(releaseSkippedReason ? { releaseSkippedReason } : {}),
         ...(cleanupWarnings.length > 0 ? { cleanupWarnings } : {}),
+        ...(recommendedNextStep ? { recommendedNextStep } : {}),
       };
     };
 
@@ -6592,6 +6737,19 @@ export class OrchestrationService {
       : this.withRunIntegrationLock(initialRun.id, executeFinalize);
   }
 
+  setRunAutoReview(input: { runId: string; enabled: boolean }): { run: OrchestrationRunRecord } {
+    const cleanId = input.runId.trim();
+    if (!cleanId) {
+      throw new OrchestrationError('invalid_argument', 'runId is required.');
+    }
+    const updated = this.store.setRunAutoReviewAuthorized(cleanId, Boolean(input.enabled));
+    if (!updated) {
+      throw new OrchestrationError('run_not_found', `Run not found: ${cleanId}`);
+    }
+    this.emitChanged('run:auto-review-updated', updated.id);
+    return { run: updated };
+  }
+
   async delegateTask(
     input: {
       from?: string;
@@ -6600,6 +6758,7 @@ export class OrchestrationService {
       reviewOf?: string;
       reviewRun?: boolean | string;
       reviewFocus?: string;
+      authorizeReviews?: boolean;
       taskContext?: OrchestrationTaskContext | null;
       background?: string;
       proposalId?: string;
@@ -6787,13 +6946,22 @@ export class OrchestrationService {
       input.planSummary?.trim() ||
       (role ? `@${role} (${resolvedAgent}): ${firstLine}` : `${resolvedAgent}: ${firstLine}`);
     const explicitRunId = input.runId?.trim();
-    const inferredRunId = explicitRunId || reviewRunTarget?.id || (input.callerPaneId === undefined
-      ? this.inferRunIdOptional(from)
-      : this.resolveBoardMemberForPane(from)?.runId) || null;
-    let dispatchRunId = explicitRunId ?? reviewRunTarget?.id;
+    const inferredRunId =
+      explicitRunId ||
+      reviewRunTarget?.id ||
+      reviewTargetDispatch?.runId ||
+      (input.callerPaneId === undefined
+        ? this.inferRunIdOptional(from)
+        : this.resolveBoardMemberForPane(from)?.runId) ||
+      null;
+    let dispatchRunId = explicitRunId ?? reviewRunTarget?.id ?? reviewTargetDispatch?.runId;
     if (explicitRunId && input.callerPaneId !== undefined) {
       this.resolveBoardCallerContext({ from: input.callerPaneId, runId: explicitRunId });
     }
+    const isReviewDispatch = Boolean(reviewTargetDispatch || reviewRunTarget);
+    const targetRunForAuth = inferredRunId ? this.store.getRun(inferredRunId) : null;
+    const requestedAuthorizeReviews =
+      typeof input.authorizeReviews === 'boolean' ? input.authorizeReviews : undefined;
     const proposalInput = {
       coordinatorPaneId: from,
       runId: inferredRunId,
@@ -6808,12 +6976,20 @@ export class OrchestrationService {
       model: resolvedModel ?? null,
       effort: resolvedEffort ?? null,
       terminal: input.terminal?.trim() || null,
+      ...(requestedAuthorizeReviews !== undefined
+        ? { authorizeReviews: requestedAuthorizeReviews }
+        : {}),
     };
     const confirmMode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
-    // Detached worktrees do not provide OS-level read-only sandboxing, so reviewOf does NOT bypass chat-and-guard.
+    // Review dispatches bypass repeated confirmation ONLY when the user explicitly pre-authorized
+    // review execution for this Run (via a prior confirmed proposal or UI toggle).
+    const autoReviewBypass = Boolean(isReviewDispatch && targetRunForAuth?.reviewAutoAuthorized);
     const bypassGate =
       input.userInitiated === true ||
-      confirmMode === 'auto';
+      confirmMode === 'auto' ||
+      autoReviewBypass;
+
+    let grantRunAutoReview = Boolean(input.userInitiated === true && requestedAuthorizeReviews === true);
 
     if (!bypassGate) {
       if (confirmMode === 'chat-and-guard') {
@@ -6834,6 +7010,9 @@ export class OrchestrationService {
         }
         normalizedTaskContext = guard.taskContext;
         dispatchRunId = guard.proposal.runId ?? undefined;
+        if (isReviewDispatch || guard.proposal.authorizeReviews === true) {
+          grantRunAutoReview = true;
+        }
       } else if (confirmMode === 'always-ui') {
         const held = await this.proposals.createHeldProposal(proposalInput, signal);
         if (held.decision !== 'approved') {
@@ -6844,6 +7023,11 @@ export class OrchestrationService {
               held.reason ||
               (held.decision === 'expired' ? '派发确认已超时。' : '用户已取消本次派发。'),
           };
+        }
+        if (typeof held.overrides?.authorizeReviews === 'boolean') {
+          grantRunAutoReview = held.overrides.authorizeReviews;
+        } else if (isReviewDispatch || held.proposal.authorizeReviews === true) {
+          grantRunAutoReview = true;
         }
         if (held.overrides) {
           const prevAgent = resolvedAgent;
@@ -6923,6 +7107,13 @@ export class OrchestrationService {
           mcpEnabled,
           role: role || undefined,
         });
+        if (grantRunAutoReview && !started.run.reviewAutoAuthorized) {
+          const updatedRun = this.store.setRunAutoReviewAuthorized(started.run.id, true);
+          if (updatedRun) {
+            started.run = updatedRun;
+            this.emitChanged('run:auto-review-updated', updatedRun.id);
+          }
+        }
         return {
           status: 'started',
           role,

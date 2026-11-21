@@ -7,6 +7,7 @@ import {
   ChevronUp,
   Cpu,
   GitBranch,
+  GitMerge,
   Network,
   Pause,
   Pin,
@@ -14,6 +15,7 @@ import {
   Search,
   Send,
   ShieldAlert,
+  ShieldCheck,
   SkipBack,
   Sparkles,
   Square,
@@ -135,7 +137,7 @@ export function OrchestrationBoardPanel({
   const [questionDrafts, setQuestionDrafts] = useState<Record<string, string>>({});
   const [agentsRoster, setAgentsRoster] = useState<OrchestrationAgentRosterEntry[]>([]);
   const [proposalDrafts, setProposalDrafts] = useState<
-    Record<string, { agent: string; worktree: boolean }>
+    Record<string, { agent: string; worktree: boolean; authorizeReviews: boolean }>
   >({});
 
   // Members search state
@@ -479,6 +481,7 @@ export function OrchestrationBoardPanel({
     proposalDrafts[p.id] ?? {
       agent: p.resolvedAgent || p.requestedAgent || 'auto',
       worktree: p.worktree,
+      authorizeReviews: p.authorizeReviews ?? true,
     };
 
   const handleApproveProposal = async (proposal: OrchestrationDispatchProposal) => {
@@ -491,9 +494,117 @@ export function OrchestrationBoardPanel({
         id: proposal.id,
         agent: draft.agent,
         worktree: draft.worktree,
+        authorizeReviews: draft.authorizeReviews,
       });
       if (!res.ok) onNotify?.(res.error);
       else onNotify?.(`已确认拉起 @${proposal.role?.replace(/^@+/, '') || 'worker'}`);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleToggleRunAutoReview = async () => {
+    const api = window.vibeMeet.orchestration?.runSetAutoReview;
+    if (!api || !model.run) return;
+    const nextEnabled = !model.reviewAutoAuthorized;
+    setBusyId(`run-auto-review:${model.run.id}`);
+    try {
+      const res = await api({ runId: model.run.id, enabled: nextEnabled });
+      if (!res.ok) onNotify?.(res.error);
+      else onNotify?.(nextEnabled ? '已开启本轮免确认自动审查' : '已切换为审查前手动确认');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleStartRunReview = async () => {
+    const api = window.vibeMeet.orchestration?.delegateTask;
+    if (!api || !model.run) return;
+    setBusyId(`run-review:${model.run.id}`);
+    try {
+      const res = await api({
+        runId: model.run.id,
+        reviewRun: true,
+        userInitiated: true,
+      });
+      if (!res.ok) onNotify?.(res.error);
+      else if (res.status === 'started') {
+        onNotify?.(`已启动整体验收审查（${res.agent ?? 'heterogeneous'}）`);
+      } else {
+        onNotify?.(res.message || '整体验收审查未启动');
+      }
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleFinalizeRun = async (force = false) => {
+    const api = window.vibeMeet.orchestration?.runFinalize;
+    if (!api || !model.run) return;
+    setBusyId(`run-finalize:${model.run.id}`);
+    try {
+      const res = await api({
+        runId: model.run.id,
+        mode: 'squash',
+        ...(force ? { force: true } : {}),
+      });
+      if (!res.ok) onNotify?.(res.error);
+      else if (res.integrated) {
+        onNotify?.(`已将 ${res.integrationBranch} 合并回 ${res.targetBranch ?? 'main'}`);
+      } else if (res.noChanges) {
+        onNotify?.('集成分支与主分支无差异，已标记收尾');
+      } else {
+        onNotify?.(res.message || '合回主分支未完成，请检查冲突');
+      }
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleTriggerWorkerReview = async (member: BoardMemberCard) => {
+    const api = window.vibeMeet.orchestration?.delegateTask;
+    if (!api || !model.run) return;
+    setBusyId(`rev:${member.dispatchId}`);
+    try {
+      const res = await api({
+        runId: model.run.id,
+        reviewOf: member.dispatchId,
+        userInitiated: true,
+      });
+      if (!res.ok) onNotify?.(res.error);
+      else if (res.status === 'started') {
+        onNotify?.(`已对 ${member.label} 发起异构审查（${res.agent ?? 'heterogeneous'}）`);
+      } else {
+        onNotify?.(res.message || '审查未启动');
+      }
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleIntegrateWorker = async (member: BoardMemberCard, force = false) => {
+    const api = window.vibeMeet.orchestration?.workerIntegrate;
+    if (!api) return;
+    setBusyId(`int:${member.dispatchId}`);
+    try {
+      const res = await api({
+        dispatchId: member.dispatchId,
+        mode: 'squash',
+        targetBranch: 'auto',
+        ...(force ? { force: true } : {}),
+      });
+      if (!res.ok) onNotify?.(res.error);
+      else if (res.integrated) {
+        onNotify?.(
+          res.usedRunIntegrationBranch
+            ? `已将 ${member.label} 暂存至集成分支 ${res.targetBranch ?? ''}`
+            : `已将 ${member.label} 合入 ${res.targetBranch ?? 'main'}`,
+        );
+      } else if (res.noChanges) {
+        onNotify?.(`${member.label} 无代码差异，已标记集成`);
+      } else {
+        onNotify?.(res.message || '集成存在冲突，请处理后重试');
+      }
     } finally {
       setBusyId(null);
     }
@@ -958,6 +1069,23 @@ export function OrchestrationBoardPanel({
               />
               <span>worktree</span>
             </label>
+            <label
+              className="wrp-check obp-wt-check"
+              title="批准后本轮 Run 内的后续异构审查与整体验收自动放行，不再重复弹窗确认"
+            >
+              <input
+                type="checkbox"
+                checked={draft.authorizeReviews}
+                disabled={busyId === `prop:${proposal.id}`}
+                onChange={(e) =>
+                  setProposalDrafts((prev) => ({
+                    ...prev,
+                    [proposal.id]: { ...draft, authorizeReviews: e.target.checked },
+                  }))
+                }
+              />
+              <span>免确认后续审查</span>
+            </label>
             <div className="obp-inline-card-btns">
               <button
                 type="button"
@@ -1038,6 +1166,50 @@ export function OrchestrationBoardPanel({
               >
                 {model.runReviewBadge.label}
               </span>
+            )}
+          </div>
+        )}
+        {model.run && model.isLive && (
+          <div className="obp-header-controls">
+            <button
+              type="button"
+              className={`obp-auto-review-pill ${model.reviewAutoAuthorized ? 'is-enabled' : ''}`}
+              title={
+                model.reviewAutoAuthorized
+                  ? '本轮 Run 的后续异构审查与整体验收已授权免确认（点击关闭）'
+                  : '开启后，本轮 Run 内的后续异构审查与整体验收将自动放行，不再重复确认'
+              }
+              disabled={busyId === `run-auto-review:${model.run.id}`}
+              onClick={() => void handleToggleRunAutoReview()}
+            >
+              <ShieldCheck size={11} />
+              <span>{model.reviewAutoAuthorized ? '免确认审查：开' : '免确认审查：关'}</span>
+            </button>
+            {model.canStartRunReview && (
+              <button
+                type="button"
+                className="wrp-btn obp-btn-sm"
+                title="对本轮已合并的全部改动发起异构整体验收审查"
+                disabled={busyId === `run-review:${model.run.id}`}
+                onClick={() => void handleStartRunReview()}
+              >
+                <ShieldCheck size={11} /> 整体验收
+              </button>
+            )}
+            {model.canFinalizeRun && (
+              <button
+                type="button"
+                className={`wrp-btn obp-btn-sm ${model.canForceFinalizeRun ? 'is-danger' : 'is-primary'}`}
+                title={
+                  model.canForceFinalizeRun
+                    ? '强制忽略未通过的整体验收并将集成分支合并回主分支'
+                    : '将当前 Run 集成分支合并回主分支并清理临时 worktree'
+                }
+                disabled={busyId === `run-finalize:${model.run.id}`}
+                onClick={() => void handleFinalizeRun(model.canForceFinalizeRun)}
+              >
+                <GitMerge size={11} /> {model.canForceFinalizeRun ? '人工放行合回' : '合并回主分支'}
+              </button>
             )}
           </div>
         )}
@@ -1662,6 +1834,49 @@ export function OrchestrationBoardPanel({
                         >
                           {member.isSettled ? <Trash2 size={12} /> : <Square size={11} />}
                         </button>
+                      </div>
+                    )}
+                    {(member.canTriggerReview || member.canIntegrate) && (
+                      <div className="obp-member-workflow-bar">
+                        {member.canTriggerReview && (
+                          <button
+                            type="button"
+                            className="wrp-btn obp-btn-sm"
+                            title={`对 ${member.label} 发起独立只读异构审查`}
+                            disabled={busyId === `rev:${member.dispatchId}`}
+                            onClick={() => void handleTriggerWorkerReview(member)}
+                          >
+                            <ShieldCheck size={11} /> {member.reviewStatus === 'rejected' || member.reviewStatus === 'escalated' ? '重新审查' : '异构审查'}
+                          </button>
+                        )}
+                        {member.canIntegrate && (
+                          <button
+                            type="button"
+                            className={`wrp-btn obp-btn-sm ${member.canForceIntegrate ? 'is-danger' : 'is-primary'}`}
+                            title={
+                              member.canForceIntegrate
+                                ? `人工跳过审查门禁并将 ${member.label} 合入（主分支脏时自动暂存到 Run 集成分支）`
+                                : `将 ${member.label} squash 合入（主分支脏时自动暂存到 Run 集成分支）`
+                            }
+                            disabled={busyId === `int:${member.dispatchId}`}
+                            onClick={() => void handleIntegrateWorker(member, member.canForceIntegrate)}
+                          >
+                            <GitMerge size={11} /> {member.canForceIntegrate ? '人工放行合入' : '合入'}
+                          </button>
+                        )}
+                        {(member.reviewStatus === 'rejected' || member.reviewStatus === 'escalated') && (
+                          <button
+                            type="button"
+                            className="wrp-btn obp-btn-sm"
+                            title="在协作板查看审查意见"
+                            onClick={() => {
+                              setRoleFilter(member.role.toLowerCase());
+                              setSubTab('board');
+                            }}
+                          >
+                            查看意见
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>

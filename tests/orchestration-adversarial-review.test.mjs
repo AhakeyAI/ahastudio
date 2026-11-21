@@ -864,15 +864,15 @@ test('Phase 2 E2E: dirty main -> aha/run/<runId> multi-worker integration -> Run
     summary: 'Backend verified.',
   });
 
-  // Default targetBranch='main' refuses because main has dirty uncommitted files.
+  // Explicit targetBranch='main' refuses because main has dirty uncommitted files.
   await assert.rejects(
-    () => service.workerIntegrate({ worker: '@backend', mode: 'squash' }, 'local-coord'),
+    () => service.workerIntegrate({ worker: '@backend', mode: 'squash', targetBranch: 'main' }, 'local-coord'),
     /uncommitted file/i,
   );
 
-  // targetBranch='auto' detects dirty main and automatically creates aha/run/<runId>!
+  // Default (omitted targetBranch -> 'auto') detects dirty main and automatically creates aha/run/<runId>!
   const int1 = await service.workerIntegrate(
-    { worker: '@backend', mode: 'squash', targetBranch: 'auto' },
+    { worker: '@backend', mode: 'squash' },
     'local-coord',
   );
   assert.equal(int1.integrated, true);
@@ -2041,4 +2041,137 @@ test('Phase 2 round-3 review fixes: evil-merge revert visibility & block, mode="
   assert.equal(existsSync(join(repo, 'foreign-only.txt')), false, 'foreign-only.txt must NOT enter main');
   const mainLogFinal = await git(repo, 'rev-list', 'main');
   assert.equal(mainLogFinal.includes(foreignSha), false, 'foreign branch commit must NOT enter main history');
+});
+
+test('Natural workflow UX: confirm-once Run review pre-authorization, Coordinator-driven tier/next-step guidance, and default targetBranch="auto"', async (t) => {
+  const { repo, store, service, run } = await createRepoHarness(t, { confirmMode: 'chat-and-guard' });
+
+  // 1. Coordinator cannot sneak authorizeReviews=true on confirmed=true if it was absent in the proposed plan!
+  const sneakProposal = await service.delegateTask({
+    from: 'local-coord',
+    callerPaneId: 'local-coord',
+    runId: run.id,
+    role: 'backend',
+    task: 'Implement helper.ts',
+    agent: 'codex',
+    worktree: true,
+    confirmed: false,
+  });
+  assert.equal(sneakProposal.status, 'confirmation_required');
+  service.recordUserPromptTurn('local-coord', 'hook');
+  const sneakAttempt = await service.delegateTask({
+    from: 'local-coord',
+    callerPaneId: 'local-coord',
+    runId: run.id,
+    role: 'backend',
+    task: 'Implement helper.ts',
+    agent: 'codex',
+    worktree: true,
+    authorizeReviews: true,
+    confirmed: true,
+    proposalId: sneakProposal.proposal.id,
+  });
+  assert.equal(sneakAttempt.status, 'confirmation_required', 'sneaking authorizeReviews on confirm MUST fail samePlan');
+  assert.equal(store.requireRun(run.id).reviewAutoAuthorized ?? false, false);
+
+  // 2. Legitimate confirm-once flow: propose with authorizeReviews=true -> user replies -> confirm starts worker & authorizes Run reviews.
+  const prop1 = await service.delegateTask({
+    from: 'local-coord',
+    callerPaneId: 'local-coord',
+    runId: run.id,
+    role: 'backend',
+    task: 'Implement helper.ts',
+    agent: 'codex',
+    worktree: true,
+    authorizeReviews: true,
+    confirmed: false,
+  });
+  assert.equal(prop1.status, 'confirmation_required');
+  assert.equal(prop1.proposal.authorizeReviews, true);
+  service.recordUserPromptTurn('local-coord', 'hook');
+  const impl = await service.delegateTask({
+    from: 'local-coord',
+    callerPaneId: 'local-coord',
+    runId: run.id,
+    role: 'backend',
+    task: 'Implement helper.ts',
+    agent: 'codex',
+    worktree: true,
+    authorizeReviews: true,
+    confirmed: true,
+    proposalId: prop1.proposal.id,
+  });
+  assert.equal(impl.status, 'started');
+  assert.equal(store.requireRun(run.id).reviewAutoAuthorized, true);
+
+  // 3. Implementation worker finishes (L1: 2 code files) -> worker_done artifacts automatically carry reviewTier + recommendedNextStep!
+  writeFileSync(join(impl.worktreePath, 'helper.ts'), 'export const answer = 42;\n', 'utf8');
+  writeFileSync(join(impl.worktreePath, 'service.ts'), 'export function runHelper() { return 42; }\n', 'utf8');
+  const doneRes = await service.workerDoneByPane(impl.ptyId, { outcome: 'completed', summary: 'implemented helper' });
+  assert.equal(doneRes.message.artifacts?.reviewTier, 'L1');
+  assert.ok(doneRes.message.artifacts?.snapshotOid && doneRes.message.artifacts.snapshotOid.length === 40);
+  assert.match(doneRes.message.artifacts?.recommendedNextStep ?? '', /delegate_task\(reviewOf="@backend"\)/);
+  assert.match(doneRes.message.artifacts?.recommendedNextStep ?? '', /pre-authorized/i);
+
+  // 4. Subsequent reviewOf starts WITHOUT another chat-and-guard prompt!
+  const rev1 = await service.delegateTask({
+    from: 'local-coord',
+    callerPaneId: 'local-coord',
+    runId: run.id,
+    reviewOf: '@backend',
+  });
+  assert.equal(rev1.status, 'started', 'pre-authorized Run reviewOf must start without re-prompting user');
+
+  // 5. Yet a NEW implementation worker in the same Run STILL requires chat-and-guard confirmation!
+  const newImplBlocked = await service.delegateTask({
+    from: 'local-coord',
+    callerPaneId: 'local-coord',
+    runId: run.id,
+    role: 'extra',
+    task: 'Do unrelated work',
+    agent: 'codex',
+    worktree: true,
+  });
+  assert.equal(newImplBlocked.status, 'confirmation_required', 'reviewAutoAuthorized must NEVER bypass confirmation for implementation workers');
+
+  // 6. Reviewer PASS automatically attaches integrate_worker next step; default workerIntegrate auto-routes dirty main to aha/run/<runId>!
+  const revDone = await service.workerDoneByPane(rev1.ptyId, {
+    outcome: 'completed',
+    verdict: 'pass',
+    summary: 'Looks solid.',
+  });
+  assert.match(revDone.message.artifacts?.recommendedNextStep ?? '', /integrate_worker\(role="@backend"\)/);
+
+  writeFileSync(join(repo, 'user-draft.txt'), 'local wip\n', 'utf8');
+  const intRes = await service.workerIntegrate({ worker: '@backend', mode: 'squash' }, 'local-coord');
+  assert.equal(intRes.integrated, true);
+  assert.equal(intRes.usedRunIntegrationBranch, true, 'omitted targetBranch defaults to auto and routes dirty main to aha/run/<runId>');
+  assert.match(intRes.recommendedNextStep ?? '', /finalize_run_integration/);
+
+  // 7. Subsequent reviewRun also starts WITHOUT re-prompting while reviewAutoAuthorized=true!
+  const runRev = await service.delegateTask({
+    from: 'local-coord',
+    callerPaneId: 'local-coord',
+    runId: run.id,
+    reviewRun: true,
+  });
+  assert.equal(runRev.status, 'started');
+  const runRevDone = await service.workerDoneByPane(runRev.ptyId, {
+    outcome: 'completed',
+    verdict: 'pass',
+    summary: 'Combined changes clean.',
+  });
+  assert.match(runRevDone.message.artifacts?.recommendedNextStep ?? '', /finalize_run_integration/);
+
+  // 8. Disabling Run auto-review via setRunAutoReview immediately restores chat-and-guard confirmation on reviews!
+  const toggled = service.setRunAutoReview({ runId: run.id, enabled: false });
+  assert.equal(toggled.run.reviewAutoAuthorized, false);
+  const blockedAgain = await service.delegateTask({
+    from: 'local-coord',
+    callerPaneId: 'local-coord',
+    runId: run.id,
+    reviewRun: true,
+  });
+  assert.equal(blockedAgain.status, 'confirmation_required');
+  rmSync(join(repo, 'user-draft.txt'));
 });

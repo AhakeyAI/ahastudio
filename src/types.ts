@@ -599,6 +599,7 @@ export interface OrchestrationRunRecord {
   runReviewStatus?: OrchestrationReviewStatus;
   runReviewRound?: number;
   runReviewFindings?: OrchestrationReviewFinding[];
+  reviewAutoAuthorized?: boolean;
 }
 
 export type OrchestrationReviewSeverity = 'P0' | 'P1' | 'P2';
@@ -836,6 +837,9 @@ export interface OrchestrationReportArtifacts {
   uncommittedCount?: number;
   changedFiles?: string[];
   changedFileCount?: number;
+  reviewTier?: 'L0' | 'L1' | 'L2';
+  reviewTierReason?: string;
+  recommendedNextStep?: string;
   reviewVerdict?: OrchestrationReviewVerdict;
   reviewFindings?: OrchestrationReviewFinding[];
 }
@@ -926,6 +930,7 @@ export interface OrchestrationDispatchProposal {
   model: string | null;
   effort: string | null;
   terminal: string | null;
+  authorizeReviews?: boolean;
   status: 'pending' | 'approved' | 'rejected' | 'expired';
   createdAt: string;
   resolvedAt: string | null;
@@ -1388,7 +1393,11 @@ export interface OrchestrationApi {
     from?: string;
     runId?: string;
     role?: string;
-    task: string;
+    task?: string;
+    reviewOf?: string;
+    reviewRun?: boolean | string;
+    reviewFocus?: string;
+    authorizeReviews?: boolean;
     agent?: string;
     taskKind?: OrchestrationTaskKind;
     worktree?: boolean;
@@ -1423,6 +1432,7 @@ export interface OrchestrationApi {
     worktree?: boolean;
     model?: string | null;
     effort?: string | null;
+    authorizeReviews?: boolean;
   }) => Promise<
     OrchestrationResult<{
       proposal: OrchestrationDispatchProposal;
@@ -1438,6 +1448,93 @@ export interface OrchestrationApi {
     id: string;
     reason?: string;
   }) => Promise<OrchestrationResult<{ proposal: OrchestrationDispatchProposal }>>;
+  workerDiff?: (opts: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+    files?: string[];
+    maxDiffBytes?: number;
+  }) => Promise<
+    OrchestrationResult<{
+      isGitRepo: boolean;
+      branch: string | null;
+      snapshotOid: string | null;
+      changedFiles: string[];
+      diffStat: string;
+      diff: string;
+      recommendedReviewTier: 'L0' | 'L1' | 'L2';
+      tierReason: string;
+      dispatchId: string;
+      role: string;
+      reviewStatus: string;
+      integrationStatus: string;
+    }>
+  >;
+  workerIntegrate?: (opts: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+    mode?: 'check' | 'squash' | 'merge';
+    targetBranch?: 'main' | 'integration' | 'auto';
+    expectedSnapshotOid?: string;
+    commitMessage?: string;
+    releaseAfter?: boolean;
+    deleteBranch?: boolean;
+    force?: boolean;
+  }) => Promise<
+    OrchestrationResult<{
+      integrated: boolean;
+      noChanges: boolean;
+      clean: boolean;
+      targetBranch: string | null;
+      usedRunIntegrationBranch: boolean;
+      changedFiles: string[];
+      conflictFiles: string[];
+      message: string;
+      recommendedNextStep?: string;
+    }>
+  >;
+  runDiff?: (opts?: {
+    runId?: string;
+    files?: string[];
+    maxDiffBytes?: number;
+  }) => Promise<
+    OrchestrationResult<{
+      runId: string;
+      hasIntegratedChanges: boolean;
+      integrationStatus: string;
+      integrationBranch: string | null;
+      runReviewStatus: string;
+      changedFiles: string[];
+      diffStat: string;
+    }>
+  >;
+  runFinalize?: (opts?: {
+    runId?: string;
+    mode?: 'check' | 'squash' | 'merge';
+    expectedSnapshotOid?: string;
+    commitMessage?: string;
+    deleteBranch?: boolean;
+    keepWorktree?: boolean;
+    force?: boolean;
+  }) => Promise<
+    OrchestrationResult<{
+      runId: string;
+      integrated: boolean;
+      noChanges: boolean;
+      clean: boolean;
+      targetBranch: string | null;
+      integrationBranch: string;
+      removedWorktree: boolean;
+      removedBranch: boolean;
+      conflictFiles: string[];
+      message: string;
+    }>
+  >;
+  runSetAutoReview?: (opts: {
+    runId: string;
+    enabled: boolean;
+  }) => Promise<OrchestrationResult<{ run: OrchestrationRunRecord }>>;
   boardPost?: (opts: {
     runId?: string;
     text: string;
