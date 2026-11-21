@@ -91,9 +91,19 @@ function StatusDot({ status }: { status: string }) {
   return <X size={12} className="asv-fail" aria-label={status} />;
 }
 
-function resolvePath(path: string, cwd?: string | null): string {
-  if (/^([a-zA-Z]:[\\/]|[\\/])/.test(path) || !cwd) return path;
-  return `${cwd.replace(/[\\/]+$/, '')}/${path.replace(/^\.?[\\/]/, '')}`;
+/** Same path as terminal file links: the main process resolves against cwd and opens or reveals it. */
+async function openChangedFile(path: string, cwd: string | null | undefined, onNotify?: (m: string) => void): Promise<void> {
+  const openLink = window.vibeMeet?.shellPty?.openLink;
+  if (!openLink) {
+    onNotify?.('当前环境不支持打开本地文件');
+    return;
+  }
+  try {
+    const res = await openLink({ target: path, ...(cwd ? { cwd } : {}) });
+    if (!res.ok) onNotify?.(res.error ?? '无法打开文件');
+  } catch (error) {
+    onNotify?.(error instanceof Error ? error.message : '无法打开文件');
+  }
 }
 
 function DiffView({ diff }: { diff: string }) {
@@ -106,7 +116,7 @@ function DiffView({ diff }: { diff: string }) {
   );
 }
 
-function FileRow({ file, cwd }: { file: WorkerTimelineFileChange; cwd?: string | null }) {
+function FileRow({ file, cwd, onNotify }: { file: WorkerTimelineFileChange; cwd?: string | null; onNotify?: (m: string) => void }) {
   const [open, setOpen] = useState(false);
   const label = file.change === 'add' ? '新增' : file.change === 'delete' ? '删除' : '修改';
   return (
@@ -116,7 +126,7 @@ function FileRow({ file, cwd }: { file: WorkerTimelineFileChange; cwd?: string |
           <ChevronRight size={12} className={open ? 'is-open' : ''} />
         </button>
         <span className={`asv-file-kind is-${file.change}`}>{label}</span>
-        <button type="button" className="asv-path" title="打开文件" onClick={() => void stageWindowStore.openFile(resolvePath(file.movePath ?? file.path, cwd))}>
+        <button type="button" className="asv-path" title="打开文件" onClick={() => void openChangedFile(file.movePath ?? file.path, cwd, onNotify)}>
           {file.path}{file.movePath ? ` → ${file.movePath}` : ''}
         </button>
         <span className="asv-stat-add">+{file.added}</span>
@@ -324,7 +334,7 @@ function ItemView({ item, cwd, onNotify }: { item: WorkerTimelineItem; cwd?: str
             <span className="asv-stat-del">-{totals.removed}</span>
             {item.status === 'declined' && <span className="asv-badge is-fail">已拒绝</span>}
           </div>
-          <div className="asv-card-body">{item.files.map((file) => <FileRow key={file.path} file={file} cwd={cwd} />)}</div>
+          <div className="asv-card-body">{item.files.map((file) => <FileRow key={file.path} file={file} cwd={cwd} onNotify={onNotify} />)}</div>
         </div>
       );
     }

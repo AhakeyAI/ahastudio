@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -81,7 +81,7 @@ async function setup(t, scenario = 'normal', enabled = true) {
         workers.set(workerId, hook.envForWorker(workerId));
         const child = scenario === 'spawn-error'
           ? fakeCodexChild()
-          : spawn(process.execPath, ['tests/fixtures/mock-codex-app-server.mjs', scenario, trace], {
+          : spawn(process.execPath, [join(cwd, 'tests/fixtures/mock-codex-app-server.mjs'), scenario, trace], {
             cwd: workdir, stdio: 'pipe', windowsHide: true,
           });
         if (scenario === 'spawn-error') {
@@ -128,7 +128,7 @@ async function setup(t, scenario = 'normal', enabled = true) {
     return response.json();
   };
   return {
-    service, store, statePath, start, run, getTrace, writes, workers, workerHttp, children, exits,
+    dir, service, store, statePath, start, run, getTrace, writes, workers, workerHttp, children, exits,
     ptyStarts: () => ptyStarts, codexStarts: () => codexStarts,
   };
 }
@@ -735,4 +735,52 @@ test('timeline patch coalescer merges streamed deltas into one patch per 30ms wi
   timeline.apply({ type: 'delta', id: 'm', kind: 'message', field: 'text', delta: '?' });
   await delay(60);
   assert.equal(sent.length, 1);
+});
+
+test('short mailbox messages are inlined into the next headless turn; long ones point at read_board', async (t) => {
+  const app = await setup(t);
+  const { dispatch } = await app.start('Stay active');
+  await until(() => app.store.getDispatchContext(dispatch.id)?.codexTurn);
+  const turnPrompts = () => app.getTrace().filter((message) => message.method === 'turn/start')
+    .map((message) => message.params.input[0].text);
+  await app.service.send({
+    from: 'coordinator-pane', to: 'dispatch:' + dispatch.id, runId: app.run.id,
+    type: 'status', subject: 'Quick question', body: 'Please also list the tests folder.',
+  });
+  await until(() => turnPrompts().length === 2);
+  const inline = turnPrompts()[1];
+  assert.match(inline, /Please also list the tests folder\./);
+  assert.match(inline, /Quick question/);
+  assert.doesNotMatch(inline, /Use the Aha read_board tool/);
+  const timeline = await until(() => {
+    const snapshot = app.service.getWorkerTimeline({ dispatchId: dispatch.id });
+    return snapshot.turns.length === 2 && snapshot.turns[1].status === 'completed' ? snapshot : null;
+  });
+  assert.match(timeline.turns[1].prompt, /Please also list the tests folder\./);
+
+  await app.service.send({
+    from: 'coordinator-pane', to: 'dispatch:' + dispatch.id, runId: app.run.id,
+    type: 'status', subject: 'Long context', body: 'detail '.repeat(300),
+  });
+  await until(() => turnPrompts().length === 3);
+  assert.match(turnPrompts()[2], /Use the Aha read_board tool/);
+});
+
+test('git fallback diff is redacted before it is stored, announced, or shown', async (t) => {
+  const app = await setup(t);
+  // A shared sparse clone gives a real HEAD without creating commits; only README.md is checked out.
+  const repo = join(app.dir, 'repo');
+  const git = (...args) => execFileSync('git', args, { cwd: app.dir, encoding: 'utf8', windowsHide: true });
+  git('clone', '--quiet', '--shared', '--no-checkout', cwd, repo);
+  git('-C', repo, 'sparse-checkout', 'set', '--no-cone', '/README.md');
+  git('-C', repo, 'checkout', '--quiet');
+  writeFileSync(join(repo, 'README.md'), readFileSync(join(repo, 'README.md'), 'utf8') + '\nleaked ' + stderrSecret + '\n');
+  const { dispatch } = await app.start('Report the diff', { cwd: repo });
+  const settled = await until(() => app.service.getWorkerTimeline({ dispatchId: dispatch.id })
+    ?.turns[0]?.items.find((item) => item.kind === 'settlement'));
+  assert.equal(settled.diffSource, 'git');
+  assert.match(settled.diff, /leaked <redacted>/);
+  assert.match(app.store.getDispatchContext(dispatch.id).codexTurn.diff, /leaked <redacted>/);
+  await app.service.waitForPendingWrites();
+  assert.doesNotMatch(readFileSync(app.statePath, 'utf8'), new RegExp(stderrSecret));
 });

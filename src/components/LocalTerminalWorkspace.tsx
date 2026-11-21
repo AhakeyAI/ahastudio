@@ -213,7 +213,8 @@ export function LocalTerminalWorkspace({
     pickAttentionStatus(stage.getWindowLeafIds(win.id).map((leafId) => agents.get(ptyIdForLeaf(leafId))));
   const activePtyId = activeLeafId ? ptyIdForLeaf(activeLeafId) : undefined;
   const activeAgent = activePtyId ? agents.get(activePtyId) : null;
-  const agentTargets: AgentPromptTarget[] = folderWindows.flatMap((win) => {
+  // Headless sessions have no PTY, so they can never receive pasted prompts.
+  const agentTargets: AgentPromptTarget[] = folderWindows.filter((win) => win.type !== 'agent-session').flatMap((win) => {
     const leafIds = stage.getWindowLeafIds(win.id);
     return leafIds.map((leafId, index) => {
       const pane = win.panes?.[leafId];
@@ -1055,7 +1056,7 @@ export function LocalTerminalWorkspace({
           onSelect={selectTab}
           onClose={stage.closeWindow}
           localOnly
-          renderTabBadge={(win) => <AgentStatusBadge status={windowAgentStatus(win)} />}
+          renderTabBadge={(win) => (win.type === 'agent-session' ? null : <AgentStatusBadge status={windowAgentStatus(win)} />)}
           onCreate={(type, opts) =>
             stage.createWindow(type, { ...opts, cwd: selectedCwd ?? opts?.cwd })
           }

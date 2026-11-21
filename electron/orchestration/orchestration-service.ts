@@ -340,7 +340,8 @@ export class OrchestrationService {
   private readonly codexPilot?: OrchestrationServiceDependencies['codexPilot'];
   private readonly codexWorkers = new Map<string, CodexAppServerPilot>();
   private readonly codexSubmitting = new Set<string>();
-  private readonly codexMailbox = new Set<string>();
+  /** Pending wake-ups per headless Worker; `opaque` means at least one wake carried no message record. */
+  private readonly codexMailbox = new Map<string, { messages: OrchestrationMessageRecord[]; opaque: boolean }>();
   private readonly workerTimelines = new Map<string, WorkerTimeline>();
   private readonly timelineListeners = new Set<(change: WorkerTimelineChange) => void>();
   private disposed = false;
@@ -2378,14 +2379,15 @@ export class OrchestrationService {
 
   private notifyTargetAndAliases(
     toHandle: string,
-    messageType: OrchestrationMessageType
+    messageType: OrchestrationMessageType,
+    message?: OrchestrationMessageRecord,
   ): void {
     this.waiters.notify(toHandle, messageType);
     const codexTarget = toHandle.startsWith('dispatch:')
       ? this.store.getDispatchContext(toHandle.slice('dispatch:'.length))?.assigneeHandle : toHandle;
     if (codexTarget && CODEX_WORKER_ID.test(codexTarget)) {
       if (this.codexWorkers.has(codexTarget)) {
-        this.codexMailbox.add(codexTarget);
+        this.queueCodexMail(codexTarget, message);
         this.deliverCodexMailbox(codexTarget);
       }
     } else {
@@ -2763,7 +2765,7 @@ export class OrchestrationService {
           payload: payloadString,
           threadId: input.threadId,
         });
-        this.notifyTargetAndAliases(recipient, msg.type);
+        this.notifyTargetAndAliases(recipient, msg.type, msg);
         return msg;
       });
       this.emitChanged('message:sent', inserted[0]?.runId);
@@ -2832,7 +2834,7 @@ export class OrchestrationService {
       }
       this.retireFinishedSpawnedWorkers(latestMsg.runId);
     }
-    this.notifyTargetAndAliases(latestMsg.toHandle, latestMsg.type);
+    this.notifyTargetAndAliases(latestMsg.toHandle, latestMsg.type, latestMsg);
     this.emitChanged('message:sent', latestMsg.runId);
 
     return {
@@ -5119,9 +5121,11 @@ export class OrchestrationService {
     if (result.diff !== null) {
       announce(result.diff);
     } else {
+      // Working-tree files can contain Worker credentials; redact before the diff is stored or published.
+      const redactDiff = (diff: string) => this.store.redactDispatchCredentials(session?.redactText(diff) ?? diff);
       void runGitCommand(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], {
         cwd, readOnly: true, maxBytes: 128 * 1024, timeoutMs: 3_000,
-      }).then((git) => announce(git.exitCode === 0 ? git.stdout : null), () => announce(null));
+      }).then((git) => announce(git.exitCode === 0 ? redactDiff(git.stdout) : null), () => announce(null));
     }
   }
 
@@ -5173,17 +5177,42 @@ export class OrchestrationService {
     }
   }
 
+  private queueCodexMail(workerId: string, message?: OrchestrationMessageRecord): void {
+    const pending = this.codexMailbox.get(workerId) ?? { messages: [], opaque: false };
+    if (!message) pending.opaque = true;
+    else if (!pending.messages.some((entry) => entry.id === message.id)) pending.messages.push(message);
+    this.codexMailbox.set(workerId, pending);
+  }
+
+  /** Inlines one or two short messages, like PTY direct delivery; anything else points the Worker at read_board. */
+  private codexMailboxPrompt(workerId: string, pending: { messages: OrchestrationMessageRecord[]; opaque: boolean }): string {
+    const pointer = 'You have a new message from AhaStation. Use the Aha read_board tool to read unread messages for your role, then continue the current assignment.';
+    const messages = pending.messages
+      .map((message) => this.store.getMessageById(message.id) ?? message)
+      .filter((message) => message.lifecycleRejectedReason === null && message.type !== 'heartbeat');
+    if (pending.opaque || messages.length === 0 || messages.length > 2) return pointer;
+    const rendered = this.store.redactDispatchCredentials(messages.map((message) => formatBoardPostForAgent(message)).join('\n\n'));
+    if (rendered.length > 1_000) return pointer;
+    this.store.markAsDeliveredForConsumer(messages.map((message) => message.id), workerId);
+    const member = this.resolveBoardMemberForPane(workerId);
+    const maxSeq = Math.max(0, ...messages
+      .filter((message) => member && message.runId === member.runId && typeof message.boardSeq === 'number')
+      .map((message) => message.boardSeq as number));
+    if (member && maxSeq > 0) this.store.advanceMemberCursor(member.runId, member.memberKey, { lastDeliveredSeq: maxSeq });
+    return `${rendered}\n\n(Full message above from AhaStation; no read_board call is needed for it. Continue the current assignment.)`;
+  }
+
   private deliverCodexMailbox(workerId: string): void {
     const session = this.codexWorkers.get(workerId);
-    if (!session?.alive || session.busy || !this.codexMailbox.delete(workerId)) return;
+    const pending = this.codexMailbox.get(workerId);
+    if (!session?.alive || session.busy || !pending) return;
+    this.codexMailbox.delete(workerId);
     const dispatch = this.store.getActiveDispatchForIdentity(workerId, null);
     if (!dispatch || this.codexSubmitting.has(dispatch.id)) {
-      if (dispatch) this.codexMailbox.add(workerId);
+      if (dispatch) this.codexMailbox.set(workerId, pending);
       return;
     }
-    void this.submitCodexTurn(dispatch, session,
-      'You have a new message from AhaStation. Use the Aha read_board tool to read unread messages for your role, then continue the current assignment.'
-    ).then(async (outcome) => {
+    void this.submitCodexTurn(dispatch, session, this.codexMailboxPrompt(workerId, pending)).then(async (outcome) => {
       if (outcome.status !== 'accepted') {
         this.failCodexDispatch(dispatch.id, outcome.status, outcome.reason);
         await session.close();
@@ -8067,7 +8096,7 @@ export class OrchestrationService {
       this.waiters.notify(paneId, msg.type);
       this.waiters.notify(`board-pane:${paneId}`, msg.type);
       if (CODEX_WORKER_ID.test(paneId)) {
-        this.codexMailbox.add(paneId);
+        this.queueCodexMail(paneId, msg);
         this.deliverCodexMailbox(paneId);
       } else {
         this.pointerDelivery.scheduleRedriveForPane(paneId);
