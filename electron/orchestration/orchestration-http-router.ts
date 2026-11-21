@@ -514,7 +514,7 @@ export async function dispatchOrchestrationHttpAction(
       }
       case 'task-list': {
         const parsed = taskListSchema.parse(payload);
-        result = service.taskList({ ...parsed, runId: scopedRunId(parsed.runId) });
+        result = service.taskList({ ...parsed, runId: scopedRunId(parsed.runId) }, httpCallerPane());
         break;
       }
       case 'task-show':
@@ -582,7 +582,7 @@ export async function dispatchOrchestrationHttpAction(
       }
       case 'worker-list': {
         const parsed = workerListSchema.parse(payload);
-        result = service.workerList({ ...parsed, runId: scopedRunId(parsed.runId) });
+        result = service.workerList({ ...parsed, runId: scopedRunId(parsed.runId) }, httpCallerPane());
         break;
       }
       case 'worker-show':
@@ -649,10 +649,10 @@ export async function dispatchOrchestrationHttpAction(
         break;
       }
       case 'check':
-        result = await service.check(checkSchema.parse(payload), context.signal);
+        result = await service.check({ ...checkSchema.parse(payload), callerPaneId: httpCallerPane() }, context.signal);
         break;
       case 'inbox':
-        result = service.inbox(inboxSchema.parse(payload));
+        result = service.inbox({ ...inboxSchema.parse(payload), callerPaneId: httpCallerPane() });
         break;
       case 'ask':
         result = await service.ask(askSchema.parse(payload), context.signal);

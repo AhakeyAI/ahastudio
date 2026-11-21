@@ -208,6 +208,8 @@ export async function removeOwnedWorkerWorktree(opts: {
   repoRootPath?: string | null;
   force?: boolean;
   deleteBranch?: string | null;
+  expectedBranchOid?: string | null;
+  allowSquashCasDelete?: boolean;
 }): Promise<{ removed: boolean; removedBranch: boolean; path: string }> {
   if (!opts.force) await assertWorkerWorktreeClean(opts.worktreePath);
 
@@ -234,7 +236,11 @@ export async function removeOwnedWorkerWorktree(opts: {
   });
   const mainRoot = listed.worktrees.find((wt) => wt.isMainWorktree)?.path;
   if (!matched) {
-    const removedBranch = mainRoot ? await deleteOwnedWorkerBranch(mainRoot, opts.deleteBranch) : false;
+    const removedBranch = mainRoot
+      ? await deleteOwnedWorkerBranch(mainRoot, opts.deleteBranch, opts.expectedBranchOid, {
+          allowSquashCasDelete: opts.allowSquashCasDelete,
+        })
+      : false;
     return { removed: false, removedBranch, path: opts.worktreePath };
   }
   if (!opts.force && matched.locked) {
@@ -256,19 +262,48 @@ export async function removeOwnedWorkerWorktree(opts: {
   if (!removed.ok) {
     throw new OrchestrationError('worktree_failed', removed.error);
   }
-  const removedBranch = await deleteOwnedWorkerBranch(mainRoot, opts.deleteBranch);
+  const removedBranch = await deleteOwnedWorkerBranch(mainRoot, opts.deleteBranch, opts.expectedBranchOid, {
+    allowSquashCasDelete: opts.allowSquashCasDelete,
+  });
   return { removed: true, removedBranch, path: removed.path };
 }
 
 export async function deleteOwnedWorkerBranch(
   repoRootPath: string,
   branchName?: string | null,
+  expectedOid?: string | null,
+  opts?: { allowSquashCasDelete?: boolean },
 ): Promise<boolean> {
   const trimmed = branchName?.trim();
   if (!trimmed || !trimmed.startsWith(WORKER_BRANCH_PREFIX)) return false;
   const valid = validateGitRefName(trimmed);
   if (!valid) return false;
-  const res = await runGitCommand(['branch', '-D', '--', valid], {
+  const cleanExpectedOid = expectedOid?.trim();
+
+  // Never delete a branch still checked out by any active worktree.
+  const listed = await listGitWorktrees(repoRootPath).catch(() => null);
+  if (!listed || !listed.ok || !listed.isGitRepo) return false;
+  const checkedOut = listed.worktrees.some((wt) => wt.branch === valid);
+  if (checkedOut) return false;
+
+  if (cleanExpectedOid) {
+    if (!/^[0-9a-f]{40}$/i.test(cleanExpectedOid)) return false;
+    if (opts?.allowSquashCasDelete) {
+      // Atomic CAS delete for verified squash-integrated worker branches:
+      // refuses deletion if the branch moved concurrently after integration.
+      const cas = await runGitCommand(['update-ref', '-d', `refs/heads/${valid}`, cleanExpectedOid], {
+        cwd: repoRootPath,
+        timeoutMs: 15_000,
+      });
+      return cas.exitCode === 0;
+    }
+    const current = await runGitCommand(['rev-parse', '--verify', 'refs/heads/' + valid], {
+      cwd: repoRootPath,
+      readOnly: true,
+    });
+    if (current.exitCode !== 0 || current.stdout.trim() !== cleanExpectedOid) return false;
+  }
+  const res = await runGitCommand(['branch', cleanExpectedOid ? '-d' : '-D', '--', valid], {
     cwd: repoRootPath,
     timeoutMs: 15_000,
   });

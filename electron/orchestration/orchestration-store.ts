@@ -675,6 +675,7 @@ export class OrchestrationStore {
     for (const id of this.messageOrder) {
       const msg = this.messages.get(id);
       if (!msg || msg.runId !== runId || msg.type === 'heartbeat') continue;
+      if (msg.lifecycleRejectedReason) continue;
       if (typeof msg.boardSeq !== 'number') continue;
       allForRun.push(msg);
     }
@@ -1209,7 +1210,9 @@ export class OrchestrationStore {
     isDetachedReviewWorktree?: boolean;
     reviewOfDispatchId?: string | null;
     reviewFocus?: string | null;
+    reviewBatchId?: string | null;
     reviewSnapshotOid?: string | null;
+    reviewRound?: number;
     ownsPane?: boolean;
     cliId?: string | null;
     model?: string | null;
@@ -1318,7 +1321,9 @@ export class OrchestrationStore {
       ...(input.isDetachedReviewWorktree ? { isDetachedReviewWorktree: true } : {}),
       ...(input.reviewOfDispatchId ? { reviewOfDispatchId: input.reviewOfDispatchId } : {}),
       ...(input.reviewFocus ? { reviewFocus: input.reviewFocus } : {}),
+      ...(input.reviewBatchId ? { reviewBatchId: input.reviewBatchId } : {}),
       ...(input.reviewSnapshotOid ? { reviewSnapshotOid: input.reviewSnapshotOid } : {}),
+      ...(typeof input.reviewRound === 'number' && input.reviewRound > 0 ? { reviewRound: input.reviewRound } : {}),
       ownsPane: input.ownsPane ?? false,
       cliId: input.cliId ?? null,
       model: input.model ?? null,
@@ -1521,6 +1526,16 @@ export class OrchestrationStore {
       next.ownsWorktree = true;
       prev.ownsWorktree = false;
     }
+    if (prev.ownsBranch) {
+      next.ownsBranch = true;
+      prev.ownsBranch = false;
+    }
+    if (prev.baseCommit && !next.baseCommit) {
+      next.baseCommit = prev.baseCommit;
+    }
+    if (prev.repoRootPath && !next.repoRootPath) {
+      next.repoRootPath = prev.repoRootPath;
+    }
     if (prev.ownsPane) {
       if (prev.assigneePaneId && prev.assigneePaneId === next.assigneePaneId) {
         next.ownsPane = true;
@@ -1549,6 +1564,33 @@ export class OrchestrationStore {
     ctx.archivedOutput = this.redactDispatchCredentials(output);
     ctx.updatedAt = this.now();
     this.persist();
+  }
+
+  markDispatchPaneClosed(dispatchId: string): OrchestrationDispatchRecord | null {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx) return null;
+    if (!ctx.ownsPane) return { ...ctx };
+    ctx.ownsPane = false;
+    ctx.updatedAt = this.now();
+    this.persist();
+    return { ...ctx };
+  }
+
+  findLatestWorkerDoneMessage(dispatchId: string): OrchestrationMessageRecord | undefined {
+    for (let i = this.messageOrder.length - 1; i >= 0; i -= 1) {
+      const msg = this.messages.get(this.messageOrder[i]!);
+      if (!msg || msg.type !== 'worker_done' || msg.lifecycleRejectedReason) continue;
+      if (msg.fromHandle === `dispatch:${dispatchId}`) return cloneMessageRecord(msg);
+      if (msg.payload) {
+        try {
+          const parsed = JSON.parse(msg.payload) as { dispatchId?: unknown };
+          if (parsed?.dispatchId === dispatchId) return cloneMessageRecord(msg);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return undefined;
   }
 
   markDispatchReleased(
@@ -1646,11 +1688,26 @@ export class OrchestrationStore {
       .map((d) => ({ ...d }));
   }
 
+  listReviewDispatchesForBatch(
+    targetDispatchId: string,
+    reviewBatchId: string,
+  ): OrchestrationDispatchRecord[] {
+    return [...this.dispatches.values()]
+      .filter(
+        (d) =>
+          d.reviewOfDispatchId === targetDispatchId &&
+          d.reviewBatchId === reviewBatchId,
+      )
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map((d) => ({ ...d }));
+  }
+
   updateDispatchReviewState(
     dispatchId: string,
     patch: {
       reviewStatus?: OrchestrationReviewStatus;
       reviewRound?: number;
+      reviewBatchId?: string | null;
       reviewSnapshotOid?: string | null;
       reviewFindings?: OrchestrationReviewFinding[];
       reviewMutatedWorkspace?: boolean;
@@ -1660,6 +1717,7 @@ export class OrchestrationStore {
     if (!dispatch) return null;
     if (patch.reviewStatus !== undefined) dispatch.reviewStatus = patch.reviewStatus;
     if (patch.reviewRound !== undefined) dispatch.reviewRound = patch.reviewRound;
+    if (patch.reviewBatchId !== undefined) dispatch.reviewBatchId = patch.reviewBatchId;
     if (patch.reviewSnapshotOid !== undefined) dispatch.reviewSnapshotOid = patch.reviewSnapshotOid;
     if (patch.reviewFindings !== undefined) {
       dispatch.reviewFindings = patch.reviewFindings.map((f) => ({ ...f }));

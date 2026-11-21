@@ -13,6 +13,7 @@ export interface AdversarialVerdictEvaluation {
   requestedVerdict: OrchestrationReviewVerdict;
   effectiveVerdict: OrchestrationReviewVerdict;
   overriddenByBlockingFindings: boolean;
+  overriddenByWorkspaceIntegrity: boolean;
   blockingFindings: OrchestrationReviewFinding[];
   advisoryFindings: OrchestrationReviewFinding[];
   findings: OrchestrationReviewFinding[];
@@ -45,44 +46,45 @@ export function normalizeReviewFindings(raw: unknown): OrchestrationReviewFindin
 }
 
 /**
- * Enforces the adversarial verdict contract:
+ * Enforces the fail-closed adversarial verdict contract:
+ * - Missing or invalid verdict defaults to `reject` (never auto-passes incomplete reports).
+ * - Explicit `reject` is always respected and never downgraded to `pass`.
  * - Any P0 or P1 finding forces `reject` even if the reviewer wrote `pass`.
- * - Only P2 findings (or none) never block integration unless the reviewer explicitly rejected with a reason.
+ * - Workspace mutation or unverifiable read-only integrity forces `reject`.
+ * - Explicit `pass` with only P2 findings (or none) passes without blocking.
  */
 export function evaluateAdversarialVerdict(input: {
   verdict?: OrchestrationReviewVerdict | null;
   findings?: readonly OrchestrationReviewFinding[] | null;
   summary?: string;
+  mutatedWorkspace?: boolean;
+  verificationFailed?: boolean;
 }): AdversarialVerdictEvaluation {
   const findings = normalizeReviewFindings(input.findings ?? []);
   const blockingFindings = findings.filter((f) => f.severity === 'P0' || f.severity === 'P1');
   const advisoryFindings = findings.filter((f) => f.severity === 'P2');
 
-  let requestedVerdict: OrchestrationReviewVerdict;
-  if (input.verdict === 'pass' || input.verdict === 'reject') {
-    requestedVerdict = input.verdict;
-  } else if (blockingFindings.length > 0) {
-    requestedVerdict = 'reject';
-  } else if (/\b(reject|not ready to merge|do not merge|暂不建议合并)\b/i.test(input.summary ?? '')) {
-    requestedVerdict = 'reject';
-  } else {
-    requestedVerdict = 'pass';
-  }
+  const requestedVerdict: OrchestrationReviewVerdict =
+    input.verdict === 'pass' ? 'pass' : 'reject';
 
   let effectiveVerdict: OrchestrationReviewVerdict = requestedVerdict;
   let overriddenByBlockingFindings = false;
-  if (blockingFindings.length > 0 && requestedVerdict === 'pass') {
+  let overriddenByWorkspaceIntegrity = false;
+
+  if (blockingFindings.length > 0 && effectiveVerdict === 'pass') {
     effectiveVerdict = 'reject';
     overriddenByBlockingFindings = true;
-  } else if (blockingFindings.length === 0 && advisoryFindings.length > 0 && requestedVerdict === 'reject') {
-    // Advisory-only P2 items must not block integration.
-    effectiveVerdict = 'pass';
+  }
+  if ((input.mutatedWorkspace || input.verificationFailed) && effectiveVerdict === 'pass') {
+    effectiveVerdict = 'reject';
+    overriddenByWorkspaceIntegrity = true;
   }
 
   return {
     requestedVerdict,
     effectiveVerdict,
     overriddenByBlockingFindings,
+    overriddenByWorkspaceIntegrity,
     blockingFindings,
     advisoryFindings,
     findings,
@@ -176,7 +178,7 @@ export function formatReviewVerdictForBoard(input: {
   const lines = [
     `[Adversarial Review ${tag} · @${input.targetRole.replace(/^@+/, '')}]`,
     ...(input.mutatedWorkspace
-      ? ['Warning: reviewer modified its isolated review worktree; changes were discarded.']
+      ? ['Rejected: reviewer modified or failed integrity verification on its isolated read-only review worktree; changes were discarded.']
       : []),
     ...(evaluation.overriddenByBlockingFindings
       ? ['Verdict overridden to REJECT because blocking P0/P1 findings were reported.']

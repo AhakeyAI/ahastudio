@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
-import { runGitCommand, validateRepoRelativePath } from '../git/git-exec.js';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { runGitCommand, validateGitRefName, validateRepoRelativePath } from '../git/git-exec.js';
 import {
   addGitWorktree,
   getGitStatus,
@@ -15,13 +15,17 @@ import { clipUtf8Bytes } from './worker-brief-context.js';
 import { deleteOwnedWorkerBranch, inferSiblingMainRepoPath } from './worker-worktree-placement.js';
 
 const GIT_SHA_RE = /^[0-9a-f]{7,40}$/i;
+const FULL_GIT_SHA_RE = /^[0-9a-f]{40}$/i;
 const DEFAULT_MAX_DIFF_BYTES = 32 * 1024;
 const MAX_DIFF_CAP_BYTES = 128 * 1024;
 const HIGH_RISK_PATH_RE =
   /(^|\/)(auth|security|permission|approval|ipc|router|store|state|orchestration|daemon|preload|main\.ts|package\.json|tsconfig|electron-builder)/i;
 
+const repoIntegrationLocks = new Map<string, Promise<void>>();
+
 export type RecommendedReviewTier = 'L0' | 'L1' | 'L2';
 export type WorkerIntegrateMode = 'check' | 'squash' | 'merge';
+export type WorkerIntegrationCheckStatus = 'clean' | 'conflict' | 'unverifiable';
 
 export interface WorkerCommitSummary {
   sha: string;
@@ -35,6 +39,7 @@ export interface WorkerDiffInspection {
   baseCommit: string | null;
   headCommit: string | null;
   snapshotOid: string | null;
+  stagedDivergentFiles: string[];
   commitsAhead: number;
   commits: WorkerCommitSummary[];
   uncommittedFiles: string[];
@@ -42,20 +47,25 @@ export interface WorkerDiffInspection {
   diffStat: string;
   diff: string;
   diffTruncated: boolean;
+  diffError?: string;
   recommendedReviewTier: RecommendedReviewTier;
   tierReason: string;
 }
 
 export interface WorkerIntegrationCheckResult {
+  checkStatus: WorkerIntegrationCheckStatus;
   clean: boolean;
   noChanges: boolean;
   targetRepoPath: string;
   targetBranch: string | null;
+  targetRef: string | null;
   targetHead: string | null;
   snapshotOid: string;
+  mergedTreeOid?: string;
   targetDirty: boolean;
   targetDirtyFiles: string[];
   conflictFiles: string[];
+  ignoredCollisionFiles: string[];
   behindCommits: number;
   aheadCommits: number;
   message: string;
@@ -63,16 +73,27 @@ export interface WorkerIntegrationCheckResult {
 
 export interface WorkerIntegrationResult {
   mode: WorkerIntegrateMode;
+  checkStatus: WorkerIntegrationCheckStatus;
   integrated: boolean;
   noChanges: boolean;
   clean: boolean;
   targetRepoPath: string;
   targetBranch: string | null;
+  targetRef: string | null;
   snapshotOid: string;
   integratedCommit: string | null;
   conflictFiles: string[];
+  ignoredCollisionFiles: string[];
   changedFiles: string[];
   message: string;
+  cleanupWarning?: string;
+}
+
+export interface ReviewWorktreeMutationResult {
+  mutated: boolean;
+  verificationFailed: boolean;
+  dirtyFiles: string[];
+  reason?: string;
 }
 
 function normalizeSha(raw?: string | null): string | null {
@@ -85,6 +106,180 @@ function parseLines(raw: string): string[] {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+function parseNullDelimitedPaths(raw: string): string[] {
+  return raw
+    .split('\0')
+    .map((entry) => entry.replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''))
+    .filter(Boolean);
+}
+
+function normalizePathKey(pathStr: string): string {
+  const normalized = pathStr.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function pathsCollide(a: string, b: string): boolean {
+  const ka = normalizePathKey(a);
+  const kb = normalizePathKey(b);
+  if (!ka || !kb) return false;
+  return ka === kb || ka.startsWith(`${kb}/`) || kb.startsWith(`${ka}/`);
+}
+
+async function resolveFullHeadCommit(cwd: string): Promise<string | null> {
+  const res = await runGitCommand(['rev-parse', '--verify', 'HEAD^{commit}'], {
+    cwd,
+    readOnly: true,
+    timeoutMs: 10_000,
+  }).catch(() => null);
+  const sha = res && res.exitCode === 0 ? res.stdout.trim() : '';
+  return FULL_GIT_SHA_RE.test(sha) ? sha : null;
+}
+
+async function resolveTargetSymbolicRef(cwd: string): Promise<string | null> {
+  const res = await runGitCommand(['symbolic-ref', '-q', 'HEAD'], {
+    cwd,
+    readOnly: true,
+    timeoutMs: 10_000,
+  }).catch(() => null);
+  return res && res.exitCode === 0 && res.stdout.trim() ? res.stdout.trim() : null;
+}
+
+export async function resolveBranchRefOid(
+  repoRootPath: string,
+  branchName?: string | null,
+): Promise<string | null> {
+  const trimmed = branchName?.trim();
+  if (!trimmed) return null;
+  const valid = validateGitRefName(trimmed);
+  if (!valid) return null;
+  const res = await runGitCommand(['rev-parse', '--verify', `refs/heads/${valid}^{commit}`], {
+    cwd: repoRootPath,
+    readOnly: true,
+    timeoutMs: 10_000,
+  }).catch(() => null);
+  const sha = res && res.exitCode === 0 ? res.stdout.trim() : '';
+  return FULL_GIT_SHA_RE.test(sha) ? sha : null;
+}
+
+async function resolveCanonicalGitCommonDir(repoPath: string): Promise<string> {
+  let rawDir = '';
+  const absRes = await runGitCommand(['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+    cwd: repoPath,
+    readOnly: true,
+    timeoutMs: 10_000,
+  }).catch(() => null);
+  if (absRes && absRes.exitCode === 0 && absRes.stdout.trim()) {
+    rawDir = absRes.stdout.trim();
+  } else {
+    const relRes = await runGitCommand(['rev-parse', '--git-common-dir'], {
+      cwd: repoPath,
+      readOnly: true,
+      timeoutMs: 10_000,
+    }).catch(() => null);
+    if (relRes && relRes.exitCode === 0 && relRes.stdout.trim()) {
+      const candidate = relRes.stdout.trim();
+      rawDir = isAbsolute(candidate) ? candidate : resolve(repoPath, candidate);
+    }
+  }
+  const resolved = rawDir ? resolve(rawDir) : resolve(repoPath);
+  let canonical = resolved;
+  try {
+    canonical = realpathSync(resolved);
+  } catch {
+    canonical = resolved;
+  }
+  return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+}
+
+async function withRepoIntegrationLock<T>(targetRepoPath: string, fn: () => Promise<T>): Promise<T> {
+  const key = await resolveCanonicalGitCommonDir(targetRepoPath);
+  const previous = repoIntegrationLocks.get(key) ?? Promise.resolve();
+  let releaseCurrent!: () => void;
+  const current = new Promise<void>((resolveLock) => {
+    releaseCurrent = resolveLock;
+  });
+  const tail = previous.then(() => current);
+  repoIntegrationLocks.set(key, tail);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    releaseCurrent();
+    if (repoIntegrationLocks.get(key) === tail) {
+      repoIntegrationLocks.delete(key);
+    }
+  }
+}
+
+export async function listIgnoredPaths(repoPath: string): Promise<string[]> {
+  const res = await runGitCommand(
+    ['ls-files', '--others', '--ignored', '--exclude-standard', '-z'],
+    {
+      cwd: repoPath,
+      readOnly: true,
+      timeoutMs: 15_000,
+    },
+  );
+  if (res.exitCode !== 0) {
+    throw new Error(res.stderr.trim() || 'git ls-files --ignored failed');
+  }
+  return parseNullDelimitedPaths(res.stdout);
+}
+
+/**
+ * Detects paths where staged index content differs from working tree content
+ * (e.g. modified-then-staged-then-edited-again, or staged deletion recreated on disk).
+ */
+export async function detectStagedWorktreeDivergence(worktreePath: string): Promise<string[]> {
+  const [stagedRes, unstagedRes, stagedDeletedRes, untrackedRes] = await Promise.all([
+    runGitCommand(['diff', '--cached', '--name-only', '-z'], {
+      cwd: worktreePath,
+      readOnly: true,
+      timeoutMs: 15_000,
+    }),
+    runGitCommand(['diff', '--name-only', '-z'], {
+      cwd: worktreePath,
+      readOnly: true,
+      timeoutMs: 15_000,
+    }),
+    runGitCommand(['diff', '--cached', '--name-only', '--diff-filter=D', '-z'], {
+      cwd: worktreePath,
+      readOnly: true,
+      timeoutMs: 15_000,
+    }),
+    runGitCommand(['ls-files', '--others', '--exclude-standard', '-z'], {
+      cwd: worktreePath,
+      readOnly: true,
+      timeoutMs: 15_000,
+    }),
+  ]);
+  if (stagedRes.exitCode !== 0 || unstagedRes.exitCode !== 0) {
+    throw new OrchestrationError(
+      'worktree_failed',
+      'Could not inspect staged vs working-tree state in worker worktree.',
+    );
+  }
+  const staged = parseNullDelimitedPaths(stagedRes.stdout);
+  const unstagedSet = new Set(parseNullDelimitedPaths(unstagedRes.stdout).map(normalizePathKey));
+  const untrackedSet = new Set(
+    (untrackedRes.exitCode === 0 ? parseNullDelimitedPaths(untrackedRes.stdout) : []).map(normalizePathKey),
+  );
+  const divergent = new Set<string>();
+  for (const pathStr of staged) {
+    if (unstagedSet.has(normalizePathKey(pathStr))) {
+      divergent.add(pathStr);
+    }
+  }
+  if (stagedDeletedRes.exitCode === 0) {
+    for (const delPath of parseNullDelimitedPaths(stagedDeletedRes.stdout)) {
+      if (untrackedSet.has(normalizePathKey(delPath))) {
+        divergent.add(delPath);
+      }
+    }
+  }
+  return [...divergent];
 }
 
 export function classifyReviewTier(input: {
@@ -121,27 +316,40 @@ export function classifyReviewTier(input: {
 }
 
 /**
- * Generates an immutable commit OID capturing HEAD + staged + unstaged + untracked changes
- * using a temporary GIT_INDEX_FILE, leaving the author's working tree, index, and stash untouched.
+ * Generates an immutable commit OID capturing HEAD + working tree changes using a temporary
+ * GIT_INDEX_FILE, leaving the author's working tree, index, and stash untouched.
+ * Refuses ambiguous staged-vs-unstaged divergence by default so staged-only changes are never dropped.
  */
 export async function captureWorkerSnapshotOid(
   worktreePath: string,
-): Promise<{ headCommit: string | null; snapshotOid: string | null; dirtyFiles: string[] }> {
+  opts?: { rejectStagedDivergence?: boolean },
+): Promise<{
+  headCommit: string | null;
+  snapshotOid: string | null;
+  dirtyFiles: string[];
+  stagedDivergentFiles: string[];
+}> {
   const status = await getGitStatus(worktreePath);
   if (!status.ok || !status.isGitRepo || !status.head) {
-    return { headCommit: null, snapshotOid: null, dirtyFiles: [] };
+    return { headCommit: null, snapshotOid: null, dirtyFiles: [], stagedDivergentFiles: [] };
   }
-  const fullHeadRes = await runGitCommand(['rev-parse', '--verify', 'HEAD^{commit}'], {
-    cwd: worktreePath,
-    readOnly: true,
-  }).catch(() => null);
-  const headCommit =
-    (fullHeadRes && fullHeadRes.exitCode === 0 ? fullHeadRes.stdout.trim() : '') || status.head;
+  const headCommit = await resolveFullHeadCommit(worktreePath);
+  if (!headCommit) {
+    return { headCommit: null, snapshotOid: null, dirtyFiles: [], stagedDivergentFiles: [] };
+  }
+  const stagedDivergentFiles = await detectStagedWorktreeDivergence(worktreePath);
+  if (stagedDivergentFiles.length > 0 && opts?.rejectStagedDivergence !== false) {
+    throw new OrchestrationError(
+      'operation_rejected',
+      `Worker worktree has staged vs working-tree divergence on ${stagedDivergentFiles.length} file(s): ${stagedDivergentFiles.join(', ')}. Commit or reconcile staged changes before snapshotting or integrating.`,
+      { stagedDivergentFiles },
+    );
+  }
   const dirtyFiles = status.entries
     .map((entry) => entry.path)
     .filter((p): p is string => Boolean(p));
   if (dirtyFiles.length === 0) {
-    return { headCommit, snapshotOid: headCommit, dirtyFiles: [] };
+    return { headCommit, snapshotOid: headCommit, dirtyFiles: [], stagedDivergentFiles };
   }
 
   const tempDir = mkdtempSync(join(tmpdir(), 'aha-git-snap-'));
@@ -180,6 +388,7 @@ export async function captureWorkerSnapshotOid(
       headCommit,
       snapshotOid: commitTree.stdout.trim(),
       dirtyFiles,
+      stagedDivergentFiles,
     };
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
@@ -207,11 +416,7 @@ export async function resolveEffectiveBaseCommit(
   if (parent.exitCode === 0 && parent.stdout.trim()) {
     return parent.stdout.trim();
   }
-  const head = await runGitCommand(['rev-parse', '--verify', 'HEAD^{commit}'], {
-    cwd: worktreePath,
-    readOnly: true,
-  });
-  return head.exitCode === 0 && head.stdout.trim() ? head.stdout.trim() : null;
+  return resolveFullHeadCommit(worktreePath);
 }
 
 export async function inspectWorkerDiff(opts: {
@@ -229,6 +434,7 @@ export async function inspectWorkerDiff(opts: {
       baseCommit: null,
       headCommit: null,
       snapshotOid: null,
+      stagedDivergentFiles: [],
       commitsAhead: 0,
       commits: [],
       uncommittedFiles: [],
@@ -242,7 +448,8 @@ export async function inspectWorkerDiff(opts: {
   }
 
   const baseCommit = await resolveEffectiveBaseCommit(opts.worktreePath, opts.baseCommit);
-  const { headCommit, snapshotOid, dirtyFiles } = await captureWorkerSnapshotOid(opts.worktreePath);
+  const { headCommit, snapshotOid, dirtyFiles, stagedDivergentFiles } =
+    await captureWorkerSnapshotOid(opts.worktreePath, { rejectStagedDivergence: false });
   const rangeBase = baseCommit ?? headCommit;
   const targetOid = snapshotOid ?? headCommit;
 
@@ -278,6 +485,7 @@ export async function inspectWorkerDiff(opts: {
   let diffStat = '';
   let diff = '';
   let diffTruncated = false;
+  let diffError: string | undefined;
 
   if (rangeBase && targetOid && rangeBase !== targetOid) {
     const [namesRes, statRes, diffRes] = await Promise.all([
@@ -295,16 +503,31 @@ export async function inspectWorkerDiff(opts: {
         maxBytes: maxDiffBytes + 4096,
       }),
     ]);
-    if (namesRes.exitCode === 0) changedFiles = parseLines(namesRes.stdout);
-    if (statRes.exitCode === 0) diffStat = statRes.stdout.trim();
-    if (diffRes.exitCode === 0) {
+    if (namesRes.exitCode === 0 && !namesRes.truncated) {
+      changedFiles = parseLines(namesRes.stdout);
+    } else {
+      diffError =
+        namesRes.stderr.trim() ||
+        `git diff --name-only failed (${namesRes.truncated ? 'truncated' : `exit ${namesRes.exitCode ?? 'unknown'}`})`;
+    }
+    if (statRes.exitCode === 0 && !statRes.truncated) {
+      diffStat = statRes.stdout.trim();
+    } else if (!diffError) {
+      diffError =
+        statRes.stderr.trim() ||
+        `git diff --stat failed (${statRes.truncated ? 'truncated' : `exit ${statRes.exitCode ?? 'unknown'}`})`;
+    }
+    if (diffRes.exitCode === 0 || diffRes.truncated) {
       const rawDiff = diffRes.stdout;
       if (diffRes.truncated || Buffer.byteLength(rawDiff, 'utf8') > maxDiffBytes) {
-        diff = `${clipUtf8Bytes(rawDiff, maxDiffBytes).trimEnd()}\n\n[Diff truncated at ${maxDiffBytes} bytes. Pass files:[...] to inspect specific files.]`;
+        const clipped = clipUtf8Bytes(rawDiff, maxDiffBytes).trimEnd();
+        diff = `${clipped}\n\n[Diff truncated at ${maxDiffBytes} bytes. Pass files:[...] to inspect specific files.]`;
         diffTruncated = true;
       } else {
         diff = rawDiff;
       }
+    } else if (!diffError) {
+      diffError = diffRes.stderr.trim() || `git diff failed with exit code ${diffRes.exitCode ?? 'unknown'}`;
     }
   }
 
@@ -318,6 +541,7 @@ export async function inspectWorkerDiff(opts: {
     baseCommit,
     headCommit,
     snapshotOid,
+    stagedDivergentFiles,
     commitsAhead: commits.length,
     commits,
     uncommittedFiles: dirtyFiles,
@@ -325,9 +549,25 @@ export async function inspectWorkerDiff(opts: {
     diffStat,
     diff,
     diffTruncated,
+    ...(diffError ? { diffError } : {}),
     recommendedReviewTier: tier,
     tierReason: reason,
   };
+}
+
+export async function resolveIntegrationMergeBase(
+  targetRepoPath: string,
+  snapshotOid: string,
+): Promise<string | null> {
+  const targetHead = await resolveFullHeadCommit(targetRepoPath);
+  if (!targetHead || !FULL_GIT_SHA_RE.test(snapshotOid.trim())) return null;
+  const res = await runGitCommand(['merge-base', targetHead, snapshotOid.trim()], {
+    cwd: targetRepoPath,
+    readOnly: true,
+    timeoutMs: 15_000,
+  }).catch(() => null);
+  const base = res && res.exitCode === 0 ? res.stdout.trim() : '';
+  return FULL_GIT_SHA_RE.test(base) ? base : null;
 }
 
 export async function resolveMainRepoRoot(
@@ -345,40 +585,116 @@ export async function resolveMainRepoRoot(
   return null;
 }
 
+async function detectIgnoredFileCollisions(
+  targetRepoPath: string,
+  targetHead: string,
+  snapshotOid: string,
+  mergedTreeOid?: string | null,
+): Promise<string[]> {
+  const ignoredFiles = await listIgnoredPaths(targetRepoPath);
+  if (ignoredFiles.length === 0) return [];
+
+  const targetDiffRef = mergedTreeOid || snapshotOid;
+  const incomingRes = await runGitCommand(
+    ['diff', '--name-only', '--diff-filter=ACMRT', '-z', targetHead, targetDiffRef],
+    { cwd: targetRepoPath, readOnly: true, timeoutMs: 15_000 },
+  );
+  if (incomingRes.exitCode !== 0) {
+    throw new OrchestrationError(
+      'worktree_failed',
+      incomingRes.stderr.trim() || 'Could not compute incoming paths for ignored-file collision check.',
+    );
+  }
+  const incomingPaths = parseNullDelimitedPaths(incomingRes.stdout);
+  if (incomingPaths.length === 0) return [];
+
+  const collisions = new Set<string>();
+  for (const ignored of ignoredFiles) {
+    for (const incoming of incomingPaths) {
+      if (pathsCollide(ignored, incoming)) {
+        collisions.add(ignored);
+        break;
+      }
+    }
+  }
+  return [...collisions];
+}
+
 async function detectMergeTreeConflicts(
   targetRepoPath: string,
   targetHead: string,
   snapshotOid: string,
-  baseCommit?: string | null,
-): Promise<{ supported: boolean; clean: boolean; conflictFiles: string[]; treeOid: string | null }> {
-  const args = baseCommit
-    ? ['merge-tree', '--write-tree', '--name-only', `--merge-base=${baseCommit}`, targetHead, snapshotOid]
-    : ['merge-tree', '--write-tree', '--name-only', targetHead, snapshotOid];
-  const res = await runGitCommand(args, { cwd: targetRepoPath, readOnly: true });
+): Promise<{
+  status: WorkerIntegrationCheckStatus;
+  conflictFiles: string[];
+  treeOid: string | null;
+  reason?: string;
+}> {
+  // Use the exact same merge-base semantics as real `git merge` (no forced --merge-base override).
+  const mergeBaseRes = await runGitCommand(['merge-base', targetHead, snapshotOid], {
+    cwd: targetRepoPath,
+    readOnly: true,
+    timeoutMs: 15_000,
+  });
+  if (mergeBaseRes.exitCode !== 0 || !mergeBaseRes.stdout.trim()) {
+    return {
+      status: 'unverifiable',
+      conflictFiles: [],
+      treeOid: null,
+      reason: 'Target HEAD and worker snapshot share no common Git ancestor.',
+    };
+  }
+
+  const res = await runGitCommand(
+    ['merge-tree', '--write-tree', '--name-only', targetHead, snapshotOid],
+    { cwd: targetRepoPath, readOnly: true, timeoutMs: 30_000 },
+  );
   if (res.exitCode === 0) {
     const firstLine = res.stdout.split(/\r?\n/)[0]?.trim() || null;
-    return { supported: true, clean: true, conflictFiles: [], treeOid: firstLine };
+    if (!firstLine || !FULL_GIT_SHA_RE.test(firstLine)) {
+      return {
+        status: 'unverifiable',
+        conflictFiles: [],
+        treeOid: null,
+        reason: 'git merge-tree returned an unexpected tree output.',
+      };
+    }
+    return { status: 'clean', conflictFiles: [], treeOid: firstLine };
   }
   if (/unknown option|usage: git merge-tree/i.test(res.stderr)) {
-    return { supported: false, clean: false, conflictFiles: [], treeOid: null };
+    return {
+      status: 'unverifiable',
+      conflictFiles: [],
+      treeOid: null,
+      reason: 'Installed Git does not support `git merge-tree --write-tree` pre-check.',
+    };
   }
   const conflictFiles = new Set<string>();
   const lines = res.stdout.split(/\r?\n/);
   // With --write-tree --name-only, line 0 is tree OID, lines until blank line are conflicted paths.
-  for (let i = 1; i < lines.length; i += 1) {
-    const line = lines[i]!.trim();
-    if (!line) break;
-    conflictFiles.add(line);
+  if (lines.length > 1 && FULL_GIT_SHA_RE.test(lines[0]?.trim() ?? '')) {
+    for (let i = 1; i < lines.length; i += 1) {
+      const line = lines[i]!.trim();
+      if (!line) break;
+      conflictFiles.add(line);
+    }
   }
   for (const line of lines) {
     const m = /CONFLICT \([^)]+\):.* in (.+)$/.exec(line);
     if (m?.[1]) conflictFiles.add(m[1].trim());
   }
+  if (res.exitCode === 1 && conflictFiles.size > 0) {
+    return {
+      status: 'conflict',
+      conflictFiles: [...conflictFiles],
+      treeOid: null,
+    };
+  }
   return {
-    supported: true,
-    clean: false,
-    conflictFiles: [...conflictFiles],
+    status: 'unverifiable',
+    conflictFiles: [],
     treeOid: null,
+    reason: res.stderr.trim() || res.stdout.trim() || `git merge-tree exited with code ${res.exitCode ?? 'unknown'}`,
   };
 }
 
@@ -387,43 +703,60 @@ export async function checkWorkerIntegration(opts: {
   worktreePath: string;
   baseCommit?: string | null;
   expectedSnapshotOid?: string | null;
+  expectedTargetRef?: string | null;
 }): Promise<WorkerIntegrationCheckResult> {
   const targetStatus = await getGitStatus(opts.targetRepoPath);
   if (!targetStatus.ok || !targetStatus.isGitRepo || !targetStatus.head) {
     throw new OrchestrationError('worktree_failed', 'Target repository is not a valid Git repository.');
   }
+  const [targetHead, targetRef] = await Promise.all([
+    resolveFullHeadCommit(opts.targetRepoPath),
+    resolveTargetSymbolicRef(opts.targetRepoPath),
+  ]);
+  if (!targetHead) {
+    throw new OrchestrationError('worktree_failed', 'Could not resolve full target repository HEAD commit.');
+  }
+  if (opts.expectedTargetRef && targetRef !== opts.expectedTargetRef) {
+    throw new OrchestrationError(
+      'operation_rejected',
+      `Target repository branch changed (expected ${opts.expectedTargetRef}, actual ${targetRef ?? 'detached HEAD'}).`,
+      { expectedTargetRef: opts.expectedTargetRef, actualTargetRef: targetRef },
+    );
+  }
   const targetDirtyFiles = targetStatus.entries
     .map((e) => e.path)
     .filter((p): p is string => Boolean(p));
 
-  const snap = await captureWorkerSnapshotOid(opts.worktreePath);
+  const snap = await captureWorkerSnapshotOid(opts.worktreePath, { rejectStagedDivergence: true });
   if (!snap.snapshotOid) {
     throw new OrchestrationError('worktree_failed', 'Could not capture worker Git snapshot.');
   }
   if (opts.expectedSnapshotOid && snap.snapshotOid !== opts.expectedSnapshotOid) {
     throw new OrchestrationError(
       'operation_rejected',
-      `Worker snapshot changed since review (expected ${opts.expectedSnapshotOid.slice(0, 10)}, actual ${snap.snapshotOid.slice(0, 10)}). Re-review before integrating.`,
+      `Worker snapshot changed since review (expected ${opts.expectedSnapshotOid}, actual ${snap.snapshotOid}). Re-review before integrating.`,
       { expectedSnapshotOid: opts.expectedSnapshotOid, actualSnapshotOid: snap.snapshotOid },
     );
   }
 
-  const baseCommit = await resolveEffectiveBaseCommit(opts.worktreePath, opts.baseCommit);
   const diffCheck = await runGitCommand(
-    ['diff', '--quiet', targetStatus.head, snap.snapshotOid],
+    ['diff', '--quiet', targetHead, snap.snapshotOid],
     { cwd: opts.targetRepoPath, readOnly: true },
   );
   if (diffCheck.exitCode === 0) {
     return {
-      clean: true,
+      checkStatus: 'clean',
+      clean: targetDirtyFiles.length === 0,
       noChanges: true,
       targetRepoPath: opts.targetRepoPath,
       targetBranch: targetStatus.branch,
-      targetHead: targetStatus.head,
+      targetRef,
+      targetHead,
       snapshotOid: snap.snapshotOid,
       targetDirty: targetDirtyFiles.length > 0,
       targetDirtyFiles,
       conflictFiles: [],
+      ignoredCollisionFiles: [],
       behindCommits: 0,
       aheadCommits: 0,
       message: 'Worker snapshot has no changes relative to target HEAD.',
@@ -431,7 +764,7 @@ export async function checkWorkerIntegration(opts: {
   }
 
   const revCount = await runGitCommand(
-    ['rev-list', '--left-right', '--count', `${targetStatus.head}...${snap.snapshotOid}`],
+    ['rev-list', '--left-right', '--count', `${targetHead}...${snap.snapshotOid}`],
     { cwd: opts.targetRepoPath, readOnly: true },
   );
   let behindCommits = 0;
@@ -442,40 +775,199 @@ export async function checkWorkerIntegration(opts: {
     aheadCommits = Number.parseInt(right || '0', 10) || 0;
   }
 
-  const mergeBase =
-    baseCommit && baseCommit !== snap.snapshotOid ? baseCommit : null;
   const mt = await detectMergeTreeConflicts(
     opts.targetRepoPath,
-    targetStatus.head,
+    targetHead,
     snap.snapshotOid,
-    mergeBase,
   );
 
+  let ignoredCollisionFiles: string[] = [];
+  if (mt.status === 'clean') {
+    ignoredCollisionFiles = await detectIgnoredFileCollisions(
+      opts.targetRepoPath,
+      targetHead,
+      snap.snapshotOid,
+      mt.treeOid,
+    );
+  }
+
+  const checkStatus: WorkerIntegrationCheckStatus =
+    ignoredCollisionFiles.length > 0 ? 'conflict' : mt.status;
+  const clean =
+    checkStatus === 'clean' &&
+    targetDirtyFiles.length === 0 &&
+    ignoredCollisionFiles.length === 0;
+
+  let message = 'Clean integration check passed.';
+  if (targetDirtyFiles.length > 0) {
+    message = `Target workspace has ${targetDirtyFiles.length} uncommitted file(s); clean or commit target workspace before integrating.`;
+  } else if (ignoredCollisionFiles.length > 0) {
+    message = `Integration blocked: incoming changes would overwrite ${ignoredCollisionFiles.length} ignored local file(s) in target workspace: ${ignoredCollisionFiles.join(', ')}`;
+  } else if (mt.status === 'conflict') {
+    message = `Merge conflicts detected in ${mt.conflictFiles.length} file(s): ${mt.conflictFiles.join(', ')}`;
+  } else if (mt.status === 'unverifiable') {
+    message = `Integration pre-check could not verify merge safety: ${mt.reason || 'unknown merge-tree error'}`;
+  }
+
   return {
-    clean: mt.supported ? mt.clean && targetDirtyFiles.length === 0 : targetDirtyFiles.length === 0,
+    checkStatus,
+    clean,
     noChanges: false,
     targetRepoPath: opts.targetRepoPath,
     targetBranch: targetStatus.branch,
-    targetHead: targetStatus.head,
+    targetRef,
+    targetHead,
     snapshotOid: snap.snapshotOid,
+    ...(mt.treeOid && mt.status === 'clean' ? { mergedTreeOid: mt.treeOid } : {}),
     targetDirty: targetDirtyFiles.length > 0,
     targetDirtyFiles,
     conflictFiles: mt.conflictFiles,
+    ignoredCollisionFiles,
     behindCommits,
     aheadCommits,
-    message:
-      targetDirtyFiles.length > 0
-        ? `Target workspace has ${targetDirtyFiles.length} uncommitted file(s); clean or commit target workspace before integrating.`
-        : mt.supported && !mt.clean
-          ? `Merge conflicts detected in ${mt.conflictFiles.length} file(s): ${mt.conflictFiles.join(', ')}`
-          : 'Clean integration check passed.',
+    message,
   };
 }
 
-async function abortAndRestoreTargetRepo(targetRepoPath: string): Promise<void> {
-  await runGitCommand(['merge', '--abort'], { cwd: targetRepoPath }).catch(() => null);
-  await runGitCommand(['reset', '--merge', 'HEAD'], { cwd: targetRepoPath }).catch(() => null);
-  await runGitCommand(['clean', '-fd'], { cwd: targetRepoPath }).catch(() => null);
+function gitFailure(result: { stdout: string; stderr: string }, fallback: string): OrchestrationError {
+  return new OrchestrationError('worktree_failed', result.stderr.trim() || result.stdout.trim() || fallback);
+}
+
+async function assertTargetUnchanged(check: WorkerIntegrationCheckResult): Promise<void> {
+  const [head, ref, status] = await Promise.all([
+    resolveFullHeadCommit(check.targetRepoPath),
+    resolveTargetSymbolicRef(check.targetRepoPath),
+    getGitStatus(check.targetRepoPath),
+  ]);
+  if (head !== check.targetHead || ref !== check.targetRef ||
+      !status.ok || !status.isGitRepo || status.entries.length > 0) {
+    throw new OrchestrationError(
+      'operation_rejected',
+      'Target branch, HEAD, or workspace changed during integration. Inspect the workspace before retrying.',
+    );
+  }
+}
+
+async function prepareIntegrationCommit(
+  check: WorkerIntegrationCheckResult,
+  mode: 'squash' | 'merge',
+  commitMessage: string,
+): Promise<{ commit: string; changedFiles: string[]; cleanupWarning?: string }> {
+  const root = mkdtempSync(join(tmpdir(), 'aha-integration-'));
+  const workspace = join(root, 'worktree');
+  let registered = false;
+  let prepared: { commit: string; changedFiles: string[]; cleanupWarning?: string } | undefined;
+  try {
+    const created = await addGitWorktree({
+      cwd: check.targetRepoPath,
+      worktreePath: workspace,
+      detach: true,
+      startPoint: check.targetHead!,
+    });
+    if (!created.ok) throw new OrchestrationError('worktree_failed', created.error);
+    registered = true;
+
+    const merge = await runGitCommand(
+      mode === 'squash'
+        ? ['merge', '--squash', '--no-overwrite-ignore', check.snapshotOid]
+        : ['merge', '--no-ff', '--no-edit', '--no-overwrite-ignore', '-m', commitMessage, check.snapshotOid],
+      { cwd: workspace, timeoutMs: 60_000 },
+    );
+    if (merge.exitCode !== 0) throw gitFailure(merge, 'Failed to merge in the integration worktree.');
+    if (mode === 'squash') {
+      const staged = await runGitCommand(['diff', '--cached', '--quiet'], { cwd: workspace, readOnly: true });
+      if (staged.exitCode === 1) {
+        const result = await runGitCommand(['commit', '-m', commitMessage], { cwd: workspace, timeoutMs: 30_000 });
+        if (result.exitCode !== 0) throw gitFailure(result, 'Failed to commit squashed worker changes.');
+      } else if (staged.exitCode !== 0) {
+        throw gitFailure(staged, 'Could not verify staged integration changes.');
+      }
+    }
+
+    const commit = await resolveFullHeadCommit(workspace);
+    if (!commit) throw new OrchestrationError('worktree_failed', 'Could not resolve the prepared integration commit.');
+    if (commit !== check.targetHead) {
+      const firstParent = await runGitCommand(['rev-parse', '--verify', `${commit}^1`], {
+        cwd: workspace,
+        readOnly: true,
+      });
+      if (firstParent.exitCode !== 0 || firstParent.stdout.trim() !== check.targetHead) {
+        throw new OrchestrationError(
+          'worktree_failed',
+          'Prepared integration commit is not based on the expected target HEAD. The target was left untouched.',
+        );
+      }
+    }
+    const tree = await runGitCommand(['rev-parse', '--verify', commit + '^{tree}'], { cwd: workspace, readOnly: true });
+    if (tree.exitCode !== 0 || !FULL_GIT_SHA_RE.test(tree.stdout.trim())) {
+      throw new OrchestrationError('worktree_failed', 'Could not resolve the prepared integration tree. The target was left untouched.');
+    }
+    const preparedTreeOid = tree.stdout.trim();
+    if (preparedTreeOid !== check.mergedTreeOid) {
+      // Allow legitimate auto-formatting pre-commit hooks, but re-verify no ignored files would be overwritten.
+      const hookIgnoredCollisions = await detectIgnoredFileCollisions(
+        check.targetRepoPath,
+        check.targetHead!,
+        check.snapshotOid,
+        preparedTreeOid,
+      );
+      if (hookIgnoredCollisions.length > 0) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          `Integration blocked: pre-commit hook output would overwrite ignored local file(s) in target workspace: ${hookIgnoredCollisions.join(', ')}`,
+          { ignoredCollisionFiles: hookIgnoredCollisions },
+        );
+      }
+    }
+    const changes = await runGitCommand(['diff', '--name-only', '-z', check.targetHead!, commit], {
+      cwd: workspace,
+      readOnly: true,
+    });
+    if (changes.exitCode !== 0 || changes.truncated) {
+      throw gitFailure(changes, 'Could not enumerate the prepared integration changes.');
+    }
+    prepared = { commit, changedFiles: parseNullDelimitedPaths(changes.stdout) };
+    return prepared;
+  } finally {
+    try {
+      if (registered) {
+        const removed = await removeGitWorktree({ cwd: check.targetRepoPath, worktreePath: workspace, force: true });
+        if (!removed.ok) throw new Error(removed.error);
+      }
+      rmSync(root, { recursive: true, force: true });
+    } catch (error) {
+      const warning = 'Integration worktree could not be cleaned up at ' + workspace + ': ' + String(error);
+      if (prepared) prepared.cleanupWarning = warning;
+      else console.warn(warning);
+    }
+  }
+}
+
+async function publishIntegrationCommit(
+  check: WorkerIntegrationCheckResult,
+  commit: string,
+): Promise<void> {
+  // Hooks ran while preparing the commit. Publication advances the checkout with Git's
+  // --ff-only and --no-overwrite-ignore collision checks without running hooks again.
+  // Any narrow concurrent modification between assertTargetUnchanged and merge relies on Git path collision checks.
+  const noHooks = mkdtempSync(join(tmpdir(), 'aha-no-hooks-'));
+  try {
+    await assertTargetUnchanged(check);
+    const result = await runGitCommand(
+      ['-c', 'core.hooksPath=' + noHooks, 'merge', '--ff-only', '--no-overwrite-ignore', commit],
+      { cwd: check.targetRepoPath, timeoutMs: 60_000 },
+    );
+    if (result.exitCode !== 0) throw gitFailure(result, 'Could not publish the prepared integration commit.');
+    const [head, ref] = await Promise.all([
+      resolveFullHeadCommit(check.targetRepoPath),
+      resolveTargetSymbolicRef(check.targetRepoPath),
+    ]);
+    if (head !== commit || ref !== check.targetRef) {
+      throw new OrchestrationError('worktree_failed', 'The target changed during publication. Check its current branch and HEAD.');
+    }
+  } finally {
+    rmSync(noHooks, { recursive: true, force: true });
+  }
 }
 
 export async function integrateWorkerChanges(opts: {
@@ -483,146 +975,121 @@ export async function integrateWorkerChanges(opts: {
   worktreePath: string;
   baseCommit?: string | null;
   expectedSnapshotOid?: string | null;
+  expectedTargetRef?: string | null;
   mode?: WorkerIntegrateMode;
   commitMessage: string;
 }): Promise<WorkerIntegrationResult> {
   const mode: WorkerIntegrateMode = opts.mode ?? 'squash';
-  const check = await checkWorkerIntegration({
-    targetRepoPath: opts.targetRepoPath,
-    worktreePath: opts.worktreePath,
-    baseCommit: opts.baseCommit,
-    expectedSnapshotOid: opts.expectedSnapshotOid,
-  });
 
   if (mode === 'check') {
+    const check = await checkWorkerIntegration({
+      targetRepoPath: opts.targetRepoPath,
+      worktreePath: opts.worktreePath,
+      baseCommit: opts.baseCommit,
+      expectedSnapshotOid: opts.expectedSnapshotOid,
+      expectedTargetRef: opts.expectedTargetRef,
+    });
     return {
       mode,
+      checkStatus: check.checkStatus,
       integrated: false,
       noChanges: check.noChanges,
       clean: check.clean,
       targetRepoPath: check.targetRepoPath,
       targetBranch: check.targetBranch,
+      targetRef: check.targetRef,
       snapshotOid: check.snapshotOid,
       integratedCommit: null,
       conflictFiles: check.conflictFiles,
+      ignoredCollisionFiles: check.ignoredCollisionFiles,
       changedFiles: [],
       message: check.message,
     };
   }
 
-  if (check.noChanges) {
+  return withRepoIntegrationLock(opts.targetRepoPath, async () => {
+    const check = await checkWorkerIntegration({
+      targetRepoPath: opts.targetRepoPath,
+      worktreePath: opts.worktreePath,
+      baseCommit: opts.baseCommit,
+      expectedSnapshotOid: opts.expectedSnapshotOid,
+      expectedTargetRef: opts.expectedTargetRef,
+    });
+
+    if (check.targetDirty) {
+      throw new OrchestrationError('operation_rejected', check.message, {
+        targetDirtyFiles: check.targetDirtyFiles,
+      });
+    }
+
+    if (check.noChanges) {
+      await assertTargetUnchanged(check);
+      return {
+        mode,
+        checkStatus: check.checkStatus,
+        integrated: false,
+        noChanges: true,
+        clean: true,
+        targetRepoPath: check.targetRepoPath,
+        targetBranch: check.targetBranch,
+        targetRef: check.targetRef,
+        snapshotOid: check.snapshotOid,
+        integratedCommit: check.targetHead,
+        conflictFiles: [],
+        ignoredCollisionFiles: [],
+        changedFiles: [],
+        message: check.message,
+      };
+    }
+
+    if (check.ignoredCollisionFiles.length > 0 || check.checkStatus === 'conflict') {
+      return {
+        mode,
+        checkStatus: 'conflict',
+        integrated: false,
+        noChanges: false,
+        clean: false,
+        targetRepoPath: check.targetRepoPath,
+        targetBranch: check.targetBranch,
+        targetRef: check.targetRef,
+        snapshotOid: check.snapshotOid,
+        integratedCommit: null,
+        conflictFiles: check.conflictFiles,
+        ignoredCollisionFiles: check.ignoredCollisionFiles,
+        changedFiles: [],
+        message: check.message,
+      };
+    }
+
+    if (check.checkStatus !== 'clean' || !check.clean || !check.targetHead) {
+      throw new OrchestrationError('operation_rejected', check.message, {
+        checkStatus: check.checkStatus,
+      });
+    }
+
+    const { commit, changedFiles, cleanupWarning } = await prepareIntegrationCommit(check, mode, opts.commitMessage);
+    const noChanges = commit === check.targetHead;
+    if (!noChanges) await publishIntegrationCommit(check, commit);
+    else await assertTargetUnchanged(check);
+
     return {
       mode,
-      integrated: false,
-      noChanges: true,
+      checkStatus: 'clean',
+      integrated: !noChanges,
+      noChanges,
       clean: true,
       targetRepoPath: check.targetRepoPath,
       targetBranch: check.targetBranch,
+      targetRef: check.targetRef,
       snapshotOid: check.snapshotOid,
-      integratedCommit: check.targetHead,
+      integratedCommit: commit,
+      ...(cleanupWarning ? { cleanupWarning } : {}),
       conflictFiles: [],
-      changedFiles: [],
-      message: check.message,
+      ignoredCollisionFiles: [],
+      changedFiles,
+      message: noChanges ? 'Worker changes are already in the target.' : `Integrated via ${mode} as ${commit.slice(0, 10)} (${changedFiles.length} file(s)).`,
     };
-  }
-
-  if (check.targetDirty) {
-    throw new OrchestrationError('operation_rejected', check.message, {
-      targetDirtyFiles: check.targetDirtyFiles,
-    });
-  }
-
-  if (check.conflictFiles.length > 0) {
-    return {
-      mode,
-      integrated: false,
-      noChanges: false,
-      clean: false,
-      targetRepoPath: check.targetRepoPath,
-      targetBranch: check.targetBranch,
-      snapshotOid: check.snapshotOid,
-      integratedCommit: null,
-      conflictFiles: check.conflictFiles,
-      changedFiles: [],
-      message: check.message,
-    };
-  }
-
-  const mergeArgs =
-    mode === 'squash'
-      ? ['merge', '--squash', check.snapshotOid]
-      : ['merge', '--no-ff', '--no-edit', '-m', opts.commitMessage, check.snapshotOid];
-
-  const mergeRes = await runGitCommand(mergeArgs, {
-    cwd: opts.targetRepoPath,
-    timeoutMs: 60_000,
   });
-  if (mergeRes.exitCode !== 0) {
-    const unmerged = await runGitCommand(['diff', '--name-only', '--diff-filter=U'], {
-      cwd: opts.targetRepoPath,
-      readOnly: true,
-    });
-    const conflictFiles = parseLines(unmerged.stdout);
-    await abortAndRestoreTargetRepo(opts.targetRepoPath);
-    return {
-      mode,
-      integrated: false,
-      noChanges: false,
-      clean: false,
-      targetRepoPath: check.targetRepoPath,
-      targetBranch: check.targetBranch,
-      snapshotOid: check.snapshotOid,
-      integratedCommit: null,
-      conflictFiles,
-      changedFiles: [],
-      message:
-        conflictFiles.length > 0
-          ? `Merge conflict aborted cleanly. Conflicting files: ${conflictFiles.join(', ')}`
-          : mergeRes.stderr.trim() || mergeRes.stdout.trim() || 'Git merge failed and was aborted.',
-    };
-  }
-
-  if (mode === 'squash') {
-    const commitRes = await runGitCommand(['commit', '-m', opts.commitMessage], {
-      cwd: opts.targetRepoPath,
-      timeoutMs: 30_000,
-    });
-    if (commitRes.exitCode !== 0) {
-      await abortAndRestoreTargetRepo(opts.targetRepoPath);
-      throw new OrchestrationError(
-        'worktree_failed',
-        commitRes.stderr.trim() || commitRes.stdout.trim() || 'Failed to commit squashed worker changes.',
-      );
-    }
-  }
-
-  const headRes = await runGitCommand(['rev-parse', 'HEAD'], {
-    cwd: opts.targetRepoPath,
-    readOnly: true,
-  });
-  const integratedCommit = headRes.exitCode === 0 ? headRes.stdout.trim() : null;
-  const changedRes =
-    integratedCommit && check.targetHead
-      ? await runGitCommand(['diff', '--name-only', check.targetHead, integratedCommit], {
-          cwd: opts.targetRepoPath,
-          readOnly: true,
-        })
-      : null;
-  const changedFiles = changedRes && changedRes.exitCode === 0 ? parseLines(changedRes.stdout) : [];
-
-  return {
-    mode,
-    integrated: true,
-    noChanges: false,
-    clean: true,
-    targetRepoPath: check.targetRepoPath,
-    targetBranch: check.targetBranch,
-    snapshotOid: check.snapshotOid,
-    integratedCommit,
-    conflictFiles: [],
-    changedFiles,
-    message: `Integrated via ${mode} as ${integratedCommit?.slice(0, 10) ?? 'HEAD'} (${changedFiles.length} file(s)).`,
-  };
 }
 
 export async function createDetachedReviewWorktree(opts: {
@@ -649,32 +1116,61 @@ export async function createDetachedReviewWorktree(opts: {
   return { worktreePath: created.path };
 }
 
+/**
+ * Verifies read-only integrity of a detached review worktree using full 40-char commit OIDs.
+ * Fails closed (`mutated: true, verificationFailed: true`) if status or HEAD cannot be read.
+ */
 export async function detectReviewWorktreeMutation(
   reviewWorktreePath: string,
   expectedSnapshotOid?: string | null,
-): Promise<{ mutated: boolean; dirtyFiles: string[] }> {
-  const status = await getGitStatus(reviewWorktreePath).catch(() => null);
-  if (!status || !status.ok || !status.isGitRepo) {
-    return { mutated: false, dirtyFiles: [] };
+): Promise<ReviewWorktreeMutationResult> {
+  const [status, fullHead] = await Promise.all([
+    getGitStatus(reviewWorktreePath).catch(() => null),
+    resolveFullHeadCommit(reviewWorktreePath),
+  ]);
+  if (!status || !status.ok || !status.isGitRepo || !fullHead) {
+    return {
+      mutated: true,
+      verificationFailed: true,
+      dirtyFiles: [],
+      reason: 'Could not verify review worktree Git status or full HEAD commit.',
+    };
   }
   const dirtyFiles = status.entries.map((e) => e.path).filter((p): p is string => Boolean(p));
-  const headChanged = Boolean(expectedSnapshotOid && status.head && status.head !== expectedSnapshotOid);
+  const cleanExpected = expectedSnapshotOid?.trim() ?? '';
+  const headChanged = Boolean(cleanExpected && fullHead !== cleanExpected);
   return {
     mutated: dirtyFiles.length > 0 || headChanged,
+    verificationFailed: false,
     dirtyFiles,
+    ...(headChanged
+      ? { reason: `Review worktree HEAD changed (${fullHead.slice(0, 10)} != ${cleanExpected.slice(0, 10)})` }
+      : dirtyFiles.length > 0
+        ? { reason: `Review worktree modified ${dirtyFiles.length} file(s): ${dirtyFiles.join(', ')}` }
+        : {}),
   };
 }
 
 export async function removeDetachedReviewWorktree(
   mainRepoRoot: string,
   reviewWorktreePath: string,
-): Promise<boolean> {
-  const removed = await removeGitWorktree({
-    cwd: mainRepoRoot,
-    worktreePath: reviewWorktreePath,
-    force: true,
-  }).catch(() => null);
-  return Boolean(removed && removed.ok);
+): Promise<{ removed: boolean; error?: string }> {
+  try {
+    const removed = await removeGitWorktree({
+      cwd: mainRepoRoot,
+      worktreePath: reviewWorktreePath,
+      force: true,
+    });
+    if (removed.ok) {
+      return { removed: true };
+    }
+    return { removed: false, error: removed.error };
+  } catch (error) {
+    return {
+      removed: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 export { deleteOwnedWorkerBranch };

@@ -578,7 +578,7 @@ function buildToolsForContext(ctx) {
     {
       name: 'integrate_worker',
       description:
-        'Safely check or integrate a settled worker changes into the main workspace (default mode="squash" for one clean commit per worker, releaseAfter=true to clean up panes, worktrees, and temporary aha/worker/* branches). Aborts cleanly on conflict and refuses to overwrite a dirty main workspace.',
+        'Safely check or integrate a settled worker changes into the main workspace (default mode="squash" for one clean commit per worker, releaseAfter=true to release panes and clean up verified worktrees and safely deletable aha/worker/* branches). Aborts cleanly on conflict and refuses to overwrite a dirty main workspace.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1003,17 +1003,24 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       const lines = [
         `Worker @${r.role || target} (${r.dispatchId || ''}) · review=${r.reviewStatus || 'none'} (R${r.reviewRound || 0}) · integration=${r.integrationStatus || 'none'}`,
         r.isGitRepo
-          ? `Git: branch=${r.branch || '(detached)'} | base=${(r.baseCommit || '').slice(0, 10) || 'none'} | head=${(r.headCommit || '').slice(0, 10) || 'none'} | snapshot=${(r.snapshotOid || '').slice(0, 10) || 'none'} | commitsAhead=${r.commitsAhead || 0} | uncommitted=${(r.uncommittedFiles || []).length}`
+          ? `Git: branch=${r.branch || '(detached)'} | base=${r.baseCommit || 'none'} | head=${r.headCommit || 'none'} | snapshotOid=${r.snapshotOid || 'none'} | commitsAhead=${r.commitsAhead || 0} | uncommitted=${(r.uncommittedFiles || []).length}`
           : `Non-git workspace: ${r.worktreePath || ''}`,
         `Recommended review tier: ${r.recommendedReviewTier || 'L0'} (${r.tierReason || ''})`,
       ];
+      if (Array.isArray(r.stagedDivergentFiles) && r.stagedDivergentFiles.length > 0) {
+        lines.push(
+          `Warning: staged vs working-tree divergence detected in: ${r.stagedDivergentFiles.join(', ')} (reconcile before review/integration).`,
+        );
+      }
       if (Array.isArray(r.commits) && r.commits.length > 0) {
         lines.push('Commits:', ...r.commits.map((c) => `  - ${c.sha} ${c.subject}`));
       }
       if (r.diffStat) {
         lines.push('Diff stat:', r.diffStat);
       }
-      if (r.diff) {
+      if (r.diffError) {
+        lines.push(`Diff error: ${r.diffError}`);
+      } else if (r.diff) {
         lines.push('', r.diff);
       } else if (r.isGitRepo) {
         lines.push('No diff changes.');
@@ -1043,8 +1050,15 @@ async function handleToolCall(name, rawArgs, activeRequests) {
         ...(Array.isArray(r.conflictFiles) && r.conflictFiles.length > 0
           ? [`Conflicts: ${r.conflictFiles.join(', ')}`]
           : []),
+        ...(Array.isArray(r.ignoredCollisionFiles) && r.ignoredCollisionFiles.length > 0
+          ? [`Ignored file collisions: ${r.ignoredCollisionFiles.join(', ')}`]
+          : []),
         ...(r.released
           ? [`Cleaned up worker resources${r.releasedReviews ? ` + ${r.releasedReviews} review helper(s)` : ''}.`]
+          : []),
+        ...(r.releaseSkippedReason ? [`Release skipped: ${r.releaseSkippedReason}`] : []),
+        ...(Array.isArray(r.cleanupWarnings) && r.cleanupWarnings.length > 0
+          ? ['Cleanup warnings:', ...r.cleanupWarnings.map((w) => `  - ${w}`)]
           : []),
       ];
       return toolText(lines.join('\n'));

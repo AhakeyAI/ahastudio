@@ -638,6 +638,7 @@ export interface OrchestrationDispatchRecord {
   isDetachedReviewWorktree?: boolean;
   reviewOfDispatchId?: string | null;
   reviewFocus?: string | null;
+  reviewBatchId?: string | null;
   reviewSnapshotOid?: string | null;
   reviewStatus?: OrchestrationReviewStatus;
   reviewRound?: number;
