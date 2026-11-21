@@ -45,6 +45,7 @@ const BOOLEAN_FLAGS = new Set([
   'format',
   'screen',
   'keepOpen',
+  'readOnly',
   'keepPane',
   'keepWorktree',
   'removeWorktree',

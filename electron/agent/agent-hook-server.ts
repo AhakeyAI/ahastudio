@@ -659,7 +659,7 @@ export function formatAdditionalContextHookStdout(
   const normProvider = provider.trim().toLowerCase();
   const cleanEvent = eventName.trim() || 'UserPromptSubmit';
 
-  if (normProvider === 'claude' || normProvider === 'claude-code') {
+  if (normProvider === 'claude' || normProvider === 'claude-code' || normProvider === 'codex') {
     return `${JSON.stringify({
       hookSpecificOutput: {
         hookEventName: cleanEvent,

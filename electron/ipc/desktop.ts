@@ -1,4 +1,4 @@
-import { app, ipcMain, nativeTheme, webContents } from 'electron';
+import { app, clipboard, ipcMain, nativeTheme, webContents } from 'electron';
 import { requestMicrophoneAccess } from '../microphone-access.js';
 import { getSettings, updateSettings, type Settings } from '../store.js';
 
@@ -24,6 +24,19 @@ export function buildUiPreferencesUpdate(
 
 export function registerDesktopIpc(): void {
   ipcMain.handle('app:version', () => app.getVersion());
+
+  ipcMain.handle('clipboard:read', async () => {
+    const [text, hasPng, hasJpeg] = await Promise.all([
+      clipboard.readText().catch(() => ''),
+      clipboard.has('image/png').catch(() => false),
+      clipboard.has('image/jpeg').catch(() => false),
+    ]);
+    return { text, hasImage: hasPng || hasJpeg };
+  });
+
+  ipcMain.handle('clipboard:write-text', async (_event, text: unknown) => {
+    if (typeof text === 'string') await clipboard.writeText(text);
+  });
 
   ipcMain.handle('app:relaunch', () => {
     app.relaunch();

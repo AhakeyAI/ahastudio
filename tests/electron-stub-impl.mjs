@@ -45,6 +45,11 @@ export const safeStorage = {
 };
 export const screen = { getPrimaryDisplay: () => ({ workAreaSize: { width: 1920, height: 1080 } }) };
 export const nativeTheme = { shouldUseDarkColors: false, themeSource: 'system', on: () => {}, removeListener: () => {} };
-export const webContents = { fromId: () => null };
+export const webContents = { fromId: () => null, getAllWebContents: () => [] };
+export const clipboard = {
+  readText: async () => '',
+  writeText: async () => {},
+  has: async () => false,
+};
 
-export default { app, ipcMain, dialog, desktopCapturer, systemPreferences, shell, BrowserWindow, safeStorage, screen, nativeTheme, webContents };
+export default { app, clipboard, ipcMain, dialog, desktopCapturer, systemPreferences, shell, BrowserWindow, safeStorage, screen, nativeTheme, webContents };

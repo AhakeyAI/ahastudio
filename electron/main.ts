@@ -219,7 +219,11 @@ app.whenReady().then(async () => {
   registerAppProtocol();
 
   session.defaultSession.setPermissionCheckHandler((_wc, permission, requestingOrigin) => {
-    if (permission === 'media') {
+    if (
+      permission === 'media' ||
+      permission === 'clipboard-read' ||
+      permission === 'clipboard-sanitized-write'
+    ) {
       return isTrustedRendererUrl(requestingOrigin);
     }
     return false;

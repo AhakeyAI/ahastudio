@@ -147,6 +147,8 @@ export interface VibeMeetApi {
   };
 
   appVersion: () => Promise<string>;
+  readClipboard?: () => Promise<{ text: string; hasImage: boolean }>;
+  writeClipboardText?: (text: string) => Promise<void>;
   relaunchApp: () => Promise<void>;
   setThemeSource?: (
     source: 'system' | 'light' | 'dark',

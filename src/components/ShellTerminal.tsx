@@ -119,8 +119,22 @@ function PersistentShellTerminal({
       onNotify: (msg) => onNotifyRef.current?.(msg),
     });
 
+    const consumedClipboardKeys = new Set<string>();
+    const consumeKeyEvent = (event: KeyboardEvent): false => {
+      event.preventDefault();
+      event.stopPropagation();
+      return false;
+    };
+
     session.terminal.attachCustomKeyEventHandler((event) => {
-      if (event.type !== 'keydown') return true;
+      const keyId = event.code || event.key;
+      if (event.type !== 'keydown') {
+        if (consumedClipboardKeys.has(keyId)) {
+          if (event.type === 'keyup') consumedClipboardKeys.delete(keyId);
+          return consumeKeyEvent(event);
+        }
+        return true;
+      }
       if (isTerminalSearchShortcut(event)) {
         event.preventDefault();
         onOpenSearchRef.current?.();
@@ -129,11 +143,35 @@ function PersistentShellTerminal({
       if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'c') {
         const sel = session.getSelection();
         if (sel) {
-          void navigator.clipboard?.writeText(sel).then(() => {
-            onNotifyRef.current?.('已复制选中内容');
-          }).catch(() => {});
-          return false;
+          consumedClipboardKeys.add(keyId);
+          if (!event.repeat) {
+            const writeClipboard = window.vibeMeet.writeClipboardText
+              ? window.vibeMeet.writeClipboardText(sel)
+              : navigator.clipboard?.writeText(sel);
+            void writeClipboard?.then(() => {
+              onNotifyRef.current?.('已复制选中内容');
+            }).catch(() => {});
+          }
+          return consumeKeyEvent(event);
         }
+      }
+      if (!isMacSearchPlatform() && event.ctrlKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'v') {
+        consumedClipboardKeys.add(keyId);
+        if (!event.repeat) {
+          const forceText = event.shiftKey;
+          const readClip = window.vibeMeet.readClipboard
+            ? window.vibeMeet.readClipboard()
+            : navigator.clipboard?.readText().then((text) => ({ text, hasImage: false }));
+          void readClip?.then(({ text, hasImage }) => {
+            if (text) {
+              session.terminal.paste(text);
+            } else if (!forceText && hasImage) {
+              const ptyId = session.getPtyId();
+              if (ptyId) void api.input(ptyId, '\x16');
+            }
+          }).catch(() => {});
+        }
+        return consumeKeyEvent(event);
       }
       if (isWorkspaceChord(event) || (Boolean(cliId) && isOrchestrationModeChord(event))) {
         return false;

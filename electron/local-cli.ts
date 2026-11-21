@@ -53,6 +53,16 @@ export function listLocalCliInventory(): LocalCliInventoryEntry[] {
   });
 }
 
+const CODEX_MCP_ENV_VARS = [
+  'AHA_TERMINAL_ID',
+  'AHA_ORCHESTRATION_PANE_TOKEN',
+  'AHA_AGENT_HOOK_PORT',
+  'AHA_AGENT_HOOK_TOKEN',
+  'AHA_AGENT_HOOK_URL',
+  'AHA_ORCHESTRATION_URL',
+  'AHA_AGENT_HOOK_ENDPOINT_FILE',
+] as const;
+
 export function resolveMcpLaunchArgs(
   cliId: OrchestrationCliId,
   opts?: ResolveMcpLaunchArgsOptions,
@@ -72,6 +82,8 @@ export function resolveMcpLaunchArgs(
       `mcp_servers.aha.command=${JSON.stringify(nodeCommand)}`,
       '-c',
       `mcp_servers.aha.args=${JSON.stringify([normalizedServerPath])}`,
+      '-c',
+      `mcp_servers.aha.env_vars=${JSON.stringify(CODEX_MCP_ENV_VARS)}`,
     ];
   }
   return [];

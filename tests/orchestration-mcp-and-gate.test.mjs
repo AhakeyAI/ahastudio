@@ -990,6 +990,15 @@ test('AgentHookServer userPromptInterceptor returns hookStdout JSON on UserPromp
     parsedStdout.hookSpecificOutput.additionalContext,
     /Orchestration mode active/
   );
+  const codexHookStdout = JSON.parse(
+    formatAdditionalContextHookStdout('codex', 'UserPromptSubmit', 'Use MCP delegate_task.')
+  );
+  assert.deepEqual(codexHookStdout, {
+    hookSpecificOutput: {
+      hookEventName: 'UserPromptSubmit',
+      additionalContext: 'Use MCP delegate_task.',
+    },
+  });
   assert.equal(seen.length, 1);
   assert.equal(seen[0].ptyId, 'pane-hook');
   assert.equal(seen[0].provider, 'claude');

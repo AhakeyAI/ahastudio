@@ -82,6 +82,8 @@ test('LOCAL_CLI_IDS includes gemini, ORCHESTRATION_CLI_IDS is deduplicated, and 
       'mcp_servers.aha.command="node"',
       '-c',
       'mcp_servers.aha.args=["C:/Users/demo/.ahastation/agent-hooks/aha-mcp-server.cjs"]',
+      '-c',
+      'mcp_servers.aha.env_vars=["AHA_TERMINAL_ID","AHA_ORCHESTRATION_PANE_TOKEN","AHA_AGENT_HOOK_PORT","AHA_AGENT_HOOK_TOKEN","AHA_AGENT_HOOK_URL","AHA_ORCHESTRATION_URL","AHA_AGENT_HOOK_ENDPOINT_FILE"]',
     ],
   );
   assert.deepEqual(
