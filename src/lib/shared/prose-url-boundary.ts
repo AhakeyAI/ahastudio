@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 // Why not all non-ascii punctuation: titles keep `・`, `–` and `·` unencoded in a url
 // (`/wiki/ジョン・スミス`), so only brackets, quotes, spaces and sentence marks end one.
 // Escaped CJK sentence marks 、。，．！？：；｡､…‥— keep this module's chunk one-byte in V8.

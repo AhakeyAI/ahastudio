@@ -176,4 +176,4 @@ npm run dev:electron
 
 ## 开源协议
 
-本项目基于 [Apache License 2.0](./LICENSE) 开源。部分第三方 CLI 图标素材遵循 [src/assets/cli-icons/THIRD-PARTY-LICENSE.txt](./src/assets/cli-icons/THIRD-PARTY-LICENSE.txt) 中的 MIT 协议。
+本项目基于 [Apache License 2.0](./LICENSE) 开源。部分移植或集成的第三方代码与资源遵循各自原始开源协议（MIT / ISC / CC0），详见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) 及 [src/assets/cli-icons/THIRD-PARTY-LICENSE.txt](./src/assets/cli-icons/THIRD-PARTY-LICENSE.txt)。

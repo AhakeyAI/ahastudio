@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import {
   TERMINAL_HTTP_URL_MAX_HARD_WRAPPED_ROWS,
   TERMINAL_HTTP_URL_MAX_LENGTH

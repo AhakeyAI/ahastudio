@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import { extractLastOscTitle } from '../../shared/agent-status/title/osc-title-extraction.js'
 import { parseFileUriPath } from './osc7-file-uri.js'
 import { extractOscScanTail, scanOsc7Uris } from './osc7-uri-extraction.js'

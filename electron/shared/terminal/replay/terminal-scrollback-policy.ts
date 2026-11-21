@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 export const DESKTOP_TERMINAL_SCROLLBACK_ROWS_DEFAULT = 5_000
 export const DESKTOP_TERMINAL_SCROLLBACK_ROWS_MIN = 1_000
 export const DESKTOP_TERMINAL_SCROLLBACK_ROWS_MAX = 50_000

@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 // Rules both OSC 7 parsers (the daemon's and the renderer's) share, so they agree on a folder.
 
 /** A `%` not followed by two hex digits is a literal `%` (nushell sends folder names unencoded). */

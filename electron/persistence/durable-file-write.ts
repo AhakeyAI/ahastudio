@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 // Atomic rename is not durable; fsync the file and directory to survive power loss.
 
 import { closeSync, fsyncSync, openSync, rmSync, writeFileSync } from 'node:fs'

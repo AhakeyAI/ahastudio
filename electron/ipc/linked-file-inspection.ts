@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import { lstat, open, readlink, realpath, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { classifyLinkedFile, type LinkedFileAction } from './launchable-file-type.js';

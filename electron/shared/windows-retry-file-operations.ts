@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import { copyFileSync, renameSync } from 'node:fs'
 import { rename } from 'node:fs/promises'
 import { setTimeout } from 'node:timers/promises'

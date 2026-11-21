@@ -1,3 +1,6 @@
+// Ported from Orca (https://github.com/stablyai/orca, Copyright (c) 2026 Lovecast Inc., MIT)
+// and Visual Studio Code (Copyright (c) Microsoft Corporation, MIT). See THIRD_PARTY_NOTICES.md.
+
 import { normalizeAbsolutePath } from '../../file-links/file-link-path-normalization'
 import { resolveExplicitFileLinkTarget } from '../../file-links/explicit-file-link-target'
 import { detectBareFilenameLinks } from './terminal-bare-file-link-detection'

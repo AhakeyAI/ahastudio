@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 const OSC7_PREFIX = '\x1b]7;'
 const ESC_CODE_UNIT = 0x1b
 const BEL_CODE_UNIT = 0x07

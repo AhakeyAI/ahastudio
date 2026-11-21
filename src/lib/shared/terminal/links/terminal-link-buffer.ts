@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 // Structural subset of xterm's buffer API so desktop xterm and the mobile document both fit.
 export type TerminalLinkBufferCell = { getWidth?(): number; getChars?(): string }
 

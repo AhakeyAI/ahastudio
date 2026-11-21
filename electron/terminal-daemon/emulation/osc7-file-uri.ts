@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import { toWindowsWslPath } from '../../shared/wsl-paths.js'
 import { escapeLiteralPercent, hasNulCharacter } from '../../shared/osc7-path-text.js'
 

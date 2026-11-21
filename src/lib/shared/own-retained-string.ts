@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import { copyUtf16SuffixToOwnedString } from './owned-utf16-suffix'
 
 // V8 SlicedString::kMinLength. Shorter slices are already flat, so copying them is pure waste.

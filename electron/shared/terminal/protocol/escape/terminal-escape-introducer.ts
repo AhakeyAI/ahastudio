@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 // Share VT500 dispatch between tail tracking and preview normalization so their DCS/SOS/PM/APC classifications agree.
 
 export type TerminalEscapeIntroducer =

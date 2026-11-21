@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import type { TerminalOscLinkRange } from '../../shared/terminal/links/terminal-osc-link-ranges.js'
 import type { TerminalModes } from './terminal-modes.js'
 import type { TerminalOwner } from '../../shared/terminal/pty/lifecycle/terminal-owner.js'

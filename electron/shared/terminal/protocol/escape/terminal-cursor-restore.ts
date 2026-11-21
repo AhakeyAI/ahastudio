@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 export const CURSOR_SHOW_SEQUENCE = '\x1b[?25h'
 
 export const CURSOR_HIDE_SEQUENCE = '\x1b[?25l'

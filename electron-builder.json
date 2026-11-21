@@ -7,7 +7,9 @@
   "files": [
     "dist/**/*",
     "dist-electron/**/*",
-    "package.json"
+    "package.json",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "asarUnpack": [
     "node_modules/@lydell/node-pty-*/**/*",

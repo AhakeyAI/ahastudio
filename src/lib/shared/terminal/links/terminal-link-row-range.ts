@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import { rangeForParsedFileLink, type WrappedLogicalLine } from './wrapped-terminal-link-ranges'
 import type { TerminalLinkBufferRange } from './terminal-link-buffer'
 

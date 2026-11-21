@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import { isWindowsAbsolutePathLike } from '../../cross-platform-path'
 import { routeNativeChatHref } from '../../native-chat/native-chat-href-routing'
 import { parseExplicitFileLinkTarget } from '../../file-links/explicit-file-link-target'

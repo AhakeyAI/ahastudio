@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import { buildTerminalHttpLogicalLines, hasHardWrappedRows } from './terminal-http-logical-lines'
 import { extractTerminalHttpLinks } from './terminal-http-url-extraction'
 import { dedupeLogicalLines } from './terminal-link-logical-line-deduplication'

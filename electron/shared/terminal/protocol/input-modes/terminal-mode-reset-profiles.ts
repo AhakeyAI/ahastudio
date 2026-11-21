@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import { CURSOR_SHOW_SEQUENCE as SHOW_CURSOR } from '../escape/terminal-cursor-restore.js'
 import { FOCUS_REPORTING_DISABLE_SEQUENCE as RESET_FOCUS_REPORTING } from './terminal-focus-reports.js'
 // Share renderer replay and daemon cold-restore mode contracts; duplicated literals drifted (#12101).

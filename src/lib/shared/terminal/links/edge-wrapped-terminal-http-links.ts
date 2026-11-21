@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import { TERMINAL_HTTP_URL_MAX_LENGTH } from './terminal-http-link-limits'
 import { translateLineWithColumns, type WrappedLogicalLine } from './wrapped-terminal-link-ranges'
 import type { TerminalLinkBuffer, TerminalLinkBufferLine } from './terminal-link-buffer'

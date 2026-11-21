@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import type { IBuffer, IBufferCell, IBufferLine, Terminal } from '@xterm/headless'
 import type { TerminalOscLinkRange } from '../../shared/terminal/links/terminal-osc-link-ranges.js'
 

@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 const COPY_BLOCK_CODE_UNITS = 4 * 1024
 
 export function copyUtf16SuffixToOwnedString(value: string, suffixCodeUnits: number): string {

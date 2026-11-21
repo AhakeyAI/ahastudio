@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 import type { TerminalModes } from '../protocol/terminal-modes.js'
 import { RESET_GRAPHIC_RENDITION } from '../../shared/terminal/protocol/input-modes/terminal-mode-reset-profiles.js'
 

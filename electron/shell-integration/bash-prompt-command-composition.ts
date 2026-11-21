@@ -1,3 +1,6 @@
+// Ported/adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
 export const BASH_PROMPT_COMMAND_COMPOSITION_BLOCK = `__aha_normalize_prompt_command_part() {
   local __aha_value="$1" __aha_output_name="$2" __aha_character __aha_chunk
   local __aha_value_length=\${#1} __aha_suffix_length=0 __aha_backslash_length=0
