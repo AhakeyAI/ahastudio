@@ -585,12 +585,27 @@ export interface OrchestrationRunRecord {
   createdAt: string;
   updatedAt: string;
   endedAt: string | null;
+  integrationBranch?: string | null;
+  integrationWorktreePath?: string | null;
+  integrationBaseCommit?: string | null;
+  integrationBaseBranch?: string | null;
+  integrationRepoRootPath?: string | null;
+  integrationStatus?: OrchestrationRunIntegrationStatus;
+  integrationHeadCommit?: string | null;
+  finalizedCommit?: string | null;
+  runReviewBatchId?: string | null;
+  runReviewSnapshotOid?: string | null;
+  runReviewBaseCommit?: string | null;
+  runReviewStatus?: OrchestrationReviewStatus;
+  runReviewRound?: number;
+  runReviewFindings?: OrchestrationReviewFinding[];
 }
 
 export type OrchestrationReviewSeverity = 'P0' | 'P1' | 'P2';
 export type OrchestrationReviewVerdict = 'pass' | 'reject';
 export type OrchestrationReviewStatus = 'none' | 'pending' | 'passed' | 'rejected' | 'escalated';
 export type OrchestrationIntegrationStatus = 'none' | 'checked' | 'merged' | 'conflict' | 'skipped';
+export type OrchestrationRunIntegrationStatus = 'none' | 'active' | 'finalized' | 'conflict';
 
 export interface OrchestrationReviewFinding {
   severity: OrchestrationReviewSeverity;
@@ -637,6 +652,7 @@ export interface OrchestrationDispatchRecord {
   ownsBranch?: boolean;
   isDetachedReviewWorktree?: boolean;
   reviewOfDispatchId?: string | null;
+  reviewOfRunId?: string | null;
   reviewFocus?: string | null;
   reviewBatchId?: string | null;
   reviewSnapshotOid?: string | null;
@@ -646,6 +662,7 @@ export interface OrchestrationDispatchRecord {
   reviewMutatedWorkspace?: boolean;
   integrationStatus?: OrchestrationIntegrationStatus;
   integratedCommit?: string | null;
+  integratedTargetBranch?: string | null;
   ownsPane?: boolean;
   cliId?: string | null;
   model?: string | null;

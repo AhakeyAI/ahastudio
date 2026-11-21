@@ -134,6 +134,21 @@
   min-width: 0;
 }
 
+.obp-header-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  min-width: 0;
+}
+
+.obp-header-badge {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .obp-run-title {
   margin: 0;
   font-size: 13px;

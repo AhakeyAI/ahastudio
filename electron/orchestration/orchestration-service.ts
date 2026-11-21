@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { resolve as resolveFsPath } from 'node:path';
 import type { PtyWriteFn } from '../agent/agent-prompt-delivery.js';
 import type { AgentPaneStatus, AgentStatusStore } from '../agent/agent-status-store.js';
+import { getGitStatus } from '../git/git-service.js';
 import type { TerminalReadResult, TerminalRuntimeTracker, TerminalSummary } from '../terminal-runtime-tracker.js';
 import {
   Coordinator,
@@ -94,23 +97,34 @@ import { normalizeWorkerCliId, resolveWorkerLaunchConfig } from './worker-launch
 import { WorkerTurnStopMonitor } from './worker-turn-stops.js';
 import {
   buildAdversarialReviewTask,
+  buildRunAdversarialReviewTask,
   evaluateAdversarialVerdict,
   formatReviewVerdictForBoard,
   MAX_ADVERSARIAL_REVIEW_ROUNDS,
   normalizeReviewFindings,
+  type RunIntegratedWorkerSummaryForReview,
 } from './adversarial-review.js';
 import {
   captureWorkerSnapshotOid,
   createDetachedReviewWorktree,
   detectReviewWorktreeMutation,
+  finalizeRunIntegrationBranch,
+  inspectCommitRangeDiff,
   inspectWorkerDiff,
   integrateWorkerChanges,
+  integrateWorkerIntoRunBranch,
+  isGitCommitAncestor,
+  isSameGitRepo,
   removeDetachedReviewWorktree,
   resolveBranchRefOid,
   resolveIntegrationMergeBase,
   resolveMainRepoRoot,
+  resolveTargetSymbolicRef,
+  type RunCommitRangeDiffInspection,
+  type RunFinalizeIntegrationResult,
   type WorkerDiffInspection,
   type WorkerIntegrateMode,
+  type WorkerIntegrateTargetBranch,
   type WorkerIntegrationResult,
 } from './worker-git-integration.js';
 import {
@@ -269,6 +283,7 @@ export interface OrchestrationServiceDependencies {
     taskKind?: OrchestrationTaskKind | null;
     coordinatorCliId?: string | null;
     authorCliId?: string | null;
+    authorCliIds?: readonly string[];
     excludeCliIds?: readonly string[];
     preferIdle?: boolean;
   }) => OrchestrationAgentSelectionResult;
@@ -345,6 +360,7 @@ export class OrchestrationService {
   private readonly inFlightObservationDispatches = new Set<string>();
   private readonly workerMutations = new Set<string>();
   private readonly reviewStartLocks = new Map<string, Promise<void>>();
+  private readonly runIntegrationLocks = new Map<string, Promise<void>>();
   private readonly retiringPanes = new Set<string>();
   private readonly disposeStatusListener: () => void;
   private readonly disposeActivityListener: () => void;
@@ -769,6 +785,69 @@ export class OrchestrationService {
     }
   }
 
+  private async withRunIntegrationLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.runIntegrationLocks.get(runId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolveLock) => {
+      release = resolveLock;
+    });
+    const tail = previous.then(() => current);
+    this.runIntegrationLocks.set(runId, tail);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.runIntegrationLocks.get(runId) === tail) {
+        this.runIntegrationLocks.delete(runId);
+      }
+    }
+  }
+
+  private isRunIntegrationBranchLive(run: OrchestrationRunRecord): boolean {
+    return Boolean(
+      (run.integrationStatus === 'active' || run.integrationStatus === 'conflict') &&
+      run.integrationBranch &&
+      run.integrationWorktreePath,
+    );
+  }
+
+  private async resolveLiveTargetRepoForDispatch(
+    run: OrchestrationRunRecord,
+    mainRepoRoot: string,
+  ): Promise<string> {
+    if (
+      this.isRunIntegrationBranchLive(run) &&
+      run.integrationWorktreePath &&
+      run.integrationRepoRootPath &&
+      (await isSameGitRepo(mainRepoRoot, run.integrationRepoRootPath))
+    ) {
+      return run.integrationWorktreePath;
+    }
+    return mainRepoRoot;
+  }
+
+  private async resolveEffectiveWorkerDiffBase(
+    run: OrchestrationRunRecord,
+    dispatch: OrchestrationDispatchRecord,
+    worktreePath: string,
+    mainRepoRoot: string | null,
+    snapshotOid: string | null,
+  ): Promise<string | null> {
+    const recordedBase = dispatch.baseCommit?.trim() || null;
+    if (!mainRepoRoot || !snapshotOid) return recordedBase;
+    const targetRepo = await this.resolveLiveTargetRepoForDispatch(run, mainRepoRoot);
+    const normPath = (p: string) => {
+      const r = resolveFsPath(p);
+      return process.platform === 'win32' ? r.toLowerCase() : r;
+    };
+    const isIsolatedWorktree =
+      Boolean(dispatch.ownsWorktree) || normPath(worktreePath) !== normPath(targetRepo);
+    if (!isIsolatedWorktree) return recordedBase;
+    const liveMergeBase = await resolveIntegrationMergeBase(targetRepo, snapshotOid);
+    return liveMergeBase ?? recordedBase;
+  }
+
   private getReviewFirewallContext(callerHandle?: string | null): {
     reviewDispatch: OrchestrationDispatchRecord;
     targetDispatchIds: Set<string>;
@@ -782,28 +861,41 @@ export class OrchestrationService {
     const direct =
       this.store.getDispatchContext(rawId) ??
       this.store.getActiveDispatchForIdentity(clean, clean);
-    if (!direct || !direct.reviewOfDispatchId) return null;
+    if (!direct || (!direct.reviewOfDispatchId && !direct.reviewOfRunId)) return null;
 
     const targetDispatchIds = new Set<string>();
     const targetTaskIds = new Set<string>();
     const targetPaneIds = new Set<string>();
     const targetRoles = new Set<string>();
-    const lineageHead =
-      this.store.resolveDispatchLineage(direct.reviewOfDispatchId) ??
-      this.store.getDispatchContext(direct.reviewOfDispatchId);
-    const ids = lineageHead
-      ? this.store.listDispatchAncestorIds(lineageHead.id)
-      : [direct.reviewOfDispatchId];
-    for (const id of ids) {
-      targetDispatchIds.add(id);
-      const d = this.store.getDispatchContext(id);
-      if (!d) continue;
+
+    const collectTargetDispatch = (d: OrchestrationDispatchRecord) => {
+      targetDispatchIds.add(d.id);
       targetTaskIds.add(d.taskId);
       if (d.assigneePaneId) targetPaneIds.add(d.assigneePaneId);
       if (d.assigneeHandle) targetPaneIds.add(d.assigneeHandle);
       const role = this.resolveRoleNameForDispatch(d).toLowerCase();
       if (role) targetRoles.add(role);
+    };
+
+    if (direct.reviewOfDispatchId) {
+      const lineageHead =
+        this.store.resolveDispatchLineage(direct.reviewOfDispatchId) ??
+        this.store.getDispatchContext(direct.reviewOfDispatchId);
+      const ids = lineageHead
+        ? this.store.listDispatchAncestorIds(lineageHead.id)
+        : [direct.reviewOfDispatchId];
+      for (const id of ids) {
+        targetDispatchIds.add(id);
+        const d = this.store.getDispatchContext(id);
+        if (d) collectTargetDispatch(d);
+      }
+    } else if (direct.reviewOfRunId) {
+      for (const d of this.store.listDispatches({ runId: direct.reviewOfRunId })) {
+        if (d.id === direct.id || d.reviewOfDispatchId || d.reviewOfRunId) continue;
+        collectTargetDispatch(d);
+      }
     }
+
     return {
       reviewDispatch: direct,
       targetDispatchIds,
@@ -970,6 +1062,264 @@ export class OrchestrationService {
       reviewFindings: mergedFindings,
     });
     return { escalated: false, reviewRound: batchRound, staleBatch: false };
+  }
+
+  /**
+   * Reconciles a Run-level secondary adversarial review batch.
+   * Mirrors `reconcileTargetReviewBatch` for `run.runReviewBatchId` / `run.runReviewStatus`.
+   */
+  private reconcileRunReviewBatch(
+    reviewDispatchId: string,
+    opts?: {
+      overrideFindings?: OrchestrationReviewFinding[];
+      overrideVerdict?: OrchestrationReviewVerdict;
+      failedReason?: string;
+    },
+  ): { escalated: boolean; reviewRound: number; staleBatch: boolean } {
+    const reviewDispatch = this.store.getDispatchContext(reviewDispatchId);
+    if (!reviewDispatch?.reviewOfRunId) {
+      return { escalated: false, reviewRound: 1, staleBatch: false };
+    }
+    const targetRun = this.store.getRun(reviewDispatch.reviewOfRunId);
+    const batchRound = reviewDispatch.reviewRound ?? targetRun?.runReviewRound ?? 1;
+    if (!targetRun) {
+      return { escalated: false, reviewRound: batchRound, staleBatch: false };
+    }
+
+    const batchId = reviewDispatch.reviewBatchId ?? null;
+    const isCurrentBatch = Boolean(
+      batchId
+        ? targetRun.runReviewBatchId === batchId
+        : !targetRun.runReviewBatchId &&
+            (!reviewDispatch.reviewSnapshotOid ||
+              targetRun.runReviewSnapshotOid === reviewDispatch.reviewSnapshotOid),
+    );
+    if (!isCurrentBatch) {
+      return { escalated: false, reviewRound: batchRound, staleBatch: true };
+    }
+
+    const batchReviews = batchId
+      ? this.store.listReviewDispatchesForRunBatch(targetRun.id, batchId)
+      : this.store
+          .listReviewDispatchesForRun(targetRun.id)
+          .filter(
+            (d) =>
+              !reviewDispatch.reviewSnapshotOid ||
+              d.reviewSnapshotOid === reviewDispatch.reviewSnapshotOid,
+          );
+    if (batchReviews.length === 0) {
+      return { escalated: false, reviewRound: batchRound, staleBatch: false };
+    }
+
+    const isEffectiveReject = (d: OrchestrationDispatchRecord): boolean => {
+      if (d.id === reviewDispatch.id && opts?.overrideVerdict) {
+        return opts.overrideVerdict === 'reject';
+      }
+      if (d.reviewStatus === 'rejected' || d.reviewMutatedWorkspace) return true;
+      if (!ACTIVE_DISPATCH_STATUSES.has(d.status) && (d.status !== 'completed' || d.reviewStatus !== 'passed')) {
+        return true;
+      }
+      return false;
+    };
+
+    const isEffectivePass = (d: OrchestrationDispatchRecord): boolean => {
+      if (d.id === reviewDispatch.id && opts?.overrideVerdict) {
+        return opts.overrideVerdict === 'pass' && !d.reviewMutatedWorkspace;
+      }
+      return (
+        d.status === 'completed' &&
+        d.reviewStatus === 'passed' &&
+        !d.reviewMutatedWorkspace
+      );
+    };
+
+    const anyRejected = batchReviews.some(isEffectiveReject);
+    const allSettled = batchReviews.every((d) =>
+      d.id === reviewDispatch.id ? true : !ACTIVE_DISPATCH_STATUSES.has(d.status),
+    );
+    const allExplicitlyPassed = allSettled && batchReviews.every(isEffectivePass);
+    const mergedFindings = batchReviews.flatMap((d) =>
+      d.id === reviewDispatch.id && opts?.overrideFindings
+        ? opts.overrideFindings
+        : (d.reviewFindings ?? []),
+    );
+    if (opts?.failedReason && !mergedFindings.some((f) => f.title === opts.failedReason)) {
+      mergedFindings.push({
+        severity: 'P1',
+        location: '(review-lifecycle)',
+        title: opts.failedReason,
+        evidence: `Run reviewer ${reviewDispatch.id} terminated without an explicit PASS verdict.`,
+      });
+    }
+
+    if (anyRejected) {
+      const escalated = batchRound >= MAX_ADVERSARIAL_REVIEW_ROUNDS;
+      this.store.updateRunReviewState(targetRun.id, {
+        runReviewStatus: escalated ? 'escalated' : 'rejected',
+        runReviewFindings: mergedFindings,
+      });
+      return { escalated, reviewRound: batchRound, staleBatch: false };
+    }
+
+    if (allExplicitlyPassed) {
+      this.store.updateRunReviewState(targetRun.id, {
+        runReviewStatus: 'passed',
+        runReviewFindings: mergedFindings,
+      });
+      return { escalated: false, reviewRound: batchRound, staleBatch: false };
+    }
+
+    this.store.updateRunReviewState(targetRun.id, {
+      runReviewStatus: 'pending',
+      runReviewFindings: mergedFindings,
+    });
+    return { escalated: false, reviewRound: batchRound, staleBatch: false };
+  }
+
+  private reconcileAnyReviewBatch(
+    reviewDispatchId: string,
+    opts?: {
+      overrideFindings?: OrchestrationReviewFinding[];
+      overrideVerdict?: OrchestrationReviewVerdict;
+      failedReason?: string;
+    },
+  ): { escalated: boolean; reviewRound: number; staleBatch: boolean } {
+    const d = this.store.getDispatchContext(reviewDispatchId);
+    if (d?.reviewOfRunId) {
+      return this.reconcileRunReviewBatch(reviewDispatchId, opts);
+    }
+    return this.reconcileTargetReviewBatch(reviewDispatchId, opts);
+  }
+
+  private resolveTargetRunForOperation(
+    explicitRunId?: string | null,
+    callerPaneId?: string,
+    fallbackFrom?: string,
+  ): OrchestrationRunRecord {
+    const cleanRunId = explicitRunId?.trim() || undefined;
+    if (callerPaneId !== undefined) {
+      const runId = this.authorizeRunAccess(cleanRunId, callerPaneId);
+      this.assertRunCoordinator(runId, callerPaneId);
+      return this.store.requireRun(runId);
+    }
+    if (cleanRunId) {
+      return this.store.requireRun(cleanRunId);
+    }
+    const inferred = this.inferRunIdOptional(fallbackFrom || 'coordinator');
+    if (inferred) {
+      return this.store.requireRun(inferred);
+    }
+    const activeRuns = this.store.listRuns({ status: 'active' });
+    if (activeRuns.length === 1) {
+      return activeRuns[0]!;
+    }
+    throw new OrchestrationError(
+      'run_not_found',
+      'No active run could be resolved. Specify runId explicitly.',
+    );
+  }
+
+  private async resolveRunCombinedDiffTarget(
+    run: OrchestrationRunRecord,
+    opts?: { requireCleanIntegrationWorktree?: boolean },
+  ): Promise<{
+    hasChanges: boolean;
+    mainRepoRoot: string | null;
+    repoPath: string | null;
+    branch: string | null;
+    baseCommit: string | null;
+    targetCommit: string | null;
+    isActiveIntegrationBranch: boolean;
+    integratedWorkers: RunIntegratedWorkerSummaryForReview[];
+  }> {
+    const integratedDispatches = this.store.listIntegratedDispatchesForRun(run.id);
+    const integratedWorkers: RunIntegratedWorkerSummaryForReview[] = integratedDispatches.map((d) => {
+      const t = this.store.getTask(d.taskId);
+      return {
+        dispatchId: d.id,
+        role: this.resolveRoleNameForDispatch(d) || d.id,
+        cliId: d.cliId ?? null,
+        taskSpec: t?.spec ?? '',
+        taskContext: t?.taskContext ?? null,
+        integratedCommit: d.integratedCommit ?? null,
+      };
+    });
+
+    const isActiveIntegrationBranch = this.isRunIntegrationBranchLive(run);
+
+    if (isActiveIntegrationBranch) {
+      const wtPath = run.integrationWorktreePath!;
+      const branch = run.integrationBranch!;
+      const mainRepoRoot =
+        run.integrationRepoRootPath ??
+        (await resolveMainRepoRoot(wtPath, this.getDefaultCwd?.() ?? null));
+      if (opts?.requireCleanIntegrationWorktree) {
+        const [status, ref] = await Promise.all([
+          getGitStatus(wtPath),
+          resolveTargetSymbolicRef(wtPath),
+        ]);
+        if (!status.ok || !status.isGitRepo) {
+          throw new OrchestrationError(
+            'worktree_failed',
+            `Run integration worktree at ${wtPath} is missing or invalid.`,
+          );
+        }
+        if (ref !== `refs/heads/${branch}`) {
+          throw new OrchestrationError(
+            'operation_rejected',
+            `Run integration worktree is on ${ref ?? 'detached HEAD'} instead of refs/heads/${branch}.`,
+          );
+        }
+        const dirty = status.entries.map((e) => e.path).filter((p): p is string => Boolean(p));
+        if (dirty.length > 0) {
+          throw new OrchestrationError(
+            'operation_rejected',
+            `Run integration worktree has ${dirty.length} uncommitted file(s): ${dirty.join(', ')}. Clean or commit them before reviewing.`,
+            { dirtyFiles: dirty },
+          );
+        }
+      }
+      const headOid =
+        (mainRepoRoot ? await resolveBranchRefOid(mainRepoRoot, branch) : null) ??
+        run.integrationHeadCommit ??
+        null;
+      const baseCommit = run.integrationBaseCommit ?? null;
+      return {
+        hasChanges: Boolean(baseCommit && headOid && baseCommit !== headOid),
+        mainRepoRoot,
+        repoPath: mainRepoRoot ?? wtPath,
+        branch,
+        baseCommit,
+        targetCommit: headOid,
+        isActiveIntegrationBranch: true,
+        integratedWorkers,
+      };
+    }
+
+    const fallbackRepoCandidate =
+      run.integrationRepoRootPath ??
+      integratedDispatches[0]?.repoRootPath ??
+      integratedDispatches[0]?.worktreePath ??
+      this.getDefaultCwd?.() ??
+      null;
+    const mainRepoRoot = fallbackRepoCandidate
+      ? await resolveMainRepoRoot(fallbackRepoCandidate, run.integrationRepoRootPath ?? this.getDefaultCwd?.() ?? null)
+      : null;
+    const baseCommit = run.integrationBaseCommit ?? null;
+    const targetCommit =
+      run.integrationHeadCommit ??
+      (run.integrationStatus === 'finalized' ? run.finalizedCommit : null) ??
+      null;
+    return {
+      hasChanges: Boolean(mainRepoRoot && baseCommit && targetCommit && baseCommit !== targetCommit),
+      mainRepoRoot,
+      repoPath: mainRepoRoot,
+      branch: run.integrationBaseBranch ?? null,
+      baseCommit,
+      targetCommit,
+      isActiveIntegrationBranch: false,
+      integratedWorkers,
+    };
   }
 
   assertTaskCoordinator(taskId: string, callerPaneId: string): void {
@@ -2382,7 +2732,7 @@ export class OrchestrationService {
     let effectiveArtifacts: OrchestrationReportArtifacts | null | undefined = input.artifacts;
     const normalizedFindings = normalizeReviewFindings(input.findings ?? []);
     let settleReview: (() => void) | undefined;
-    if (resolvedDispatch.reviewOfDispatchId) {
+    if (resolvedDispatch.reviewOfDispatchId || resolvedDispatch.reviewOfRunId) {
       if (!hasLifecycleAuthority(resolvedDispatch, from)) {
         throw new OrchestrationError(
           'operation_rejected',
@@ -2418,6 +2768,7 @@ export class OrchestrationService {
           dispatch: resolvedDispatch,
         };
       }
+      const isRunReview = Boolean(resolvedDispatch.reviewOfRunId && !resolvedDispatch.reviewOfDispatchId);
       if (outcome === 'completed') {
         if (input.verdict !== 'pass' && input.verdict !== 'reject') {
           throw new OrchestrationError(
@@ -2426,7 +2777,12 @@ export class OrchestrationService {
             { dispatchId: resolvedDispatch.id },
           );
         }
-        const targetDispatch = this.store.getDispatchContext(resolvedDispatch.reviewOfDispatchId);
+        const targetDispatch = resolvedDispatch.reviewOfDispatchId
+          ? this.store.getDispatchContext(resolvedDispatch.reviewOfDispatchId)
+          : undefined;
+        const targetRun = resolvedDispatch.reviewOfRunId
+          ? this.store.getRun(resolvedDispatch.reviewOfRunId)
+          : undefined;
         const workspaceCompromised = Boolean(
           input.mutatedReviewWorkspace || input.reviewVerificationFailed,
         );
@@ -2443,13 +2799,18 @@ export class OrchestrationService {
             reviewFindings: evaluation.findings,
             ...(workspaceCompromised ? { reviewMutatedWorkspace: true } : {}),
           });
-          this.reconcileTargetReviewBatch(resolvedDispatch.id);
+          this.reconcileAnyReviewBatch(resolvedDispatch.id);
         };
-        const reviewRound = resolvedDispatch.reviewRound ?? targetDispatch?.reviewRound ?? 1;
+        const reviewRound =
+          resolvedDispatch.reviewRound ??
+          (isRunReview ? targetRun?.runReviewRound : targetDispatch?.reviewRound) ??
+          1;
         const escalated = evaluation.effectiveVerdict === 'reject' && reviewRound >= MAX_ADVERSARIAL_REVIEW_ROUNDS;
-        const targetRole = targetDispatch
-          ? this.resolveRoleNameForDispatch(targetDispatch) || targetDispatch.id
-          : resolvedDispatch.reviewOfDispatchId;
+        const targetRole = isRunReview
+          ? (resolvedDispatch.reviewOfRunId ?? resolvedDispatch.runId)
+          : targetDispatch
+            ? this.resolveRoleNameForDispatch(targetDispatch) || targetDispatch.id
+            : (resolvedDispatch.reviewOfDispatchId ?? resolvedDispatch.id);
         summary = formatReviewVerdictForBoard({
           targetRole,
           reviewRound,
@@ -2458,6 +2819,7 @@ export class OrchestrationService {
           escalated,
           mutatedWorkspace: workspaceCompromised,
           summary,
+          isRunReview,
         });
         effectiveArtifacts = {
           ...(effectiveArtifacts ?? {}),
@@ -2473,7 +2835,7 @@ export class OrchestrationService {
               ? { reviewMutatedWorkspace: true }
               : {}),
           });
-          this.reconcileTargetReviewBatch(resolvedDispatch.id, {
+          this.reconcileAnyReviewBatch(resolvedDispatch.id, {
             failedReason: 'Reviewer reported ' + outcome,
           });
         };
@@ -2545,7 +2907,7 @@ export class OrchestrationService {
           ? this.terminalTracker?.getTerminal(resolvedDispatch.assigneePaneId)?.cwd
           : undefined) ??
         null;
-      if (resolvedDispatch.reviewOfDispatchId) {
+      if (resolvedDispatch.reviewOfDispatchId || resolvedDispatch.reviewOfRunId) {
         if (!resolvedDispatch.isDetachedReviewWorktree || !repoPath) {
           mutatedReviewWorkspace = true;
           reviewVerificationFailed = true;
@@ -3555,6 +3917,7 @@ export class OrchestrationService {
     priority?: OrchestrationMessagePriority;
     retryOfDispatchId?: string;
     reviewOf?: string;
+    reviewRun?: boolean | string;
     reviewFocus?: string;
     cliId?: string;
     agent?: string;
@@ -3598,7 +3961,27 @@ export class OrchestrationService {
     }
 
     const reusingTerminal = input.terminal?.trim() || undefined;
-    if (input.reviewOf?.trim() && reusingTerminal) {
+    const isReviewRunRequest =
+      input.reviewRun === true ||
+      (typeof input.reviewRun === 'string' && input.reviewRun.trim().length > 0);
+    if (input.reviewOf?.trim() && isReviewRunRequest) {
+      throw new OrchestrationError(
+        'invalid_argument',
+        'Cannot combine reviewOf and reviewRun in the same dispatch.',
+      );
+    }
+    if (
+      typeof input.reviewRun === 'string' &&
+      input.reviewRun.trim() &&
+      input.runId?.trim() &&
+      input.reviewRun.trim() !== input.runId.trim()
+    ) {
+      throw new OrchestrationError(
+        'invalid_argument',
+        `Conflicting runId (${input.runId.trim()}) and reviewRun (${input.reviewRun.trim()}).`,
+      );
+    }
+    if ((input.reviewOf?.trim() || isReviewRunRequest) && reusingTerminal) {
       throw new OrchestrationError(
         'operation_rejected',
         'Adversarial review cannot reuse an existing terminal. Spawn a fresh reviewer in an isolated detached worktree.',
@@ -3649,7 +4032,7 @@ export class OrchestrationService {
       );
     }
 
-    // Serialize concurrent adversarial review starts for the same target dispatch
+    // Serialize concurrent adversarial review starts for the same target dispatch or run
     // so reviewRound / reviewBatchId assignment is strictly atomic.
     if (input.reviewOf?.trim()) {
       const targetPreview = this.resolveDispatchByRoleOrTarget(
@@ -3658,6 +4041,20 @@ export class OrchestrationService {
         input.runId,
       );
       return this.withReviewStartLock(targetPreview.id, () =>
+        this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig),
+      );
+    }
+    if (isReviewRunRequest) {
+      const explicitRunTarget =
+        typeof input.reviewRun === 'string' ? input.reviewRun.trim() : input.runId;
+      const runPreview = this.resolveTargetRunForOperation(
+        explicitRunTarget,
+        input.callerPaneId,
+        from,
+      );
+      // Share the per-Run integration lock so runFinalizeIntegration / workerIntegrate cannot
+      // race ahead while a Run-level review terminal is booting and before runReviewStatus="pending" is persisted.
+      return this.withRunIntegrationLock(runPreview.id, () =>
         this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig),
       );
     }
@@ -3677,10 +4074,17 @@ export class OrchestrationService {
     let task: OrchestrationTaskRecord;
     let run: OrchestrationRunRecord;
     let reviewTarget: OrchestrationDispatchRecord | null = null;
+    let reviewRunTarget: OrchestrationRunRecord | null = null;
     let reviewBatchId: string | null = null;
     let reviewSnapshotOid: string | null = null;
+    let reviewBaseCommit: string | null = null;
+    let reviewRunBaseCommit: string | null = null;
     let reviewDetachedWorktree: { worktreePath: string; mainRepoRoot: string } | null = null;
     let reviewRoundForTarget = 0;
+
+    const isReviewRunRequest =
+      input.reviewRun === true ||
+      (typeof input.reviewRun === 'string' && input.reviewRun.trim().length > 0);
 
     if (input.reviewOf?.trim()) {
       const target = this.resolveDispatchByRoleOrTarget(
@@ -3727,11 +4131,19 @@ export class OrchestrationService {
         );
       }
 
+      const effectiveReviewBase = await this.resolveEffectiveWorkerDiffBase(
+        run,
+        target,
+        targetPath,
+        mainRepoRoot,
+        reviewSnapshotOid,
+      );
       const diff = await inspectWorkerDiff({
         worktreePath: targetPath,
-        baseCommit: target.baseCommit,
+        baseCommit: effectiveReviewBase,
         maxDiffBytes: 16 * 1024,
       });
+      reviewBaseCommit = diff.baseCommit ?? effectiveReviewBase ?? null;
 
       // Parallel L2 perspectives targeting the same snapshot join the current pending batch;
       // a new snapshot or a previously settled batch starts a brand new batch and bumps reviewRound.
@@ -3739,6 +4151,7 @@ export class OrchestrationService {
         Boolean(target.reviewBatchId) &&
         target.reviewStatus === 'pending' &&
         target.reviewSnapshotOid === reviewSnapshotOid &&
+        (!target.reviewBaseCommit || !reviewBaseCommit || target.reviewBaseCommit === reviewBaseCommit) &&
         (target.reviewRound ?? 0) > 0;
       if (canJoinCurrentBatch) {
         reviewBatchId = target.reviewBatchId!;
@@ -3786,6 +4199,109 @@ export class OrchestrationService {
         spec: builtReview.taskSpec,
         taskContext: builtReview.taskContext,
         taskTitle: input.taskTitle ?? `Adversarial review of @${targetRole}`,
+        displayName: reviewLabel,
+        priority: input.priority ?? 'high',
+      });
+    } else if (isReviewRunRequest) {
+      const explicitRunTarget =
+        typeof input.reviewRun === 'string' ? input.reviewRun.trim() : input.runId;
+      let targetRun = this.resolveTargetRunForOperation(
+        explicitRunTarget,
+        input.callerPaneId,
+        from,
+      );
+      if (targetRun.status !== 'active') {
+        targetRun = this.store.updateRunStatus(targetRun.id, 'active');
+      }
+      run = targetRun;
+      reviewRunTarget = targetRun;
+
+      const resolvedTarget = await this.resolveRunCombinedDiffTarget(targetRun, {
+        requireCleanIntegrationWorktree: true,
+      });
+      if (!resolvedTarget.hasChanges || !resolvedTarget.mainRepoRoot || !resolvedTarget.baseCommit || !resolvedTarget.targetCommit) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          `No integrated changes found for run ${targetRun.id}. Integrate at least one worker before launching a Run-level adversarial review.`,
+          { runId: targetRun.id },
+        );
+      }
+
+      const combinedDiff = await inspectCommitRangeDiff({
+        repoPath: resolvedTarget.repoPath ?? resolvedTarget.mainRepoRoot,
+        baseCommit: resolvedTarget.baseCommit,
+        targetCommit: resolvedTarget.targetCommit,
+        branch: resolvedTarget.branch,
+        maxDiffBytes: 16 * 1024,
+      });
+      if (combinedDiff.diffError || combinedDiff.changedFiles.length === 0) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          combinedDiff.diffError
+            ? `Could not inspect combined Run diff for ${targetRun.id}: ${combinedDiff.diffError}`
+            : `Combined Run diff for ${targetRun.id} has no file changes to review.`,
+          { runId: targetRun.id },
+        );
+      }
+
+      reviewSnapshotOid = resolvedTarget.targetCommit;
+      reviewRunBaseCommit = resolvedTarget.baseCommit;
+
+      const canJoinCurrentBatch =
+        Boolean(targetRun.runReviewBatchId) &&
+        targetRun.runReviewStatus === 'pending' &&
+        targetRun.runReviewSnapshotOid === reviewSnapshotOid &&
+        (targetRun.runReviewRound ?? 0) > 0;
+      if (canJoinCurrentBatch) {
+        reviewBatchId = targetRun.runReviewBatchId!;
+        reviewRoundForTarget = targetRun.runReviewRound!;
+      } else {
+        const isFreshPostPassSnapshot =
+          targetRun.runReviewStatus === 'passed' &&
+          Boolean(targetRun.runReviewSnapshotOid) &&
+          targetRun.runReviewSnapshotOid !== reviewSnapshotOid;
+        reviewRoundForTarget = isFreshPostPassSnapshot ? 1 : (targetRun.runReviewRound ?? 0) + 1;
+        if (reviewRoundForTarget > MAX_ADVERSARIAL_REVIEW_ROUNDS) {
+          this.store.updateRunReviewState(targetRun.id, { runReviewStatus: 'escalated' });
+          throw new OrchestrationError(
+            'operation_rejected',
+            `Run-level adversarial review limit reached (${MAX_ADVERSARIAL_REVIEW_ROUNDS} rounds) for ${targetRun.id}. Escalate the remaining disagreement to the user.`,
+            { runId: targetRun.id, maxRounds: MAX_ADVERSARIAL_REVIEW_ROUNDS },
+          );
+        }
+        reviewBatchId = `rrbat_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+      }
+
+      const effectiveMcpForReview =
+        input.mcpEnabled ?? this.isMcpEnabledForCliDep?.(launchConfig.cliId) ?? false;
+      const builtRunReview = buildRunAdversarialReviewTask({
+        runId: targetRun.id,
+        runObjective: targetRun.objective,
+        diff: combinedDiff,
+        integratedWorkers: resolvedTarget.integratedWorkers,
+        reviewFocus: input.reviewFocus ?? (input.spec?.trim() || undefined),
+        reviewRound: reviewRoundForTarget,
+        maxRounds: MAX_ADVERSARIAL_REVIEW_ROUNDS,
+        mcpEnabled: effectiveMcpForReview,
+        cliCommand: this.cliCommand,
+      });
+
+      const detached = await createDetachedReviewWorktree({
+        mainRepoRoot: resolvedTarget.mainRepoRoot,
+        snapshotOid: reviewSnapshotOid,
+        reviewSlug: `run-${targetRun.id}-r${reviewRoundForTarget}`,
+      });
+      reviewDetachedWorktree = {
+        worktreePath: detached.worktreePath,
+        mainRepoRoot: resolvedTarget.mainRepoRoot,
+      };
+
+      const reviewLabel = input.role?.trim() || input.displayName?.trim() || 'review-run';
+      task = this.store.createTask({
+        runId: run.id,
+        spec: builtRunReview.taskSpec,
+        taskContext: builtRunReview.taskContext,
+        taskTitle: input.taskTitle ?? `Run-level adversarial review (${targetRun.id})`,
         displayName: reviewLabel,
         priority: input.priority ?? 'high',
       });
@@ -3890,12 +4406,29 @@ export class OrchestrationService {
       ? this.terminalTracker?.getTerminal(reusingTerminal)?.cwd ?? baseCwd
       : undefined;
 
+    let effectiveBaseBranch = input.baseBranch;
+    if (
+      !reviewDetachedWorktree &&
+      !effectiveBaseBranch?.trim() &&
+      this.isRunIntegrationBranchLive(run) &&
+      run.integrationBranch &&
+      run.integrationRepoRootPath
+    ) {
+      const [sameRepo, branchOid] = await Promise.all([
+        isSameGitRepo(baseCwd, run.integrationRepoRootPath),
+        resolveBranchRefOid(run.integrationRepoRootPath, run.integrationBranch),
+      ]);
+      if (sameRepo && branchOid) {
+        effectiveBaseBranch = run.integrationBranch;
+      }
+    }
+
     const placement = reviewDetachedWorktree
       ? {
           cwd: reviewDetachedWorktree.worktreePath,
           worktreePath: reviewDetachedWorktree.worktreePath,
           branch: null,
-          baseCommit: reviewTarget?.baseCommit ?? null,
+          baseCommit: reviewRunBaseCommit ?? reviewBaseCommit ?? reviewTarget?.baseCommit ?? null,
           ownsWorktree: true,
           ownsBranch: false,
           repoRootPath: reviewDetachedWorktree.mainRepoRoot,
@@ -3908,7 +4441,7 @@ export class OrchestrationService {
           worktree: reviewTarget ? false : input.worktree,
           noWorktree: reviewTarget ? true : input.noWorktree,
           branch: input.branch,
-          baseBranch: input.baseBranch,
+          baseBranch: effectiveBaseBranch,
           reusingTerminalCwd,
         });
 
@@ -3976,10 +4509,12 @@ export class OrchestrationService {
         ownsBranch: placement.ownsBranch,
         isDetachedReviewWorktree: Boolean(reviewDetachedWorktree),
         reviewOfDispatchId: reviewTarget?.id ?? null,
+        reviewOfRunId: reviewRunTarget?.id ?? null,
         reviewFocus: input.reviewFocus?.trim() || null,
         reviewBatchId,
         reviewSnapshotOid,
-        ...(reviewTarget ? { reviewRound: reviewRoundForTarget } : {}),
+        reviewBaseCommit: reviewRunBaseCommit ?? reviewBaseCommit,
+        ...(reviewTarget || reviewRunTarget ? { reviewRound: reviewRoundForTarget } : {}),
         ownsPane,
         cliId: launchConfig.cliId,
         model: launchConfig.model,
@@ -3994,6 +4529,16 @@ export class OrchestrationService {
           reviewRound: reviewRoundForTarget,
           reviewBatchId,
           reviewSnapshotOid,
+          reviewBaseCommit,
+        });
+      }
+      if (reviewRunTarget) {
+        this.store.updateRunReviewState(reviewRunTarget.id, {
+          runReviewStatus: 'pending',
+          runReviewRound: reviewRoundForTarget,
+          runReviewBatchId: reviewBatchId,
+          runReviewSnapshotOid: reviewSnapshotOid,
+          runReviewBaseCommit: reviewRunBaseCommit,
         });
       }
     } catch (err) {
@@ -4054,9 +4599,9 @@ export class OrchestrationService {
     if (!delivery.ok) {
       const reason = delivery.error ?? `Failed to deliver worker prompt to ${ptyId}`;
       this.store.failDispatch(ctx.id, reason);
-      if (ctx.reviewOfDispatchId) {
+      if (ctx.reviewOfDispatchId || ctx.reviewOfRunId) {
         this.store.updateDispatchReviewState(ctx.id, { reviewStatus: 'rejected' });
-        this.reconcileTargetReviewBatch(ctx.id, {
+        this.reconcileAnyReviewBatch(ctx.id, {
           overrideVerdict: 'reject',
           failedReason: 'Reviewer prompt delivery failed',
         });
@@ -4844,9 +5389,9 @@ export class OrchestrationService {
         forceFailTask: true,
         summary: input.reason?.trim() || 'Worker stopped by coordinator',
       });
-      if (dispatch.reviewOfDispatchId) {
+      if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
         this.store.updateDispatchReviewState(dispatch.id, { reviewStatus: 'rejected' });
-        this.reconcileTargetReviewBatch(dispatch.id, {
+        this.reconcileAnyReviewBatch(dispatch.id, {
           overrideVerdict: 'reject',
           failedReason: 'Reviewer stopped before completing verification',
         });
@@ -4931,9 +5476,9 @@ export class OrchestrationService {
         forceFailTask: true,
         summary: input.reason?.trim() || 'Worker dispatch abandoned by coordinator',
       });
-      if (dispatch.reviewOfDispatchId) {
+      if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
         this.store.updateDispatchReviewState(dispatch.id, { reviewStatus: 'rejected' });
-        this.reconcileTargetReviewBatch(dispatch.id, {
+        this.reconcileAnyReviewBatch(dispatch.id, {
           overrideVerdict: 'reject',
           failedReason: 'Reviewer dispatch abandoned before completing verification',
         });
@@ -5200,9 +5745,25 @@ export class OrchestrationService {
         : undefined) ??
       this.getDefaultCwd?.() ??
       process.cwd();
+    const run = this.store.getRun(dispatch.runId);
+    const mainRepoRoot = run
+      ? await resolveMainRepoRoot(worktreePath, dispatch.repoRootPath ?? this.getDefaultCwd?.() ?? null).catch(() => null)
+      : null;
+    const snapForBase = mainRepoRoot
+      ? await captureWorkerSnapshotOid(worktreePath, { rejectStagedDivergence: false }).catch(() => null)
+      : null;
+    const effectiveBaseCommit = run
+      ? await this.resolveEffectiveWorkerDiffBase(
+          run,
+          dispatch,
+          worktreePath,
+          mainRepoRoot,
+          snapForBase?.snapshotOid ?? null,
+        )
+      : dispatch.baseCommit;
     const inspection = await inspectWorkerDiff({
       worktreePath,
-      baseCommit: dispatch.baseCommit,
+      baseCommit: effectiveBaseCommit,
       files: input.files,
       maxDiffBytes: input.maxDiffBytes,
     });
@@ -5223,6 +5784,7 @@ export class OrchestrationService {
       worker?: string;
       taskId?: string;
       mode?: WorkerIntegrateMode;
+      targetBranch?: WorkerIntegrateTargetBranch;
       expectedSnapshotOid?: string;
       commitMessage?: string;
       releaseAfter?: boolean;
@@ -5234,6 +5796,7 @@ export class OrchestrationService {
     dispatchId: string;
     taskId: string;
     role: string;
+    usedRunIntegrationBranch: boolean;
     released: boolean;
     releasedReviews: number;
     releaseSkippedReason?: string;
@@ -5253,7 +5816,7 @@ export class OrchestrationService {
         `Worker ${dispatch.id} is still active (${dispatch.status}). Wait for completion before integrating.`,
       );
     }
-    if (dispatch.reviewOfDispatchId) {
+    if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
       throw new OrchestrationError(
         'operation_rejected',
         `Dispatch ${dispatch.id} is a read-only adversarial review and cannot be integrated.`,
@@ -5263,6 +5826,7 @@ export class OrchestrationService {
     const mode: WorkerIntegrateMode = input.mode ?? 'squash';
     const role = this.resolveRoleNameForDispatch(dispatch) || dispatch.id;
     const task = this.store.requireTask(dispatch.taskId);
+    this.store.requireRun(dispatch.runId);
     const worktreePath = dispatch.worktreePath;
     if (!worktreePath) {
       return {
@@ -5283,6 +5847,7 @@ export class OrchestrationService {
         dispatchId: dispatch.id,
         taskId: dispatch.taskId,
         role,
+        usedRunIntegrationBranch: false,
         released: false,
         releasedReviews: 0,
       };
@@ -5321,233 +5886,710 @@ export class OrchestrationService {
         dispatchId: dispatch.id,
         taskId: dispatch.taskId,
         role,
+        usedRunIntegrationBranch: false,
         released: false,
         releasedReviews: 0,
       };
     }
 
-    // Server-side adversarial review gate for write modes (`squash` / `merge`).
-    // Terminal/HTTP callers (`callerPaneId !== undefined`) cannot override review gates with `force`.
-    const manualUserOverride = callerPaneId === undefined && input.force === true;
-    const callerExpectedOid = input.expectedSnapshotOid?.trim() || undefined;
-    let authoritativeExpectedOid: string | undefined = callerExpectedOid;
+    const executeIntegrate = async () => {
+      const run = this.store.requireRun(dispatch.runId);
+      const latestDispatch = this.store.getDispatchContext(dispatch.id) ?? dispatch;
+      const hasActiveRunIntegrationBranch = this.isRunIntegrationBranchLive(run);
+      const sameRunRepo = run.integrationRepoRootPath
+        ? await isSameGitRepo(mainRepoRoot, run.integrationRepoRootPath)
+        : true;
 
-    if (mode !== 'check') {
-      const reviewStatus = dispatch.reviewStatus ?? 'none';
-      if (reviewStatus === 'passed') {
-        const approvedOid = dispatch.reviewSnapshotOid?.trim() || '';
-        if (!approvedOid) {
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Worker ${dispatch.id} has reviewStatus=passed but no server-recorded approved snapshot OID. Re-run adversarial review before integrating.`,
+      if (hasActiveRunIntegrationBranch && !sameRunRepo) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          `Run ${run.id} already has an active integration branch (${run.integrationBranch}) in a different Git repository (${run.integrationRepoRootPath}). Finalize it before integrating workers from another repository.`,
+          { runId: run.id, integrationBranch: run.integrationBranch },
+        );
+      }
+      if (run.integrationRepoRootPath && !sameRunRepo) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          `Run ${run.id} integration tracking is bound to a different Git repository (${run.integrationRepoRootPath}) and cannot integrate workers from ${mainRepoRoot}. Start a separate Run for the other repository.`,
+          {
+            runId: run.id,
+            integrationRepoRootPath: run.integrationRepoRootPath,
+            workerRepoRootPath: mainRepoRoot,
+          },
+        );
+      }
+      if (input.targetBranch === 'main' && hasActiveRunIntegrationBranch) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          `Run ${run.id} already has an active integration branch (${run.integrationBranch}). Integrate into targetBranch="integration" or finalize the Run integration branch first to avoid splitting Run changes.`,
+          { runId: run.id, integrationBranch: run.integrationBranch },
+        );
+      }
+
+      let useRunIntegrationBranch = false;
+      if (input.targetBranch === 'integration' || (!input.targetBranch && hasActiveRunIntegrationBranch)) {
+        useRunIntegrationBranch = true;
+      } else if (input.targetBranch === 'auto') {
+        if (hasActiveRunIntegrationBranch) {
+          useRunIntegrationBranch = true;
+        } else {
+          const mainStatus = await getGitStatus(mainRepoRoot);
+          useRunIntegrationBranch = Boolean(
+            mainStatus.ok && mainStatus.isGitRepo && mainStatus.entries.length > 0,
           );
         }
-        if (callerExpectedOid && callerExpectedOid !== approvedOid) {
+      }
+
+      if (
+        useRunIntegrationBranch &&
+        !hasActiveRunIntegrationBranch &&
+        (run.integrationBranch || run.integrationWorktreePath)
+      ) {
+        const retainedBranchExists = run.integrationBranch
+          ? Boolean(await resolveBranchRefOid(mainRepoRoot, run.integrationBranch))
+          : false;
+        const retainedWorktreeExists = run.integrationWorktreePath
+          ? existsSync(run.integrationWorktreePath)
+          : false;
+        if (retainedBranchExists || retainedWorktreeExists) {
           throw new OrchestrationError(
             'operation_rejected',
-            `Caller expectedSnapshotOid (${callerExpectedOid}) does not match server-approved review snapshot (${approvedOid}).`,
-            { callerExpectedOid, approvedSnapshotOid: approvedOid },
-          );
-        }
-        authoritativeExpectedOid = approvedOid;
-      } else if (!manualUserOverride) {
-        if (reviewStatus === 'pending') {
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Integration blocked: adversarial review for ${dispatch.id} is still pending. Wait for all reviewers in batch ${dispatch.reviewBatchId ?? '(current)'} to report PASS.`,
-          );
-        }
-        if (reviewStatus === 'rejected' || reviewStatus === 'escalated') {
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Integration blocked: adversarial review for ${dispatch.id} is ${reviewStatus}. Fix blocking findings and pass a new review round before integrating.`,
-          );
-        }
-        // reviewStatus === 'none': only explicit L0 changes are exempt from adversarial review.
-        // Evaluate L0 against the exact merge-base(targetHead, snapshotOid)..snapshotOid range
-        // that `integrateWorkerChanges` will actually merge (never a stale or fallback HEAD~1).
-        const l0Snap = await captureWorkerSnapshotOid(worktreePath, { rejectStagedDivergence: true });
-        if (!l0Snap.snapshotOid) {
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Integration blocked: could not capture worker snapshot for L0 review exemption on ${dispatch.id}.`,
-          );
-        }
-        const mergeBase = await resolveIntegrationMergeBase(mainRepoRoot, l0Snap.snapshotOid);
-        if (!mergeBase) {
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Integration blocked: could not determine common Git merge-base for L0 review exemption on ${dispatch.id}.`,
-          );
-        }
-        const diffPreview = await inspectWorkerDiff({
-          worktreePath,
-          baseCommit: mergeBase,
-          maxDiffBytes: 8 * 1024,
-        });
-        if (!diffPreview.snapshotOid || diffPreview.snapshotOid !== l0Snap.snapshotOid ||
-            diffPreview.diffError || diffPreview.stagedDivergentFiles.length > 0 ||
-            diffPreview.recommendedReviewTier !== 'L0') {
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Integration blocked: ${diffPreview.recommendedReviewTier} change (${diffPreview.diffError || diffPreview.tierReason}) requires a passing adversarial review before ${mode} integration.`,
+            `Run ${run.id} retained a previous integration branch or worktree (${run.integrationBranch ?? run.integrationWorktreePath}). Remove it before starting a new integration branch wave.`,
             {
-              recommendedReviewTier: diffPreview.recommendedReviewTier,
-              tierReason: diffPreview.tierReason,
-              dispatchId: dispatch.id,
+              runId: run.id,
+              integrationBranch: run.integrationBranch,
+              integrationWorktreePath: run.integrationWorktreePath,
             },
           );
         }
-        if (callerExpectedOid && callerExpectedOid !== diffPreview.snapshotOid) {
-          throw new OrchestrationError('operation_rejected', 'Worker snapshot changed since inspection. Inspect it again.');
-        }
-        authoritativeExpectedOid = diffPreview.snapshotOid;
       }
-    }
 
-    const branchOidBeforeIntegrate =
-      dispatch.ownsBranch && dispatch.branch?.startsWith(WORKER_BRANCH_PREFIX)
-        ? await resolveBranchRefOid(mainRepoRoot, dispatch.branch)
-        : null;
+      // Server-side adversarial review gate for write modes (`squash` / `merge`).
+      // Terminal/HTTP callers (`callerPaneId !== undefined`) cannot override review gates with `force`.
+      const manualUserOverride = callerPaneId === undefined && input.force === true;
+      const callerExpectedOid = input.expectedSnapshotOid?.trim() || undefined;
+      let authoritativeExpectedOid: string | undefined = callerExpectedOid;
 
-    const commitMessage =
-      input.commitMessage?.trim() ||
-      `chore(orchestration): integrate @${role} (${task.taskTitle.slice(0, 72)})`;
+      if (mode !== 'check') {
+        const reviewStatus = latestDispatch.reviewStatus ?? 'none';
+        if (reviewStatus === 'passed') {
+          const approvedOid = latestDispatch.reviewSnapshotOid?.trim() || '';
+          if (!approvedOid) {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Worker ${latestDispatch.id} has reviewStatus=passed but no server-recorded approved snapshot OID. Re-run adversarial review before integrating.`,
+            );
+          }
+          if (callerExpectedOid && callerExpectedOid !== approvedOid) {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Caller expectedSnapshotOid (${callerExpectedOid}) does not match server-approved review snapshot (${approvedOid}).`,
+              { callerExpectedOid, approvedSnapshotOid: approvedOid },
+            );
+          }
+          authoritativeExpectedOid = approvedOid;
+        } else if (!manualUserOverride) {
+          if (reviewStatus === 'pending') {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Integration blocked: adversarial review for ${latestDispatch.id} is still pending. Wait for all reviewers in batch ${latestDispatch.reviewBatchId ?? '(current)'} to report PASS.`,
+            );
+          }
+          if (reviewStatus === 'rejected' || reviewStatus === 'escalated') {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Integration blocked: adversarial review for ${latestDispatch.id} is ${reviewStatus}. Fix blocking findings and pass a new review round before integrating.`,
+            );
+          }
+          // reviewStatus === 'none': only explicit L0 changes are exempt from adversarial review.
+          // Evaluate L0 against the exact merge-base(targetHead, snapshotOid)..snapshotOid range
+          // that integration will actually merge (never a stale or fallback HEAD~1).
+          const l0Snap = await captureWorkerSnapshotOid(worktreePath, { rejectStagedDivergence: true });
+          if (!l0Snap.snapshotOid) {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Integration blocked: could not capture worker snapshot for L0 review exemption on ${latestDispatch.id}.`,
+            );
+          }
+          const l0TargetRepo =
+            useRunIntegrationBranch && hasActiveRunIntegrationBranch
+              ? run.integrationWorktreePath!
+              : mainRepoRoot;
+          const mergeBase = await resolveIntegrationMergeBase(l0TargetRepo, l0Snap.snapshotOid);
+          if (!mergeBase) {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Integration blocked: could not determine common Git merge-base for L0 review exemption on ${latestDispatch.id}.`,
+            );
+          }
+          const diffPreview = await inspectWorkerDiff({
+            worktreePath,
+            baseCommit: mergeBase,
+            maxDiffBytes: 8 * 1024,
+          });
+          if (!diffPreview.snapshotOid || diffPreview.snapshotOid !== l0Snap.snapshotOid ||
+              diffPreview.diffError || diffPreview.stagedDivergentFiles.length > 0 ||
+              diffPreview.recommendedReviewTier !== 'L0') {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Integration blocked: ${diffPreview.recommendedReviewTier} change (${diffPreview.diffError || diffPreview.tierReason}) requires a passing adversarial review before ${mode} integration.`,
+              {
+                recommendedReviewTier: diffPreview.recommendedReviewTier,
+                tierReason: diffPreview.tierReason,
+                dispatchId: latestDispatch.id,
+              },
+            );
+          }
+          if (callerExpectedOid && callerExpectedOid !== diffPreview.snapshotOid) {
+            throw new OrchestrationError('operation_rejected', 'Worker snapshot changed since inspection. Inspect it again.');
+          }
+          authoritativeExpectedOid = diffPreview.snapshotOid;
+        }
+      }
 
-    const result = await integrateWorkerChanges({
-      targetRepoPath: mainRepoRoot,
-      worktreePath,
-      baseCommit: dispatch.baseCommit,
-      expectedSnapshotOid: authoritativeExpectedOid,
-      mode,
-      commitMessage,
-    });
+      const branchOidBeforeIntegrate =
+        latestDispatch.ownsBranch && latestDispatch.branch?.startsWith(WORKER_BRANCH_PREFIX)
+          ? await resolveBranchRefOid(mainRepoRoot, latestDispatch.branch)
+          : null;
 
-    if (mode === 'check') {
-      this.store.updateDispatchIntegrationState(dispatch.id, {
-        integrationStatus: result.clean ? 'checked' : 'conflict',
+      const commitMessage =
+        input.commitMessage?.trim() ||
+        `chore(orchestration): integrate @${role} (${task.taskTitle.slice(0, 72)})`;
+
+      const targetRepoForBase =
+        useRunIntegrationBranch && hasActiveRunIntegrationBranch
+          ? run.integrationWorktreePath!
+          : mainRepoRoot;
+      const currentSnapForBase =
+        authoritativeExpectedOid ??
+        (await captureWorkerSnapshotOid(worktreePath, { rejectStagedDivergence: false }).catch(() => null))
+          ?.snapshotOid ??
+        null;
+      let effectiveIntegrationBaseCommit: string | null = latestDispatch.baseCommit ?? null;
+      if (
+        latestDispatch.reviewStatus === 'passed' &&
+        latestDispatch.reviewSnapshotOid &&
+        latestDispatch.reviewBaseCommit &&
+        (mode !== 'check' || latestDispatch.reviewSnapshotOid === currentSnapForBase)
+      ) {
+        effectiveIntegrationBaseCommit = latestDispatch.reviewBaseCommit;
+      } else if (latestDispatch.baseCommit && currentSnapForBase) {
+        const stillDescendsFromRecordedBase = await isGitCommitAncestor(
+          worktreePath,
+          latestDispatch.baseCommit,
+          currentSnapForBase,
+        );
+        if (!stillDescendsFromRecordedBase) {
+          effectiveIntegrationBaseCommit = await resolveIntegrationMergeBase(
+            targetRepoForBase,
+            currentSnapForBase,
+          );
+        }
+      }
+
+      let result: WorkerIntegrationResult;
+      let runBranchResult: Awaited<ReturnType<typeof integrateWorkerIntoRunBranch>> | null = null;
+      if (useRunIntegrationBranch) {
+        runBranchResult = await integrateWorkerIntoRunBranch({
+          mainRepoRoot,
+          runId: run.id,
+          existingBranch: hasActiveRunIntegrationBranch ? run.integrationBranch : null,
+          existingWorktreePath: hasActiveRunIntegrationBranch ? run.integrationWorktreePath : null,
+          existingBaseCommit: run.integrationBaseCommit ?? null,
+          existingBaseBranch: run.integrationBaseBranch ?? null,
+          worktreePath,
+          baseCommit: effectiveIntegrationBaseCommit,
+          recordedBaseCommit: latestDispatch.baseCommit,
+          expectedSnapshotOid: authoritativeExpectedOid,
+          mode,
+          commitMessage,
+        });
+        result = runBranchResult.result;
+      } else {
+        const expectedMainRef =
+          sameRunRepo && run.integrationBaseBranch?.trim()
+            ? `refs/heads/${run.integrationBaseBranch.trim()}`
+            : null;
+        result = await integrateWorkerChanges({
+          targetRepoPath: mainRepoRoot,
+          worktreePath,
+          baseCommit: effectiveIntegrationBaseCommit,
+          recordedBaseCommit: latestDispatch.baseCommit,
+          expectedSnapshotOid: authoritativeExpectedOid,
+          expectedTargetRef: expectedMainRef,
+          mode,
+          commitMessage,
+        });
+      }
+
+      if (mode === 'check') {
+        this.store.updateDispatchIntegrationState(latestDispatch.id, {
+          integrationStatus: result.clean ? 'checked' : 'conflict',
+        });
+        this.emitChanged('worker:integration-checked', latestDispatch.runId);
+        return {
+          ...result,
+          dispatchId: latestDispatch.id,
+          taskId: latestDispatch.taskId,
+          role,
+          usedRunIntegrationBranch: useRunIntegrationBranch,
+          released: false,
+          releasedReviews: 0,
+        };
+      }
+
+      if (!result.integrated && !result.noChanges) {
+        this.store.updateDispatchIntegrationState(latestDispatch.id, { integrationStatus: 'conflict' });
+        this.emitChanged('worker:integration-conflict', latestDispatch.runId);
+        return {
+          ...result,
+          dispatchId: latestDispatch.id,
+          taskId: latestDispatch.taskId,
+          role,
+          usedRunIntegrationBranch: useRunIntegrationBranch,
+          released: false,
+          releasedReviews: 0,
+        };
+      }
+
+      // If this was a brand-new Run integration branch with zero diff, integrateWorkerIntoRunBranch
+      // rolled back the empty branch/worktree so no Run integration branch became active.
+      const effectiveUsedRunBranch =
+        useRunIntegrationBranch && (hasActiveRunIntegrationBranch || result.integrated);
+
+      this.store.updateDispatchIntegrationState(latestDispatch.id, {
+        integrationStatus: 'merged',
+        integratedCommit: result.integratedCommit,
+        integratedTargetBranch: effectiveUsedRunBranch ? result.targetBranch : (useRunIntegrationBranch ? null : result.targetBranch),
       });
-      this.emitChanged('worker:integration-checked', dispatch.runId);
-      return {
-        ...result,
-        dispatchId: dispatch.id,
-        taskId: dispatch.taskId,
-        role,
-        released: false,
-        releasedReviews: 0,
-      };
-    }
 
-    if (!result.integrated && !result.noChanges) {
-      this.store.updateDispatchIntegrationState(dispatch.id, { integrationStatus: 'conflict' });
-      this.emitChanged('worker:integration-conflict', dispatch.runId);
-      return {
-        ...result,
-        dispatchId: dispatch.id,
-        taskId: dispatch.taskId,
-        role,
-        released: false,
-        releasedReviews: 0,
-      };
-    }
+      const latestRun = this.store.requireRun(run.id);
+      if (effectiveUsedRunBranch && runBranchResult) {
+        this.store.updateRunIntegrationState(run.id, {
+          integrationBranch: runBranchResult.integrationBranch,
+          integrationWorktreePath: runBranchResult.integrationWorktreePath,
+          integrationBaseCommit: latestRun.integrationBaseCommit ?? runBranchResult.integrationBaseCommit,
+          integrationBaseBranch: latestRun.integrationBaseBranch ?? runBranchResult.integrationBaseBranch,
+          integrationRepoRootPath: mainRepoRoot,
+          integrationStatus: 'active',
+          integrationHeadCommit: result.integratedCommit,
+          finalizedCommit: null,
+        });
+      } else if (!useRunIntegrationBranch && sameRunRepo) {
+        const reopeningAfterFinalized =
+          result.integrated && !result.noChanges && latestRun.integrationStatus === 'finalized';
+        this.store.updateRunIntegrationState(run.id, {
+          integrationBaseCommit: latestRun.integrationBaseCommit ?? result.targetHeadBefore ?? null,
+          integrationBaseBranch: latestRun.integrationBaseBranch ?? result.targetBranch ?? null,
+          integrationRepoRootPath: latestRun.integrationRepoRootPath ?? mainRepoRoot,
+          integrationHeadCommit: result.integratedCommit,
+          ...(reopeningAfterFinalized
+            ? { integrationStatus: 'none', finalizedCommit: null }
+            : {}),
+        });
+      }
 
-    this.store.updateDispatchIntegrationState(dispatch.id, {
-      integrationStatus: 'merged',
-      integratedCommit: result.integratedCommit,
-    });
+      // Reset Wave 1's completed Run-level review metadata when starting a brand-new
+      // integration wave AFTER a prior finalization (whether via aha/run/* or directly on main).
+      // Within an active wave, preserve `runReviewStatus === 'passed'` + `runReviewSnapshotOid`
+      // so `runFinalizeIntegration` strictly enforces TOCTOU until a fresh Run-level review passes.
+      if (
+        (effectiveUsedRunBranch || (!useRunIntegrationBranch && sameRunRepo)) &&
+        result.integrated &&
+        !result.noChanges &&
+        latestRun.integrationStatus === 'finalized'
+      ) {
+        this.store.updateRunReviewState(run.id, {
+          runReviewStatus: 'none',
+          runReviewRound: 0,
+          runReviewBatchId: null,
+          runReviewSnapshotOid: null,
+          runReviewBaseCommit: null,
+          runReviewFindings: [],
+        });
+      }
 
-    const boardMsg = this.store.insertMessage({
-      runId: dispatch.runId,
-      from: callerPaneId || 'coordinator',
-      to: `run:${dispatch.runId}`,
-      type: 'status',
-      subject: `Integrated @${role}`,
-      body: result.noChanges
-        ? `[@${role}] No diff relative to ${result.targetBranch ?? 'HEAD'}; marked integrated.`
-        : `[@${role}] ${result.message}`,
-      fromRole: 'coordinator',
-      mentions: [role.toLowerCase()],
-      kind: 'update',
-      artifacts: {
-        branch: result.targetBranch,
-        headCommit: result.integratedCommit?.slice(0, 10) ?? null,
-        snapshotOid: result.snapshotOid,
-        changedFiles: result.changedFiles.slice(0, 20),
-        changedFileCount: result.changedFiles.length,
-      },
-    });
-    this.store.markAsReadAndDelivered([boardMsg.id]);
+      const boardMsg = this.store.insertMessage({
+        runId: latestDispatch.runId,
+        from: callerPaneId || 'coordinator',
+        to: `run:${latestDispatch.runId}`,
+        type: 'status',
+        subject: `Integrated @${role}${effectiveUsedRunBranch && result.targetBranch ? ` -> ${result.targetBranch}` : ''}`,
+        body: result.noChanges
+          ? `[@${role}] No diff relative to ${result.targetBranch ?? 'HEAD'}; marked integrated.`
+          : `[@${role}] ${result.message}${effectiveUsedRunBranch && result.targetBranch ? ` on ${result.targetBranch}` : ''}`,
+        fromRole: 'coordinator',
+        mentions: [role.toLowerCase()],
+        kind: 'update',
+        artifacts: {
+          branch: result.targetBranch,
+          headCommit: result.integratedCommit?.slice(0, 10) ?? null,
+          snapshotOid: result.snapshotOid,
+          changedFiles: result.changedFiles.slice(0, 20),
+          changedFileCount: result.changedFiles.length,
+        },
+      });
+      this.store.markAsReadAndDelivered([boardMsg.id]);
 
-    let released = false;
-    let releasedReviews = 0;
-    let releaseSkippedReason: string | undefined;
-    const cleanupWarnings: string[] = result.cleanupWarning ? [result.cleanupWarning] : [];
+      let released = false;
+      let releasedReviews = 0;
+      let releaseSkippedReason: string | undefined;
+      const cleanupWarnings: string[] = result.cleanupWarning ? [result.cleanupWarning] : [];
 
-    if (input.releaseAfter !== false) {
-      // Collect reviews attached to any dispatch in this author's lineage.
-      const lineageIds = this.store.listDispatchAncestorIds(dispatch.id);
-      const seenReviewIds = new Set<string>();
-      for (const ancestorId of lineageIds) {
-        const reviews = this.store.listReviewDispatchesForTarget(ancestorId);
-        for (const rev of reviews) {
-          if (seenReviewIds.has(rev.id)) continue;
-          seenReviewIds.add(rev.id);
-          if ((!rev.releasedAt || rev.ownsWorktree) && !ACTIVE_DISPATCH_STATUSES.has(rev.status)) {
-            try {
-              const revRel = await this.workerRelease({ dispatchId: rev.id, force: true });
-              if (revRel.worktreeError) {
-                cleanupWarnings.push(`Review ${rev.id} worktree cleanup failed: ${revRel.worktreeError}`);
-              } else if (revRel.dispatch.releasedAt) {
-                releasedReviews += 1;
+      if (input.releaseAfter !== false) {
+        // Collect reviews attached to any dispatch in this author's lineage.
+        const lineageIds = this.store.listDispatchAncestorIds(latestDispatch.id);
+        const seenReviewIds = new Set<string>();
+        for (const ancestorId of lineageIds) {
+          const reviews = this.store.listReviewDispatchesForTarget(ancestorId);
+          for (const rev of reviews) {
+            if (seenReviewIds.has(rev.id)) continue;
+            seenReviewIds.add(rev.id);
+            if ((!rev.releasedAt || rev.ownsWorktree) && !ACTIVE_DISPATCH_STATUSES.has(rev.status)) {
+              try {
+                const revRel = await this.workerRelease({ dispatchId: rev.id, force: true });
+                if (revRel.worktreeError) {
+                  cleanupWarnings.push(`Review ${rev.id} worktree cleanup failed: ${revRel.worktreeError}`);
+                } else if (revRel.dispatch.releasedAt) {
+                  releasedReviews += 1;
+                }
+              } catch (err) {
+                cleanupWarnings.push(
+                  `Review ${rev.id} cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
+                );
               }
-            } catch (err) {
-              cleanupWarnings.push(
-                `Review ${rev.id} cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
-              );
             }
           }
         }
+
+        try {
+          const rel = await this.mutateWorkerResources(latestDispatch, async () => {
+            const current = this.store.getDispatchContext(latestDispatch.id);
+            const head = this.store.resolveDispatchLineage(latestDispatch.id);
+            if (!current || head?.id !== latestDispatch.id) {
+              throw new OrchestrationError('operation_rejected', 'Worker lineage changed; retained worktree and branch.');
+            }
+            return this.releaseWorker(current, {
+              dispatchId: latestDispatch.id,
+              keepBranch: input.deleteBranch === false,
+              expectedBranchOid: branchOidBeforeIntegrate,
+            }, result.snapshotOid);
+          });
+          if (rel.worktreeError) {
+            releaseSkippedReason = rel.worktreeError;
+            cleanupWarnings.push(rel.worktreeError);
+          } else {
+            released = Boolean(rel.dispatch.releasedAt);
+            if (rel.removedWorktree && latestDispatch.ownsBranch && input.deleteBranch !== false && !rel.removedBranch) {
+              cleanupWarnings.push('Worker branch was retained because Git could not safely delete it.');
+            }
+          }
+        } catch (error) {
+          releaseSkippedReason = 'Worker cleanup deferred: ' + (error instanceof Error ? error.message : String(error));
+          cleanupWarnings.push(releaseSkippedReason);
+        }
       }
 
-      try {
-        const rel = await this.mutateWorkerResources(dispatch, async () => {
-          const current = this.store.getDispatchContext(dispatch.id);
-          const head = this.store.resolveDispatchLineage(dispatch.id);
-          if (!current || head?.id !== dispatch.id) {
-            throw new OrchestrationError('operation_rejected', 'Worker lineage changed; retained worktree and branch.');
-          }
-          return this.releaseWorker(current, {
-            dispatchId: dispatch.id,
-            keepBranch: input.deleteBranch === false,
-            expectedBranchOid: branchOidBeforeIntegrate,
-          }, result.snapshotOid);
-        });
-        if (rel.worktreeError) {
-          releaseSkippedReason = rel.worktreeError;
-          cleanupWarnings.push(rel.worktreeError);
-        } else {
-          released = Boolean(rel.dispatch.releasedAt);
-          if (rel.removedWorktree && dispatch.ownsBranch && input.deleteBranch !== false && !rel.removedBranch) {
-            cleanupWarnings.push('Worker branch was retained because Git could not safely delete it.');
-          }
-        }
-      } catch (error) {
-        releaseSkippedReason = 'Worker cleanup deferred: ' + (error instanceof Error ? error.message : String(error));
-        cleanupWarnings.push(releaseSkippedReason);
-      }
+      this.emitChanged('worker:integrated', latestDispatch.runId);
+      return {
+        ...result,
+        dispatchId: latestDispatch.id,
+        taskId: latestDispatch.taskId,
+        role,
+        usedRunIntegrationBranch: effectiveUsedRunBranch,
+        released,
+        releasedReviews,
+        ...(releaseSkippedReason ? { releaseSkippedReason } : {}),
+        ...(cleanupWarnings.length > 0 ? { cleanupWarnings } : {}),
+      };
+    };
+
+    return mode === 'check'
+      ? executeIntegrate()
+      : this.withRunIntegrationLock(dispatch.runId, executeIntegrate);
+  }
+
+  async runDiff(
+    input: {
+      runId?: string;
+      files?: string[];
+      maxDiffBytes?: number;
+    },
+    callerPaneId?: string,
+  ): Promise<RunCommitRangeDiffInspection & {
+    runId: string;
+    hasIntegratedChanges: boolean;
+    integrationStatus: string;
+    integrationBranch: string | null;
+    integrationWorktreePath: string | null;
+    runReviewStatus: string;
+    runReviewRound: number;
+    runReviewSnapshotOid: string | null;
+    integratedWorkers: Array<{
+      dispatchId: string;
+      role: string;
+      cliId: string | null;
+      integratedCommit: string | null;
+    }>;
+    message?: string;
+  }> {
+    const run = this.resolveTargetRunForOperation(input.runId, callerPaneId);
+    const target = await this.resolveRunCombinedDiffTarget(run);
+    const workersSummary = target.integratedWorkers.map((w) => ({
+      dispatchId: w.dispatchId,
+      role: w.role,
+      cliId: w.cliId ?? null,
+      integratedCommit: w.integratedCommit ?? null,
+    }));
+
+    if (!target.hasChanges || !target.repoPath || !target.baseCommit || !target.targetCommit) {
+      return {
+        isGitRepo: Boolean(target.mainRepoRoot),
+        repoPath: target.repoPath ?? '',
+        branch: target.branch,
+        baseCommit: target.baseCommit,
+        targetCommit: target.targetCommit,
+        commitsAhead: 0,
+        commits: [],
+        changedFiles: [],
+        diffStat: '',
+        diff: '',
+        diffTruncated: false,
+        recommendedReviewTier: 'L0',
+        tierReason: 'no integrated changes recorded for run',
+        runId: run.id,
+        hasIntegratedChanges: false,
+        integrationStatus: run.integrationStatus ?? 'none',
+        integrationBranch: run.integrationBranch ?? null,
+        integrationWorktreePath: run.integrationWorktreePath ?? null,
+        runReviewStatus: run.runReviewStatus ?? 'none',
+        runReviewRound: run.runReviewRound ?? 0,
+        runReviewSnapshotOid: run.runReviewSnapshotOid ?? null,
+        integratedWorkers: workersSummary,
+        message: 'No integrated changes recorded for this run yet.',
+      };
     }
 
-    this.emitChanged('worker:integrated', dispatch.runId);
+    const inspection = await inspectCommitRangeDiff({
+      repoPath: target.repoPath,
+      baseCommit: target.baseCommit,
+      targetCommit: target.targetCommit,
+      branch: target.branch,
+      files: input.files,
+      maxDiffBytes: input.maxDiffBytes,
+    });
     return {
-      ...result,
-      dispatchId: dispatch.id,
-      taskId: dispatch.taskId,
-      role,
-      released,
-      releasedReviews,
-      ...(releaseSkippedReason ? { releaseSkippedReason } : {}),
-      ...(cleanupWarnings.length > 0 ? { cleanupWarnings } : {}),
+      ...inspection,
+      runId: run.id,
+      hasIntegratedChanges: inspection.changedFiles.length > 0 || inspection.commitsAhead > 0,
+      integrationStatus: run.integrationStatus ?? 'none',
+      integrationBranch: run.integrationBranch ?? null,
+      integrationWorktreePath: run.integrationWorktreePath ?? null,
+      runReviewStatus: run.runReviewStatus ?? 'none',
+      runReviewRound: run.runReviewRound ?? 0,
+      runReviewSnapshotOid: run.runReviewSnapshotOid ?? null,
+      integratedWorkers: workersSummary,
     };
+  }
+
+  async runFinalizeIntegration(
+    input: {
+      runId?: string;
+      mode?: WorkerIntegrateMode;
+      expectedSnapshotOid?: string;
+      commitMessage?: string;
+      deleteBranch?: boolean;
+      keepWorktree?: boolean;
+      force?: boolean;
+    },
+    callerPaneId?: string,
+  ): Promise<WorkerIntegrationResult & {
+    runId: string;
+    integrationBranch: string;
+    integrationWorktreePath: string;
+    removedWorktree: boolean;
+    removedBranch: boolean;
+    releasedReviews: number;
+    cleanupWarnings?: string[];
+  }> {
+    const initialRun = this.resolveTargetRunForOperation(input.runId, callerPaneId);
+    const mode: WorkerIntegrateMode = input.mode ?? 'squash';
+    const executeFinalize = async () => {
+      const run = this.store.requireRun(initialRun.id);
+      if (
+        !this.isRunIntegrationBranchLive(run) ||
+        !run.integrationBranch ||
+        !run.integrationWorktreePath ||
+        !run.integrationRepoRootPath
+      ) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          `Run ${run.id} does not have an active integration branch to finalize (status=${run.integrationStatus ?? 'none'}).`,
+          { runId: run.id, integrationStatus: run.integrationStatus ?? 'none' },
+        );
+      }
+
+      const manualUserOverride = callerPaneId === undefined && input.force === true;
+      const callerExpectedOid = input.expectedSnapshotOid?.trim() || undefined;
+      let authoritativeExpectedOid: string | undefined = callerExpectedOid;
+
+      if (mode !== 'check') {
+        const activeDispatches = this.store
+          .listDispatches({ runId: run.id })
+          .filter((d) => ACTIVE_DISPATCH_STATUSES.has(d.status));
+        if (activeDispatches.length > 0) {
+          throw new OrchestrationError(
+            'operation_rejected',
+            `Run ${run.id} still has ${activeDispatches.length} active dispatch(es) (${activeDispatches.map((d) => d.id).join(', ')}). Wait for all workers/reviews to settle before finalizing.`,
+            { activeDispatchIds: activeDispatches.map((d) => d.id) },
+          );
+        }
+
+        const runReviewStatus = run.runReviewStatus ?? 'none';
+        if (runReviewStatus === 'passed') {
+          const approvedOid = run.runReviewSnapshotOid?.trim() || '';
+          if (!approvedOid) {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Run ${run.id} has runReviewStatus=passed without a recorded snapshot OID. Re-run Run-level adversarial review before finalizing.`,
+            );
+          }
+          if (callerExpectedOid && callerExpectedOid !== approvedOid) {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Caller expectedSnapshotOid (${callerExpectedOid}) does not match Run-level approved snapshot (${approvedOid}).`,
+              { callerExpectedOid, approvedSnapshotOid: approvedOid },
+            );
+          }
+          authoritativeExpectedOid = approvedOid;
+        } else if (!manualUserOverride) {
+          if (runReviewStatus === 'pending') {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Finalization blocked: Run-level adversarial review for ${run.id} is still pending (batch ${run.runReviewBatchId ?? '(current)'}).`,
+            );
+          }
+          if (runReviewStatus === 'rejected' || runReviewStatus === 'escalated') {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Finalization blocked: Run-level adversarial review for ${run.id} is ${runReviewStatus}. Fix blocking findings and pass a new Run-level review before finalizing.`,
+            );
+          }
+        }
+      }
+
+      const expectedTargetRef =
+        !manualUserOverride && run.integrationBaseBranch
+          ? `refs/heads/${run.integrationBaseBranch}`
+          : undefined;
+      const commitMessage =
+        input.commitMessage?.trim() ||
+        `chore(orchestration): finalize run ${run.id} (${run.objective.slice(0, 72)})`;
+
+      const finalized: RunFinalizeIntegrationResult = await finalizeRunIntegrationBranch({
+        mainRepoRoot: run.integrationRepoRootPath,
+        integrationBranch: run.integrationBranch,
+        integrationWorktreePath: run.integrationWorktreePath,
+        baseCommit: run.integrationBaseCommit ?? null,
+        expectedTargetRef,
+        expectedSnapshotOid: authoritativeExpectedOid,
+        mode,
+        commitMessage,
+        deleteBranch: input.deleteBranch,
+        keepWorktree: input.keepWorktree,
+      });
+
+      if (mode === 'check') {
+        return {
+          ...finalized.result,
+          runId: run.id,
+          integrationBranch: finalized.integrationBranch,
+          integrationWorktreePath: finalized.integrationWorktreePath,
+          removedWorktree: false,
+          removedBranch: false,
+          releasedReviews: 0,
+        };
+      }
+
+      if (!finalized.result.integrated && !finalized.result.noChanges) {
+        this.store.updateRunIntegrationState(run.id, { integrationStatus: 'conflict' });
+        this.emitChanged('run:integration-conflict', run.id);
+        return {
+          ...finalized.result,
+          runId: run.id,
+          integrationBranch: finalized.integrationBranch,
+          integrationWorktreePath: finalized.integrationWorktreePath,
+          removedWorktree: false,
+          removedBranch: false,
+          releasedReviews: 0,
+          ...(finalized.cleanupWarnings.length > 0 ? { cleanupWarnings: finalized.cleanupWarnings } : {}),
+        };
+      }
+
+      const cleanupWarnings = [...finalized.cleanupWarnings];
+      let releasedReviews = 0;
+      for (const rev of this.store.listReviewDispatchesForRun(run.id)) {
+        if ((!rev.releasedAt || rev.ownsWorktree) && !ACTIVE_DISPATCH_STATUSES.has(rev.status)) {
+          try {
+            const revRel = await this.workerRelease({ dispatchId: rev.id, force: true });
+            if (revRel.worktreeError) {
+              cleanupWarnings.push(`Run review ${rev.id} worktree cleanup failed: ${revRel.worktreeError}`);
+            } else if (revRel.dispatch.releasedAt) {
+              releasedReviews += 1;
+            }
+          } catch (err) {
+            cleanupWarnings.push(
+              `Run review ${rev.id} cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+      }
+
+      this.store.updateRunIntegrationState(run.id, {
+        integrationStatus: 'finalized',
+        finalizedCommit: finalized.result.integratedCommit,
+        integrationHeadCommit: finalized.result.integratedCommit,
+        integrationWorktreePath: finalized.removedWorktree ? null : run.integrationWorktreePath,
+        integrationBranch: finalized.removedBranch ? null : run.integrationBranch,
+      });
+
+      const boardMsg = this.store.insertMessage({
+        runId: run.id,
+        from: callerPaneId || 'coordinator',
+        to: `run:${run.id}`,
+        type: 'status',
+        subject: `Finalized ${finalized.integrationBranch} -> ${finalized.result.targetBranch ?? 'main'}`,
+        body: finalized.result.noChanges
+          ? `[Run ${run.id}] No diff between ${finalized.integrationBranch} and ${finalized.result.targetBranch ?? 'HEAD'}; marked finalized.`
+          : `[Run ${run.id}] Promoted ${finalized.integrationBranch} into ${finalized.result.targetBranch ?? 'main'}: ${finalized.result.message}`,
+        fromRole: 'coordinator',
+        kind: 'update',
+        artifacts: {
+          branch: finalized.result.targetBranch,
+          headCommit: finalized.result.integratedCommit?.slice(0, 10) ?? null,
+          snapshotOid: finalized.result.snapshotOid,
+          changedFiles: finalized.result.changedFiles.slice(0, 20),
+          changedFileCount: finalized.result.changedFiles.length,
+        },
+      });
+      this.store.markAsReadAndDelivered([boardMsg.id]);
+
+      this.emitChanged('run:integration-finalized', run.id);
+      return {
+        ...finalized.result,
+        runId: run.id,
+        integrationBranch: finalized.integrationBranch,
+        integrationWorktreePath: finalized.integrationWorktreePath,
+        removedWorktree: finalized.removedWorktree,
+        removedBranch: finalized.removedBranch,
+        releasedReviews,
+        ...(cleanupWarnings.length > 0 ? { cleanupWarnings } : {}),
+      };
+    };
+
+    return mode === 'check'
+      ? executeFinalize()
+      : this.withRunIntegrationLock(initialRun.id, executeFinalize);
   }
 
   async delegateTask(
@@ -5556,6 +6598,7 @@ export class OrchestrationService {
       role?: string;
       task?: string;
       reviewOf?: string;
+      reviewRun?: boolean | string;
       reviewFocus?: string;
       taskContext?: OrchestrationTaskContext | null;
       background?: string;
@@ -5580,8 +6623,17 @@ export class OrchestrationService {
     signal?: AbortSignal
   ): Promise<OrchestrationDelegateTaskResult> {
     const reviewOfRaw = input.reviewOf?.trim() || '';
+    const isReviewRunRequest =
+      input.reviewRun === true ||
+      (typeof input.reviewRun === 'string' && input.reviewRun.trim().length > 0);
     const reviewFocus = input.reviewFocus?.trim() || '';
-    if (reviewOfRaw && input.terminal?.trim()) {
+    if (reviewOfRaw && isReviewRunRequest) {
+      throw new OrchestrationError(
+        'invalid_argument',
+        'Cannot combine reviewOf and reviewRun in the same delegate_task call.',
+      );
+    }
+    if ((reviewOfRaw || isReviewRunRequest) && input.terminal?.trim()) {
       throw new OrchestrationError(
         'operation_rejected',
         'Adversarial review cannot reuse an existing terminal. Spawn a fresh reviewer in an isolated detached worktree.',
@@ -5594,12 +6646,34 @@ export class OrchestrationService {
     if (reviewTargetDispatch && input.callerPaneId !== undefined) {
       this.authorizeRunAccess(reviewTargetDispatch.runId, input.callerPaneId);
     }
+    if (
+      typeof input.reviewRun === 'string' &&
+      input.reviewRun.trim() &&
+      input.runId?.trim() &&
+      input.reviewRun.trim() !== input.runId.trim()
+    ) {
+      throw new OrchestrationError(
+        'invalid_argument',
+        `Conflicting runId (${input.runId.trim()}) and reviewRun (${input.reviewRun.trim()}).`,
+      );
+    }
+    const reviewRunTarget = isReviewRunRequest
+      ? this.resolveTargetRunForOperation(
+          typeof input.reviewRun === 'string' ? input.reviewRun.trim() : input.runId,
+          input.callerPaneId,
+          from,
+        )
+      : null;
+    const isAdversarialReview = Boolean(reviewTargetDispatch || reviewRunTarget);
+
     const reviewTargetRole = reviewTargetDispatch
       ? this.resolveRoleNameForDispatch(reviewTargetDispatch) || reviewTargetDispatch.id
       : '';
     const fallbackReviewTask = reviewTargetDispatch
       ? `Adversarial review of @${reviewTargetRole}${reviewFocus ? ` (${reviewFocus})` : ''}`
-      : '';
+      : reviewRunTarget
+        ? `Run-level adversarial review of ${reviewRunTarget.id}${reviewFocus ? ` (${reviewFocus})` : ''}`
+        : '';
     const taskText = this.store.redactDispatchCredentials(input.task?.trim() || fallbackReviewTask);
     if (!taskText) {
       throw new OrchestrationError('invalid_argument', 'Missing task specification.');
@@ -5617,7 +6691,9 @@ export class OrchestrationService {
     }
     const defaultReviewRole = reviewTargetDispatch
       ? `review-${reviewTargetRole.replace(/^@+/, '')}`
-      : '';
+      : reviewRunTarget
+        ? 'review-run'
+        : '';
     const role = this.store.redactDispatchCredentials(
       (input.role ?? defaultReviewRole).trim().replace(/^@+/, ''),
     );
@@ -5629,8 +6705,8 @@ export class OrchestrationService {
     const displayName = role || undefined;
     const taskTitle = role ? `@${role}: ${firstLine}` : firstLine;
 
-    const effectiveTaskKind = input.taskKind ?? (reviewTargetDispatch ? 'review' : undefined);
-    let worktree = reviewTargetDispatch
+    const effectiveTaskKind = input.taskKind ?? (isAdversarialReview ? 'review' : undefined);
+    let worktree = isAdversarialReview
       ? false
       : (input.worktree ?? this.getDefaultWorktreeDep?.() ?? true);
     const requestedAgent = input.agent?.trim() || 'auto';
@@ -5640,6 +6716,16 @@ export class OrchestrationService {
       this.terminalTracker?.getTerminal(from)?.cliId ??
       null;
     const authorCliId = reviewTargetDispatch?.cliId ?? null;
+    const authorCliIds = reviewRunTarget
+      ? [
+          ...new Set(
+            this.store
+              .listIntegratedDispatchesForRun(reviewRunTarget.id)
+              .map((d) => d.cliId)
+              .filter((c): c is string => Boolean(c)),
+          ),
+        ]
+      : undefined;
 
     let resolvedAgent: string;
     let selectionReason: string;
@@ -5656,6 +6742,7 @@ export class OrchestrationService {
           taskKind: effectiveTaskKind ?? null,
           coordinatorCliId,
           authorCliId,
+          ...(authorCliIds && authorCliIds.length > 0 ? { authorCliIds } : {}),
           preferIdle: Boolean(input.terminal),
         });
       } catch (err) {
@@ -5700,10 +6787,10 @@ export class OrchestrationService {
       input.planSummary?.trim() ||
       (role ? `@${role} (${resolvedAgent}): ${firstLine}` : `${resolvedAgent}: ${firstLine}`);
     const explicitRunId = input.runId?.trim();
-    const inferredRunId = explicitRunId || (input.callerPaneId === undefined
+    const inferredRunId = explicitRunId || reviewRunTarget?.id || (input.callerPaneId === undefined
       ? this.inferRunIdOptional(from)
       : this.resolveBoardMemberForPane(from)?.runId) || null;
-    let dispatchRunId = explicitRunId;
+    let dispatchRunId = explicitRunId ?? reviewRunTarget?.id;
     if (explicitRunId && input.callerPaneId !== undefined) {
       this.resolveBoardCallerContext({ from: input.callerPaneId, runId: explicitRunId });
     }
@@ -5821,6 +6908,7 @@ export class OrchestrationService {
           callerPaneId: input.callerPaneId,
           ...(reusableTaskId ? { taskId: reusableTaskId } : { spec: taskText }),
           ...(reviewTargetDispatch ? { reviewOf: reviewTargetDispatch.id } : {}),
+          ...(reviewRunTarget ? { reviewRun: reviewRunTarget.id } : {}),
           ...(reviewFocus ? { reviewFocus } : {}),
           ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
           taskTitle,
@@ -7651,9 +8739,9 @@ export class OrchestrationService {
               dispatchId,
               res.error ?? `Failed to deliver deferred dispatch prompt to ${ptyId}`
             );
-            if (latest.reviewOfDispatchId) {
+            if (latest.reviewOfDispatchId || latest.reviewOfRunId) {
               this.store.updateDispatchReviewState(dispatchId, { reviewStatus: 'rejected' });
-              this.reconcileTargetReviewBatch(dispatchId, {
+              this.reconcileAnyReviewBatch(dispatchId, {
                 overrideVerdict: 'reject',
                 failedReason: 'Deferred reviewer prompt delivery failed',
               });
@@ -7770,7 +8858,7 @@ export class OrchestrationService {
     for (const dispatch of this.store.listDispatches()) {
       if (ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) {
         runIds.add(dispatch.runId);
-        if (dispatch.reviewOfDispatchId) {
+        if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
           activeReviewIdsBefore.add(dispatch.id);
         }
       }
@@ -7798,7 +8886,7 @@ export class OrchestrationService {
           if (after.reviewStatus !== 'passed' && after.reviewStatus !== 'rejected') {
             this.store.updateDispatchReviewState(after.id, { reviewStatus: 'rejected' });
           }
-          this.reconcileTargetReviewBatch(after.id, {
+          this.reconcileAnyReviewBatch(after.id, {
             failedReason: `Reviewer exited or timed out (${after.lastFailureReason || after.status})`,
           });
         }

@@ -35,6 +35,7 @@ import {
   type OrchestrationReportArtifacts,
   type OrchestrationReviewFinding,
   type OrchestrationReviewStatus,
+  type OrchestrationRunIntegrationStatus,
   type OrchestrationRunRecord,
   type OrchestrationSnapshot,
   type OrchestrationStartObservation,
@@ -89,6 +90,15 @@ function cloneMessageRecord(msg: OrchestrationMessageRecord): OrchestrationMessa
             ...(msg.artifacts.changedFiles ? { changedFiles: [...msg.artifacts.changedFiles] } : {}),
           },
         }
+      : {}),
+  };
+}
+
+function cloneRunRecord(run: OrchestrationRunRecord): OrchestrationRunRecord {
+  return {
+    ...run,
+    ...(run.runReviewFindings
+      ? { runReviewFindings: run.runReviewFindings.map((f) => ({ ...f })) }
       : {}),
   };
 }
@@ -331,7 +341,7 @@ export class OrchestrationStore {
     this.runs.clear();
     for (const run of parsed.runs ?? []) {
       if (run && typeof run.id === 'string') {
-        this.runs.set(run.id, { ...run });
+        this.runs.set(run.id, cloneRunRecord(run));
       }
     }
 
@@ -875,7 +885,7 @@ export class OrchestrationStore {
 
   getRun(runId: string): OrchestrationRunRecord | undefined {
     const run = this.runs.get(runId);
-    return run ? { ...run } : undefined;
+    return run ? cloneRunRecord(run) : undefined;
   }
 
   requireRun(runId: string): OrchestrationRunRecord {
@@ -883,7 +893,7 @@ export class OrchestrationStore {
     if (!run) {
       throw new OrchestrationError('run_not_found', `Run ${runId} was not found.`);
     }
-    return { ...run };
+    return cloneRunRecord(run);
   }
 
   getCurrentRunForConsumer(handleOrPane: string): OrchestrationRunRecord | undefined {
@@ -891,7 +901,7 @@ export class OrchestrationStore {
     if (direct) {
       const run = this.runs.get(direct);
       if (run && run.id !== UNBOUND_RUN_ID) {
-        return { ...run };
+        return cloneRunRecord(run);
       }
     }
     return undefined;
@@ -901,7 +911,7 @@ export class OrchestrationStore {
     return [...this.runs.values()]
       .filter((r) => r.id !== UNBOUND_RUN_ID && (!filter?.status || r.status === filter.status))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-      .map((r) => ({ ...r }));
+      .map(cloneRunRecord);
   }
 
   updateRunStatus(
@@ -922,7 +932,75 @@ export class OrchestrationStore {
     }
     this.prune();
     this.persist();
-    return { ...run };
+    return cloneRunRecord(run);
+  }
+
+  updateRunIntegrationState(
+    runId: string,
+    patch: {
+      integrationBranch?: string | null;
+      integrationWorktreePath?: string | null;
+      integrationBaseCommit?: string | null;
+      integrationBaseBranch?: string | null;
+      integrationRepoRootPath?: string | null;
+      integrationStatus?: OrchestrationRunIntegrationStatus;
+      integrationHeadCommit?: string | null;
+      finalizedCommit?: string | null;
+    },
+  ): OrchestrationRunRecord | null {
+    const run = this.runs.get(runId);
+    if (!run) return null;
+    if (patch.integrationBranch !== undefined) run.integrationBranch = patch.integrationBranch;
+    if (patch.integrationWorktreePath !== undefined) {
+      run.integrationWorktreePath = patch.integrationWorktreePath;
+    }
+    if (patch.integrationBaseCommit !== undefined) {
+      run.integrationBaseCommit = patch.integrationBaseCommit;
+    }
+    if (patch.integrationBaseBranch !== undefined) {
+      run.integrationBaseBranch = patch.integrationBaseBranch;
+    }
+    if (patch.integrationRepoRootPath !== undefined) {
+      run.integrationRepoRootPath = patch.integrationRepoRootPath;
+    }
+    if (patch.integrationStatus !== undefined) run.integrationStatus = patch.integrationStatus;
+    if (patch.integrationHeadCommit !== undefined) {
+      run.integrationHeadCommit = patch.integrationHeadCommit;
+    }
+    if (patch.finalizedCommit !== undefined) run.finalizedCommit = patch.finalizedCommit;
+    run.updatedAt = this.now();
+    this.persist();
+    return cloneRunRecord(run);
+  }
+
+  updateRunReviewState(
+    runId: string,
+    patch: {
+      runReviewBatchId?: string | null;
+      runReviewSnapshotOid?: string | null;
+      runReviewBaseCommit?: string | null;
+      runReviewStatus?: OrchestrationReviewStatus;
+      runReviewRound?: number;
+      runReviewFindings?: OrchestrationReviewFinding[];
+    },
+  ): OrchestrationRunRecord | null {
+    const run = this.runs.get(runId);
+    if (!run) return null;
+    if (patch.runReviewBatchId !== undefined) run.runReviewBatchId = patch.runReviewBatchId;
+    if (patch.runReviewSnapshotOid !== undefined) {
+      run.runReviewSnapshotOid = patch.runReviewSnapshotOid;
+    }
+    if (patch.runReviewBaseCommit !== undefined) {
+      run.runReviewBaseCommit = patch.runReviewBaseCommit;
+    }
+    if (patch.runReviewStatus !== undefined) run.runReviewStatus = patch.runReviewStatus;
+    if (patch.runReviewRound !== undefined) run.runReviewRound = patch.runReviewRound;
+    if (patch.runReviewFindings !== undefined) {
+      run.runReviewFindings = patch.runReviewFindings.map((f) => ({ ...f }));
+    }
+    run.updatedAt = this.now();
+    this.persist();
+    return cloneRunRecord(run);
   }
 
   // ==================== Tasks ====================
@@ -1209,9 +1287,11 @@ export class OrchestrationStore {
     ownsBranch?: boolean;
     isDetachedReviewWorktree?: boolean;
     reviewOfDispatchId?: string | null;
+    reviewOfRunId?: string | null;
     reviewFocus?: string | null;
     reviewBatchId?: string | null;
     reviewSnapshotOid?: string | null;
+    reviewBaseCommit?: string | null;
     reviewRound?: number;
     ownsPane?: boolean;
     cliId?: string | null;
@@ -1320,9 +1400,11 @@ export class OrchestrationStore {
       ...(input.ownsBranch ? { ownsBranch: true } : {}),
       ...(input.isDetachedReviewWorktree ? { isDetachedReviewWorktree: true } : {}),
       ...(input.reviewOfDispatchId ? { reviewOfDispatchId: input.reviewOfDispatchId } : {}),
+      ...(input.reviewOfRunId ? { reviewOfRunId: input.reviewOfRunId } : {}),
       ...(input.reviewFocus ? { reviewFocus: input.reviewFocus } : {}),
       ...(input.reviewBatchId ? { reviewBatchId: input.reviewBatchId } : {}),
       ...(input.reviewSnapshotOid ? { reviewSnapshotOid: input.reviewSnapshotOid } : {}),
+      ...(input.reviewBaseCommit ? { reviewBaseCommit: input.reviewBaseCommit } : {}),
       ...(typeof input.reviewRound === 'number' && input.reviewRound > 0 ? { reviewRound: input.reviewRound } : {}),
       ownsPane: input.ownsPane ?? false,
       cliId: input.cliId ?? null,
@@ -1702,6 +1784,40 @@ export class OrchestrationStore {
       .map((d) => ({ ...d }));
   }
 
+  listReviewDispatchesForRun(runId: string): OrchestrationDispatchRecord[] {
+    return [...this.dispatches.values()]
+      .filter((d) => d.reviewOfRunId === runId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map((d) => ({ ...d }));
+  }
+
+  listReviewDispatchesForRunBatch(
+    runId: string,
+    reviewBatchId: string,
+  ): OrchestrationDispatchRecord[] {
+    return [...this.dispatches.values()]
+      .filter(
+        (d) =>
+          d.reviewOfRunId === runId &&
+          d.reviewBatchId === reviewBatchId,
+      )
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map((d) => ({ ...d }));
+  }
+
+  listIntegratedDispatchesForRun(runId: string): OrchestrationDispatchRecord[] {
+    return [...this.dispatches.values()]
+      .filter(
+        (d) =>
+          d.runId === runId &&
+          !d.reviewOfDispatchId &&
+          !d.reviewOfRunId &&
+          d.integrationStatus === 'merged',
+      )
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+      .map((d) => ({ ...d }));
+  }
+
   updateDispatchReviewState(
     dispatchId: string,
     patch: {
@@ -1709,6 +1825,7 @@ export class OrchestrationStore {
       reviewRound?: number;
       reviewBatchId?: string | null;
       reviewSnapshotOid?: string | null;
+      reviewBaseCommit?: string | null;
       reviewFindings?: OrchestrationReviewFinding[];
       reviewMutatedWorkspace?: boolean;
     },
@@ -1719,6 +1836,7 @@ export class OrchestrationStore {
     if (patch.reviewRound !== undefined) dispatch.reviewRound = patch.reviewRound;
     if (patch.reviewBatchId !== undefined) dispatch.reviewBatchId = patch.reviewBatchId;
     if (patch.reviewSnapshotOid !== undefined) dispatch.reviewSnapshotOid = patch.reviewSnapshotOid;
+    if (patch.reviewBaseCommit !== undefined) dispatch.reviewBaseCommit = patch.reviewBaseCommit;
     if (patch.reviewFindings !== undefined) {
       dispatch.reviewFindings = patch.reviewFindings.map((f) => ({ ...f }));
     }
@@ -1735,12 +1853,16 @@ export class OrchestrationStore {
     patch: {
       integrationStatus?: OrchestrationIntegrationStatus;
       integratedCommit?: string | null;
+      integratedTargetBranch?: string | null;
     },
   ): OrchestrationDispatchRecord | null {
     const dispatch = this.dispatches.get(dispatchId);
     if (!dispatch) return null;
     if (patch.integrationStatus !== undefined) dispatch.integrationStatus = patch.integrationStatus;
     if (patch.integratedCommit !== undefined) dispatch.integratedCommit = patch.integratedCommit;
+    if (patch.integratedTargetBranch !== undefined) {
+      dispatch.integratedTargetBranch = patch.integratedTargetBranch;
+    }
     dispatch.updatedAt = this.now();
     this.persist();
     return { ...dispatch };

@@ -6,7 +6,7 @@ const http = require('node:http');
 const https = require('node:https');
 
 const TWO_WORD_COMMANDS = {
-  run: ['create', 'use', 'current', 'list', 'show'],
+  run: ['create', 'use', 'current', 'list', 'show', 'diff', 'finalize'],
   task: ['create', 'list', 'update', 'show', 'done', 'fail'],
   gate: ['create', 'resolve', 'list'],
   dispatch: ['show'],
@@ -56,6 +56,7 @@ const BOOLEAN_FLAGS = new Set([
   'detach',
   'releaseAfter',
   'deleteBranch',
+  'reviewRun',
   'tasks',
   'messages',
   'help',
@@ -131,7 +132,12 @@ function parseCliArgs(argv) {
       if (!rawKey) continue;
       const key = toCamel(rawKey);
       const rawVal = token.slice(eqIndex + 1);
-      const val = BOOLEAN_FLAGS.has(key) ? toBoolean(rawVal) : rawVal;
+      const val =
+        key === 'reviewRun' && rawVal.trim() && !/^(true|false|1|0|yes|no)$/i.test(rawVal.trim())
+          ? rawVal.trim()
+          : BOOLEAN_FLAGS.has(key)
+            ? toBoolean(rawVal)
+            : rawVal;
       if (REPEATABLE_FLAGS.has(key)) {
         if (!Array.isArray(flags[key])) flags[key] = [];
         flags[key].push(val);
@@ -610,6 +616,42 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
         action: 'run-show',
         payload: { id: String(flags.id ?? positional[0] ?? '') },
       };
+    case 'run-diff': {
+      const files = [
+        ...(Array.isArray(flags.file) ? flags.file : flags.file ? [flags.file] : []),
+        ...(flags.files ? splitCsv(String(flags.files)) || [] : []),
+      ]
+        .map((v) => String(v).trim())
+        .filter(Boolean);
+      const targetRunId = runId || flags.id || positional[0];
+      return {
+        action: 'run-diff',
+        payload: {
+          ...(targetRunId ? { runId: String(targetRunId) } : {}),
+          ...(files.length > 0 ? { files } : {}),
+          ...(flags.maxDiffBytes ? { maxDiffBytes: toNumber(flags.maxDiffBytes) } : {}),
+        },
+      };
+    }
+    case 'run-finalize': {
+      const targetRunId = runId || flags.id || positional[0];
+      return {
+        action: 'run-finalize',
+        payload: {
+          ...(targetRunId ? { runId: String(targetRunId) } : {}),
+          ...(flags.mode ? { mode: String(flags.mode) } : {}),
+          ...(flags.expectedSnapshot || flags.expectedSnapshotOid
+            ? { expectedSnapshotOid: String(flags.expectedSnapshot ?? flags.expectedSnapshotOid) }
+            : {}),
+          ...(flags.commitMessage || flags.message
+            ? { commitMessage: String(flags.commitMessage ?? flags.message) }
+            : {}),
+          ...(flags.deleteBranch !== undefined ? { deleteBranch: toBoolean(flags.deleteBranch) } : {}),
+          ...(flags.keepWorktree !== undefined ? { keepWorktree: toBoolean(flags.keepWorktree) } : {}),
+          ...(flags.force !== undefined ? { force: toBoolean(flags.force) } : {}),
+        },
+      };
+    }
     case 'task-create': {
       if (flags.spec !== undefined && flags.specFile !== undefined) {
         throw new Error('Cannot combine --spec and --spec-file.');
@@ -709,6 +751,9 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
           ...(flags.priority ? { priority: String(flags.priority) } : {}),
           ...(flags.retryOf ? { retryOfDispatchId: String(flags.retryOf) } : {}),
           ...(flags.reviewOf ? { reviewOf: String(flags.reviewOf) } : {}),
+          ...(flags.reviewRun
+            ? { reviewRun: typeof flags.reviewRun === 'string' ? flags.reviewRun : true }
+            : {}),
           ...(flags.reviewFocus ? { reviewFocus: String(flags.reviewFocus) } : {}),
           ...(workerCli ? { cliId: String(workerCli) } : {}),
           ...(flags.model ? { model: String(flags.model) } : {}),
@@ -760,6 +805,7 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
           ...(flags.worker ? { worker: String(flags.worker) } : {}),
           ...(flags.task || flags.taskId ? { taskId: String(flags.task ?? flags.taskId) } : {}),
           ...(flags.mode ? { mode: String(flags.mode) } : {}),
+          ...(flags.targetBranch ? { targetBranch: String(flags.targetBranch) } : {}),
           ...(flags.expectedSnapshot || flags.expectedSnapshotOid
             ? { expectedSnapshotOid: String(flags.expectedSnapshot ?? flags.expectedSnapshotOid) }
             : {}),
@@ -1167,9 +1213,9 @@ async function main() {
         '',
         'Orchestration Commands:',
         '  agents',
-        '  worker-start | worker-list | worker-show | worker-read | worker-keep-open | worker-release | worker-stop | worker-abandon',
+        '  worker-start | worker-list | worker-show | worker-read | worker-diff | worker-integrate | worker-keep-open | worker-release | worker-stop | worker-abandon',
         '  approve | deny | reset',
-        '  run-create | run-use | run-current | run-list | run-show',
+        '  run-create | run-use | run-current | run-list | run-show | run-diff | run-finalize',
         '  task-create | task-list | task-update | task-show | task-done | task-fail',
         '  dispatch | dispatch-show',
         '  coordinator-start | coordinator-stop | coordinator-tick | coordinator-status',

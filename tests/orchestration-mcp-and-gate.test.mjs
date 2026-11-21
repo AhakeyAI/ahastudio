@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { execFile as execFileCb, spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
 
 import {
   AgentHookServer,
@@ -10,6 +12,7 @@ import {
 } from '../dist-electron/agent/agent-hook-server.js';
 import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
 import { mergeCliLaunchArgs } from '../dist-electron/local-terminal-sessions.js';
+import { selectAgentForTask } from '../dist-electron/orchestration/agent-roster.js';
 import { DispatchProposalManager } from '../dist-electron/orchestration/dispatch-proposals.js';
 import {
   dispatchOrchestrationHttpAction,
@@ -121,8 +124,9 @@ function createMockSelector() {
   };
 }
 
-function spawnMcpClient(t, env, framing = 'newline') {
+function spawnMcpClient(t, env, framing = 'newline', cwd = undefined) {
   const child = spawn(process.execPath, [MCP_SERVER_PATH], {
+    ...(cwd ? { cwd } : {}),
     env: {
       PATH: process.env.PATH || '',
       SystemRoot: process.env.SystemRoot || '',
@@ -765,7 +769,7 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   const coordClient = spawnMcpClient(t, coordEnv, 'newline');
   await coordClient.request('initialize', { protocolVersion: '2024-11-05' });
 
-  // Coordinator gets 11 tools (including shared board + diff/integrate close-out tools) with dynamic agent enum.
+  // Coordinator gets 13 tools (including shared board + diff/integrate + Phase 2 run diff/finalize tools) with dynamic agent enum.
   const coordToolsRes = await coordClient.request('tools/list', {});
   const coordToolNames = coordToolsRes.result.tools.map((tool) => tool.name);
   assert.deepEqual(coordToolNames, [
@@ -780,8 +784,18 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
     'manage_worker',
     'inspect_worker_diff',
     'integrate_worker',
+    'inspect_run_diff',
+    'finalize_run_integration',
   ]);
   const delegateTool = coordToolsRes.result.tools.find((tool) => tool.name === 'delegate_task');
+  assert.equal(delegateTool.inputSchema.properties.reviewRun?.type, 'boolean', 'reviewRun uses flat boolean JSON Schema for Gemini/Codex MCP compatibility');
+  assert.equal(delegateTool.inputSchema.properties.reviewRun?.oneOf, undefined, 'reviewRun must not use oneOf');
+  const integrateTool = coordToolsRes.result.tools.find((tool) => tool.name === 'integrate_worker');
+  assert.deepEqual(integrateTool.inputSchema.properties.targetBranch.enum, [
+    'main',
+    'integration',
+    'auto',
+  ]);
   assert.deepEqual(delegateTool.inputSchema.properties.agent.enum, [
     'auto',
     'claude',
@@ -801,6 +815,21 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   assert.equal(agentsCall.result.isError, undefined);
   assert.match(agentsCall.result.content[0].text, /codex/);
   assert.match(agentsCall.result.content[0].text, /not-installed/);
+
+  // tools/call: inspect_run_diff & finalize_run_integration before any run/integration return clean responses.
+  const emptyRunDiffCall = await coordClient.request('tools/call', {
+    name: 'inspect_run_diff',
+    arguments: {},
+  });
+  assert.equal(emptyRunDiffCall.result.isError, true);
+  assert.match(emptyRunDiffCall.result.content[0].text, /run_not_found|not part of any/i);
+
+  const emptyFinalizeCall = await coordClient.request('tools/call', {
+    name: 'finalize_run_integration',
+    arguments: { mode: 'check' },
+  });
+  assert.equal(emptyFinalizeCall.result.isError, true);
+  assert.match(emptyFinalizeCall.result.content[0].text, /run_not_found|not part of any/i);
 
   // tools/call: delegate_task on Turn 1 -> blocked by chat-and-guard even with empty optional strings & snake_case aliases!
   service.recordUserPromptTurn('local-coord', 'hook');
@@ -1023,4 +1052,178 @@ test('AgentHookServer userPromptInterceptor returns hookStdout JSON on UserPromp
     ),
     ['-c', 'mcp_servers.aha.command="node"', '-c', 'mcp_servers.aha.args=["/a.cjs"]', '-m', 'gpt-5.4']
   );
+});
+
+test('Stdio MCP server Phase 2 happy path: integrate_worker(targetBranch="integration") -> inspect_run_diff -> delegate_task(reviewRun=true) -> finalize_run_integration', async (t) => {
+  const execFile = promisify(execFileCb);
+  const git = async (cwd, ...args) => {
+    const { stdout } = await execFile('git', args, { cwd, windowsHide: true });
+    return stdout.trim();
+  };
+  const root = mkdtempSync(join(tmpdir(), 'aha-mcp-phase2-'));
+  const repo = join(root, 'repo');
+  mkdirSync(repo, { recursive: true });
+  let mcpChildToClose = null;
+  t.after(async () => {
+    if (mcpChildToClose && mcpChildToClose.exitCode === null) {
+      await new Promise((resolveExit) => {
+        mcpChildToClose.once('exit', resolveExit);
+        mcpChildToClose.kill();
+        setTimeout(resolveExit, 1000).unref();
+      });
+    }
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  await git(repo, 'init', '-b', 'main');
+  await git(repo, 'config', 'user.name', 'Test User');
+  await git(repo, 'config', 'user.email', 'test@example.com');
+  writeFileSync(join(repo, 'README.md'), '# MCP Phase 2\n', 'utf8');
+  await git(repo, 'add', '.');
+  await git(repo, 'commit', '-m', 'init');
+
+  // Dirty main workspace forces Run integration branch usage.
+  writeFileSync(join(repo, 'user-wip.txt'), 'uncommitted user work\n', 'utf8');
+
+  const agentStatusStore = new AgentStatusStore();
+  const tracker = new TerminalRuntimeTracker();
+  agentStatusStore.registerPane('local-coord', { agentId: 'claude' });
+  tracker.registerPty({ ptyId: 'local-coord', cwd: repo, cliId: 'claude' });
+
+  let spawnSeq = 0;
+  const store = new OrchestrationStore();
+  const service = new OrchestrationService({
+    store,
+    agentStatusStore,
+    terminalTracker: tracker,
+    writePty: async () => ({ ok: true }),
+    spawnWorkerPty: async (opts) => {
+      spawnSeq += 1;
+      const ptyId = `local-mcp-p2-w${spawnSeq}`;
+      agentStatusStore.registerPane(ptyId, { agentId: opts.cliId });
+      tracker.registerPty({ ptyId, cwd: opts.cwd || repo, cliId: opts.cliId });
+      tracker.ingestUtf8Data(ptyId, `Worker ${ptyId} booted\r\n`);
+      return { ptyId, agentId: opts.cliId, cwd: opts.cwd };
+    },
+    closeWorkerPty: async (ptyId) => {
+      tracker.markExited(ptyId, 0);
+      agentStatusStore.removePane(ptyId);
+      return { ok: true };
+    },
+    isPtyAlive: (ptyId) => tracker.isAlive(ptyId),
+    listCodingAgents: () => makeSampleRoster(),
+    selectAgentForTask,
+    getConfirmMode: () => 'auto',
+    getDefaultWorktree: () => true,
+    getDefaultCwd: () => repo,
+    isMcpEnabledForCli: () => true,
+    maxDepth: 1,
+    settleDelayMs: 0,
+  });
+  t.after(() => service.dispose());
+
+  const run = store.createRun({
+    objective: 'MCP Phase 2 E2E',
+    coordinatorHandle: 'local-coord',
+    coordinatorPaneId: 'local-coord',
+  });
+
+  const hookServer = new AgentHookServer(agentStatusStore);
+  hookServer.setOrchestrationHandler((action, payload, context) =>
+    dispatchOrchestrationHttpAction(service, action, payload, context)
+  );
+  await hookServer.start();
+  t.after(() => hookServer.stop());
+
+  const coordClient = spawnMcpClient(t, hookServer.envForPane('local-coord'), 'newline', repo);
+  mcpChildToClose = coordClient.child;
+  await coordClient.request('initialize', { protocolVersion: '2024-11-05' });
+
+  // 1. Delegate L0 docs worker via MCP and complete it.
+  const delRes = await coordClient.request(
+    'tools/call',
+    {
+      name: 'delegate_task',
+      arguments: {
+        role: 'docs',
+        task: 'Add guide.md',
+        agent: 'codex',
+        worktree: true,
+      },
+    },
+    30_000,
+  );
+  assert.equal(delRes.result.isError, undefined, delRes.result.content[0].text);
+  const wDispatch = store.listDispatches({ runId: run.id }).find((d) => d.assigneePaneId === 'local-mcp-p2-w1');
+  assert.ok(wDispatch?.worktreePath);
+  writeFileSync(join(wDispatch.worktreePath, 'guide.md'), '# Guide\n', 'utf8');
+  await service.workerDoneByPane(wDispatch.assigneePaneId, { outcome: 'completed', summary: 'Added guide.md' });
+
+  // 2. Integrate via MCP with targetBranch="integration" -> aha/run/<runId> created, dirty main untouched.
+  const intCall = await coordClient.request(
+    'tools/call',
+    {
+      name: 'integrate_worker',
+      arguments: {
+        role: 'docs',
+        mode: 'squash',
+        targetBranch: 'integration',
+      },
+    },
+    30_000,
+  );
+  assert.equal(intCall.result.isError, undefined, intCall.result.content[0].text);
+  assert.match(intCall.result.content[0].text, new RegExp(`aha/run/${run.id}`));
+  assert.match(intCall.result.content[0].text, /finalize_run_integration/);
+  assert.equal(readFileSync(join(repo, 'user-wip.txt'), 'utf8'), 'uncommitted user work\n');
+
+  // 3. Inspect combined Run diff via MCP.
+  const diffCall = await coordClient.request(
+    'tools/call',
+    {
+      name: 'inspect_run_diff',
+      arguments: {},
+    },
+    30_000,
+  );
+  assert.equal(diffCall.result.isError, undefined, diffCall.result.content[0].text);
+  assert.match(diffCall.result.content[0].text, /integration=active/);
+  assert.match(diffCall.result.content[0].text, /guide\.md/);
+
+  // 4. Launch Run-level adversarial review via MCP delegate_task(reviewRun=true) -> heterogeneous avoidance of codex.
+  const revCall = await coordClient.request(
+    'tools/call',
+    {
+      name: 'delegate_task',
+      arguments: {
+        reviewRun: true,
+        reviewFocus: 'docs & completeness',
+      },
+    },
+    30_000,
+  );
+  assert.equal(revCall.result.isError, undefined, revCall.result.content[0].text);
+  const revDispatch = store.listReviewDispatchesForRun(run.id)[0];
+  assert.ok(revDispatch);
+  assert.notEqual(revDispatch.cliId, 'codex', 'Run reviewer must avoid codex author CLI');
+  await service.workerDoneByPane(revDispatch.assigneePaneId, {
+    outcome: 'completed',
+    verdict: 'pass',
+    summary: 'Combined Run changes verified clean.',
+  });
+
+  // 5. Clean dirty main and finalize via MCP finalize_run_integration(mode="squash").
+  rmSync(join(repo, 'user-wip.txt'));
+  const finCall = await coordClient.request(
+    'tools/call',
+    {
+      name: 'finalize_run_integration',
+      arguments: { mode: 'squash' },
+    },
+    30_000,
+  );
+  assert.equal(finCall.result.isError, undefined, finCall.result.content[0].text);
+  assert.match(finCall.result.content[0].text, /Cleaned up run integration worktree/);
+  assert.equal(existsSync(join(repo, 'guide.md')), true);
+  assert.equal(store.requireRun(run.id).integrationStatus, 'finalized');
 });

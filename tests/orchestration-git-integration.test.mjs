@@ -11,9 +11,14 @@ import {
   checkWorkerIntegration,
   createDetachedReviewWorktree,
   deleteOwnedWorkerBranch,
+  deleteRunIntegrationBranch,
   detectReviewWorktreeMutation,
+  finalizeRunIntegrationBranch,
+  formatRunIntegrationBranchName,
+  inspectCommitRangeDiff,
   inspectWorkerDiff,
   integrateWorkerChanges,
+  integrateWorkerIntoRunBranch,
   removeDetachedReviewWorktree,
 } from '../dist-electron/orchestration/worker-git-integration.js';
 import {
@@ -488,4 +493,458 @@ test('squash integration supports auto-formatting pre-commit hooks and allowSqua
   assert.equal(removed.removed, true);
   assert.equal(removed.removedBranch, true);
   assert.equal(await git(repo, 'branch', '--list', worker.branch), '');
+});
+
+test('Phase 2: Run integration branch aha/run/<runId> isolates dirty main, supports read-only check, multi-worker squash, and safe finalization with CAS cleanup', async (t) => {
+  const { repo } = await initTempRepo(t);
+  const baseHead = await git(repo, 'rev-parse', 'HEAD');
+  const runId = 'run_phase2_dirty';
+  const expectedRunBranch = formatRunIntegrationBranchName(runId);
+  assert.equal(expectedRunBranch, 'aha/run/run_phase2_dirty');
+
+  // Create uncommitted dirty user work in main repo.
+  writeFileSync(join(repo, 'user-wip.txt'), 'unsaved user draft\n', 'utf8');
+
+  // Worker 1 & Worker 2 in isolated worktrees.
+  const w1 = await prepareWorkerWorktreePlacement({ baseCwd: repo, taskId: 'p2_w1', name: 'api' });
+  const w2 = await prepareWorkerWorktreePlacement({ baseCwd: repo, taskId: 'p2_w2', name: 'ui' });
+  writeFileSync(join(w1.worktreePath, 'api.ts'), 'export const api = "v1";\n', 'utf8');
+  writeFileSync(join(w2.worktreePath, 'ui.ts'), 'export const ui = "v1";\n', 'utf8');
+
+  // 1. Read-only mode="check" into Run integration branch MUST NOT create branch or worktree on disk!
+  const checkBefore = await integrateWorkerIntoRunBranch({
+    mainRepoRoot: repo,
+    runId,
+    worktreePath: w1.worktreePath,
+    baseCommit: w1.baseCommit,
+    mode: 'check',
+    commitMessage: 'check only',
+  });
+  assert.equal(checkBefore.result.clean, true);
+  assert.equal(checkBefore.result.integrated, false);
+  assert.equal(checkBefore.result.willCreateIntegrationBranch, true);
+  assert.equal(await git(repo, 'branch', '--list', expectedRunBranch), '');
+  assert.equal(existsSync(checkBefore.integrationWorktreePath), false);
+
+  // 2. Squash Worker 1 into aha/run/<runId> while main is dirty.
+  const int1 = await integrateWorkerIntoRunBranch({
+    mainRepoRoot: repo,
+    runId,
+    worktreePath: w1.worktreePath,
+    baseCommit: w1.baseCommit,
+    mode: 'squash',
+    commitMessage: 'feat: integrate api into run branch',
+  });
+  assert.equal(int1.result.integrated, true);
+  assert.equal(int1.createdRunBranch, true);
+  assert.equal(int1.integrationBranch, expectedRunBranch);
+  assert.equal(int1.integrationBaseCommit, baseHead);
+  assert.equal(int1.integrationBaseBranch, 'main');
+  assert.equal(existsSync(join(int1.integrationWorktreePath, 'api.ts')), true);
+  assert.equal(
+    existsSync(join(int1.integrationWorktreePath, 'user-wip.txt')),
+    false,
+    'dirty user files in main MUST NOT leak into aha/run/<runId>',
+  );
+  assert.equal(readFileSync(join(repo, 'user-wip.txt'), 'utf8'), 'unsaved user draft\n');
+  assert.equal(await git(repo, 'rev-parse', 'HEAD'), baseHead);
+
+  // 3. Squash Worker 2 into the same active aha/run/<runId> branch.
+  const int2 = await integrateWorkerIntoRunBranch({
+    mainRepoRoot: repo,
+    runId,
+    existingBranch: int1.integrationBranch,
+    existingWorktreePath: int1.integrationWorktreePath,
+    existingBaseCommit: int1.integrationBaseCommit,
+    existingBaseBranch: int1.integrationBaseBranch,
+    worktreePath: w2.worktreePath,
+    baseCommit: w2.baseCommit,
+    mode: 'squash',
+    commitMessage: 'feat: integrate ui into run branch',
+  });
+  assert.equal(int2.result.integrated, true);
+  assert.equal(int2.createdRunBranch, false);
+  assert.equal(existsSync(join(int1.integrationWorktreePath, 'ui.ts')), true);
+  const runHead = await git(int1.integrationWorktreePath, 'rev-parse', 'HEAD');
+  assert.equal(runHead, int2.result.integratedCommit);
+
+  // 4. Pure read-only inspectCommitRangeDiff works cleanly across combined Run changes even while main is dirty.
+  const rangeDiff = await inspectCommitRangeDiff({
+    repoPath: int1.integrationWorktreePath,
+    baseCommit: baseHead,
+    targetCommit: runHead,
+    branch: expectedRunBranch,
+  });
+  assert.equal(rangeDiff.commitsAhead, 2);
+  assert.deepEqual(rangeDiff.changedFiles.sort(), ['api.ts', 'ui.ts']);
+  assert.match(rangeDiff.diff, /export const api = "v1";/);
+  assert.match(rangeDiff.diff, /export const ui = "v1";/);
+
+  // 5. Finalization refuses while main workspace is still dirty.
+  await assert.rejects(
+    () =>
+      finalizeRunIntegrationBranch({
+        mainRepoRoot: repo,
+        integrationBranch: expectedRunBranch,
+        integrationWorktreePath: int1.integrationWorktreePath,
+        baseCommit: baseHead,
+        expectedTargetRef: 'refs/heads/main',
+        mode: 'squash',
+        commitMessage: 'should fail on dirty main',
+      }),
+    /uncommitted file/i,
+  );
+  assert.equal(readFileSync(join(repo, 'user-wip.txt'), 'utf8'), 'unsaved user draft\n');
+  assert.equal(existsSync(int1.integrationWorktreePath), true);
+
+  // 6. Finalization refuses if _run-* worktree itself has stray uncommitted edits.
+  writeFileSync(join(int1.integrationWorktreePath, 'stray.tmp'), 'oops\n', 'utf8');
+  await assert.rejects(
+    () =>
+      finalizeRunIntegrationBranch({
+        mainRepoRoot: repo,
+        integrationBranch: expectedRunBranch,
+        integrationWorktreePath: int1.integrationWorktreePath,
+        baseCommit: baseHead,
+        expectedTargetRef: 'refs/heads/main',
+        mode: 'check',
+        commitMessage: 'check dirty run wt',
+      }),
+    /Run integration worktree has 1 uncommitted file/i,
+  );
+  rmSync(join(int1.integrationWorktreePath, 'stray.tmp'));
+
+  // 7. User commits their WIP on main (advancing main cleanly), then switches away and back.
+  await git(repo, 'add', 'user-wip.txt');
+  await git(repo, 'commit', '-m', 'user saves wip');
+  const mainWithWip = await git(repo, 'rev-parse', 'HEAD');
+
+  // Guard: if main is on a different branch than expectedTargetRef, finalization refuses.
+  await git(repo, 'checkout', '-b', 'other-branch');
+  await assert.rejects(
+    () =>
+      finalizeRunIntegrationBranch({
+        mainRepoRoot: repo,
+        integrationBranch: expectedRunBranch,
+        integrationWorktreePath: int1.integrationWorktreePath,
+        baseCommit: baseHead,
+        expectedTargetRef: 'refs/heads/main',
+        mode: 'squash',
+        commitMessage: 'wrong target branch',
+      }),
+    /Target repository branch changed/i,
+  );
+  await git(repo, 'checkout', 'main');
+  await git(repo, 'branch', '-D', 'other-branch');
+
+  // 8. Finalize promotes aha/run/<runId> via squash cleanly on top of user's commit and cleans up!
+  const finalized = await finalizeRunIntegrationBranch({
+    mainRepoRoot: repo,
+    integrationBranch: expectedRunBranch,
+    integrationWorktreePath: int1.integrationWorktreePath,
+    baseCommit: baseHead,
+    expectedTargetRef: 'refs/heads/main',
+    expectedSnapshotOid: runHead,
+    mode: 'squash',
+    commitMessage: 'feat: finalize combined run changes',
+  });
+  assert.equal(finalized.result.integrated, true);
+  assert.equal(finalized.result.mode, 'squash');
+  assert.equal(finalized.removedWorktree, true);
+  assert.equal(finalized.removedBranch, true);
+  assert.equal(existsSync(int1.integrationWorktreePath), false);
+  assert.equal(await git(repo, 'branch', '--list', expectedRunBranch), '');
+  assert.equal(await git(repo, 'rev-list', '--count', `${mainWithWip}..HEAD`), '1');
+  assert.equal(readFileSync(join(repo, 'user-wip.txt'), 'utf8'), 'unsaved user draft\n');
+  assert.equal(readFileSync(join(repo, 'api.ts'), 'utf8'), 'export const api = "v1";\n');
+  assert.equal(readFileSync(join(repo, 'ui.ts'), 'utf8'), 'export const ui = "v1";\n');
+
+  // Safety check: deleteRunIntegrationBranch refuses non-aha/run/* branches.
+  assert.equal(await deleteRunIntegrationBranch(repo, 'main', finalized.result.integratedCommit, { allowSquashCasDelete: true }), false);
+});
+
+test('Phase 2: first integration conflict into a new aha/run/<runId> rolls back empty branch and worktree cleanly', async (t) => {
+  const { repo } = await initTempRepo(t);
+  const runId = 'run_rollback_conflict';
+  const expectedBranch = formatRunIntegrationBranchName(runId);
+
+  const w = await prepareWorkerWorktreePlacement({ baseCwd: repo, taskId: 'rb_1', name: 'conflict' });
+  writeFileSync(join(w.worktreePath, 'app.ts'), 'export const version = 100;\n', 'utf8');
+
+  // Advance main with a conflicting edit on app.ts, plus dirty file.
+  writeFileSync(join(repo, 'app.ts'), 'export const version = 200;\n', 'utf8');
+  await git(repo, 'add', 'app.ts');
+  await git(repo, 'commit', '-m', 'conflicting main edit');
+  writeFileSync(join(repo, 'dirty.txt'), 'wip\n', 'utf8');
+
+  const res = await integrateWorkerIntoRunBranch({
+    mainRepoRoot: repo,
+    runId,
+    worktreePath: w.worktreePath,
+    baseCommit: w.baseCommit,
+    mode: 'squash',
+    commitMessage: 'conflict on first integration',
+  });
+  assert.equal(res.result.integrated, false);
+  assert.equal(res.result.checkStatus, 'conflict');
+  assert.ok(res.result.conflictFiles.includes('app.ts'));
+  assert.equal(res.createdRunBranch, false);
+  assert.equal(existsSync(res.integrationWorktreePath), false, 'newly created empty run worktree must be rolled back');
+  assert.equal(await git(repo, 'branch', '--list', expectedBranch), '', 'newly created empty run branch must be rolled back');
+});
+
+test('Phase 2: finalizeRunIntegrationBranch refuses to overwrite ignored local files in main and preserves aha/run/<runId>', async (t) => {
+  const { repo } = await initTempRepo(t);
+  const originalIgnored = Buffer.from('SECRET_LOCAL_ENV=keep_safe\n', 'utf8');
+  writeFileSync(join(repo, 'local.env'), originalIgnored);
+
+  const w = await prepareWorkerWorktreePlacement({ baseCwd: repo, taskId: 'run_ign', name: 'ign' });
+  writeFileSync(join(w.worktreePath, 'local.env'), 'OVERWRITTEN=bad\n', 'utf8');
+  await git(w.worktreePath, 'add', '-f', 'local.env');
+  await git(w.worktreePath, 'commit', '-m', 'force add ignored file');
+
+  // Integrating into clean _run-* succeeds because _run-* does not have local.env on disk.
+  const staged = await integrateWorkerIntoRunBranch({
+    mainRepoRoot: repo,
+    runId: 'run_ignored_finalize',
+    worktreePath: w.worktreePath,
+    baseCommit: w.baseCommit,
+    mode: 'squash',
+    commitMessage: 'stage into run branch',
+  });
+  assert.equal(staged.result.integrated, true);
+
+  // Promoting back to main MUST catch the ignored-file collision in main and preserve both local.env and aha/run/*.
+  const fin = await finalizeRunIntegrationBranch({
+    mainRepoRoot: repo,
+    integrationBranch: staged.integrationBranch,
+    integrationWorktreePath: staged.integrationWorktreePath,
+    baseCommit: staged.integrationBaseCommit,
+    expectedTargetRef: 'refs/heads/main',
+    mode: 'squash',
+    commitMessage: 'must block ignored collision',
+  });
+  assert.equal(fin.result.integrated, false);
+  assert.equal(fin.result.checkStatus, 'conflict');
+  assert.ok(fin.result.ignoredCollisionFiles.includes('local.env'));
+  assert.equal(fin.removedWorktree, false);
+  assert.equal(fin.removedBranch, false);
+  assert.deepEqual(readFileSync(join(repo, 'local.env')), originalIgnored);
+  assert.equal(existsSync(staged.integrationWorktreePath), true);
+  assert.ok((await git(repo, 'branch', '--list', staged.integrationBranch)).includes(staged.integrationBranch));
+});
+
+test('Phase 2: empty first integration (noChanges) rolls back newly created aha/run/<runId> branch and worktree', async (t) => {
+  const { repo } = await initTempRepo(t);
+  writeFileSync(join(repo, 'dirty.txt'), 'dirty main\n');
+
+  const w = await prepareWorkerWorktreePlacement({ baseCwd: repo, taskId: 'run_empty', name: 'empty' });
+  const runId = 'run_empty_first';
+  const expectedBranch = formatRunIntegrationBranchName(runId);
+
+  const res = await integrateWorkerIntoRunBranch({
+    mainRepoRoot: repo,
+    runId,
+    worktreePath: w.worktreePath,
+    baseCommit: w.baseCommit,
+    mode: 'squash',
+    commitMessage: 'no-op worker',
+  });
+  assert.equal(res.result.noChanges, true);
+  assert.equal(res.result.integrated, false);
+  assert.equal(res.createdRunBranch, false);
+  assert.equal(existsSync(res.integrationWorktreePath), false, 'empty run worktree must be rolled back');
+  assert.equal(await git(repo, 'branch', '--list', expectedBranch), '', 'empty run branch must be rolled back');
+});
+
+test('Phase 2: finalizeRunIntegrationBranch mode="merge" creates 2-parent merge commit and cleans up via CAS', async (t) => {
+  const { repo } = await initTempRepo(t);
+  const w1 = await prepareWorkerWorktreePlacement({ baseCwd: repo, taskId: 'run_m1', name: 'm1' });
+  writeFileSync(join(w1.worktreePath, 'm1.txt'), 'merge one\n');
+  await git(w1.worktreePath, 'add', 'm1.txt');
+  await git(w1.worktreePath, 'commit', '-m', 'feat: merge one');
+
+  const staged = await integrateWorkerIntoRunBranch({
+    mainRepoRoot: repo,
+    runId: 'run_merge_finalize',
+    worktreePath: w1.worktreePath,
+    baseCommit: w1.baseCommit,
+    mode: 'squash',
+    commitMessage: 'chore: stage m1',
+  });
+  assert.equal(staged.result.integrated, true);
+
+  const fin = await finalizeRunIntegrationBranch({
+    mainRepoRoot: repo,
+    integrationBranch: staged.integrationBranch,
+    integrationWorktreePath: staged.integrationWorktreePath,
+    baseCommit: staged.integrationBaseCommit,
+    expectedTargetRef: 'refs/heads/main',
+    mode: 'merge',
+    commitMessage: 'merge: finalize run_merge_finalize',
+  });
+  assert.equal(fin.result.integrated, true);
+  assert.equal(fin.result.mode, 'merge');
+  assert.equal(fin.removedWorktree, true);
+  assert.equal(fin.removedBranch, true);
+  assert.equal(readFileSync(join(repo, 'm1.txt'), 'utf8'), 'merge one\n');
+  const parents = (await git(repo, 'rev-list', '--parents', '-n', '1', fin.result.integratedCommit)).split(/\s+/);
+  assert.equal(parents.length, 3, 'merge mode must produce a 2-parent merge commit');
+  assert.equal(existsSync(staged.integrationWorktreePath), false);
+  assert.equal(await git(repo, 'branch', '--list', staged.integrationBranch), '');
+});
+
+test('Phase 2 hardening: integrateWorkerIntoRunBranch refuses leftover branch/worktree reuse and enforces base branch parity in check mode', async (t) => {
+  const { repo } = await initTempRepo(t);
+  const runId = 'run_leftover_guard';
+
+  const w1 = await prepareWorkerWorktreePlacement({ baseCwd: repo, taskId: 'lg_1', name: 'w1' });
+  writeFileSync(join(w1.worktreePath, 'w1.txt'), 'w1\n', 'utf8');
+  const staged = await integrateWorkerIntoRunBranch({
+    mainRepoRoot: repo,
+    runId,
+    worktreePath: w1.worktreePath,
+    baseCommit: w1.baseCommit,
+    mode: 'squash',
+    commitMessage: 'stage w1',
+  });
+  assert.equal(staged.result.integrated, true);
+
+  // Finalize with keepWorktree=true so both branch and worktree stay on disk.
+  const fin = await finalizeRunIntegrationBranch({
+    mainRepoRoot: repo,
+    integrationBranch: staged.integrationBranch,
+    integrationWorktreePath: staged.integrationWorktreePath,
+    baseCommit: staged.integrationBaseCommit,
+    expectedTargetRef: 'refs/heads/main',
+    mode: 'squash',
+    commitMessage: 'finalize keep',
+    keepWorktree: true,
+  });
+  assert.equal(fin.result.integrated, true);
+
+  // Attempting to start a brand-new wave (existingBranch/existingWorktreePath omitted) MUST reject in BOTH check and squash.
+  const w2 = await prepareWorkerWorktreePlacement({ baseCwd: repo, taskId: 'lg_2', name: 'w2' });
+  writeFileSync(join(w2.worktreePath, 'w2.txt'), 'w2\n', 'utf8');
+  await assert.rejects(
+    () =>
+      integrateWorkerIntoRunBranch({
+        mainRepoRoot: repo,
+        runId,
+        existingBaseBranch: 'main',
+        worktreePath: w2.worktreePath,
+        baseCommit: w2.baseCommit,
+        mode: 'check',
+        commitMessage: 'check leftover',
+      }),
+    /already exists on disk/i,
+  );
+  await assert.rejects(
+    () =>
+      integrateWorkerIntoRunBranch({
+        mainRepoRoot: repo,
+        runId,
+        existingBaseBranch: 'main',
+        worktreePath: w2.worktreePath,
+        baseCommit: w2.baseCommit,
+        mode: 'squash',
+        commitMessage: 'squash leftover',
+      }),
+    /already exists on disk/i,
+  );
+
+  // Switch to another branch and check a brand-new runId with existingBaseBranch='main': check mode MUST reject just like squash.
+  await git(repo, 'checkout', '-b', 'wrong-branch');
+  await assert.rejects(
+    () =>
+      integrateWorkerIntoRunBranch({
+        mainRepoRoot: repo,
+        runId: 'run_branch_parity',
+        existingBaseBranch: 'main',
+        worktreePath: w2.worktreePath,
+        baseCommit: w2.baseCommit,
+        mode: 'check',
+        commitMessage: 'check wrong branch',
+      }),
+    /bound to base branch "main"/i,
+  );
+});
+
+test('Phase 2 review scope invariants: block evil-merge main reverts and block mode="merge" importing add+revert branch history', async (t) => {
+  const { repo } = await initTempRepo(t);
+  const baseHead = await git(repo, 'rev-parse', 'HEAD');
+
+  // P1 #1: Worker off C0 merges newer main (which fixed app.ts to version=2), but keeps old app.ts (version=1).
+  const wEvil = await prepareWorkerWorktreePlacement({ baseCwd: repo, taskId: 'evil_1', name: 'evil' });
+  writeFileSync(join(repo, 'app.ts'), 'export const version = 2; // security fix\n', 'utf8');
+  await git(repo, 'add', 'app.ts');
+  await git(repo, 'commit', '-m', 'fix: security fix on main');
+  const fixedMainHead = await git(repo, 'rev-parse', 'HEAD');
+
+  writeFileSync(join(wEvil.worktreePath, 'task.md'), '# Task\n', 'utf8');
+  await git(wEvil.worktreePath, 'add', 'task.md');
+  await git(wEvil.worktreePath, 'commit', '-m', 'feat: add task.md');
+  await git(wEvil.worktreePath, 'merge', '--no-commit', '--no-ff', 'main');
+  // Restore old app.ts content in the merge commit (evil merge silently reverting main's fix).
+  writeFileSync(join(wEvil.worktreePath, 'app.ts'), 'export const version = 1;\n', 'utf8');
+  await git(wEvil.worktreePath, 'add', 'app.ts');
+  await git(wEvil.worktreePath, 'commit', '-m', 'merge main keeping old app.ts');
+
+  // Even when called with baseCommit=C0 (where diff C0..snapshot only shows task.md), both check & squash MUST reject!
+  await assert.rejects(
+    () =>
+      checkWorkerIntegration({
+        targetRepoPath: repo,
+        worktreePath: wEvil.worktreePath,
+        baseCommit: baseHead,
+      }),
+    /outside the reviewed diff/i,
+  );
+  await assert.rejects(
+    () =>
+      integrateWorkerChanges({
+        targetRepoPath: repo,
+        worktreePath: wEvil.worktreePath,
+        baseCommit: baseHead,
+        mode: 'squash',
+        commitMessage: 'must not revert main fix',
+      }),
+    /outside the reviewed diff/i,
+  );
+  assert.equal(await git(repo, 'rev-parse', 'HEAD'), fixedMainHead);
+  assert.equal(readFileSync(join(repo, 'app.ts'), 'utf8'), 'export const version = 2; // security fix\n');
+
+  // P2 #2: Branch with F1 (add temp-secret.txt) + F2 (delete temp-secret.txt) has identical tree to main,
+  // but mode="merge" MUST refuse importing F1 and F2 into main's permanent commit history.
+  await git(repo, 'checkout', '-b', 'temp-churn');
+  writeFileSync(join(repo, 'temp-secret.txt'), 'TEMPORARY SECRET\n', 'utf8');
+  await git(repo, 'add', 'temp-secret.txt');
+  await git(repo, 'commit', '-m', 'chore: add temp secret');
+  const f1Sha = await git(repo, 'rev-parse', 'HEAD');
+  rmSync(join(repo, 'temp-secret.txt'));
+  await git(repo, 'add', '-A');
+  await git(repo, 'commit', '-m', 'chore: remove temp secret');
+  const f2Sha = await git(repo, 'rev-parse', 'HEAD');
+
+  const wChurn = await prepareWorkerWorktreePlacement({ baseCwd: repo, taskId: 'churn_1', name: 'churn' });
+  writeFileSync(join(wChurn.worktreePath, 'clean-note.md'), '# Note\n', 'utf8');
+  await git(wChurn.worktreePath, 'add', 'clean-note.md');
+  await git(wChurn.worktreePath, 'commit', '-m', 'docs: add clean-note.md');
+
+  await git(repo, 'checkout', 'main');
+  await assert.rejects(
+    () =>
+      integrateWorkerChanges({
+        targetRepoPath: repo,
+        worktreePath: wChurn.worktreePath,
+        baseCommit: f2Sha,
+        mode: 'merge',
+        commitMessage: 'must not import temp-churn history',
+      }),
+    /Cannot use mode="merge".*not an ancestor/i,
+  );
+  assert.equal(await git(repo, 'rev-parse', 'HEAD'), fixedMainHead);
+  const mainHistory = await git(repo, 'rev-list', 'main');
+  assert.equal(mainHistory.includes(f1Sha), false, 'F1 must not enter main history');
+  assert.equal(mainHistory.includes(f2Sha), false, 'F2 must not enter main history');
 });

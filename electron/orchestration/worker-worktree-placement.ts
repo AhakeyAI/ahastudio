@@ -10,6 +10,25 @@ import { runGitCommand, validateGitRefName } from '../git/git-exec.js';
 import { OrchestrationError } from './orchestration-types.js';
 
 export const WORKER_BRANCH_PREFIX = 'aha/worker/';
+export const RUN_INTEGRATION_BRANCH_PREFIX = 'aha/run/';
+
+export function formatRunIntegrationBranchName(runId: string): string {
+  const cleaned = runId
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  const slug = cleaned || 'run';
+  const candidate = `${RUN_INTEGRATION_BRANCH_PREFIX}${slug}`;
+  const valid = validateGitRefName(candidate);
+  if (!valid || !valid.startsWith(RUN_INTEGRATION_BRANCH_PREFIX)) {
+    throw new OrchestrationError(
+      'invalid_argument',
+      `Could not derive a valid Git branch name for run "${runId}".`,
+    );
+  }
+  return valid;
+}
 
 export interface WorkerWorktreePlacementInput {
   baseCwd: string;
@@ -268,16 +287,17 @@ export async function removeOwnedWorkerWorktree(opts: {
   return { removed: true, removedBranch, path: removed.path };
 }
 
-export async function deleteOwnedWorkerBranch(
+async function deletePrefixedOwnedBranch(
   repoRootPath: string,
+  allowedPrefix: string,
   branchName?: string | null,
   expectedOid?: string | null,
   opts?: { allowSquashCasDelete?: boolean },
 ): Promise<boolean> {
   const trimmed = branchName?.trim();
-  if (!trimmed || !trimmed.startsWith(WORKER_BRANCH_PREFIX)) return false;
+  if (!trimmed || !trimmed.startsWith(allowedPrefix)) return false;
   const valid = validateGitRefName(trimmed);
-  if (!valid) return false;
+  if (!valid || !valid.startsWith(allowedPrefix)) return false;
   const cleanExpectedOid = expectedOid?.trim();
 
   // Never delete a branch still checked out by any active worktree.
@@ -289,7 +309,7 @@ export async function deleteOwnedWorkerBranch(
   if (cleanExpectedOid) {
     if (!/^[0-9a-f]{40}$/i.test(cleanExpectedOid)) return false;
     if (opts?.allowSquashCasDelete) {
-      // Atomic CAS delete for verified squash-integrated worker branches:
+      // Atomic CAS delete for verified squash-integrated owned branches:
       // refuses deletion if the branch moved concurrently after integration.
       const cas = await runGitCommand(['update-ref', '-d', `refs/heads/${valid}`, cleanExpectedOid], {
         cwd: repoRootPath,
@@ -308,6 +328,36 @@ export async function deleteOwnedWorkerBranch(
     timeoutMs: 15_000,
   });
   return res.exitCode === 0;
+}
+
+export async function deleteOwnedWorkerBranch(
+  repoRootPath: string,
+  branchName?: string | null,
+  expectedOid?: string | null,
+  opts?: { allowSquashCasDelete?: boolean },
+): Promise<boolean> {
+  return deletePrefixedOwnedBranch(
+    repoRootPath,
+    WORKER_BRANCH_PREFIX,
+    branchName,
+    expectedOid,
+    opts,
+  );
+}
+
+export async function deleteRunIntegrationBranch(
+  repoRootPath: string,
+  branchName?: string | null,
+  expectedOid?: string | null,
+  opts?: { allowSquashCasDelete?: boolean },
+): Promise<boolean> {
+  return deletePrefixedOwnedBranch(
+    repoRootPath,
+    RUN_INTEGRATION_BRANCH_PREFIX,
+    branchName,
+    expectedOid,
+    opts,
+  );
 }
 
 export async function assertWorkerWorktreeClean(worktreePath: string): Promise<void> {

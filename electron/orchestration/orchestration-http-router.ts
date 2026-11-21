@@ -150,6 +150,7 @@ const workerStartSchema = z.object({
   priority: priorityEnum.optional(),
   retryOfDispatchId: z.string().trim().min(1).optional(),
   reviewOf: z.string().trim().min(1).max(128).optional(),
+  reviewRun: z.union([z.boolean(), z.string().trim().min(1).max(128)]).optional(),
   reviewFocus: z.string().trim().min(1).max(400).optional(),
   cliId: z.string().trim().min(1).optional(),
   agent: z.string().trim().min(1).optional(),
@@ -310,10 +311,27 @@ const workerIntegrateSchema = z.object({
   worker: z.string().trim().min(1).optional(),
   taskId: z.string().trim().min(1).optional(),
   mode: z.enum(['check', 'squash', 'merge']).optional(),
+  targetBranch: z.enum(['main', 'integration', 'auto']).optional(),
   expectedSnapshotOid: z.string().trim().min(7).max(40).optional(),
   commitMessage: z.string().trim().min(1).max(500).optional(),
   releaseAfter: z.boolean().optional(),
   deleteBranch: z.boolean().optional(),
+  force: z.boolean().optional(),
+});
+
+const runDiffSchema = z.object({
+  runId: z.string().trim().min(1).optional(),
+  files: z.array(z.string().trim().min(1).max(400)).max(30).optional(),
+  maxDiffBytes: z.number().int().min(1_024).max(131_072).optional(),
+});
+
+const runFinalizeSchema = z.object({
+  runId: z.string().trim().min(1).optional(),
+  mode: z.enum(['check', 'squash', 'merge']).optional(),
+  expectedSnapshotOid: z.string().trim().min(7).max(40).optional(),
+  commitMessage: z.string().trim().min(1).max(500).optional(),
+  deleteBranch: z.boolean().optional(),
+  keepWorktree: z.boolean().optional(),
   force: z.boolean().optional(),
 });
 
@@ -322,6 +340,7 @@ const delegateTaskSchema = z.object({
   role: z.string().trim().max(120).optional(),
   task: z.string().trim().min(1).optional(),
   reviewOf: z.string().trim().min(1).max(128).optional(),
+  reviewRun: z.union([z.boolean(), z.string().trim().min(1).max(128)]).optional(),
   reviewFocus: z.string().trim().min(1).max(400).optional(),
   ...taskContextFields,
   agent: z.string().trim().min(1).optional(),
@@ -335,8 +354,8 @@ const delegateTaskSchema = z.object({
   planSummary: z.string().trim().max(1_000).optional(),
   runId: z.string().trim().min(1).optional(),
   callerCwd: z.string().trim().min(1).optional(),
-}).refine((val) => Boolean(val.task || val.reviewOf), {
-  message: 'Either task or reviewOf is required.',
+}).refine((val) => Boolean(val.task || val.reviewOf || val.reviewRun), {
+  message: 'Either task, reviewOf, or reviewRun is required.',
 });
 
 const workerDoneSelfSchema = z.object({
@@ -435,6 +454,7 @@ const READ_ONLY_ORCHESTRATION_ACTIONS = new Set([
   'run-current',
   'run-list',
   'run-show',
+  'run-diff',
   'task-list',
   'task-show',
   'dispatch-show',
@@ -506,6 +526,12 @@ export async function dispatchOrchestrationHttpAction(
         break;
       case 'run-show':
         result = service.runShow(runShowSchema.parse(payload).id, httpCallerPane());
+        break;
+      case 'run-diff':
+        result = await service.runDiff(runDiffSchema.parse(payload), httpCallerPane());
+        break;
+      case 'run-finalize':
+        result = await service.runFinalizeIntegration(runFinalizeSchema.parse(payload), httpCallerPane());
         break;
       case 'task-create': {
         const parsed = taskCreateSchema.parse(payload);

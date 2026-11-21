@@ -177,7 +177,7 @@ function buildDelegateTaskTool(ctx) {
         task: {
           type: 'string',
           description:
-            'Clear, self-contained task specification for the worker (workers start with a blank context and cannot see your prior chat). Optional when reviewOf is set.',
+            'Clear, self-contained task specification for the worker (workers start with a blank context and cannot see your prior chat). Optional when reviewOf or reviewRun is set.',
         },
         reviewOf: {
           type: 'string',
@@ -185,11 +185,16 @@ function buildDelegateTaskTool(ctx) {
           description:
             'Launch an isolated read-only adversarial review of this settled worker (@role or dispatchId). Automatically selects a heterogeneous Coding Agent avoiding the author CLI, snapshots the diff into a detached review worktree, and withholds author self-summary.',
         },
+        reviewRun: {
+          type: 'boolean',
+          description:
+            'Launch a post-integration Run-level overall secondary adversarial review across the combined changes of your active Run. Avoids all integrated implementation CLIs, snapshots the combined integrated commit into a detached read-only worktree, and firewalls worker verbal summaries.',
+        },
         reviewFocus: {
           type: 'string',
           maxLength: 400,
           description:
-            'Optional review focus angle when reviewOf is set (enables parallel multi-perspective L2 reviews, e.g. "security & state transitions" vs "edge cases & tests").',
+            'Optional review focus angle when reviewOf or reviewRun is set (enables parallel multi-perspective L2 reviews, e.g. "security & state transitions" vs "edge cases & tests").',
         },
         context: {
           type: 'string',
@@ -578,7 +583,7 @@ function buildToolsForContext(ctx) {
     {
       name: 'integrate_worker',
       description:
-        'Safely check or integrate a settled worker changes into the main workspace (default mode="squash" for one clean commit per worker, releaseAfter=true to release panes and clean up verified worktrees and safely deletable aha/worker/* branches). Aborts cleanly on conflict and refuses to overwrite a dirty main workspace.',
+        'Safely check or integrate a settled worker changes into the main workspace or the Run integration branch aha/run/<runId> (default mode="squash" for one clean commit per worker, releaseAfter=true to release panes and clean up verified worktrees and safely deletable aha/worker/* branches). Aborts cleanly on conflict and refuses to overwrite a dirty main workspace unless targetBranch="integration" or "auto" routes to aha/run/<runId>.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -590,6 +595,11 @@ function buildToolsForContext(ctx) {
             type: 'string',
             enum: ['check', 'squash', 'merge'],
             description: 'Integration mode: "check" (read-only conflict check), "squash" (default, one clean commit), or "merge".',
+          },
+          targetBranch: {
+            type: 'string',
+            enum: ['main', 'integration', 'auto'],
+            description: 'Target branch strategy: "main" (default unless a Run integration branch is already active), "integration" (use aha/run/<runId> in an isolated worktree even when main has dirty edits), or "auto" (use main if clean, otherwise aha/run/<runId>).',
           },
           expectedSnapshotOid: {
             type: 'string',
@@ -614,6 +624,66 @@ function buildToolsForContext(ctx) {
           },
         },
         required: ['role'],
+      },
+    },
+    {
+      name: 'inspect_run_diff',
+      description:
+        'Read-only inspection of the combined integrated changes across a Run (baseCommit..integrationHead on aha/run/<runId> or main), including integrated workers, commits, diff stat, bounded unified diff, integration status, and Run-level secondary adversarial review status.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          runId: {
+            type: 'string',
+            description: 'Optional run ID (defaults to this coordinator active run).',
+          },
+          files: {
+            type: 'array',
+            maxItems: 30,
+            items: { type: 'string', minLength: 1, maxLength: 400 },
+            description: 'Optional relative file paths to inspect full diff for specific files.',
+          },
+          maxDiffBytes: {
+            type: 'number',
+            description: 'Optional diff byte budget (1024..131072, default 32768).',
+          },
+        },
+      },
+    },
+    {
+      name: 'finalize_run_integration',
+      description:
+        'Check or promote an active Run integration branch (aha/run/<runId>) back into the main branch once the main workspace is clean (default mode="squash"). Enforces Run-level adversarial review gates if started, protects against dirty main / ignored-file collisions / conflicts, and cleans up the _run-* worktree and aha/run/* branch.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          runId: {
+            type: 'string',
+            description: 'Optional run ID (defaults to this coordinator active run).',
+          },
+          mode: {
+            type: 'string',
+            enum: ['check', 'squash', 'merge'],
+            description: 'Promotion mode: "check" (read-only conflict check), "squash" (default, one clean commit), or "merge".',
+          },
+          expectedSnapshotOid: {
+            type: 'string',
+            description: 'Optional commit OID of aha/run/<runId> HEAD to guarantee no drift since review.',
+          },
+          commitMessage: {
+            type: 'string',
+            maxLength: 500,
+            description: 'Optional commit message when promoting into main.',
+          },
+          deleteBranch: {
+            type: 'boolean',
+            description: 'Delete the aha/run/<runId> branch via atomic CAS after promotion (default: true).',
+          },
+          keepWorktree: {
+            type: 'boolean',
+            description: 'Retain the _run-* integration worktree after promotion (default: false).',
+          },
+        },
       },
     },
   ];
@@ -850,6 +920,11 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       const terminal = nonEmptyStr(args.terminal);
       const planSummary = nonEmptyStr(args.planSummary ?? args.plan_summary);
       const reviewOf = nonEmptyStr(args.reviewOf ?? args.review_of);
+      const rawReviewRun = args.reviewRun !== undefined ? args.reviewRun : args.review_run;
+      const reviewRun =
+        typeof rawReviewRun === 'boolean'
+          ? rawReviewRun
+          : nonEmptyStr(rawReviewRun);
       const reviewFocus = nonEmptyStr(args.reviewFocus ?? args.review_focus);
       const context = nonEmptyStr(args.context) || nonEmptyStr(args.background);
       const proposalId = nonEmptyStr(args.proposalId);
@@ -859,6 +934,7 @@ async function handleToolCall(name, rawArgs, activeRequests) {
         ...(role ? { role } : {}),
         ...(typeof args.task === 'string' && args.task.trim() ? { task: args.task } : {}),
         ...(reviewOf ? { reviewOf } : {}),
+        ...(reviewRun !== undefined ? { reviewRun } : {}),
         ...(reviewFocus ? { reviewFocus } : {}),
         ...(context ? { context } : {}),
         ...(taskContext !== undefined ? { taskContext } : {}),
@@ -1030,11 +1106,13 @@ async function handleToolCall(name, rawArgs, activeRequests) {
     case 'integrate_worker': {
       const target = nonEmptyStr(args.role ?? args.worker ?? args.dispatchId ?? args.dispatch_id);
       const mode = nonEmptyStr(args.mode);
+      const targetBranch = nonEmptyStr(args.targetBranch ?? args.target_branch);
       const expectedSnapshotOid = nonEmptyStr(args.expectedSnapshotOid ?? args.expected_snapshot_oid);
       const commitMessage = nonEmptyStr(args.commitMessage ?? args.commit_message);
       const res = await callAction('worker-integrate', {
         ...(target ? { worker: target } : {}),
         ...(mode ? { mode } : {}),
+        ...(targetBranch ? { targetBranch } : {}),
         ...(expectedSnapshotOid ? { expectedSnapshotOid } : {}),
         ...(commitMessage ? { commitMessage } : {}),
         ...(typeof args.releaseAfter === 'boolean' ? { releaseAfter: args.releaseAfter } : {}),
@@ -1044,7 +1122,10 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       if (!res.ok) return toolText(res.errorText, true);
       const r = res.result || {};
       const lines = [
-        `Integration [${r.mode || 'squash'}] for @${r.role || target}: ${r.message || ''}`,
+        `Integration [${r.mode || 'squash'}] for @${r.role || target}${r.targetBranch ? ` -> ${r.targetBranch}` : ''}: ${r.message || ''}`,
+        ...(r.usedRunIntegrationBranch
+          ? [`Run integration branch active (${r.targetBranch || 'aha/run/*'}). Call finalize_run_integration once the main workspace is clean.`]
+          : []),
         ...(r.integratedCommit ? [`Commit: ${r.integratedCommit}`] : []),
         ...(r.snapshotOid ? [`Snapshot: ${r.snapshotOid}`] : []),
         ...(Array.isArray(r.conflictFiles) && r.conflictFiles.length > 0
@@ -1057,6 +1138,81 @@ async function handleToolCall(name, rawArgs, activeRequests) {
           ? [`Cleaned up worker resources${r.releasedReviews ? ` + ${r.releasedReviews} review helper(s)` : ''}.`]
           : []),
         ...(r.releaseSkippedReason ? [`Release skipped: ${r.releaseSkippedReason}`] : []),
+        ...(Array.isArray(r.cleanupWarnings) && r.cleanupWarnings.length > 0
+          ? ['Cleanup warnings:', ...r.cleanupWarnings.map((w) => `  - ${w}`)]
+          : []),
+      ];
+      return toolText(lines.join('\n'));
+    }
+    case 'inspect_run_diff': {
+      const runId = nonEmptyStr(args.runId ?? args.run_id);
+      const files = Array.isArray(args.files)
+        ? args.files.map(nonEmptyStr).filter(Boolean)
+        : undefined;
+      const maxDiffBytes = finitePositiveInt(args.maxDiffBytes ?? args.max_diff_bytes);
+      const res = await callAction('run-diff', {
+        ...(runId ? { runId } : {}),
+        ...(files && files.length > 0 ? { files } : {}),
+        ...(maxDiffBytes !== undefined ? { maxDiffBytes } : {}),
+      });
+      if (!res.ok) return toolText(res.errorText, true);
+      const r = res.result || {};
+      const lines = [
+        `Run ${r.runId || ''} · integration=${r.integrationStatus || 'none'}${r.integrationBranch ? ` (${r.integrationBranch})` : ''} · runReview=${r.runReviewStatus || 'none'} (R${r.runReviewRound || 0})`,
+        r.hasIntegratedChanges
+          ? `Git: branch=${r.branch || '(detached)'} | base=${r.baseCommit || 'none'} | target=${r.targetCommit || 'none'} | commits=${r.commitsAhead || 0} | files=${(r.changedFiles || []).length}`
+          : (r.message || 'No integrated changes recorded for this run yet.'),
+        `Recommended review tier: ${r.recommendedReviewTier || 'L0'} (${r.tierReason || ''})`,
+      ];
+      if (Array.isArray(r.integratedWorkers) && r.integratedWorkers.length > 0) {
+        lines.push(
+          'Integrated workers:',
+          ...r.integratedWorkers.map(
+            (w) => `  - @${w.role} (${w.dispatchId}${w.cliId ? `, ${w.cliId}` : ''})${w.integratedCommit ? ` @ ${String(w.integratedCommit).slice(0, 10)}` : ''}`,
+          ),
+        );
+      }
+      if (Array.isArray(r.commits) && r.commits.length > 0) {
+        lines.push('Commits:', ...r.commits.map((c) => `  - ${c.sha} ${c.subject}`));
+      }
+      if (r.diffStat) {
+        lines.push('Diff stat:', r.diffStat);
+      }
+      if (r.diffError) {
+        lines.push(`Diff error: ${r.diffError}`);
+      } else if (r.diff) {
+        lines.push('', r.diff);
+      }
+      return toolText(lines.join('\n'));
+    }
+    case 'finalize_run_integration': {
+      const runId = nonEmptyStr(args.runId ?? args.run_id);
+      const mode = nonEmptyStr(args.mode);
+      const expectedSnapshotOid = nonEmptyStr(args.expectedSnapshotOid ?? args.expected_snapshot_oid);
+      const commitMessage = nonEmptyStr(args.commitMessage ?? args.commit_message);
+      const res = await callAction('run-finalize', {
+        ...(runId ? { runId } : {}),
+        ...(mode ? { mode } : {}),
+        ...(expectedSnapshotOid ? { expectedSnapshotOid } : {}),
+        ...(commitMessage ? { commitMessage } : {}),
+        ...(typeof args.deleteBranch === 'boolean' ? { deleteBranch: args.deleteBranch } : {}),
+        ...(typeof args.keepWorktree === 'boolean' ? { keepWorktree: args.keepWorktree } : {}),
+      });
+      if (!res.ok) return toolText(res.errorText, true);
+      const r = res.result || {};
+      const lines = [
+        `Run finalization [${r.mode || 'squash'}] ${r.integrationBranch || ''} -> ${r.targetBranch || 'main'}: ${r.message || ''}`,
+        ...(r.integratedCommit ? [`Commit: ${r.integratedCommit}`] : []),
+        ...(r.snapshotOid ? [`Run snapshot: ${r.snapshotOid}`] : []),
+        ...(Array.isArray(r.conflictFiles) && r.conflictFiles.length > 0
+          ? [`Conflicts: ${r.conflictFiles.join(', ')}`]
+          : []),
+        ...(Array.isArray(r.ignoredCollisionFiles) && r.ignoredCollisionFiles.length > 0
+          ? [`Ignored file collisions: ${r.ignoredCollisionFiles.join(', ')}`]
+          : []),
+        ...(r.removedWorktree
+          ? [`Cleaned up run integration worktree${r.removedBranch ? ` and branch ${r.integrationBranch}` : ''}${r.releasedReviews ? ` + ${r.releasedReviews} run review helper(s)` : ''}.`]
+          : []),
         ...(Array.isArray(r.cleanupWarnings) && r.cleanupWarnings.length > 0
           ? ['Cleanup warnings:', ...r.cleanupWarnings.map((w) => `  - ${w}`)]
           : []),

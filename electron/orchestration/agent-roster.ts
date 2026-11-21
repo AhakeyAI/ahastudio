@@ -61,6 +61,8 @@ export interface SelectAgentForTaskOptions {
   coordinatorCliId?: string | null;
   /** CLI that authored the work under review; review tasks strictly avoid it first. */
   authorCliId?: string | null;
+  /** Multiple author CLIs (e.g. Run-level review across several integrated workers). */
+  authorCliIds?: readonly string[];
   excludeCliIds?: readonly string[];
   preferIdle?: boolean;
 }
@@ -196,17 +198,18 @@ function rankCandidates(
   opts: {
     taskKind?: OrchestrationTaskKind | null;
     coordinatorCliId?: string | null;
-    authorCliId?: string | null;
+    authorCliIds?: ReadonlySet<string>;
     preferIdle?: boolean;
   },
 ): Array<{ entry: OrchestrationAgentRosterEntry; score: number; heterogeneousReview: boolean; usedIdleBoost: boolean }> {
+  const authorSet = opts.authorCliIds ?? new Set<string>();
   return candidates
     .map((entry, index) => {
       let score = affinityScore(entry.cliId, opts.taskKind);
       let heterogeneousReview = false;
       if (opts.taskKind === 'review') {
-        if (opts.authorCliId) {
-          if (entry.cliId !== opts.authorCliId) {
+        if (authorSet.size > 0) {
+          if (!authorSet.has(entry.cliId)) {
             score += 60;
             heterogeneousReview = true;
           }
@@ -238,7 +241,15 @@ export function selectAgentForTask(opts: SelectAgentForTaskOptions): SelectedAge
   const coordinatorCliId = opts.coordinatorCliId
     ? normalizeAgentCliAlias(opts.coordinatorCliId)
     : null;
-  const authorCliId = opts.authorCliId ? normalizeAgentCliAlias(opts.authorCliId) : null;
+  const authorCliIds = new Set<string>();
+  if (opts.authorCliId) {
+    const normalized = normalizeAgentCliAlias(opts.authorCliId);
+    if (normalized) authorCliIds.add(normalized);
+  }
+  for (const raw of opts.authorCliIds ?? []) {
+    const normalized = normalizeAgentCliAlias(raw);
+    if (normalized) authorCliIds.add(normalized);
+  }
   const availableEntries = opts.roster.filter(
     (entry) => entry.available && !excluded.has(entry.cliId),
   );
@@ -269,7 +280,7 @@ export function selectAgentForTask(opts: SelectAgentForTaskOptions): SelectedAge
     }
     const fallbacks = rankCandidates(
       availableEntries.filter((item) => item.cliId !== entry.cliId),
-      { taskKind: opts.taskKind, coordinatorCliId, authorCliId, preferIdle: opts.preferIdle },
+      { taskKind: opts.taskKind, coordinatorCliId, authorCliIds, preferIdle: opts.preferIdle },
     ).map((item) => item.entry.cliId);
 
     return {
@@ -298,14 +309,14 @@ export function selectAgentForTask(opts: SelectAgentForTaskOptions): SelectedAge
   const ranked = rankCandidates(availableEntries, {
     taskKind: opts.taskKind,
     coordinatorCliId,
-    authorCliId,
+    authorCliIds,
     preferIdle: opts.preferIdle,
   });
   const top = ranked[0];
   const reasons: string[] = [];
   if (top.heterogeneousReview) {
-    if (authorCliId) {
-      reasons.push(`异构评审（避开实现者 ${authorCliId}）`);
+    if (authorCliIds.size > 0) {
+      reasons.push(`异构评审（避开实现者 ${[...authorCliIds].join('/')}）`);
     } else if (coordinatorCliId) {
       reasons.push(`异构评审（避开协调者 ${coordinatorCliId}）`);
     }

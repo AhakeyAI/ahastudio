@@ -95,6 +95,8 @@ export interface BoardViewModel {
   run: OrchestrationRunRecord | null;
   isLive: boolean;
   runStatusLabel: string;
+  runIntegrationBadge?: { label: string; tone: StatusTone } | null;
+  runReviewBadge?: { label: string; tone: StatusTone } | null;
   hasAnyActiveRun: boolean;
   headSeq: number;
   posts: BoardPostView[];
@@ -753,11 +755,40 @@ export function buildBoardViewModel(
     openQuestions.length +
     openGates.length;
 
+  let runIntegrationBadge: { label: string; tone: StatusTone } | null = null;
+  if (run.integrationStatus === 'active' && run.integrationBranch) {
+    runIntegrationBadge = { label: `集成分支 ${run.integrationBranch}`, tone: 'accent' };
+  } else if (run.integrationStatus === 'finalized') {
+    runIntegrationBadge = { label: 'Run 已合入主分支', tone: 'ok' };
+  } else if (run.integrationStatus === 'conflict') {
+    runIntegrationBadge = { label: 'Run 集成冲突', tone: 'error' };
+  }
+
+  let runReviewBadge: { label: string; tone: StatusTone } | null = null;
+  if (run.runReviewStatus === 'escalated') {
+    runReviewBadge = { label: '整体验收升级', tone: 'error' };
+  } else if (run.runReviewStatus === 'rejected') {
+    runReviewBadge = { label: `整体验收打回 R${run.runReviewRound ?? 1}`, tone: 'warn' };
+  } else if (run.runReviewStatus === 'pending') {
+    runReviewBadge = { label: '整体对抗审查中', tone: 'accent' };
+  } else if (run.runReviewStatus === 'passed') {
+    const stalePass =
+      run.integrationStatus !== 'finalized' &&
+      Boolean(run.runReviewSnapshotOid) &&
+      Boolean(run.integrationHeadCommit) &&
+      run.runReviewSnapshotOid !== run.integrationHeadCommit;
+    runReviewBadge = stalePass
+      ? { label: '整体验收需重审', tone: 'warn' }
+      : { label: '整体验收通过', tone: 'ok' };
+  }
+
   return {
     runs,
     run,
     isLive: run.status === 'active',
     runStatusLabel: runStatusDisplayLabel(run.status),
+    runIntegrationBadge,
+    runReviewBadge,
     hasAnyActiveRun,
     headSeq,
     posts,

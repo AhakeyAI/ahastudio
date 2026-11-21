@@ -1021,6 +1021,26 @@ export function OrchestrationBoardPanel({
             </button>
           )}
         </div>
+        {(model.runIntegrationBadge || model.runReviewBadge) && (
+          <div className="obp-header-badges">
+            {model.runIntegrationBadge && (
+              <span
+                className={`obp-stage-pill obp-header-badge tone-${model.runIntegrationBadge.tone}`}
+                title={model.runIntegrationBadge.label}
+              >
+                {model.runIntegrationBadge.label}
+              </span>
+            )}
+            {model.runReviewBadge && (
+              <span
+                className={`obp-stage-pill obp-header-badge tone-${model.runReviewBadge.tone}`}
+                title={model.runReviewBadge.label}
+              >
+                {model.runReviewBadge.label}
+              </span>
+            )}
+          </div>
+        )}
         <nav className="obp-subtabs" role="tablist" aria-label="协作视图">
           <button
             type="button"
