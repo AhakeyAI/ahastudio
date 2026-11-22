@@ -15,6 +15,7 @@ import {
   type AgentMcpCliId,
 } from './agent/agent-mcp-installer.js';
 import { AgentStatusStore } from './agent/agent-status-store.js';
+import { coordinatorInstructions } from './orchestration/coordinator-prompt.js';
 import { registerAgentIpc } from './ipc/agent.js';
 import { registerAgentHooksIpc } from './ipc/agent-hooks.js';
 import { registerAgentMcpIpc } from './ipc/agent-mcp.js';
@@ -351,7 +352,8 @@ app.whenReady().then(async () => {
 
   const hookInstaller = new AgentHookInstaller();
   const mcpCliIdSet = new Set<string>(AGENT_MCP_CLI_IDS);
-  const { enabledCodexPilot, launchCodexPilot } = await import('./orchestration/codex-app-server-pilot.js');
+  const { COORDINATOR_APPROVED_MCP_TOOLS, enabledCodexPilot, launchCodexPilot } =
+    await import('./orchestration/codex-app-server-pilot.js');
   const orchestrationStore = OrchestrationStore.forUserDataDir(() => app.getPath('userData'));
   const orchestrationService = new OrchestrationService({
     store: orchestrationStore,
@@ -482,31 +484,10 @@ app.whenReady().then(async () => {
     if (mcpCtx.role === 'worker' && !mcpCtx.canDelegate) {
       return null;
     }
-    const availableAgents = mcpCtx.roster.filter((entry) => entry.available);
-    const agentListText =
-      availableAgents.length > 0
-        ? availableAgents
-            .map((a) => {
-              const idleNote = a.idlePanes.length > 0 ? ` (${a.idlePanes.length} idle)` : '';
-              return `${a.cliId}${idleNote}: ${a.specialty}`;
-            })
-            .join('; ')
-        : '(no available coding agents detected)';
-    const lines = [
-      '[AhaStation Orchestration Mode Active — Coordinator]',
-      'Prefer AhaStation MCP tools (`delegate_task`, `post_message`, `read_board`, `board_wait`, `team_status`, `manage_worker`) over built-in subagents so tasks run in visible AhaStation Coding Agent terminals with optional isolated Git worktrees.',
-      `Available Coding Agents: ${agentListText}.`,
-      'Pick the Coding Agent best suited to each subtask (prefer a heterogeneous CLI for independent review/tests).',
-      ...(mcpCtx.confirmMode === 'chat-and-guard'
-        ? [
-            'Confirmation rule (2-step): before spawning new workers on a request, first call `delegate_task` with `confirmed=false` to register the dispatch plan without spawning, then give ONE short natural sentence confirming role, Coding Agent, task, and whether to use an isolated worktree; after the user replies to confirm, call `delegate_task` with `confirmed=true` (parallel batch calls in that confirmed turn all pass without re-confirming).',
-          ]
-        : []),
-    ];
     const hookStdout = formatAdditionalContextHookStdout(
       req.provider,
       req.eventName,
-      lines.join('\n'),
+      coordinatorInstructions(mcpCtx),
     );
     return hookStdout ? { hookStdout } : null;
   });
@@ -545,9 +526,24 @@ app.whenReady().then(async () => {
   const { AgentSessionManager } = await import('./orchestration/agent-session-manager.js');
   const { registerAgentSessionsIpc } = await import('./ipc/agent-sessions.js');
   const agentSessions = new AgentSessionManager({
-    launch: (_sessionId, cwd, events) => launchCodexPilot({ cwd, events }),
+    launch: (sessionId, cwd, events, { orchestration }) => {
+      if (!orchestration) return launchCodexPilot({ cwd, events });
+      const mcpServerPath = resolveActiveMcpServerPath();
+      if (!agentHookServer || !mcpServerPath) throw new Error('Aha MCP Server is unavailable');
+      return launchCodexPilot({
+        cwd, events,
+        mcp: {
+          serverPath: mcpServerPath, env: agentHookServer.envForSession(sessionId),
+          requiredTool: 'delegate_task', approvedTools: COORDINATOR_APPROVED_MCP_TOOLS,
+        },
+      });
+    },
+    coordinatorInstructions: (sessionId) =>
+      coordinatorInstructions(orchestrationService.getMcpContextForPane(sessionId)),
+    onCoordinatorEnded: (sessionId) => orchestrationService.endSessionCoordinator(sessionId),
     storageFile: () => join(app.getPath('userData'), 'agent-sessions.json'),
   });
+  orchestrationService.setSessionCoordinators({ get: (id) => agentSessions.coordinatorState(id) });
   const agentSessionsIpc = registerAgentSessionsIpc(ipcCtx, agentSessions);
   const offPtyExit = shellPtyCtrl.onPtyExit((ptyId) => {
     orchestrationService.markPtyExited(ptyId);

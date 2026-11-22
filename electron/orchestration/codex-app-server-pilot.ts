@@ -350,8 +350,9 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   get closing(): boolean { return this.stopping; }
   get latestTurnKey(): string | null { return this.outputTurnKey; }
 
-  async open({ cwd, model, policy, resumeSessionId, network = false }: {
+  async open({ cwd, model, policy, resumeSessionId, network = false, developerInstructions }: {
     cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string; network?: boolean;
+    developerInstructions?: string;
   }): Promise<string> {
     const wanted = POLICIES[policy];
     try {
@@ -362,6 +363,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
       const settings = {
         cwd, ...(model ? { model } : {}), sandbox: wanted.sandbox,
         approvalPolicy: wanted.approvalPolicy, approvalsReviewer: 'user',
+        ...(developerInstructions ? { developerInstructions } : {}),
       };
       const result = object(resumeSessionId
         ? await this.request('thread/resume', { threadId: resumeSessionId, ...settings, excludeTurns: true })

@@ -257,6 +257,7 @@ const api = {
     answer: (opts) => ipcRenderer.invoke('agent-sessions:answer', opts),
     close: (opts) => ipcRenderer.invoke('agent-sessions:close', opts),
     timeline: (opts) => ipcRenderer.invoke('agent-sessions:timeline', opts),
+    setOrchestration: (opts) => ipcRenderer.invoke('agent-sessions:set-orchestration', opts),
     onChanged: (cb) => {
       const listener = (_, sessions) => cb(sessions);
       ipcRenderer.on('agent-sessions:changed', listener);

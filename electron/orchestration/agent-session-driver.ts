@@ -88,8 +88,10 @@ export interface AgentSessionDriver {
 
   /** Starts a conversation, or continues `resumeSessionId` where the provider left it. */
   /** `network` lets sandboxed commands reach the network; off unless asked for. */
+  /** `developerInstructions` are set on the conversation, e.g. the Coordinator rules in orchestration mode. */
   open(input: {
     cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string; network?: boolean;
+    developerInstructions?: string;
   }): Promise<string>;
   /** `model`, `effort`, `policy`, and `network` apply to this turn and stay in effect for later ones. */
   startTurn(input: {

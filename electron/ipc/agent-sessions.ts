@@ -26,6 +26,7 @@ const answerSchema = z.object({
   answers: z.record(z.string().max(200), z.array(z.string().max(4_000)).max(20)).nullable(),
 }).strict();
 const targetSchema = z.object({ id }).strict();
+const orchestrationSchema = z.object({ id, enabled: z.boolean() }).strict();
 const respondSchema = z.object({
   id, requestId: z.string().min(1).max(64), allow: z.boolean(), reason: z.string().max(2_000).optional(),
 }).strict();
@@ -71,6 +72,11 @@ export function registerAgentSessionsIpc(ctx: IpcContext, manager: AgentSessionM
   });
   secure('close', targetSchema, async (input) => {
     await manager.close(input.id);
+    return {};
+  });
+  secure('set-orchestration', orchestrationSchema, async (input) => {
+    const result = await manager.setOrchestration(input.id, input.enabled);
+    if (!result.ok) throw new Error(result.error);
     return {};
   });
   secure('timeline', targetSchema, (input) => ({ timeline: manager.getTimeline(input.id) }));

@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
 import { AgentHookServer } from '../dist-electron/agent/agent-hook-server.js';
+import { AgentSessionManager } from '../dist-electron/orchestration/agent-session-manager.js';
 import {
   COORDINATOR_APPROVED_MCP_TOOLS, CodexAppServerPilot, codexMcpConfigArgs,
 } from '../dist-electron/orchestration/codex-app-server-pilot.js';
@@ -243,4 +245,115 @@ test('Aha MCP server exposes Coordinator tools to a session and delegates throug
 
   app.sessions.set(SESSION_A, { cwd: sessionCwd, provider: 'codex', active: false });
   assert.deepEqual((await mcpRequest(env, 'tools/list', {})).tools, []);
+});
+
+function sessionSetup(t, { dir = mkdtempSync(join(cwd, '.session-coordinator-test-')), failOrchestration = false, owner = true } = {}) {
+  const trace = join(dir, 'rpc.jsonl');
+  const launches = [];
+  const ended = [];
+  const manager = new AgentSessionManager({
+    launch: (id, workdir, events, { orchestration }) => {
+      launches.push({ id, orchestration });
+      if (orchestration && failOrchestration) throw new Error('Aha MCP Server is unavailable');
+      return new CodexAppServerPilot(
+        spawn(process.execPath, [join(cwd, 'tests/fixtures/mock-codex-app-server.mjs'), 'normal', trace], {
+          cwd: workdir, stdio: 'pipe', windowsHide: true,
+        }),
+        events, 850, [], orchestration ? 'delegate_task' : null,
+      );
+    },
+    coordinatorInstructions: (id) => `[AhaStation Orchestration Mode Active — Coordinator] for ${id}`,
+    onCoordinatorEnded: (id) => ended.push(id),
+    storageFile: () => join(dir, 'agent-sessions.json'),
+  });
+  if (owner) {
+    t.after(async () => {
+      await manager.dispose();
+      rmSync(dir, { force: true, recursive: true, maxRetries: 20, retryDelay: 100 });
+    });
+  }
+  const sent = (method) => {
+    try {
+      return readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse)
+        .filter((message) => message.method === method).map((message) => message.params);
+    } catch {
+      return [];
+    }
+  };
+  const info = (id) => manager.list().find((session) => session.id === id);
+  return { dir, manager, launches, ended, sent, info };
+}
+
+async function settle(read, timeout = 4_000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (read()) return;
+    await delay(20);
+  }
+  assert.fail('Expected session state did not appear');
+}
+
+test('orchestration mode switches only between turns and resumes the same thread with Coordinator rules', async (t) => {
+  const app = sessionSetup(t);
+  const session = await app.manager.create({ cwd, policy: 'workspace-write' });
+  assert.equal(session.orchestration, false);
+  assert.equal(app.manager.coordinatorState(session.id).active, false);
+
+  await app.manager.send(session.id, { text: 'WAIT_FOR_INTERRUPT' });
+  const busy = await app.manager.setOrchestration(session.id, true);
+  assert.equal(busy.ok, false);
+  assert.equal(app.info(session.id).orchestration, false);
+  await app.manager.interrupt(session.id);
+  await settle(() => app.info(session.id).status === 'idle');
+
+  assert.deepEqual(await app.manager.setOrchestration(session.id, true), { ok: true });
+  const on = app.info(session.id);
+  assert.deepEqual([on.status, on.orchestration, on.providerSessionId], ['idle', true, 'mock-thread-id']);
+  assert.deepEqual(app.launches.map((launch) => launch.orchestration), [false, true]);
+  const resumed = app.sent('thread/resume');
+  assert.equal(resumed.length, 1);
+  assert.equal(resumed[0].threadId, 'mock-thread-id');
+  assert.match(resumed[0].developerInstructions, /Orchestration Mode Active/);
+  assert.equal(app.sent('thread/start')[0].developerInstructions, undefined);
+  assert.equal(app.sent('mcpServerStatus/list').length, 1, 'an orchestrating thread must expose delegate_task');
+  assert.deepEqual(app.manager.coordinatorState(session.id), { cwd, provider: 'codex', active: true });
+  // The replaced process must not close the session or leave a failed turn behind.
+  assert.equal(app.manager.getTimeline(session.id).turns.at(-1).status, 'interrupted');
+  assert.equal((await app.manager.send(session.id, { text: 'Plan the work' })).status, 'accepted');
+  await settle(() => app.info(session.id).status === 'idle');
+
+  assert.deepEqual(await app.manager.setOrchestration(session.id, false), { ok: true });
+  assert.deepEqual(app.ended, [session.id]);
+  assert.equal(app.sent('thread/resume')[1].developerInstructions, undefined);
+  assert.deepEqual(app.launches.map((launch) => launch.orchestration), [false, true, false]);
+  assert.equal(app.manager.coordinatorState(session.id).active, false);
+});
+
+test('orchestration mode survives a restart and applies when the conversation resumes', async (t) => {
+  const dir = mkdtempSync(join(cwd, '.session-coordinator-test-'));
+  const first = sessionSetup(t, { dir, owner: false });
+  const session = await first.manager.create({ cwd, policy: 'read-only' });
+  await first.manager.setOrchestration(session.id, true);
+  await first.manager.dispose();
+
+  const second = sessionSetup(t, { dir });
+  const restored = second.info(session.id);
+  assert.deepEqual([restored.status, restored.orchestration], ['suspended', true]);
+  assert.equal(second.manager.coordinatorState(session.id).active, false, 'no process, no Coordinator calls');
+  assert.equal((await second.manager.send(session.id, { text: 'Continue coordinating' })).status, 'accepted');
+  assert.deepEqual(second.launches.map((launch) => launch.orchestration), [true]);
+  assert.match(second.sent('thread/resume').at(-1).developerInstructions, /Orchestration Mode Active/);
+  assert.equal(second.manager.coordinatorState(session.id).active, true);
+});
+
+test('a failed switch keeps the previous mode so the next message resumes the plain conversation', async (t) => {
+  const app = sessionSetup(t, { failOrchestration: true });
+  const session = await app.manager.create({ cwd, policy: 'read-only' });
+  const result = await app.manager.setOrchestration(session.id, true);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Aha MCP Server is unavailable/);
+  assert.deepEqual([app.info(session.id).orchestration, app.info(session.id).status], [false, 'failed']);
+  assert.deepEqual(app.ended, [session.id]);
+  assert.equal((await app.manager.send(session.id, { text: 'Still here?' })).status, 'accepted');
+  assert.deepEqual(app.launches.map((launch) => launch.orchestration), [false, true, false]);
 });

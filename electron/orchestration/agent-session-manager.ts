@@ -21,6 +21,8 @@ export interface AgentSessionInfo {
   effort: string | null;
   policy: AgentSessionPolicy;
   network: boolean;
+  /** Acts as a Coordinator through Aha MCP; only switched while idle, and kept across restarts. */
+  orchestration: boolean;
   providerSessionId: string | null;
   status: AgentSessionStatus;
   error: string | null;
@@ -43,10 +45,18 @@ interface Session {
   timeline: WorkerTimeline;
   turns: number;
   requests: Map<string, PendingRequest>;
+  /** Bumped for each provider process, so a replaced process cannot change the session. */
+  generation: number;
 }
 
 export interface AgentSessionManagerDependencies {
-  launch: (sessionId: string, cwd: string, events: AgentSessionEvents) => AgentSessionDriver;
+  launch: (
+    sessionId: string, cwd: string, events: AgentSessionEvents, options: { orchestration: boolean },
+  ) => AgentSessionDriver;
+  /** Coordinator rules for an orchestrating session's conversation; without it orchestration mode is unavailable. */
+  coordinatorInstructions?: (sessionId: string) => string;
+  /** A session stopped coordinating (switched off or closed); its pending orchestration state can go. */
+  onCoordinatorEnded?: (sessionId: string) => void;
   /** Where sessions are kept across restarts; omitted keeps them in memory only. */
   storageFile?: () => string;
   now?: () => number;
@@ -98,7 +108,7 @@ export class AgentSessionManager {
     const info: AgentSessionInfo = {
       id: `agent-session-${randomUUID()}`, provider: 'codex', title: input.title?.trim() || '', cwd: input.cwd,
       model: input.model ?? null, effort: input.effort ?? null, policy: input.policy, network: input.network ?? false,
-      providerSessionId: null, status: 'starting', error: null, pendingQuestions: [], createdAt: this.now(),
+      orchestration: false, providerSessionId: null, status: 'starting', error: null, pendingQuestions: [], createdAt: this.now(),
     };
     const session = this.track(info);
     this.sessionsChanged();
@@ -157,6 +167,51 @@ export class AgentSessionManager {
     return delivery;
   }
 
+  /** Coordinator state the orchestration service checks before trusting the session's MCP calls. */
+  coordinatorState(id: string): { cwd: string; provider: string; active: boolean } | null {
+    const info = this.sessions.get(id)?.info;
+    if (!info) return null;
+    const live = info.status === 'starting' || info.status === 'idle' || info.status === 'running';
+    return { cwd: info.cwd, provider: info.provider, active: info.orchestration && live };
+  }
+
+  /**
+   * Switches orchestration mode between turns. A running provider process is replaced and the same
+   * conversation resumed with (or without) Aha MCP; a suspended session takes the mode on its next resume.
+   */
+  async setOrchestration(id: string, enabled: boolean): Promise<{ ok: true } | { ok: false; error: string }> {
+    const session = this.sessions.get(id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    const { info } = session;
+    if (info.orchestration === enabled) return { ok: true };
+    if (enabled && !this.deps.coordinatorInstructions) return { ok: false, error: '编排模式当前不可用' };
+    if (info.status === 'starting' || info.status === 'running' || session.driver?.busy || session.requests.size > 0) {
+      return { ok: false, error: '请等本轮结束后再切换编排模式' };
+    }
+    if (!info.providerSessionId || info.status === 'closed') return { ok: false, error: '这个会话无法切换编排模式' };
+    info.orchestration = enabled;
+    if (!enabled) this.deps.onCoordinatorEnded?.(id);
+    const driver = session.driver;
+    if (!driver?.alive) {
+      this.sessionsChanged();
+      return { ok: true };
+    }
+    session.generation++;
+    session.driver = null;
+    info.status = 'starting';
+    this.sessionsChanged();
+    await driver.close();
+    await this.connect(session, true);
+    // connect() moved the status on; widen the type narrowed by the assignment above.
+    if ((info.status as AgentSessionStatus) === 'idle') return { ok: true };
+    // Fall back to the previous mode; the conversation resumes with it on the next message.
+    const error = info.error ?? '会话没有恢复';
+    info.orchestration = !enabled;
+    if (enabled) this.deps.onCoordinatorEnded?.(id);
+    this.sessionsChanged();
+    return { ok: false, error };
+  }
+
   async interrupt(id: string): Promise<boolean> {
     return (await this.sessions.get(id)?.driver?.interrupt()) ?? false;
   }
@@ -192,6 +247,7 @@ export class AgentSessionManager {
     const session = this.sessions.get(id);
     if (!session) return;
     this.sessions.delete(id);
+    if (session.info.orchestration) this.deps.onCoordinatorEnded?.(id);
     await session.driver?.close(true);
     this.sessionsChanged();
   }
@@ -206,7 +262,7 @@ export class AgentSessionManager {
 
   private track(info: AgentSessionInfo, initial?: WorkerTimelineSnapshot): Session {
     const session: Session = {
-      info, driver: null, requests: new Map(),
+      info, driver: null, requests: new Map(), generation: 0,
       turns: initial?.turns.length ?? 0,
       timeline: new WorkerTimeline({
         workerHandle: info.id, cliId: info.provider, model: info.model, readOnly: info.policy === 'read-only',
@@ -233,11 +289,15 @@ export class AgentSessionManager {
     info.status = 'starting';
     info.error = null;
     if (resume) this.sessionsChanged();
+    const generation = ++session.generation;
     try {
-      session.driver = this.deps.launch(info.id, info.cwd, this.eventsFor(session));
+      const orchestration = info.orchestration;
+      const developerInstructions = orchestration ? this.deps.coordinatorInstructions?.(info.id) : undefined;
+      session.driver = this.deps.launch(info.id, info.cwd, this.eventsFor(session, generation), { orchestration });
       info.provider = session.driver.provider;
       info.providerSessionId = await session.driver.open({
         cwd: info.cwd, model: info.model, policy: info.policy, network: info.network,
+        ...(developerInstructions ? { developerInstructions } : {}),
         ...(resume && info.providerSessionId ? { resumeSessionId: info.providerSessionId } : {}),
       });
       if (!session.driver.alive) throw new Error(info.error ?? 'The agent closed while starting');
@@ -253,14 +313,16 @@ export class AgentSessionManager {
     this.sessionsChanged();
   }
 
-  private eventsFor(session: Session): AgentSessionEvents {
+  private eventsFor(session: Session, generation: number): AgentSessionEvents {
     const { info, timeline } = session;
+    const current = () => session.generation === generation;
     return {
       onTurnStarted: () => {},
       onTimeline: (turnKey, event) => {
-        if (timeline.activeTurn?.dispatchId === turnKey) timeline.apply(event);
+        if (current() && timeline.activeTurn?.dispatchId === turnKey) timeline.apply(event);
       },
       onTurnCompleted: (_turnKey, result) => {
+        if (!current()) return;
         this.cancelRequests(session, 'Turn ended');
         timeline.completeTurn({
           turnId: result.turnId, stopReason: result.stopReason, usage: result.usage, error: result.error,
@@ -271,7 +333,7 @@ export class AgentSessionManager {
         this.sessionsChanged();
       },
       onRequest: (turnKey, request) => {
-        if (request.signal.aborted) return Promise.resolve(DECLINE);
+        if (!current() || request.signal.aborted) return Promise.resolve(DECLINE);
         const requestId = `req_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
         return new Promise<AgentRuntimeResponse>((resolve) => {
           session.requests.set(requestId, { turnKey, request, resolve });
@@ -288,6 +350,7 @@ export class AgentSessionManager {
         });
       },
       onExit: (reason) => {
+        if (!current()) return;
         this.cancelRequests(session, reason);
         const expected = Boolean(session.driver?.closing) && !info.error;
         timeline.endActiveTurn(expected ? 'interrupted' : 'failed', reason);
@@ -337,7 +400,7 @@ export class AgentSessionManager {
     for (const entry of saved) {
       if (!entry?.id || !AGENT_SESSION_ID.test(entry.id) || !entry.providerSessionId || !entry.timeline) continue;
       const { timeline, ...rest } = entry;
-      const session = this.track({ ...rest, network: rest.network === true, status: 'suspended', error: null, pendingQuestions: [] }, timeline);
+      const session = this.track({ ...rest, network: rest.network === true, orchestration: rest.orchestration === true, status: 'suspended', error: null, pendingQuestions: [] }, timeline);
       session.timeline.setMeta({ alive: false });
     }
   }

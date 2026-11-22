@@ -623,6 +623,16 @@ export class OrchestrationService {
     this.sessionCoordinators = registry;
   }
 
+  /** An Agent session left orchestration mode or closed: drop what was waiting on it as Coordinator. */
+  endSessionCoordinator(sessionId: string): void {
+    if (!AGENT_SESSION_ID.test(sessionId)) return;
+    this.approvals.cancelForPane(sessionId);
+    this.proposals.cancelForPane(sessionId);
+    this.waiters.cancel(sessionId);
+    this.waiters.cancelConsumer(sessionId);
+    this.emitChanged('pane-mode:changed');
+  }
+
   private sessionCoordinator(id: string): { cwd: string; provider: string; active: boolean } | null {
     return AGENT_SESSION_ID.test(id) ? this.sessionCoordinators?.get(id) ?? null : null;
   }

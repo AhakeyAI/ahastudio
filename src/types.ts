@@ -104,6 +104,8 @@ export interface AgentSessionInfo {
   effort: string | null;
   policy: AgentSessionPolicy;
   network: boolean;
+  /** Acts as a Coordinator through Aha MCP. */
+  orchestration: boolean;
   providerSessionId: string | null;
   status: 'starting' | 'idle' | 'running' | 'suspended' | 'closed' | 'failed';
   error: string | null;
@@ -133,6 +135,7 @@ export interface AgentSessionsApi {
   respond: (opts: { id: string; requestId: string; allow: boolean; reason?: string }) => AgentSessionResult;
   close: (opts: { id: string }) => AgentSessionResult;
   timeline: (opts: { id: string }) => AgentSessionResult<{ timeline: WorkerTimelineSnapshot | null }>;
+  setOrchestration: (opts: { id: string; enabled: boolean }) => AgentSessionResult;
   onChanged: (cb: (sessions: AgentSessionInfo[]) => void) => () => void;
 }
 

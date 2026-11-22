@@ -1,5 +1,5 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { ArrowDown, ChevronRight, CircleAlert, CircleCheck, Hourglass, Square } from 'lucide-react';
+import { ArrowDown, ChevronRight, CircleAlert, CircleCheck, Hourglass, Square, Workflow } from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
 import { countDiffStats, parseUnifiedDiff } from '../lib/git-panel-model';
@@ -324,6 +324,20 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     void run('interrupt', () => api.workerInterrupt!({ dispatchId: targetDispatchId }));
   };
 
+  // Switching replaces the Codex process, so it waits until nothing is running or waiting on the person.
+  const canToggleOrchestration = Boolean(
+    info?.providerSessionId && !running && approvals.length === 0 && !info.pendingQuestions.length &&
+      (info.status === 'idle' || resumable),
+  );
+  const toggleOrchestration = () => {
+    if (!sessionId || !info) return;
+    const enabled = !info.orchestration;
+    void run('orchestration', async () => window.vibeMeet?.agentSessions?.setOrchestration({ id: sessionId, enabled }))
+      .then((ok) => {
+        if (ok) onNotify?.(enabled ? '已开启编排模式：这个会话可以派发和管理 Worker' : '已关闭编排模式');
+      });
+  };
+
   const stage = dispatch?.stage;
   const stageLabel = direct
     ? (info ? SESSION_STATUS_LABELS[info.status] : '已结束')
@@ -346,6 +360,20 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               <i className="asv-stage-dot" aria-hidden="true" />
               {stageLabel}
             </span>
+          )}
+          {direct && info && info.status !== 'closed' && (
+            <button
+              type="button"
+              className={`asv-btn asv-orchestration${info.orchestration ? ' is-on' : ''}`}
+              aria-pressed={info.orchestration}
+              disabled={!canToggleOrchestration || busy === 'orchestration'}
+              title={canToggleOrchestration
+                ? (info.orchestration ? '关闭后这个会话不再派发和管理 Worker' : '开启后这个会话作为协调者派发和管理 Worker')
+                : '本轮结束后才能切换编排模式'}
+              onClick={toggleOrchestration}
+            >
+              <Workflow size={12} /> {busy === 'orchestration' ? '切换中…' : info.orchestration ? '编排模式 · 开' : '编排模式'}
+            </button>
           )}
           {alive && !(direct && resumable) && (
             <button type="button" className="asv-btn is-quiet-danger" disabled={busy === 'stop'} onClick={stop}>

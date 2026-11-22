@@ -81,6 +81,7 @@
 .asv-btn:disabled { opacity: 0.5; cursor: default; }
 .asv-btn.is-primary { border-color: var(--asv-ink-strong); background: var(--asv-ink-strong); color: var(--workspace-bg); }
 .asv-btn.is-primary:hover:not(:disabled) { background: var(--asv-ink); }
+.asv-btn.asv-orchestration.is-on { border-color: var(--workspace-accent); color: var(--workspace-accent); }
 .asv-btn.is-quiet-danger { border-color: transparent; background: none; color: var(--asv-ink-2); }
 .asv-btn.is-quiet-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--asv-bad) 10%, transparent); color: var(--asv-bad); }
 .asv-text-btn {
