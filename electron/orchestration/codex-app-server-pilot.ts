@@ -3,6 +3,9 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { augmentedPath, resolveBinaryFromPath } from '../bin-resolve.js';
+import type {
+  AgentOutputSlice, AgentSessionDriver, AgentSessionEvents, AgentSessionPolicy, TurnDelivery,
+} from './agent-session-driver.js';
 import { spawnWindowsCodexJob } from './windows-codex-job.js';
 import type {
   WorkerTimelineEvent, WorkerTimelineFileChange, WorkerTimelineItemStatus, WorkerTimelineItemUpdate,
@@ -16,21 +19,9 @@ const CHILD_CLOSE_TIMEOUT_MS = 3_000;
 
 type Obj = Record<string, unknown>;
 type RpcId = string | number;
-type Delivery = { status: 'accepted' } | {
-  status: 'not_accepted' | 'unknown_acceptance'; reason: string;
-};
-
-export interface CodexTurnResult {
-  turnId: string;
-  stopReason: string;
-  finalText: string;
-  diff: string | null;
-  usage: Record<string, number> | null;
-  error: string | null;
-}
 
 interface ActiveTurn {
-  dispatchId: string;
+  turnKey: string;
   id: string | null;
   messages: Map<string, string>;
   usageBaseline: Record<string, number>;
@@ -38,22 +29,6 @@ interface ActiveTurn {
   usage: Record<string, number> | null;
   idle: Promise<void>;
   finish: () => void;
-}
-
-export interface CodexApproval {
-  method: string;
-  toolInput: string;
-  message?: string;
-  signal: AbortSignal;
-}
-
-export interface CodexPilotEvents {
-  onTurnStarted: (dispatchId: string) => void;
-  onTurnCompleted: (dispatchId: string, result: CodexTurnResult) => void;
-  onApproval: (dispatchId: string, request: CodexApproval) => Promise<boolean>;
-  onExit: (reason: string, exitCode: number | null) => void;
-  /** Normalized process events for the active turn; text is already pilot-redacted. */
-  onTimeline?: (dispatchId: string, event: WorkerTimelineEvent) => void;
 }
 
 class RpcRejection extends Error {}
@@ -239,7 +214,7 @@ export function launchCodexPilot(options: {
   cwd: string;
   mcpServerPath: string;
   mcpEnv: Record<string, string>;
-  events: CodexPilotEvents;
+  events: AgentSessionEvents;
 }): CodexAppServerPilot {
   const codex = resolveBinaryFromPath('codex');
   const node = resolveBinaryFromPath('node');
@@ -275,7 +250,10 @@ export function launchCodexPilot(options: {
   ].filter((value): value is string => Boolean(value)));
 }
 
-export class CodexAppServerPilot {
+export class CodexAppServerPilot implements AgentSessionDriver {
+  readonly provider = 'codex' as const;
+  // Writable policies, resume, and steering are not wired to the app-server yet.
+  readonly capabilities = { resume: false, steer: false, policies: ['read-only'] as readonly AgentSessionPolicy[] };
   private readonly pending = new Map<number, (error: Error | null, value?: unknown) => void>();
   private readonly disconnect = new AbortController();
   private seq = 0;
@@ -285,7 +263,7 @@ export class CodexAppServerPilot {
   private output = '';
   private stderrTail = Buffer.alloc(0);
   private offset = 0;
-  private outputDispatchId: string | null = null;
+  private outputTurnKey: string | null = null;
   private disconnected = false;
   private stopping = false;
   private stopPromise: Promise<void> | null = null;
@@ -293,7 +271,7 @@ export class CodexAppServerPilot {
 
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
-    private readonly events: CodexPilotEvents,
+    private readonly events: AgentSessionEvents,
     private readonly requestTimeoutMs = 30_000,
     private readonly secrets: readonly string[] = [],
   ) {
@@ -338,9 +316,12 @@ export class CodexAppServerPilot {
   get sessionId(): string | null { return this.threadId; }
   get busy(): boolean { return this.active !== null; }
   get closing(): boolean { return this.stopping; }
-  get latestDispatchId(): string | null { return this.outputDispatchId; }
+  get latestTurnKey(): string | null { return this.outputTurnKey; }
 
-  async open(cwd: string, model: string | null): Promise<string> {
+  async open({ cwd, model, policy }: { cwd: string; model: string | null; policy: AgentSessionPolicy }): Promise<string> {
+    if (!this.capabilities.policies.includes(policy)) {
+      throw new Error(`Codex sessions do not support the ${policy} policy yet`);
+    }
     try {
       await this.request('initialize', {
         clientInfo: { name: 'ahastation', title: 'AhaStation', version: '0.1.0' },
@@ -384,18 +365,18 @@ export class CodexAppServerPilot {
     });
   }
 
-  async startTurn(dispatchId: string, prompt: string, effort: string | null): Promise<Delivery> {
+  async startTurn({ turnKey, prompt, effort }: { turnKey: string; prompt: string; effort?: string | null }): Promise<TurnDelivery> {
     if (!this.alive || !this.threadId || this.active) {
       return { status: 'not_accepted', reason: 'Codex thread is closed or busy' };
     }
     let finish!: () => void;
     const idle = new Promise<void>((resolve) => { finish = resolve; });
     const turn: ActiveTurn = {
-      dispatchId, id: null, messages: new Map(), diff: null, usage: null, usageBaseline: this.tokenTotal, idle, finish,
+      turnKey, id: null, messages: new Map(), diff: null, usage: null, usageBaseline: this.tokenTotal, idle, finish,
     };
     this.active = turn;
-    if (this.outputDispatchId !== dispatchId) {
-      this.outputDispatchId = dispatchId;
+    if (this.outputTurnKey !== turnKey) {
+      this.outputTurnKey = turnKey;
       this.output = '';
       this.offset = 0;
     }
@@ -421,8 +402,8 @@ export class CodexAppServerPilot {
     }
   }
 
-  read(dispatchId: string, cursor = 0, limit = 8_000, screen = false) {
-    if (this.outputDispatchId !== dispatchId) return null;
+  read(turnKey: string, cursor = 0, limit = 8_000, screen = false): AgentOutputSlice | null {
+    if (this.outputTurnKey !== turnKey) return null;
     const start = screen ? this.offset : Math.min(Math.max(Math.floor(cursor), this.offset), this.offset + this.output.length);
     limit = Math.max(1, Math.min(256_000, Math.floor(limit)));
     const text = this.output.slice(start - this.offset, screen ? undefined : start - this.offset + limit);
@@ -590,7 +571,7 @@ export class CodexAppServerPilot {
         }
       }
       this.finishTurn(turn);
-      this.events.onTurnCompleted(turn.dispatchId, {
+      this.events.onTurnCompleted(turn.turnKey, {
         turnId, stopReason: string(reportedTurn.status) ?? 'unknown',
         finalText: this.redact([...turn.messages.values()].at(-1) ?? ''),
         usage: turn.usage,
@@ -604,7 +585,7 @@ export class CodexAppServerPilot {
     if (turn.id) return;
     turn.id = id;
     this.timeline(turn, { type: 'turn_started', turnId: id });
-    this.events.onTurnStarted(turn.dispatchId);
+    this.events.onTurnStarted(turn.turnKey);
   }
 
   private emitTimeline(turn: ActiveTurn, method: string, params: Obj): void {
@@ -615,7 +596,7 @@ export class CodexAppServerPilot {
   private timeline(turn: ActiveTurn, event: WorkerTimelineEvent): void {
     if (!this.events.onTimeline) return;
     try {
-      this.events.onTimeline(turn.dispatchId, this.redactEvent(event));
+      this.events.onTimeline(turn.turnKey, this.redactEvent(event));
     } catch (error) {
       console.warn('[orchestration] Codex timeline listener failed:', error);
     }
@@ -687,7 +668,8 @@ export class CodexAppServerPilot {
     let allowed = false;
     if (!this.stopping && matchesTurn && supportsConfirmation) {
       try {
-        allowed = await this.events.onApproval(turn.dispatchId, {
+        const response = await this.events.onRequest(turn.turnKey, {
+          kind: 'approval',
           method,
           toolInput: this.redact(mcpConfirmation
             ? JSON.stringify({ server: params.serverName, metadata: params._meta, schema })
@@ -695,6 +677,7 @@ export class CodexAppServerPilot {
           message: this.redact(string(params.reason ?? params.message) ?? '') || undefined,
           signal: this.disconnect.signal,
         });
+        allowed = 'decision' in response && response.decision === 'accept';
       } catch {
         // Fail closed if the host cannot record the approval.
       }

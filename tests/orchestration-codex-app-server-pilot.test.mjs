@@ -32,7 +32,7 @@ function fakeCodexChild() {
 
 function recordCodexExit(exits) {
   return {
-    onTurnStarted() {}, onTurnCompleted() {}, onApproval: async () => false,
+    onTurnStarted() {}, onTurnCompleted() {}, onRequest: async () => ({ decision: 'decline' }),
     onExit: (reason, code) => exits.push({ reason, code }),
   };
 }
@@ -275,11 +275,22 @@ test('close reuses a bounded wait when neither child error nor close arrives', {
   assert.match(exits[0].reason, /Timed out waiting for Codex app-server to close/);
 });
 
+test('a policy the driver does not list is refused before anything is sent to Codex', async () => {
+  const child = fakeCodexChild();
+  const sent = [];
+  child.stdin.on('data', (chunk) => sent.push(chunk));
+  const session = new CodexAppServerPilot(child, recordCodexExit([]));
+  assert.deepEqual(session.capabilities.policies, ['read-only']);
+  await assert.rejects(session.open({ cwd, model: null, policy: 'workspace-write' }), /workspace-write/);
+  assert.equal(sent.length, 0);
+  await session.close();
+});
+
 test('bounded stderr is included and redacted on startup failure and process exit', async () => {
   const child = fakeCodexChild();
   const exits = [];
   const session = new CodexAppServerPilot(child, recordCodexExit(exits), 850, [stderrSecret]);
-  const opening = session.open(cwd, null);
+  const opening = session.open({ cwd, model: null, policy: 'read-only' });
   child.stderr.write(Buffer.from('discarded-prefix ' + 'a'.repeat(5_000)));
   child.stderr.write(Buffer.from('\nTOML denied credential=' + stderrSecret.slice(0, 10)));
   child.stderr.write(Buffer.from(stderrSecret.slice(10) + '\n末尾'));

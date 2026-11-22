@@ -2,9 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { resolve as resolveFsPath } from 'node:path';
 import { runGitCommand } from '../git/git-exec.js';
-import {
-  CODEX_WORKER_ID, type CodexAppServerPilot, type CodexPilotEvents, type CodexTurnResult,
-} from './codex-app-server-pilot.js';
+import type { AgentSessionDriver, AgentSessionEvents, AgentTurnResult } from './agent-session-driver.js';
+import { CODEX_WORKER_ID } from './codex-app-server-pilot.js';
 import {
   WorkerTimeline, type WorkerTimelineChange, type WorkerTimelineSnapshot, type WorkerTimelineTurnStatus,
 } from './worker-timeline.js';
@@ -278,7 +277,7 @@ export interface OrchestrationServiceDependencies {
   }) => Promise<WorkerPaneCandidate | null>;
   codexPilot?: {
     enabled: () => boolean;
-    launch: (workerId: string, cwd: string, events: CodexPilotEvents) => CodexAppServerPilot;
+    launch: (workerId: string, cwd: string, events: AgentSessionEvents) => AgentSessionDriver;
   };
   closeWorkerPty?: (ptyId: string) => Promise<unknown> | unknown;
   isPtyAlive?: (ptyId: string) => boolean;
@@ -338,7 +337,7 @@ export class OrchestrationService {
   private readonly writePty: PtyWriteFn;
   private readonly spawnWorkerPty?: OrchestrationServiceDependencies['spawnWorkerPty'];
   private readonly codexPilot?: OrchestrationServiceDependencies['codexPilot'];
-  private readonly codexWorkers = new Map<string, CodexAppServerPilot>();
+  private readonly codexWorkers = new Map<string, AgentSessionDriver>();
   private readonly codexSubmitting = new Set<string>();
   /** Pending wake-ups per headless Worker; `opaque` means at least one wake carried no message record. */
   private readonly codexMailbox = new Map<string, { messages: OrchestrationMessageRecord[]; opaque: boolean }>();
@@ -757,8 +756,8 @@ export class OrchestrationService {
 
   private retireFinishedCodexWorkers(runId?: string): void {
     for (const [workerId, codex] of this.codexWorkers) {
-      if (!codex.alive || !codex.latestDispatchId || this.store.getActiveDispatchForIdentity(workerId, null)) continue;
-      const dispatch = this.store.getDispatchContext(codex.latestDispatchId);
+      if (!codex.alive || !codex.latestTurnKey || this.store.getActiveDispatchForIdentity(workerId, null)) continue;
+      const dispatch = this.store.getDispatchContext(codex.latestTurnKey);
       if (!dispatch || dispatch.retained || (runId && dispatch.runId !== runId)) continue;
       const run = this.store.getRun(dispatch.runId);
       if (run?.status === 'active') continue;
@@ -5221,7 +5220,7 @@ export class OrchestrationService {
   private async openCodexWorker(cwd: string, model: string | null) {
     if (this.disposed || !this.codexPilot) return null;
     const id = `codex-worker-${randomUUID()}`;
-    let session: CodexAppServerPilot | undefined;
+    let session: AgentSessionDriver | undefined;
     const timeline = this.createWorkerTimeline(id, model, (text) => session?.redactText(text) ?? text);
     try {
       session = this.codexPilot.launch(id, cwd, {
@@ -5236,14 +5235,15 @@ export class OrchestrationService {
           if (updated && !waiting) this.store.updateDispatchStage(dispatchId, 'working');
         },
         onTurnCompleted: (dispatchId, result) => this.completeCodexTurn(id, cwd, dispatchId, result),
-        onApproval: (dispatchId, request) => {
+        onRequest: async (dispatchId, request) => {
           const dispatch = this.store.getDispatchContext(dispatchId);
-          return dispatch?.assigneeHandle === id
-            ? this.approvals.holdCodexRequest(dispatch, request)
-            : Promise.resolve(false);
+          // Only approvals can be answered from the approval lane; anything else fails closed.
+          const allowed = request.kind === 'approval' && dispatch?.assigneeHandle === id &&
+            await this.approvals.holdCodexRequest(dispatch, request);
+          return { decision: allowed ? 'accept' : 'decline' };
         },
         onExit: (reason, exitCode) => {
-          const dispatchId = session?.latestDispatchId;
+          const dispatchId = session?.latestTurnKey;
           if (session && dispatchId) this.archiveCodexOutput(session, dispatchId);
           timeline.endActiveTurn(session?.closing ? 'interrupted' : 'failed', reason);
           timeline.setMeta({ alive: false });
@@ -5260,7 +5260,7 @@ export class OrchestrationService {
         },
       });
       this.codexWorkers.set(id, session);
-      const sessionId = await session.open(cwd, model);
+      const sessionId = await session.open({ cwd, model, policy: 'read-only' });
       if (!session.alive || this.disposed) throw new Error('Codex app-server closed during initialization');
       timeline.setMeta({ providerSessionId: sessionId });
       return { id, session, sessionId };
@@ -5273,7 +5273,7 @@ export class OrchestrationService {
     }
   }
 
-  private archiveCodexOutput(session: CodexAppServerPilot, dispatchId: string): void {
+  private archiveCodexOutput(session: AgentSessionDriver, dispatchId: string): void {
     const result = session.read(dispatchId, 0, undefined, true);
     if (result) this.store.archiveDispatchOutput(dispatchId, result.text);
   }
@@ -5292,7 +5292,7 @@ export class OrchestrationService {
     this.emitChanged('dispatch:codex-status', dispatch.runId);
   }
 
-  private completeCodexTurn(workerId: string, cwd: string, dispatchId: string, result: CodexTurnResult): void {
+  private completeCodexTurn(workerId: string, cwd: string, dispatchId: string, result: AgentTurnResult): void {
     const session = this.codexWorkers.get(workerId);
     if (session) this.archiveCodexOutput(session, dispatchId);
     this.approvals.cancelForDispatch(dispatchId, 'Codex turn ended');
@@ -5364,12 +5364,12 @@ export class OrchestrationService {
     this.publishCodexStatus(dispatch, 'Codex Worker exited before report_done', reason, { exitCode });
   }
 
-  private async submitCodexTurn(dispatch: OrchestrationDispatchRecord, session: CodexAppServerPilot, prompt: string) {
+  private async submitCodexTurn(dispatch: OrchestrationDispatchRecord, session: AgentSessionDriver, prompt: string) {
     this.codexSubmitting.add(dispatch.id);
     const timeline = this.workerTimelines.get(dispatch.assigneeHandle);
     timeline?.beginTurn({ dispatchId: dispatch.id, prompt });
     try {
-      const result = await session.startTurn(dispatch.id, prompt, dispatch.effort ?? null);
+      const result = await session.startTurn({ turnKey: dispatch.id, prompt, effort: dispatch.effort ?? null });
       if (result.status !== 'accepted') timeline?.endActiveTurn('failed', result.reason);
       if (result.status === 'unknown_acceptance') this.failCodexDispatch(dispatch.id, result.status, result.reason);
       if (result.status === 'accepted' && !session.alive) {
