@@ -44,7 +44,7 @@ async function mcpRequest(env, method, params, spawnCwd = cwd) {
   }
 }
 
-async function setup(t, { confirmMode = 'auto', stallThresholdMs } = {}) {
+async function setup(t, { confirmMode = 'auto', stallThresholdMs, pilotEnabled = true } = {}) {
   const dir = mkdtempSync(join(cwd, '.session-coordinator-test-'));
   const agentStatusStore = new AgentStatusStore();
   const store = new OrchestrationStore({ resolveFile: () => join(dir, 'state.json') });
@@ -60,7 +60,7 @@ async function setup(t, { confirmMode = 'auto', stallThresholdMs } = {}) {
     spawnWorkerPty: async () => { throw new Error('Session Coordinator tests expect headless Workers'); },
     isPtyAlive: (id) => id === 'coordinator-pane',
     codexPilot: {
-      enabled: () => true,
+      enabled: () => pilotEnabled,
       launch(workerId, workdir, events) {
         launches.push({ workerId, workdir });
         const child = spawn(process.execPath, [join(cwd, 'tests/fixtures/mock-codex-app-server.mjs'), 'normal'], {
@@ -222,6 +222,29 @@ test('an orchestrating session gets Coordinator actions only, and only while orc
   assert.equal((await app.call(SESSION_A, 'team-status')).code, 'operation_rejected');
   assert.equal((await app.call(SESSION_A, 'board-read')).code, 'operation_rejected');
   assert.equal(app.service.isPaneAlive(SESSION_A), false);
+});
+
+test('a session Coordinator sends read-only Codex tasks to the headless pilot even when the pilot setting is off', async (t) => {
+  const app = await setup(t, { pilotEnabled: false });
+  const sessionCwd = mkdtempSync(join(app.dir, 'session-cwd-'));
+  app.sessions.set(SESSION_A, { cwd: sessionCwd, provider: 'codex', active: true });
+
+  const started = await app.call(SESSION_A, 'delegate-task', {
+    role: 'scout', task: 'Survey the repository', agent: 'codex', taskKind: 'research', worktree: false,
+  });
+  assert.equal(started.ok, true, started.error);
+  assert.equal(started.result.status, 'started');
+  assert.equal(started.result.dispatch.executionMode, 'codex-app-server');
+  assert.equal(app.launches.length, 1);
+  assert.equal(app.launches[0].workdir, sessionCwd);
+
+  // A terminal Coordinator without the pilot setting still gets a PTY Worker; spawning fails here
+  // because these tests never create real terminals.
+  const pty = await app.call('coordinator-pane', 'delegate-task', {
+    role: 'reader', task: 'Read the README', agent: 'codex', taskKind: 'research', worktree: false,
+  });
+  assert.equal(pty.code, 'terminal_unavailable', pty.error);
+  assert.equal(app.launches.length, 1, 'the terminal Coordinator never reaches the pilot');
 });
 
 test('Aha MCP server exposes Coordinator tools to a session and delegates through its identity', async (t) => {

@@ -5054,8 +5054,13 @@ export class OrchestrationService {
           reusingTerminalCwd,
         });
 
+    // A run a session coordinates sends read-only Codex tasks to the headless pilot even when the
+    // pilot setting is off; terminal-coordinated runs still need it.
+    const runIsSessionCoordinated =
+      AGENT_SESSION_ID.test(run.coordinatorPaneId ?? '') || this.isActiveSessionCoordinator(from);
     const usePilot = !reusingTerminal && launchConfig.cliId === 'codex' &&
-      (input.readOnly === true || Boolean(reviewTarget || reviewRunTarget)) && this.codexPilot?.enabled();
+      (input.readOnly === true || Boolean(reviewTarget || reviewRunTarget)) &&
+      Boolean(this.codexPilot && (this.codexPilot.enabled() || runIsSessionCoordinated));
     const pilot = usePilot
       ? await this.openCodexWorker(placement.cwd ?? process.cwd(), launchConfig.model)
       : null;
