@@ -229,6 +229,18 @@ export const COORDINATOR_APPROVED_MCP_TOOLS = [
   'post_message', 'message_worker', 'inspect_worker_diff', 'inspect_run_diff',
 ] as const;
 
+/**
+ * The approved tools for a session launched with `policy`. `full-auto` maps to Codex's `never`
+ * approval policy, under which a tool call that still needs approval fails outright, so
+ * `manage_worker` must be pre-approved there. `integrate_worker` and `finalize_run_integration`
+ * are never approved: changing Git history always needs the person.
+ */
+export function coordinatorApprovedMcpTools(policy: AgentSessionPolicy): readonly string[] {
+  return policy === 'full-auto'
+    ? [...COORDINATOR_APPROVED_MCP_TOOLS, 'manage_worker']
+    : COORDINATOR_APPROVED_MCP_TOOLS;
+}
+
 export function codexMcpConfigArgs(
   node: string, mcp: { serverPath: string; env: Record<string, string>; approvedTools?: readonly string[] },
 ): string[] {

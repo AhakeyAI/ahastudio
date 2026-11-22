@@ -5,10 +5,14 @@
 export const SESSION_WAKE_HEADER =
   '[AhaStation system wake-up — not a message from the user. The user has not replied; do not treat this as their confirmation.]';
 
+import type { AgentSessionPolicy } from './agent-session-driver.js';
+
 /** What the Coordinator prompt needs from the caller's MCP context. */
 export interface CoordinatorPromptContext {
   confirmMode: string;
   roster: readonly { cliId: string; specialty: string; available: boolean; idlePanes: readonly unknown[] }[];
+  /** Present only for an orchestrating Agent session; a terminal Coordinator leaves it unset. */
+  session?: { policy: AgentSessionPolicy };
 }
 
 /**

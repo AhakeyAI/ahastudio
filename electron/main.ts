@@ -352,7 +352,7 @@ app.whenReady().then(async () => {
 
   const hookInstaller = new AgentHookInstaller();
   const mcpCliIdSet = new Set<string>(AGENT_MCP_CLI_IDS);
-  const { COORDINATOR_APPROVED_MCP_TOOLS, enabledCodexPilot, launchCodexPilot } =
+  const { coordinatorApprovedMcpTools, enabledCodexPilot, launchCodexPilot } =
     await import('./orchestration/codex-app-server-pilot.js');
   const orchestrationStore = OrchestrationStore.forUserDataDir(() => app.getPath('userData'));
   const orchestrationService = new OrchestrationService({
@@ -526,7 +526,7 @@ app.whenReady().then(async () => {
   const { AgentSessionManager } = await import('./orchestration/agent-session-manager.js');
   const { registerAgentSessionsIpc } = await import('./ipc/agent-sessions.js');
   const agentSessions = new AgentSessionManager({
-    launch: (sessionId, cwd, events, { orchestration }) => {
+    launch: (sessionId, cwd, events, { orchestration, policy }) => {
       if (!orchestration) return launchCodexPilot({ cwd, events });
       const mcpServerPath = resolveActiveMcpServerPath();
       if (!agentHookServer || !mcpServerPath) throw new Error('Aha MCP Server is unavailable');
@@ -534,12 +534,15 @@ app.whenReady().then(async () => {
         cwd, events,
         mcp: {
           serverPath: mcpServerPath, env: agentHookServer.envForSession(sessionId),
-          requiredTool: 'delegate_task', approvedTools: COORDINATOR_APPROVED_MCP_TOOLS,
+          requiredTool: 'delegate_task', approvedTools: coordinatorApprovedMcpTools(policy),
         },
       });
     },
-    coordinatorInstructions: (sessionId) =>
-      coordinatorInstructions(orchestrationService.getMcpContextForPane(sessionId)),
+    coordinatorInstructions: (sessionId, { policy }) =>
+      coordinatorInstructions({
+        ...orchestrationService.getMcpContextForPane(sessionId),
+        session: { policy },
+      }),
     onCoordinatorEnded: (sessionId) => orchestrationService.endSessionCoordinator(sessionId),
     onUserTurn: (sessionId) => orchestrationService.recordUserPromptTurn(sessionId, 'session'),
     onCoordinatorIdle: (sessionId) => orchestrationService.sessionCoordinatorIdle(sessionId),

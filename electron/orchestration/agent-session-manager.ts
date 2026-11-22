@@ -49,14 +49,17 @@ interface Session {
   generation: number;
   /** The provider accepted a turn; Codex saves a thread only then, so before it there is nothing to resume. */
   hasTurns: boolean;
+  /** Policy the live process was launched with; Aha MCP approvals are baked in at that point. */
+  launchedPolicy: AgentSessionPolicy | null;
 }
 
 export interface AgentSessionManagerDependencies {
   launch: (
-    sessionId: string, cwd: string, events: AgentSessionEvents, options: { orchestration: boolean },
+    sessionId: string, cwd: string, events: AgentSessionEvents,
+    options: { orchestration: boolean; policy: AgentSessionPolicy },
   ) => AgentSessionDriver;
   /** Coordinator rules for an orchestrating session's conversation; without it orchestration mode is unavailable. */
-  coordinatorInstructions?: (sessionId: string) => string;
+  coordinatorInstructions?: (sessionId: string, options: { policy: AgentSessionPolicy }) => string;
   /** A session stopped coordinating (switched off or closed); its pending orchestration state can go. */
   onCoordinatorEnded?: (sessionId: string) => void;
   /**
@@ -136,12 +139,40 @@ export class AgentSessionManager {
     const text = input.text.trim();
     if (!session) return { status: 'not_accepted', reason: 'Session not found' };
     if (!text) return { status: 'not_accepted', reason: 'Message is empty' };
+    const { info } = session;
+    const wanted = input.policy ?? info.policy;
     if (this.resumable(session)) {
+      const previous = info.policy;
+      if (info.orchestration) info.policy = wanted;
       await this.connect(session, true);
-      if (session.info.status !== 'idle') return { status: 'not_accepted', reason: session.info.error ?? 'Session did not resume' };
+      if (session.info.status !== 'idle') {
+        info.policy = previous;
+        this.sessionsChanged();
+        return { status: 'not_accepted', reason: session.info.error ?? 'Session did not resume' };
+      }
     }
     if (!session.driver?.alive || session.info.status !== 'idle') {
       return { status: 'not_accepted', reason: `Session is ${session.info.status}` };
+    }
+    // An orchestrating session whose approval tier changed must be relaunched: the Aha MCP tool
+    // approvals are baked into the process arguments, so a per-turn policy delta cannot grant
+    // manage_worker under `full-auto`. The other tiers differ only per turn and need no relaunch.
+    if (info.orchestration && (wanted === 'full-auto') !== (session.launchedPolicy === 'full-auto')) {
+      const previous = info.policy;
+      info.policy = wanted;
+      const driver = session.driver;
+      session.generation++;
+      session.driver = null;
+      info.status = 'starting';
+      this.sessionsChanged();
+      await driver.close();
+      await this.connect(session, true);
+      // connect() moved the status on; widen the type narrowed by the assignment above.
+      if ((info.status as AgentSessionStatus) !== 'idle') {
+        info.policy = previous;
+        this.sessionsChanged();
+        return { status: 'not_accepted', reason: info.error ?? 'Session did not restart' };
+      }
     }
     if (!session.info.title) session.info.title = text.split('\n')[0]!.slice(0, 60);
     const delivery = await this.startTurn(session, text, input);
@@ -299,7 +330,7 @@ export class AgentSessionManager {
 
   private track(info: AgentSessionInfo, initial?: WorkerTimelineSnapshot): Session {
     const session: Session = {
-      info, driver: null, requests: new Map(), generation: 0,
+      info, driver: null, requests: new Map(), generation: 0, launchedPolicy: null,
       turns: initial?.turns.length ?? 0,
       // A turn that never reached the provider ends failed with no turn id and no output.
       hasTurns: initial?.turns.some((turn) => turn.status !== 'failed' || turn.turnId !== null || turn.items.length > 0) ?? false,
@@ -335,8 +366,13 @@ export class AgentSessionManager {
     const generation = ++session.generation;
     try {
       const orchestration = info.orchestration;
-      const developerInstructions = orchestration ? this.deps.coordinatorInstructions?.(info.id) : undefined;
-      session.driver = this.deps.launch(info.id, info.cwd, this.eventsFor(session, generation), { orchestration });
+      const developerInstructions = orchestration
+        ? this.deps.coordinatorInstructions?.(info.id, { policy: info.policy })
+        : undefined;
+      session.driver = this.deps.launch(info.id, info.cwd, this.eventsFor(session, generation), {
+        orchestration, policy: info.policy,
+      });
+      session.launchedPolicy = info.policy;
       info.provider = session.driver.provider;
       info.providerSessionId = await session.driver.open({
         cwd: info.cwd, model: info.model, policy: info.policy, network: info.network,

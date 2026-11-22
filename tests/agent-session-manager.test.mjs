@@ -6,7 +6,7 @@ import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { AGENT_SESSION_ID, AgentSessionManager } from '../dist-electron/orchestration/agent-session-manager.js';
-import { CodexAppServerPilot } from '../dist-electron/orchestration/codex-app-server-pilot.js';
+import { CodexAppServerPilot, coordinatorApprovedMcpTools } from '../dist-electron/orchestration/codex-app-server-pilot.js';
 
 const cwd = process.cwd();
 
@@ -41,6 +41,117 @@ function setup(t, scenario = 'normal', { dir = mkdtempSync(join(cwd, '.agent-ses
   const status = (id) => manager.list().find((session) => session.id === id)?.status;
   return { manager, sent, turns, status };
 }
+
+function orchSetup(t, { dir = mkdtempSync(join(cwd, '.agent-session-test-')), failPolicy } = {}) {
+  const trace = join(dir, 'rpc.jsonl');
+  const launches = [];
+  const manager = new AgentSessionManager({
+    launch: (_id, workdir, events, options) => {
+      launches.push({ ...options });
+      if (options.orchestration && options.policy === failPolicy) {
+        throw new Error(`launch unavailable for ${failPolicy}`);
+      }
+      return new CodexAppServerPilot(
+        spawn(process.execPath, [join(cwd, 'tests/fixtures/mock-codex-app-server.mjs'), 'normal', trace], {
+          cwd: workdir, stdio: 'pipe', windowsHide: true,
+        }),
+        events, 850, [], options.orchestration ? 'delegate_task' : null,
+      );
+    },
+    coordinatorInstructions: (_id, options) => `[Coordinator] policy=${options.policy}`,
+    storageFile: () => join(dir, 'agent-sessions.json'),
+  });
+  t.after(async () => {
+    await manager.dispose();
+    rmSync(dir, { force: true, recursive: true });
+  });
+  const sent = (method) => {
+    try {
+      return readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse)
+        .filter((message) => message.method === method).map((message) => message.params);
+    } catch {
+      return [];
+    }
+  };
+  const status = (id) => manager.list().find((session) => session.id === id)?.status;
+  const info = (id) => manager.list().find((session) => session.id === id);
+  return { manager, launches, sent, status, info };
+}
+
+test('an orchestrating session relaunches when the turn policy crosses the full-auto tier', async (t) => {
+  const { manager, launches, sent, status, info } = orchSetup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  assert.equal((await manager.setOrchestration(session.id, true)).ok, true);
+  assert.deepEqual(
+    launches.map((launch) => [launch.orchestration, launch.policy]),
+    [[false, 'workspace-write'], [true, 'workspace-write']],
+  );
+
+  // A thread with no accepted turns cannot be rejoined, so the relaunch test needs one first.
+  assert.equal((await manager.send(session.id, { text: 'seed the thread' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+
+  assert.equal((await manager.send(session.id, { text: 'run free', policy: 'full-auto' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+  assert.equal(launches.length, 3, 'full-auto approvals are baked into the process arguments');
+  assert.deepEqual([launches[2].orchestration, launches[2].policy], [true, 'full-auto']);
+  assert.equal(sent('thread/resume').length, 1, 'the same thread resumes under the new process');
+  assert.equal(info(session.id).policy, 'full-auto');
+  assert.equal(sent('turn/start').at(-1).approvalPolicy, 'never');
+
+  assert.equal((await manager.send(session.id, { text: 'back to asking', policy: 'read-only' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+  assert.equal(launches.length, 4, 'leaving full-auto relaunches too');
+  assert.deepEqual([launches[3].orchestration, launches[3].policy], [true, 'read-only']);
+  assert.equal(sent('thread/resume').length, 2, 'the same thread resumes again');
+  assert.equal(info(session.id).policy, 'read-only');
+});
+
+test('an orchestrating session changes the sandbox tier per turn without relaunching', async (t) => {
+  const { manager, launches, sent, status, info } = orchSetup(t);
+  const session = await manager.create({ cwd, policy: 'read-only' });
+  assert.equal((await manager.setOrchestration(session.id, true)).ok, true);
+  assert.equal(launches.length, 2);
+
+  assert.equal((await manager.send(session.id, { text: 'write this time', policy: 'workspace-write' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+  assert.equal(launches.length, 2, 'the same approval tier stays on the same process');
+  assert.equal(info(session.id).policy, 'workspace-write');
+  assert.equal(sent('turn/start').at(-1).sandboxPolicy.type, 'workspaceWrite');
+});
+
+test('a failed policy relaunch keeps the session policy and sends nothing', async (t) => {
+  const { manager, launches, sent, info } = orchSetup(t, { failPolicy: 'full-auto' });
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  assert.equal((await manager.setOrchestration(session.id, true)).ok, true);
+  const turnsSent = sent('turn/start').length;
+  const delivery = await manager.send(session.id, { text: 'go auto', policy: 'full-auto' });
+  assert.equal(delivery.status, 'not_accepted');
+  assert.match(delivery.reason, /launch unavailable for full-auto/);
+  assert.equal(info(session.id).policy, 'workspace-write');
+  assert.equal(sent('turn/start').length, turnsSent, 'nothing was sent');
+  assert.equal(launches.length, 3, 'the relaunch was attempted once');
+});
+
+test('a plain session changes policy per turn without relaunching', async (t) => {
+  const { manager, launches, status, info } = orchSetup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  assert.equal((await manager.send(session.id, { text: 'go', policy: 'full-auto' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+  assert.equal(launches.length, 1);
+  assert.equal(info(session.id).policy, 'full-auto');
+});
+
+test('coordinatorApprovedMcpTools pre-approves manage_worker only under full-auto', () => {
+  const base = coordinatorApprovedMcpTools('workspace-write');
+  assert.ok(base.includes('delegate_task'));
+  assert.ok(!base.includes('manage_worker'));
+  assert.deepEqual(coordinatorApprovedMcpTools('read-only'), base);
+  const full = coordinatorApprovedMcpTools('full-auto');
+  assert.deepEqual(full, [...base, 'manage_worker']);
+  assert.ok(!full.includes('integrate_worker'));
+  assert.ok(!full.includes('finalize_run_integration'));
+});
 
 test('a session opens without Aha MCP and runs turns one at a time with the chosen settings', async (t) => {
   const { manager, sent, turns, status } = setup(t);
