@@ -7,6 +7,8 @@ export interface AgentSessionContextValue {
   /** Picks the syntax theme for code blocks and diffs. */
   appearance: CodeHighlightAppearance;
   onNotify?: (message: string) => void;
+  /** Set when approvals are answered somewhere other than the orchestration approval lane. */
+  resolveApproval?: (approvalId: string, allow: boolean, reason?: string) => Promise<{ ok: boolean; error?: string }>;
 }
 
 export const AgentSessionContext = createContext<AgentSessionContextValue>({ cwd: null, appearance: 'light' });

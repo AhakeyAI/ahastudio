@@ -1,3 +1,4 @@
+import { agentSessionClient, isStandaloneSession } from '../lib/agent-session-client';
 import {
   useCallback,
   useEffect,
@@ -1054,12 +1055,24 @@ export function LocalTerminalWorkspace({
           windows={folderWindows}
           activeWindowId={active?.id ?? null}
           onSelect={selectTab}
-          onClose={stage.closeWindow}
+          onClose={(id) => {
+            const closing = folderWindows.find((win) => win.id === id);
+            // Closing the tab of a direct session ends it; Worker sessions keep running without a tab.
+            if (closing?.type === 'agent-session' && isStandaloneSession(closing.workerId)) {
+              void window.vibeMeet?.agentSessions?.close({ id: closing.workerId });
+            }
+            stage.closeWindow(id);
+          }}
           localOnly
           renderTabBadge={(win) => (win.type === 'agent-session' ? null : <AgentStatusBadge status={windowAgentStatus(win)} />)}
-          onCreate={(type, opts) =>
-            stage.createWindow(type, { ...opts, cwd: selectedCwd ?? opts?.cwd })
-          }
+          onCreate={(type, opts) => {
+            const cwd = selectedCwd ?? opts?.cwd;
+            if (type !== 'agent-session') return stage.createWindow(type, { ...opts, cwd });
+            void agentSessionClient.create({ ...(cwd ? { cwd } : {}), policy: 'workspace-write' }).then((res) => {
+              if (!res.ok) return handleNotify(res.error);
+              void stageWindowStore.createWindow('agent-session', { ...opts, cwd: res.session.cwd, workerId: res.session.id });
+            });
+          }}
         />
         <div className="terminal-tab-actions">
           {active && activeLeafId && (

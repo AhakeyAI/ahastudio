@@ -1,7 +1,8 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { ArrowUp, Cpu, Folder, GitBranch, Lock, MessageCircleQuestion, ShieldAlert, Square } from 'lucide-react';
 import { formatTokenCount } from '../../lib/worker-timeline-model';
-import type { OrchestrationQuestionRecord, WorkerTimelineItem } from '../../types';
+import { POLICY_LABELS } from '../../lib/agent-session-client';
+import type { AgentSessionPolicy, OrchestrationQuestionRecord, WorkerTimelineItem } from '../../types';
 import { useAgentSession } from './session-context';
 
 type ApprovalItem = Extract<WorkerTimelineItem, { kind: 'approval' }>;
@@ -9,17 +10,20 @@ type ApprovalItem = Extract<WorkerTimelineItem, { kind: 'approval' }>;
 const COMPOSER_MAX_HEIGHT = 200;
 
 function ApprovalBanner({ item }: { item: ApprovalItem }) {
-  const { onNotify } = useAgentSession();
+  const { onNotify, resolveApproval } = useAgentSession();
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const api = window.vibeMeet?.orchestration;
   const decide = async (allow: boolean) => {
     const call = allow ? api?.approve : api?.deny;
-    if (!call) return;
+    if (!resolveApproval && !call) return;
     setBusy(true);
     try {
-      const res = await call({ id: item.approvalId, ...(allow ? {} : { reason: reason.trim() || 'Denied from Agent session' }) });
-      if (!res.ok) onNotify?.(res.error);
+      const denial = reason.trim() || 'Denied from Agent session';
+      const res = resolveApproval
+        ? await resolveApproval(item.approvalId, allow, allow ? undefined : denial)
+        : await call!({ id: item.approvalId, ...(allow ? {} : { reason: denial }) });
+      if (!res.ok) onNotify?.(res.error ?? '操作失败');
     } finally {
       setBusy(false);
     }
@@ -117,6 +121,11 @@ export interface SessionComposerProps {
   branch: string | null;
   model: string | null;
   readOnly: boolean;
+  /** Direct sessions only: the permission level, switchable between turns. */
+  policy?: AgentSessionPolicy;
+  onPolicyChange?: (policy: AgentSessionPolicy) => void;
+  /** Direct sessions take one turn at a time, so sending waits for the running turn. */
+  direct?: boolean;
   usage: { input: number; output: number; total: number } | null;
   /** Resolves true once the message was accepted, which clears the draft. */
   onSend: (text: string) => Promise<boolean>;
@@ -134,9 +143,14 @@ export function SessionComposer(props: SessionComposerProps) {
     el.style.height = `${Math.min(COMPOSER_MAX_HEIGHT, el.scrollHeight)}px`;
   }, [draft, props.alive]);
 
+  const blocked = Boolean(props.direct && props.running);
+  const placeholder = props.direct
+    ? (props.running ? '正在工作，可以先写好下一条' : '给 Codex 发消息')
+    : (props.running ? '补充指令，本轮结束后送达' : '给 Worker 发送追加指令');
+
   const send = async () => {
     const text = draft.trim();
-    if (!text || props.sending) return;
+    if (!text || props.sending || blocked) return;
     if (await props.onSend(text)) setDraft('');
   };
 
@@ -153,7 +167,7 @@ export function SessionComposer(props: SessionComposerProps) {
           <textarea
             ref={inputRef}
             className="asv-composer-input"
-            placeholder={props.running ? '补充指令，本轮结束后送达' : '给 Worker 发送追加指令'}
+            placeholder={placeholder}
             value={draft}
             rows={1}
             onChange={(event) => setDraft(event.target.value)}
@@ -163,7 +177,7 @@ export function SessionComposer(props: SessionComposerProps) {
                 void send();
               }
             }}
-            aria-label="追加指令"
+            aria-label={props.direct ? '消息' : '追加指令'}
           />
           <div className="asv-composer-bar">
             <span className="asv-composer-hint">Enter 发送 · Shift+Enter 换行</span>
@@ -172,7 +186,7 @@ export function SessionComposer(props: SessionComposerProps) {
                 <Square size={12} fill="currentColor" />
               </button>
             )}
-            <button type="button" className="asv-round-btn is-primary" disabled={!draft.trim() || props.sending} onClick={() => void send()} aria-label="发送" title="发送">
+            <button type="button" className="asv-round-btn is-primary" disabled={!draft.trim() || props.sending || blocked} onClick={() => void send()} aria-label="发送" title="发送">
               <ArrowUp size={15} strokeWidth={2.25} />
             </button>
           </div>
@@ -184,7 +198,17 @@ export function SessionComposer(props: SessionComposerProps) {
         {props.cwd && <Chip icon={<Folder size={12} />} title={props.cwd}>{baseName(props.cwd)}</Chip>}
         {props.branch && <Chip icon={<GitBranch size={12} />} title={props.branch}>{props.branch}</Chip>}
         {props.model && <Chip icon={<Cpu size={12} />}>{props.model}</Chip>}
-        {props.readOnly && <Chip icon={<Lock size={12} />}>只读</Chip>}
+        {props.policy && props.onPolicyChange ? (
+          <label className="asv-chip asv-policy" title="权限：下一条消息起生效">
+            <Lock size={12} />
+            <select value={props.policy} disabled={props.running} aria-label="权限"
+              onChange={(event) => props.onPolicyChange!(event.target.value as AgentSessionPolicy)}>
+              {(Object.keys(POLICY_LABELS) as AgentSessionPolicy[]).map((value) => (
+                <option key={value} value={value}>{POLICY_LABELS[value]}</option>
+              ))}
+            </select>
+          </label>
+        ) : props.readOnly && <Chip icon={<Lock size={12} />}>只读</Chip>}
         <span className="asv-strip-spacer" />
         {props.usage && (
           <span className="asv-chip" title={`输入 ${props.usage.input} · 输出 ${props.usage.output}`}>

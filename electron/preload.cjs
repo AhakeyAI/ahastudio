@@ -248,6 +248,20 @@ const api = {
       return () => ipcRenderer.removeListener('orchestration:worker-timeline-patch', listener);
     },
   },
+  agentSessions: {
+    list: () => ipcRenderer.invoke('agent-sessions:list', {}),
+    create: (opts) => ipcRenderer.invoke('agent-sessions:create', opts),
+    send: (opts) => ipcRenderer.invoke('agent-sessions:send', opts),
+    interrupt: (opts) => ipcRenderer.invoke('agent-sessions:interrupt', opts),
+    respond: (opts) => ipcRenderer.invoke('agent-sessions:respond', opts),
+    close: (opts) => ipcRenderer.invoke('agent-sessions:close', opts),
+    timeline: (opts) => ipcRenderer.invoke('agent-sessions:timeline', opts),
+    onChanged: (cb) => {
+      const listener = (_, sessions) => cb(sessions);
+      ipcRenderer.on('agent-sessions:changed', listener);
+      return () => ipcRenderer.removeListener('agent-sessions:changed', listener);
+    },
+  },
 };
 
 contextBridge.exposeInMainWorld('vibeMeet', api);

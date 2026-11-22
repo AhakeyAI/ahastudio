@@ -3,6 +3,7 @@ import { ArrowDown, ChevronRight, CircleAlert, CircleCheck, Hourglass, Square } 
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
 import { countDiffStats, parseUnifiedDiff } from '../lib/git-panel-model';
+import { agentSessionClient, isStandaloneSession } from '../lib/agent-session-client';
 import { orchestrationClient } from '../lib/orchestration-client';
 import { stageWindowStore, type StageWindow } from '../lib/stage-window-store';
 import { terminalSessionStore } from '../lib/terminal-session-store';
@@ -17,6 +18,8 @@ import {
   turnHasLiveItem,
 } from '../lib/worker-timeline-model';
 import type {
+  AgentSessionInfo,
+  AgentSessionPolicy,
   OrchestrationDispatchRecord,
   OrchestrationDispatchStage,
   WorkerTimelineFileChange,
@@ -181,6 +184,14 @@ const TurnView = memo(function TurnView({ turn, minHeight }: { turn: WorkerTimel
   );
 });
 
+const SESSION_STATUS_LABELS: Record<AgentSessionInfo['status'], string> = {
+  starting: '启动中',
+  idle: '就绪',
+  running: '工作中',
+  closed: '已结束',
+  failed: '失败',
+};
+
 function latestDispatchFor(dispatches: OrchestrationDispatchRecord[], workerId?: string, dispatchId?: string) {
   const mine = dispatches.filter((d) => (workerId && d.assigneeHandle === workerId) || d.id === dispatchId);
   return mine.sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1) ?? null;
@@ -190,14 +201,20 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const [reloadKey, setReloadKey] = useState(0);
   const { timeline, loading, error } = useWorkerTimeline(win.workerId, win.dispatchId, reloadKey);
   const snapshot = useSyncExternalStore(orchestrationClient.subscribe, orchestrationClient.getSnapshot);
-  const dispatch = latestDispatchFor(snapshot.dispatches, win.workerId ?? timeline?.workerHandle, win.dispatchId);
+  // A direct session belongs to the person at the keyboard; it has no dispatch, task, or report_done.
+  const direct = isStandaloneSession(win.workerId);
+  const directSessions = useSyncExternalStore(agentSessionClient.subscribe, agentSessionClient.getSnapshot);
+  const info = direct ? directSessions.find((entry) => entry.id === win.workerId) : undefined;
+  const [nextPolicy, setNextPolicy] = useState<AgentSessionPolicy | null>(null);
+  const policy = nextPolicy ?? info?.policy;
+  const dispatch = direct ? null : latestDispatchFor(snapshot.dispatches, win.workerId ?? timeline?.workerHandle, win.dispatchId);
   const task = dispatch ? snapshot.tasks.find((t) => t.id === dispatch.taskId) : undefined;
   const role = task?.displayName?.trim().replace(/^@+/, '');
-  const title = role ? `@${role}` : task?.taskTitle || win.title;
+  const title = direct ? info?.title || win.title : role ? `@${role}` : task?.taskTitle || win.title;
   const usage = totalTokenUsage(timeline);
   const running = Boolean(activeTimelineTurn(timeline));
-  const alive = Boolean(timeline?.alive);
-  const cwd = dispatch?.worktreePath ?? win.cwd ?? null;
+  const alive = direct ? info?.status === 'idle' || info?.status === 'running' : Boolean(timeline?.alive);
+  const cwd = info?.cwd ?? dispatch?.worktreePath ?? win.cwd ?? null;
   const targetDispatchId = dispatch?.id ?? win.dispatchId;
   const approvals = useMemo(() => pendingApprovals(timeline), [timeline]);
   const questions = useMemo(
@@ -205,7 +222,15 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     [snapshot.questions, targetDispatchId],
   );
   const appearance = useSyncExternalStore(terminalSessionStore.subscribe, terminalSessionStore.getAppearance);
-  const session = useMemo(() => ({ cwd, appearance, onNotify }), [cwd, appearance, onNotify]);
+  const sessionId = direct ? win.workerId : undefined;
+  const session = useMemo(() => ({
+    cwd, appearance, onNotify,
+    ...(sessionId ? {
+      resolveApproval: async (requestId: string, allow: boolean, reason?: string) =>
+        (await window.vibeMeet?.agentSessions?.respond({ id: sessionId, requestId, allow, ...(reason ? { reason } : {}) }))
+          ?? { ok: false, error: '会话接口不可用' },
+    } : {}),
+  }), [cwd, appearance, onNotify, sessionId]);
 
   const dockRef = useRef<HTMLDivElement>(null);
   const [dockHeight, setDockHeight] = useState(0);
@@ -244,6 +269,18 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   };
 
   const send = async (text: string) => {
+    if (sessionId) {
+      const sessions = window.vibeMeet?.agentSessions;
+      if (!sessions) return false;
+      const ok = await run('send', () => sessions.send({
+        id: sessionId, text, ...(nextPolicy && nextPolicy !== info?.policy ? { policy: nextPolicy } : {}),
+      }));
+      if (ok) {
+        setNextPolicy(null);
+        scroll.scrollToEnd();
+      }
+      return ok;
+    }
     if (!targetDispatchId || !api) return false;
     const [first = '', ...rest] = text.split('\n');
     const long = first.length > 200;
@@ -258,17 +295,31 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   };
 
   const stop = () => {
+    if (sessionId) {
+      void run('stop', async () => window.vibeMeet?.agentSessions?.close({ id: sessionId }));
+      return;
+    }
     if (!targetDispatchId || !api?.workerStop) return;
     void run('stop', () => api.workerStop!({ dispatchId: targetDispatchId, reason: 'Stopped from Agent session' }));
   };
 
   const interrupt = () => {
+    if (sessionId) {
+      void run('interrupt', async () => window.vibeMeet?.agentSessions?.interrupt({ id: sessionId }));
+      return;
+    }
     if (!targetDispatchId || !api?.workerInterrupt) return;
     void run('interrupt', () => api.workerInterrupt!({ dispatchId: targetDispatchId }));
   };
 
   const stage = dispatch?.stage;
-  const stageLabel = stage ? STAGE_LABELS[stage] ?? stage : timeline ? (alive ? '运行中' : '已结束') : '';
+  const stageLabel = direct
+    ? (info ? SESSION_STATUS_LABELS[info.status] : '已结束')
+    : stage ? STAGE_LABELS[stage] ?? stage : timeline ? (alive ? '运行中' : '已结束') : '';
+  const emptyText = !direct ? '这个 Worker 还没有可回放的过程记录。'
+    : !info ? '这个会话已经结束。'
+      : info.status === 'failed' ? `会话无法启动：${info.error ?? '未知错误'}`
+        : info.status === 'starting' ? '正在启动 Codex…' : '发一条消息开始。';
 
   return (
     <AgentSessionContext.Provider value={session}>
@@ -279,7 +330,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
           {task?.taskTitle && role && <span className="asv-subtitle">{task.taskTitle}</span>}
           <span className="asv-spacer" />
           {stageLabel && (
-            <span className={`asv-stage${stage ? ` is-${stage}` : ''}`}>
+            <span className={`asv-stage${stage ? ` is-${stage}` : info?.status === 'running' ? ' is-working' : info?.status === 'failed' ? ' is-failed' : ''}`}>
               <i className="asv-stage-dot" aria-hidden="true" />
               {stageLabel}
             </span>
@@ -300,7 +351,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
                 <button type="button" className="asv-btn" onClick={() => setReloadKey((k) => k + 1)}>重试</button>
               </div>
             )}
-            {!loading && !error && !timeline && <div className="asv-empty">这个 Worker 还没有可回放的过程记录。</div>}
+            {!loading && !error && !timeline?.turns.length && (!timeline || direct) && <div className="asv-empty">{emptyText}</div>}
             {timeline?.turns.map((turn) => (
               <TurnView key={turn.key} turn={turn} minHeight={turn.key === scroll.anchoredTurnKey ? scroll.anchoredMinHeight : undefined} />
             ))}
@@ -325,6 +376,8 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             branch={dispatch?.branch ?? null}
             model={timeline?.model ?? dispatch?.model ?? null}
             readOnly={timeline?.readOnly ?? true}
+            direct={direct}
+            {...(direct && policy ? { policy, onPolicyChange: setNextPolicy } : {})}
             usage={usage}
             onSend={send}
             onInterrupt={interrupt}

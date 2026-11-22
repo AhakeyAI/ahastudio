@@ -400,6 +400,9 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-chip { display: inline-flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; }
 .asv-chip > span { overflow: hidden; text-overflow: ellipsis; }
 .asv-chip > svg { flex: none; opacity: 0.8; }
+.asv-policy select { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; outline: none; padding: 0; }
+.asv-policy select:focus-visible { text-decoration: underline; }
+.asv-policy select:disabled { cursor: default; }
 .asv-strip-spacer { flex: 1; }
 
 .asv-to-bottom {
