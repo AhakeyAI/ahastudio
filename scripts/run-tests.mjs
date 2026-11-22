@@ -70,6 +70,13 @@ export function resolveConcurrency({ explicitConcurrency, envConcurrency, platfo
   return platform === 'win32' ? 2 : null;
 }
 
+// On POSIX, @lydell/node-pty can keep a finished test worker's event loop alive.
+// On Windows, --test-force-exit calls process.exit() while ConPTY background
+// conout threads are still shutting down, deadlocking Node exit.
+export function shouldForceExit(platform) {
+  return platform !== 'win32';
+}
+
 function main() {
   const here = dirname(fileURLToPath(import.meta.url));
   const repoRoot = join(here, '..');
@@ -93,6 +100,9 @@ function main() {
   });
 
   const nodeArgs = ['--import', './tests/register-electron-stub.mjs', '--test'];
+  if (shouldForceExit(process.platform) && !extraNodeArgs.includes('--test-force-exit')) {
+    nodeArgs.push('--test-force-exit');
+  }
   if (resolvedConcurrency != null) {
     nodeArgs.push(`--test-concurrency=${resolvedConcurrency}`);
   }

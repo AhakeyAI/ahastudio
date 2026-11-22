@@ -426,13 +426,13 @@ test('3. start-confirmation timeout fails dispatch/task cleanly, late workerDone
     // Cross startConfirmationTimeoutMs (10_000ms): fails with agent_prompt_stalled and forceFailTask: true.
     h.advance(1);
     const stalledTick = await h.service.coordinatorTick(run.id, { workerPaneIds: ['w1'] });
-    assert.equal(stalledTick.converged, false); // t2 is still pending
+    assert.equal(stalledTick.converged, true); // t1 failed, so t2 is blocked by its failed dependency
     const d1Stalled = h.store.getDispatchContext(d1.id);
     assert.equal(d1Stalled?.status, 'failed');
     assert.equal(d1Stalled?.failureCount, 1);
     assert.ok(d1Stalled?.lastFailureReason?.startsWith(`${AGENT_PROMPT_STALLED_ERROR}:`));
     assert.equal(h.store.getTask('t1')?.status, 'failed');
-    assert.equal(h.store.getTask('t2')?.status, 'pending');
+    assert.equal(h.store.getTask('t2')?.status, 'blocked');
     assert.ok(h.events.some((e) => e.reason === 'coordinator:start-timeout'));
 
     // Next tick does NOT blindly re-paste or re-dispatch failed task.
@@ -440,7 +440,7 @@ test('3. start-confirmation timeout fails dispatch/task cleanly, late workerDone
     await h.service.coordinatorTick(run.id, { workerPaneIds: ['w1'] });
     assert.equal(h.pasteWritesFor('w1').length, pasteCountAfterDispatch);
     assert.equal(h.store.getTask('t1')?.status, 'failed');
-    assert.equal(h.store.getTask('t2')?.status, 'pending');
+    assert.equal(h.store.getTask('t2')?.status, 'blocked');
 
     // Unauthorized late workerDone on stalled dispatch is rejected cleanly.
     const unauth = h.service.workerDone({

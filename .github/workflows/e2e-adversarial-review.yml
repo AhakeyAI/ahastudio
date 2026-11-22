@@ -63,4 +63,8 @@ jobs:
         run: npm ci
 
       - name: Run adversarial-review E2E suite
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: npm run test:e2e

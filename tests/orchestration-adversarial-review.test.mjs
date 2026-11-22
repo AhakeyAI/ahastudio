@@ -325,7 +325,7 @@ test('full autonomous close-out: server review gate, chat-and-guard non-bypass, 
   assert.equal(rev1Proposal.status, 'confirmation_required');
 
   // After a real user reply turn + explicit confirmation, reviewer starts in isolated detached worktree.
-  service.recordUserPromptTurn('local-coord', 'hook');
+  service.recordUserPromptTurn('local-coord', 'pty');
   const rev1 = await service.delegateTask({
     from: 'local-coord',
     callerPaneId: 'local-coord',
@@ -2059,7 +2059,7 @@ test('Natural workflow UX: confirm-once Run review pre-authorization, Coordinato
     confirmed: false,
   });
   assert.equal(sneakProposal.status, 'confirmation_required');
-  service.recordUserPromptTurn('local-coord', 'hook');
+  service.recordUserPromptTurn('local-coord', 'pty');
   const sneakAttempt = await service.delegateTask({
     from: 'local-coord',
     callerPaneId: 'local-coord',
@@ -2089,7 +2089,7 @@ test('Natural workflow UX: confirm-once Run review pre-authorization, Coordinato
   });
   assert.equal(prop1.status, 'confirmation_required');
   assert.equal(prop1.proposal.authorizeReviews, true);
-  service.recordUserPromptTurn('local-coord', 'hook');
+  service.recordUserPromptTurn('local-coord', 'pty');
   const impl = await service.delegateTask({
     from: 'local-coord',
     callerPaneId: 'local-coord',
@@ -2452,7 +2452,7 @@ test('Audit re-review fixes (P1 #1-#2, P2 #3-#4): detached HEAD guard, strict fi
   assert.match(step1Res.body.error, /--confirmed --proposal-id/);
 
   // Simulate user reply turn, then complete step 2 purely via CLI flags!
-  service.recordUserPromptTurn('local-coord', 'hook');
+  service.recordUserPromptTurn('local-coord', 'pty');
   // P2 #3: Also verify a super-fast reviewer that submits PASS inside onPaneSpawned (BEFORE workerStart returns!)
   // does NOT leave the target stranded in 'pending'!
   let fastPassSubmitted = false;

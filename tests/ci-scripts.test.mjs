@@ -9,6 +9,7 @@ import {
   parseRunnerArgs,
   resolveConcurrency,
   selectTestFiles,
+  shouldForceExit,
 } from '../scripts/run-tests.mjs';
 import {
   isPrereleaseVersion,
@@ -57,6 +58,10 @@ test('run-tests splits fast suite from long real-Git E2E and applies Windows con
     () => resolveConcurrency({ explicitConcurrency: '0', envConcurrency: undefined, platform: 'linux', fileCount: 2 }),
     /Invalid test concurrency/,
   );
+
+  assert.equal(shouldForceExit('win32'), false);
+  assert.equal(shouldForceExit('linux'), true);
+  assert.equal(shouldForceExit('darwin'), true);
 });
 
 test('verify-release-version enforces tag/package version parity and detects prereleases', () => {

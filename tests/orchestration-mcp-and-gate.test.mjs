@@ -235,7 +235,7 @@ function spawnMcpClient(t, env, framing = 'newline', cwd = undefined) {
   return { child, request, notify, getStderr: () => stderrText };
 }
 
-test('DispatchProposalManager deduplicates pty+hook turns and enforces chat-and-guard batch lease', async (t) => {
+test('DispatchProposalManager counts only keystroke turns and enforces chat-and-guard batch lease', async (t) => {
   let clock = 10_000;
   const agentStatusStore = new AgentStatusStore();
   const tracker = new TerminalRuntimeTracker();
@@ -269,14 +269,14 @@ test('DispatchProposalManager deduplicates pty+hook turns and enforces chat-and-
   });
   t.after(() => service.dispose());
 
-  // Advance to Turn 10 with paired PTY + hook events (deduplicated within 1500ms).
+  // Advance to Turn 10 with PTY Enter + hook pairs; the hook never advances the turn on its own.
   for (let i = 0; i < 10; i += 1) {
     clock += 5_000;
     const tPty = service.recordUserPromptTurn('local-coord', 'pty');
     clock += 200;
     const tHook = service.recordUserPromptTurn('local-coord', 'hook');
     assert.equal(tPty, i + 1);
-    assert.equal(tHook, i + 1, 'paired pty+hook within 1500ms must only advance turn by 1');
+    assert.equal(tHook, i + 1, 'the hook that follows a keystroke must not advance the turn again');
   }
   assert.equal(service.proposals.getUserTurn('local-coord'), 10);
 
@@ -318,7 +318,7 @@ test('DispatchProposalManager deduplicates pty+hook turns and enforces chat-and-
     assert.equal(result.status, 'confirmation_required');
   }
 
-  // User replies on Turn 11 (paired pty + hook -> advances to 11 once).
+  // User replies on Turn 11 (pty Enter advances, the following hook does not).
   clock += 3_000;
   service.recordUserPromptTurn('local-coord', 'pty');
   clock += 150;
@@ -354,9 +354,11 @@ test('DispatchProposalManager deduplicates pty+hook turns and enforces chat-and-
   assert.equal(res1.task.taskTitle, '@reviewer: Review diff A');
   assert.equal(spawnCount, 2);
 
-  // Next user turn (Turn 12) clears the Turn 11 lease and requires fresh confirmation.
+  // A hook with no keystroke (text AhaStation typed in) is not a user turn.
   clock += 5_000;
-  service.recordUserPromptTurn('local-coord', 'hook');
+  assert.equal(service.recordUserPromptTurn('local-coord', 'hook'), 11);
+  // Next user turn (Turn 12) clears the Turn 11 lease and requires fresh confirmation.
+  service.recordUserPromptTurn('local-coord', 'pty');
   assert.equal(service.proposals.getUserTurn('local-coord'), 12);
   const blockedTurn12 = await service.delegateTask({
     from: 'local-coord',
@@ -375,13 +377,13 @@ test('DispatchProposalManager deduplicates pty+hook turns and enforces chat-and-
   assert.equal(service.proposals.hasPendingChatProposalForCurrentTurn('local-coord'), true);
   assert.equal(service.recordUserPromptTurn('local-coord', 'pty'), 12, 'mid-generation pty Enter must be ignored');
 
-  // Once agent finishes turn (idle/waiting), a confirmation Enter within 1.5s of the Turn 12 hook is NOT swallowed by deduplication!
+  // Once the agent finishes its turn (idle/waiting), the confirmation Enter advances the turn.
   agentStatusStore.ingestHookEvent({ ptyId: 'local-coord', agentId: 'claude', state: 'done' });
   clock += 400; // still within 1500ms of Turn 12 hook!
   assert.equal(
     service.recordUserPromptTurn('local-coord', 'pty'),
     13,
-    'confirmation Enter after evaluateChatGuard must advance turn even within 1500ms of prior hook'
+    'confirmation Enter after evaluateChatGuard must advance the turn'
   );
   const confirmedTurn13 = await service.delegateTask({
     from: 'local-coord',
@@ -832,7 +834,7 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   assert.match(emptyFinalizeCall.result.content[0].text, /run_not_found|not part of any/i);
 
   // tools/call: delegate_task on Turn 1 -> blocked by chat-and-guard even with empty optional strings & snake_case aliases!
-  service.recordUserPromptTurn('local-coord', 'hook');
+  service.recordUserPromptTurn('local-coord', 'pty');
   const blockedCall = await coordClient.request('tools/call', {
     name: 'delegate_task',
     arguments: {
@@ -855,7 +857,7 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   assert.match(blockedCall.result.content[0].text, /Agent: codex/);
 
   // User confirms (Turn 2) -> delegate_task succeeds with snake_case aliases & blank optional strings stripped!
-  service.recordUserPromptTurn('local-coord', 'hook');
+  service.recordUserPromptTurn('local-coord', 'pty');
   const startedCall = await coordClient.request('tools/call', {
     name: 'delegate_task',
     arguments: {
