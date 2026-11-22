@@ -4,11 +4,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import ts from 'typescript';
+import { build } from 'esbuild';
 import { ipcMain } from 'electron';
 import { registerShellPtyIpc } from '../dist-electron/ipc/shell-pty.js';
+import { buildDispatchPreamble } from '../dist-electron/orchestration/worker-dispatch-preamble.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'aha-agent-session-ui-'));
 test.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -25,8 +27,27 @@ function emit(name, rewrite = (s) => s) {
 }
 
 const model = await import(emit('worker-timeline-model'));
-const markdown = await import(emit('safe-markdown'));
+const anchoring = await import(emit('timeline-scroll-anchoring'));
 const paneTreeUrl = emit('terminal-pane-tree');
+
+/** Bundles the real Markdown component with React's server renderer and returns its HTML. */
+async function loadMarkdownRenderer() {
+  const outfile = join(dir, 'session-markdown.cjs');
+  await build({
+    stdin: {
+      contents: `
+        import { createElement } from 'react';
+        import { renderToStaticMarkup } from 'react-dom/server';
+        import { SessionMarkdown } from './src/components/agent-session/SessionMarkdown.tsx';
+        export const render = (text) => renderToStaticMarkup(createElement(SessionMarkdown, { text }));`,
+      resolveDir: fileURLToPath(new URL('..', import.meta.url)),
+      loader: 'js',
+    },
+    outfile, bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', logLevel: 'silent',
+  });
+  const mod = await import(pathToFileURL(outfile).href);
+  return (mod.default ?? mod).render;
+}
 
 /** Loads a fresh stage store whose persistence goes to `disk` instead of the Electron bridge. */
 async function loadStageStore(disk) {
@@ -166,16 +187,141 @@ test('timeline formatting helpers', () => {
   assert.deepEqual(model.pendingApprovals(snapshot).map((item) => item.id), ['a1']);
 });
 
-test('safe Markdown keeps raw HTML as text and only links http(s) URLs', () => {
-  const blocks = markdown.parseMarkdown('# Title\n\nSome **bold** and `code` <img src=x onerror=alert(1)>\n\n- one\n- two\n\n```ts\nconst a = 1;\n```\n[ok](https://example.com) [bad](javascript:alert(1))');
-  assert.deepEqual(blocks.map((block) => block.type), ['heading', 'paragraph', 'list', 'code', 'paragraph']);
-  const inline = blocks[1].children;
-  assert.deepEqual(inline.map((node) => node.type), ['text', 'strong', 'text', 'code', 'text']);
-  assert.match(inline.at(-1).text, /<img src=x onerror=alert\(1\)>/);
-  assert.equal(blocks[3].lang, 'ts');
-  assert.equal(blocks[3].text, 'const a = 1;');
-  const links = blocks[4].children.filter((node) => node.type === 'link');
-  assert.deepEqual(links.map((node) => node.href), ['https://example.com']);
+test('session Markdown keeps raw HTML as text, never emits hrefs or images, and renders GFM', async () => {
+  const render = await loadMarkdownRenderer();
+  const html = render([
+    '# Title',
+    '',
+    'Some **bold** and `code` <img src=x onerror=alert(1)> <script>alert(2)</script>',
+    '',
+    '<div onclick="alert(3)">block html</div>',
+    '',
+    '| File | Lines |',
+    '| --- | --- |',
+    '| a.ts | 12 |',
+    '',
+    '- [x] done',
+    '',
+    '```ts',
+    'const a = "<b>";',
+    '```',
+    '',
+    '[ok](https://example.com) [file](src/app.ts:12) [bad](javascript:alert(1)) [data](data:text/html,x) ![pic](https://example.com/a.png)',
+  ].join('\n'));
+
+  assert.doesNotMatch(html, /<(img|script|div onclick|iframe)\b/i, 'raw HTML and images never become elements');
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.match(html, /&lt;div onclick=/);
+  assert.doesNotMatch(html, /\shref=/, 'links are opened through IPC, so no anchor can navigate');
+  assert.doesNotMatch(html, /javascript:|data:text/);
+  assert.match(html, /<a class="asv-md-link"[^>]*title="https:\/\/example\.com"[^>]*>ok<\/a>/);
+  assert.match(html, /<a class="asv-md-link"[^>]*title="src\/app\.ts:12"[^>]*>file<\/a>/);
+  assert.match(html, /<span class="asv-md-deadlink">bad<\/span>/);
+  assert.match(html, /<a class="asv-md-link"[^>]*title="https:\/\/example\.com\/a\.png"[^>]*>pic<\/a>/);
+  assert.match(html, /<div class="asv-md-table"><table>/);
+  assert.match(html, /<td>a\.ts<\/td>/);
+  assert.match(html, /<input type="checkbox" disabled="" checked=""\/>/);
+  assert.match(html, /<div class="asv-code" data-lang="ts">/);
+  assert.match(html, /const a = &quot;&lt;b&gt;&quot;;/);
+});
+
+test('dispatch prompts split into the task body and the orchestration wrapper', () => {
+  const base = { taskId: 'task_1', dispatchId: 'ctx_1', coordinatorHandle: 'run:r1', workerHandle: 'codex-worker-1', runId: 'r1' };
+  const spec = 'Review the diff.\n\n### Constraints\n- read only\n- When finished early, say so';
+
+  const mcp = model.splitDispatchPrompt(buildDispatchPreamble({
+    ...base, taskSpec: spec, mcpEnabled: true, headless: true, role: 'reviewer',
+    worktreePath: 'C:/repo/wt', branch: 'aha/worker/x', canDispatchSubWorkers: true,
+  }));
+  assert.equal(mcp.body, spec);
+  assert.equal(mcp.followUp, false);
+  assert.match(mcp.system, /^\[Worker @reviewer\]\nWorkspace: C:\/repo\/wt\nBranch: aha\/worker\/x\n\n- Need clarification/);
+  assert.match(mcp.system, /report_done/);
+  assert.match(mcp.system, /delegate_task/);
+
+  const followUp = model.splitDispatchPrompt(buildDispatchPreamble({
+    ...base, taskSpec: 'Also check tests', mcpEnabled: true, headless: true, role: 'reviewer', isFollowUp: true,
+  }));
+  assert.deepEqual({ body: followUp.body, followUp: followUp.followUp }, { body: 'Also check tests', followUp: true });
+
+  const cli = model.splitDispatchPrompt(buildDispatchPreamble({ ...base, taskSpec: spec, dispatchCapability: 'aha_dispatch_secret' }));
+  assert.equal(cli.body, spec);
+  assert.match(cli.system, /^\[ORCHESTRATION DISPATCH ctx_1\]/);
+  assert.match(cli.system, /=== ORCHESTRATION PROTOCOL ===/);
+  assert.doesNotMatch(cli.system, /Review the diff/);
+
+  const plain = model.splitDispatchPrompt('Just do it\r\n- When finished, stop');
+  assert.deepEqual(plain, { body: 'Just do it\n- When finished, stop', system: null, followUp: false });
+  const truncated = model.splitDispatchPrompt('[ORCHESTRATION DISPATCH ctx_1]\nTask: t\n\n=== TASK SPECIFICATION ===\nhalf a spec');
+  assert.equal(truncated.system, null, 'an unterminated wrapper is shown whole rather than guessed at');
+  assert.match(truncated.body, /half a spec/);
+});
+
+test('work log helpers unwrap shell commands and format durations, fences, and multi-file diffs', () => {
+  assert.equal(model.unwrapShellCommand('bash -lc "npm test"'), 'npm test');
+  assert.equal(model.unwrapShellCommand('bash -lc "rg -n \\"expiresAt\\" src"'), 'rg -n "expiresAt" src');
+  assert.equal(model.unwrapShellCommand('/bin/zsh -lc \'git status --short\''), 'git status --short');
+  assert.equal(
+    model.unwrapShellCommand('"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoProfile -Command "Get-Content a.ts"'),
+    'Get-Content a.ts',
+  );
+  assert.equal(model.unwrapShellCommand('node -c "x"'), 'node -c "x"', 'only shells are unwrapped');
+  assert.equal(model.unwrapShellCommand('  rg -n foo src  '), 'rg -n foo src');
+
+  assert.equal(model.formatDuration(1_234), '1.2s');
+  assert.equal(model.formatDuration(42_900), '42s');
+  assert.equal(model.formatDuration(185_000), '3m 05s');
+  assert.equal(model.formatDuration(3_725_000), '1h 02m');
+  assert.equal(model.formatDuration(null), '');
+  assert.equal(model.formatElapsed(1_000, 9_999), '8s');
+  assert.equal(model.formatElapsed(1_000, 66_000), '1m 05s');
+  assert.equal(model.formatElapsed(5_000, 1_000), '0s');
+
+  assert.equal(model.fenceLanguage('TS title="a.ts"'), 'ts');
+  assert.equal(model.fenceLanguage('c++'), 'c++');
+  assert.equal(model.fenceLanguage('text'), null);
+  assert.equal(model.fenceLanguage(''), null);
+  assert.equal(model.fenceLanguage('<script>'), null);
+
+  const diff = [
+    'diff --git a/src/a.ts b/src/a.ts', 'index 1..2 100644', '--- a/src/a.ts', '+++ b/src/a.ts', '@@ -1 +1 @@', '-old', '+new',
+    'diff --git a/old.md b/docs/new.md', 'similarity index 90%', '--- a/old.md', '+++ b/docs/new.md', '@@ -1 +1 @@', '-+++ b/fake.md', '+text',
+  ].join('\n');
+  const files = model.splitDiffByFile(diff);
+  assert.deepEqual(files.map((file) => file.path), ['src/a.ts', 'docs/new.md']);
+  assert.match(files[0].diff, /^diff --git a\/src\/a\.ts/);
+  assert.doesNotMatch(files[0].diff, /new\.md/);
+  assert.deepEqual(model.splitDiffByFile('@@ -1 +1 @@\n-a\n+b').map((file) => file.path), ['']);
+  assert.deepEqual(model.splitDiffByFile('  \n'), []);
+
+  const group = model.groupTimelineItems([command('c1', 1_000, 2_000), command('c2', 2_100, null), command('c3', 2_200, 2_300)])[0];
+  assert.equal(model.liveGroupItem(group).id, 'c2');
+  assert.equal(model.turnHasLiveItem({ items: [command('c1', 1, 2), message('m', 'x', { status: 'completed' })] }), false);
+  assert.equal(model.turnHasLiveItem({ items: [command('c1', 1, null)] }), true);
+});
+
+test('timeline scroll follows the end, releases on an upward move, and reveals opened rows', () => {
+  const view = (scrollTop, scrollHeight = 2_000, clientHeight = 600) => ({ scrollTop, scrollHeight, clientHeight });
+  assert.equal(anchoring.distanceFromEnd(view(1_400)), 0);
+  assert.equal(anchoring.modeAfterScroll('following-end', 1_400, view(1_000)), 'free-scrolling', 'scrolling up lets go');
+  assert.equal(
+    anchoring.modeAfterScroll('following-end', 1_400, view(1_400, 2_600)), 'following-end',
+    'content growing under a pinned view is not the reader leaving',
+  );
+  assert.equal(anchoring.modeAfterScroll('free-scrolling', 900, view(1_100)), 'free-scrolling', 'scrolling down part way stays free');
+  assert.equal(anchoring.modeAfterScroll('free-scrolling', 900, view(1_360)), 'following-end', 'reaching the end resumes following');
+
+  assert.equal(anchoring.anchoredTurnMinHeight({ viewportHeight: 800, composerInset: 150 }), 626);
+  assert.equal(anchoring.anchoredTurnMinHeight({ viewportHeight: 100, composerInset: 150 }), 0);
+
+  const viewport = { viewportTop: 0, viewportBottom: 800, composerOverlayHeight: 150, anchorOffset: 24 };
+  assert.equal(anchoring.resolveDisclosureRevealScrollDelta({ ...viewport, rowTop: 300, rowBottom: 600 }), 0, 'already visible');
+  assert.equal(anchoring.resolveDisclosureRevealScrollDelta({ ...viewport, rowTop: 300, rowBottom: 750 }), 100, 'hidden by the composer');
+  assert.equal(
+    anchoring.resolveDisclosureRevealScrollDelta({ ...viewport, rowTop: 100, rowBottom: 1_400 }), 76,
+    'a tall row scrolls only until its header reaches the anchor offset',
+  );
+  assert.equal(anchoring.resolveDisclosureRevealScrollDelta({ ...viewport, rowTop: 10, rowBottom: 1_400 }), 0);
 });
 
 test('stage store creates, dedupes, switches, persists, and restores agent-session windows', async () => {

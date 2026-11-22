@@ -42,13 +42,21 @@ Certain ported, adapted, or bundled components retain their original upstream co
 - **@ricky0123/vad-web** (`public/vad/vad.worklet.bundle.min.js`): ISC License (`https://github.com/ricky0123/vad`)
 - **Silero VAD** (`public/vad/silero_vad_v5.onnx`): MIT License (`https://github.com/snakers4/silero-vad`)
 
+## 5. T3 Code (`https://github.com/pingdotgg/t3code`)
+
+- **License:** MIT License
+- **Copyright:** Copyright (c) 2026 T3 Tools Inc.
+- **Ported / adapted files in this repository:**
+  - `src/lib/timeline-scroll-anchoring.ts` (`resolveDisclosureRevealScrollDelta`, ported from `apps/web/src/components/chat/timelineScrollAnchoring.ts`)
+  - `src/components/agent-session-view.css`, `src/components/agent-session/*` (chat surface layout, work-log row and composer presentation adapted from `apps/web/src/components/chat/WorkLog.tsx`, `ComposerSurface.tsx` and `apps/web/src/index.css`)
+
 ---
 
 ## License Texts
 
-### MIT License (Orca / Microsoft)
+### MIT License (Orca / Microsoft / T3 Code)
 
-Applies to the Orca, Visual Studio Code, ONNX Runtime Web, and Silero VAD components listed above (with the respective upstream Copyright notices).
+Applies to the Orca, Visual Studio Code, ONNX Runtime Web, Silero VAD, and T3 Code components listed above (with the respective upstream Copyright notices).
 
 ```text
 MIT License

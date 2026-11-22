@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useId, useMemo, useState, useSyncExternalStore, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react';
+import { Fragment, useEffect, useMemo, useState, useSyncExternalStore, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react';
 import { Bot, ClipboardPaste, FileDiff, FileText, LoaderCircle, RefreshCw, Send, X } from 'lucide-react';
 import type { BundledLanguage } from 'shiki/langs';
 import {
@@ -8,18 +8,10 @@ import {
   isAgentStatusVisible,
   relativeFromDir,
 } from '../lib/agent-status-view';
+import { useCodeHighlight } from '../hooks/useCodeHighlight';
 import { detectCodeLanguage } from '../lib/code-language';
-import {
-  requestCodeHighlight,
-  type CodeHighlightSource,
-  type CodeHighlightTokens,
-} from '../lib/code-syntax-highlight-client';
-import type {
-  CodeHighlightAppearance,
-  DiffHighlightRow,
-  SyntaxToken,
-} from '../lib/code-syntax-highlight';
 import { terminalSessionStore } from '../lib/terminal-session-store';
+import { renderLineTokens } from './SyntaxTokens';
 import {
   countDiffStats,
   formatFileSize,
@@ -66,71 +58,6 @@ const CODE_LINE_HEIGHT = 18;
 
 function useCodeLanguage(filePath: string): BundledLanguage | null {
   return useMemo(() => detectCodeLanguage(filePath), [filePath]);
-}
-
-interface CodeHighlightResult {
-  kind: 'code' | 'diff';
-  content: readonly string[] | readonly DiffHighlightRow[];
-  lang: BundledLanguage;
-  appearance: CodeHighlightAppearance;
-  tokens: CodeHighlightTokens;
-}
-
-function useCodeHighlight(
-  kind: 'code' | 'diff',
-  content: readonly string[] | readonly DiffHighlightRow[],
-  lang: BundledLanguage | null,
-  appearance: CodeHighlightAppearance,
-): CodeHighlightTokens {
-  const consumer = useId();
-  const [result, setResult] = useState<CodeHighlightResult | null>(null);
-
-  useEffect(() => {
-    if (!lang || content.length === 0) return;
-    let cancelled = false;
-    const source: CodeHighlightSource = kind === 'code'
-      ? { kind, lines: content as readonly string[] }
-      : { kind, rows: content as readonly DiffHighlightRow[] };
-    void requestCodeHighlight(consumer, source, lang, appearance).then((tokens) => {
-      if (!cancelled) setResult({ kind, content, lang, appearance, tokens });
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [consumer, kind, content, lang, appearance]);
-
-  if (
-    !lang ||
-    result?.kind !== kind ||
-    result.content !== content ||
-    result.lang !== lang ||
-    result.appearance !== appearance
-  ) {
-    return null;
-  }
-  return result.tokens;
-}
-
-function renderLineTokens(tokens: readonly SyntaxToken[]): ReactNode {
-  if (tokens.length === 0) return null;
-  return tokens.map((tok, i) =>
-    tok.color || tok.italic ? (
-      <span
-        key={i}
-        style={
-          tok.color && tok.italic
-            ? { color: tok.color, fontStyle: 'italic' }
-            : tok.color
-              ? { color: tok.color }
-              : { fontStyle: 'italic' }
-        }
-      >
-        {tok.text}
-      </span>
-    ) : (
-      tok.text
-    )
-  );
 }
 
 export function previewKey(target: PanelPreviewTarget | null): string {
