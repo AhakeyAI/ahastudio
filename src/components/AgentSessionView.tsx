@@ -188,6 +188,7 @@ const SESSION_STATUS_LABELS: Record<AgentSessionInfo['status'], string> = {
   starting: '启动中',
   idle: '就绪',
   running: '工作中',
+  suspended: '待恢复',
   closed: '已结束',
   failed: '失败',
 };
@@ -206,14 +207,17 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const directSessions = useSyncExternalStore(agentSessionClient.subscribe, agentSessionClient.getSnapshot);
   const info = direct ? directSessions.find((entry) => entry.id === win.workerId) : undefined;
   const [nextPolicy, setNextPolicy] = useState<AgentSessionPolicy | null>(null);
+  const [nextNetwork, setNextNetwork] = useState<boolean | null>(null);
   const policy = nextPolicy ?? info?.policy;
+  const network = nextNetwork ?? info?.network ?? false;
+  const resumable = Boolean(info?.providerSessionId) && (info?.status === 'suspended' || info?.status === 'failed');
   const dispatch = direct ? null : latestDispatchFor(snapshot.dispatches, win.workerId ?? timeline?.workerHandle, win.dispatchId);
   const task = dispatch ? snapshot.tasks.find((t) => t.id === dispatch.taskId) : undefined;
   const role = task?.displayName?.trim().replace(/^@+/, '');
   const title = direct ? info?.title || win.title : role ? `@${role}` : task?.taskTitle || win.title;
   const usage = totalTokenUsage(timeline);
   const running = Boolean(activeTimelineTurn(timeline));
-  const alive = direct ? info?.status === 'idle' || info?.status === 'running' : Boolean(timeline?.alive);
+  const alive = direct ? info?.status === 'idle' || info?.status === 'running' || resumable : Boolean(timeline?.alive);
   const cwd = info?.cwd ?? dispatch?.worktreePath ?? win.cwd ?? null;
   const targetDispatchId = dispatch?.id ?? win.dispatchId;
   const approvals = useMemo(() => pendingApprovals(timeline), [timeline]);
@@ -273,10 +277,13 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       const sessions = window.vibeMeet?.agentSessions;
       if (!sessions) return false;
       const ok = await run('send', () => sessions.send({
-        id: sessionId, text, ...(nextPolicy && nextPolicy !== info?.policy ? { policy: nextPolicy } : {}),
+        id: sessionId, text,
+        ...(nextPolicy && nextPolicy !== info?.policy ? { policy: nextPolicy } : {}),
+        ...(nextNetwork !== null && nextNetwork !== info?.network ? { network: nextNetwork } : {}),
       }));
       if (ok) {
         setNextPolicy(null);
+        setNextNetwork(null);
         scroll.scrollToEnd();
       }
       return ok;
@@ -303,6 +310,11 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     void run('stop', () => api.workerStop!({ dispatchId: targetDispatchId, reason: 'Stopped from Agent session' }));
   };
 
+  const answer = async (requestId: string, answers: Record<string, string[]> | null) => {
+    if (!sessionId) return false;
+    return run('answer', async () => window.vibeMeet?.agentSessions?.answer({ id: sessionId, requestId, answers }));
+  };
+
   const interrupt = () => {
     if (sessionId) {
       void run('interrupt', async () => window.vibeMeet?.agentSessions?.interrupt({ id: sessionId }));
@@ -318,7 +330,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     : stage ? STAGE_LABELS[stage] ?? stage : timeline ? (alive ? '运行中' : '已结束') : '';
   const emptyText = !direct ? '这个 Worker 还没有可回放的过程记录。'
     : !info ? '这个会话已经结束。'
-      : info.status === 'failed' ? `会话无法启动：${info.error ?? '未知错误'}`
+      : info.status === 'failed' && !resumable ? `会话无法启动：${info.error ?? '未知错误'}`
         : info.status === 'starting' ? '正在启动 Codex…' : '发一条消息开始。';
 
   return (
@@ -335,7 +347,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               {stageLabel}
             </span>
           )}
-          {alive && (
+          {alive && !(direct && resumable) && (
             <button type="button" className="asv-btn is-quiet-danger" disabled={busy === 'stop'} onClick={stop}>
               <Square size={10} fill="currentColor" /> 停止
             </button>
@@ -378,6 +390,10 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             readOnly={timeline?.readOnly ?? true}
             direct={direct}
             {...(direct && policy ? { policy, onPolicyChange: setNextPolicy } : {})}
+            {...(direct ? {
+              network, onNetworkChange: setNextNetwork, resumable,
+              directQuestions: info?.pendingQuestions ?? [], onAnswer: answer,
+            } : {})}
             usage={usage}
             onSend={send}
             onInterrupt={interrupt}

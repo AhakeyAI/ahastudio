@@ -254,6 +254,7 @@ const api = {
     send: (opts) => ipcRenderer.invoke('agent-sessions:send', opts),
     interrupt: (opts) => ipcRenderer.invoke('agent-sessions:interrupt', opts),
     respond: (opts) => ipcRenderer.invoke('agent-sessions:respond', opts),
+    answer: (opts) => ipcRenderer.invoke('agent-sessions:answer', opts),
     close: (opts) => ipcRenderer.invoke('agent-sessions:close', opts),
     timeline: (opts) => ipcRenderer.invoke('agent-sessions:timeline', opts),
     onChanged: (cb) => {

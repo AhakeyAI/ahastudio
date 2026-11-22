@@ -269,6 +269,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   private seq = 0;
   private tokenTotal: Record<string, number> | null = {};
   private policy: AgentSessionPolicy = 'read-only';
+  private network = false;
   private threadId: string | null = null;
   private active: ActiveTurn | null = null;
   private output = '';
@@ -331,8 +332,8 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   get closing(): boolean { return this.stopping; }
   get latestTurnKey(): string | null { return this.outputTurnKey; }
 
-  async open({ cwd, model, policy, resumeSessionId }: {
-    cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string;
+  async open({ cwd, model, policy, resumeSessionId, network = false }: {
+    cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string; network?: boolean;
   }): Promise<string> {
     const wanted = POLICIES[policy];
     try {
@@ -354,6 +355,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
         throw new Error(`Codex did not confirm the requested ${policy} sandbox and approvals`);
       }
       this.policy = policy;
+      this.network = network;
       // The resumed thread's running token total is unknown until Codex reports it.
       if (resumeSessionId) this.tokenTotal = null;
       this.threadId = id;
@@ -388,13 +390,15 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     });
   }
 
-  async startTurn({ turnKey, prompt, effort, model, policy }: {
+  async startTurn({ turnKey, prompt, effort, model, policy, network }: {
     turnKey: string; prompt: string; effort?: string | null; model?: string | null; policy?: AgentSessionPolicy;
+    network?: boolean;
   }): Promise<TurnDelivery> {
     if (!this.alive || !this.threadId || this.active) {
       return { status: 'not_accepted', reason: 'Codex thread is closed or busy' };
     }
     const wanted = POLICIES[policy ?? this.policy];
+    const networkAccess = network ?? this.network;
     let finish!: () => void;
     const idle = new Promise<void>((resolve) => { finish = resolve; });
     const turn: ActiveTurn = {
@@ -413,13 +417,14 @@ export class CodexAppServerPilot implements AgentSessionDriver {
         ...(effort ? { effort } : {}),
         ...(model ? { model } : {}),
         sandboxPolicy: wanted.sandboxType === 'readOnly'
-          ? { type: 'readOnly', networkAccess: false }
-          : { type: 'workspaceWrite', writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
+          ? { type: 'readOnly', networkAccess }
+          : { type: 'workspaceWrite', writableRoots: [], networkAccess, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
         approvalPolicy: wanted.approvalPolicy, approvalsReviewer: 'user',
       }));
       const id = string(object(result.turn).id);
       if (!id) throw new Error('Codex did not acknowledge a turn ID');
       if (policy) this.policy = policy;
+      if (network !== undefined) this.network = network;
       this.observeStart(turn, id);
       return { status: 'accepted' };
     } catch (error) {
@@ -684,6 +689,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     const questions = asked.map((question) => ({
       id: string(question.id) ?? '', header: this.redact(string(question.header) ?? ''),
       prompt: this.redact(string(question.question) ?? ''),
+      allowOther: question.isOther === true || !Array.isArray(question.options) || question.options.length === 0,
       options: (Array.isArray(question.options) ? question.options : []).map(object).map((option) => ({
         label: string(option.label) ?? '', description: string(option.description) ?? '',
       })),

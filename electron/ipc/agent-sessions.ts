@@ -15,9 +15,15 @@ const createSchema = z.object({
   policy,
   model: optionalName,
   effort: optionalName,
+  network: z.boolean().optional(),
 }).strict();
 const sendSchema = z.object({
   id, text: z.string().min(1).max(512_000), policy: policy.optional(), model: optionalName, effort: optionalName,
+  network: z.boolean().optional(),
+}).strict();
+const answerSchema = z.object({
+  id, requestId: z.string().min(1).max(64),
+  answers: z.record(z.string().max(200), z.array(z.string().max(4_000)).max(20)).nullable(),
 }).strict();
 const targetSchema = z.object({ id }).strict();
 const respondSchema = z.object({
@@ -47,7 +53,7 @@ export function registerAgentSessionsIpc(ctx: IpcContext, manager: AgentSessionM
     if (!cwd || !isAbsolute(cwd) || !existsSync(cwd) || !statSync(cwd).isDirectory()) {
       throw new Error('请选择一个项目文件夹后再新建会话');
     }
-    return { session: await manager.create({ cwd, policy: input.policy, model: input.model, effort: input.effort }) };
+    return { session: await manager.create({ cwd, policy: input.policy, model: input.model, effort: input.effort, network: input.network }) };
   });
   secure('send', sendSchema, async ({ id: sessionId, ...message }) => {
     const delivery = await manager.send(sessionId, message);
@@ -57,6 +63,10 @@ export function registerAgentSessionsIpc(ctx: IpcContext, manager: AgentSessionM
   secure('interrupt', targetSchema, async (input) => ({ interrupted: await manager.interrupt(input.id) }));
   secure('respond', respondSchema, (input) => {
     if (!manager.respond(input.id, input.requestId, input.allow, input.reason)) throw new Error('这个授权请求已经结束');
+    return {};
+  });
+  secure('answer', answerSchema, (input) => {
+    if (!manager.answer(input.id, input.requestId, input.answers)) throw new Error('这个提问已经结束，或还有问题没有回答');
     return {};
   });
   secure('close', targetSchema, async (input) => {

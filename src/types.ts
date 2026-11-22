@@ -103,20 +103,32 @@ export interface AgentSessionInfo {
   model: string | null;
   effort: string | null;
   policy: AgentSessionPolicy;
+  network: boolean;
   providerSessionId: string | null;
-  status: 'starting' | 'idle' | 'running' | 'closed' | 'failed';
+  status: 'starting' | 'idle' | 'running' | 'suspended' | 'closed' | 'failed';
   error: string | null;
+  pendingQuestions: { requestId: string; questions: AgentSessionQuestion[] }[];
   createdAt: number;
+}
+
+export interface AgentSessionQuestion {
+  id: string;
+  header: string;
+  prompt: string;
+  allowOther: boolean;
+  options: { label: string; description: string }[];
 }
 
 type AgentSessionResult<T = object> = Promise<({ ok: true } & T) | { ok: false; error: string }>;
 
 export interface AgentSessionsApi {
   list: () => AgentSessionResult<{ sessions: AgentSessionInfo[] }>;
-  create: (opts: { cwd?: string; policy: AgentSessionPolicy; model?: string | null; effort?: string | null }) =>
+  create: (opts: { cwd?: string; policy: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean }) =>
     AgentSessionResult<{ session: AgentSessionInfo }>;
-  send: (opts: { id: string; text: string; policy?: AgentSessionPolicy; model?: string | null; effort?: string | null }) =>
-    AgentSessionResult;
+  send: (opts: {
+    id: string; text: string; policy?: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
+  }) => AgentSessionResult;
+  answer: (opts: { id: string; requestId: string; answers: Record<string, string[]> | null }) => AgentSessionResult;
   interrupt: (opts: { id: string }) => AgentSessionResult<{ interrupted: boolean }>;
   respond: (opts: { id: string; requestId: string; allow: boolean; reason?: string }) => AgentSessionResult;
   close: (opts: { id: string }) => AgentSessionResult;

@@ -33,9 +33,18 @@ export interface AgentRuntimeRequest {
   method: string;
   toolInput: string;
   message?: string;
-  questions?: { id: string; header: string; prompt: string; options: { label: string; description: string }[] }[];
+  questions?: AgentQuestion[];
   /** Aborts when the session ends, so a held request stops waiting. */
   signal: AbortSignal;
+}
+
+export interface AgentQuestion {
+  id: string;
+  header: string;
+  prompt: string;
+  /** The answer may be free text instead of one of the options. */
+  allowOther: boolean;
+  options: { label: string; description: string }[];
 }
 
 export type AgentRuntimeResponse =
@@ -78,12 +87,14 @@ export interface AgentSessionDriver {
   readonly latestTurnKey: string | null;
 
   /** Starts a conversation, or continues `resumeSessionId` where the provider left it. */
+  /** `network` lets sandboxed commands reach the network; off unless asked for. */
   open(input: {
-    cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string;
+    cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string; network?: boolean;
   }): Promise<string>;
-  /** `model`, `effort`, and `policy` apply to this turn and stay in effect for later ones. */
+  /** `model`, `effort`, `policy`, and `network` apply to this turn and stay in effect for later ones. */
   startTurn(input: {
     turnKey: string; prompt: string; effort?: string | null; model?: string | null; policy?: AgentSessionPolicy;
+    network?: boolean;
   }): Promise<TurnDelivery>;
   /** Asks the provider to stop the running turn; the turn then completes as interrupted. */
   interrupt(): Promise<boolean>;

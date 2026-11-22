@@ -362,7 +362,7 @@ test('a question from Codex is answered through onRequest; secret or unanswered 
   await until(() => turns.length === 1);
   assert.equal(requests[0].kind, 'question');
   assert.deepEqual(requests[0].questions, [{
-    id: 'db', header: 'Database', prompt: 'Which database?',
+    id: 'db', header: 'Database', prompt: 'Which database?', allowOther: false,
     options: [{ label: 'SQLite', description: 'Local file' }, { label: 'Postgres', description: 'Server' }],
   }]);
   assert.equal(turns[0].finalText, 'answer: {"db":{"answers":["SQLite"]}}');

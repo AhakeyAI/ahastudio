@@ -365,6 +365,8 @@ export interface WorkerTimelineOptions {
   redact?: (text: string) => string;
   now?: () => number;
   onPatch?: (patch: WorkerTimelineChange) => void;
+  /** Earlier turns to continue from, e.g. a session saved before the app restarted. */
+  initial?: WorkerTimelineSnapshot;
 }
 
 /** One mutation's effect; item and turn are live references, cloned when a patch is flushed. */
@@ -396,6 +398,24 @@ export class WorkerTimeline {
     this.redact = options.redact ?? ((text) => text);
     this.now = options.now ?? Date.now;
     this.onPatch = options.onPatch;
+    if (options.initial) this.restore(options.initial);
+  }
+
+  private restore(initial: WorkerTimelineSnapshot): void {
+    this.header.providerSessionId = initial.providerSessionId;
+    for (const turn of structuredClone(initial.turns)) {
+      // A turn still running when the snapshot was taken can never finish now.
+      if (turn.status === 'running') {
+        turn.status = 'interrupted';
+        turn.stopReason = 'interrupted';
+        turn.completedAt ??= turn.startedAt;
+        for (const item of turn.items) {
+          if ('status' in item && item.status === 'running') item.status = 'failed';
+        }
+      }
+      this.turns.push(turn);
+      this.generation = Math.max(this.generation, turn.generation);
+    }
   }
 
   get workerHandle(): string { return this.header.workerHandle; }

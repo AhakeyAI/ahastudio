@@ -1,8 +1,8 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowUp, Cpu, Folder, GitBranch, Lock, MessageCircleQuestion, ShieldAlert, Square } from 'lucide-react';
+import { ArrowUp, Cpu, Folder, GitBranch, Globe, Lock, MessageCircleQuestion, ShieldAlert, Square } from 'lucide-react';
 import { formatTokenCount } from '../../lib/worker-timeline-model';
 import { POLICY_LABELS } from '../../lib/agent-session-client';
-import type { AgentSessionPolicy, OrchestrationQuestionRecord, WorkerTimelineItem } from '../../types';
+import type { AgentSessionInfo, AgentSessionPolicy, OrchestrationQuestionRecord, WorkerTimelineItem } from '../../types';
 import { useAgentSession } from './session-context';
 
 type ApprovalItem = Extract<WorkerTimelineItem, { kind: 'approval' }>;
@@ -99,6 +99,67 @@ function QuestionBanner({ question }: { question: OrchestrationQuestionRecord })
   );
 }
 
+type DirectQuestion = AgentSessionInfo['pendingQuestions'][number];
+
+/** Questions the agent asked through its own protocol; every question needs an answer before sending. */
+function DirectQuestionBanner({ entry, onAnswer }: {
+  entry: DirectQuestion;
+  onAnswer: (requestId: string, answers: Record<string, string[]> | null) => Promise<boolean>;
+}) {
+  const [picked, setPicked] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+  const complete = entry.questions.every((question) => picked[question.id]?.trim());
+  const submit = async (answers: Record<string, string[]> | null) => {
+    setBusy(true);
+    try {
+      await onAnswer(entry.requestId, answers);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="asv-banner is-question" role="group" aria-label="Codex 提问">
+      <div className="asv-banner-head">
+        <MessageCircleQuestion size={14} />
+        <span className="asv-banner-title">Codex 在等你的答复</span>
+      </div>
+      {entry.questions.map((question) => (
+        <div key={question.id} className="asv-banner-qa">
+          <div className="asv-banner-question">
+            {question.header && <strong>{question.header}</strong>} {question.prompt}
+          </div>
+          {question.options.length > 0 && (
+            <div className="asv-banner-options">
+              {question.options.map((option) => (
+                <button key={option.label} type="button" title={option.description || undefined}
+                  className={`asv-btn${picked[question.id] === option.label ? ' is-primary' : ''}`}
+                  aria-pressed={picked[question.id] === option.label} disabled={busy}
+                  onClick={() => setPicked((prev) => ({ ...prev, [question.id]: option.label }))}>
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          )}
+          {question.allowOther && (
+            <input className="asv-banner-input" placeholder={question.options.length ? '或输入其他答复' : '输入答复'}
+              aria-label={`${question.header || question.prompt} 的答复`} disabled={busy}
+              value={question.options.some((option) => option.label === picked[question.id]) ? '' : picked[question.id] ?? ''}
+              onChange={(event) => setPicked((prev) => ({ ...prev, [question.id]: event.target.value }))} />
+          )}
+        </div>
+      ))}
+      <div className="asv-banner-actions">
+        <span className="asv-strip-spacer" />
+        <button type="button" className="asv-btn" disabled={busy} onClick={() => void submit(null)}>跳过</button>
+        <button type="button" className="asv-btn is-primary" disabled={busy || !complete}
+          onClick={() => void submit(Object.fromEntries(entry.questions.map((question) => [question.id, [picked[question.id]!.trim()]])))}>
+          答复
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Chip({ icon, children, title }: { icon: ReactNode; children: ReactNode; title?: string }) {
   return (
     <span className="asv-chip" title={title}>
@@ -124,6 +185,12 @@ export interface SessionComposerProps {
   /** Direct sessions only: the permission level, switchable between turns. */
   policy?: AgentSessionPolicy;
   onPolicyChange?: (policy: AgentSessionPolicy) => void;
+  network?: boolean;
+  onNetworkChange?: (network: boolean) => void;
+  directQuestions?: readonly DirectQuestion[];
+  onAnswer?: (requestId: string, answers: Record<string, string[]> | null) => Promise<boolean>;
+  /** The session is not running but sending a message resumes it. */
+  resumable?: boolean;
   /** Direct sessions take one turn at a time, so sending waits for the running turn. */
   direct?: boolean;
   usage: { input: number; output: number; total: number } | null;
@@ -145,7 +212,7 @@ export function SessionComposer(props: SessionComposerProps) {
 
   const blocked = Boolean(props.direct && props.running);
   const placeholder = props.direct
-    ? (props.running ? '正在工作，可以先写好下一条' : '给 Codex 发消息')
+    ? (props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : '给 Codex 发消息')
     : (props.running ? '补充指令，本轮结束后送达' : '给 Worker 发送追加指令');
 
   const send = async () => {
@@ -156,10 +223,13 @@ export function SessionComposer(props: SessionComposerProps) {
 
   return (
     <div className="asv-dock-inner">
-      {(props.approvals.length > 0 || props.questions.length > 0) && (
+      {(props.approvals.length > 0 || props.questions.length > 0 || Boolean(props.directQuestions?.length)) && (
         <div className="asv-banner-lane">
           {props.approvals.map((item) => <ApprovalBanner key={item.id} item={item} />)}
           {props.questions.map((question) => <QuestionBanner key={question.messageId} question={question} />)}
+          {props.onAnswer && props.directQuestions?.map((entry) => (
+            <DirectQuestionBanner key={entry.requestId} entry={entry} onAnswer={props.onAnswer!} />
+          ))}
         </div>
       )}
       {props.alive ? (
@@ -209,6 +279,15 @@ export function SessionComposer(props: SessionComposerProps) {
             </select>
           </label>
         ) : props.readOnly && <Chip icon={<Lock size={12} />}>只读</Chip>}
+        {props.onNetworkChange && (
+          <button type="button" className={`asv-chip asv-chip-toggle${props.network ? ' is-on' : ''}`}
+            disabled={props.running} aria-pressed={Boolean(props.network)}
+            title={props.network ? '命令可以联网：下一条消息起生效' : '命令不能联网（npm install 等会失败）：下一条消息起生效'}
+            onClick={() => props.onNetworkChange!(!props.network)}>
+            <Globe size={12} />
+            <span>{props.network ? '联网' : '不联网'}</span>
+          </button>
+        )}
         <span className="asv-strip-spacer" />
         {props.usage && (
           <span className="asv-chip" title={`输入 ${props.usage.input} · 输出 ${props.usage.output}`}>

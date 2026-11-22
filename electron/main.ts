@@ -546,17 +546,19 @@ app.whenReady().then(async () => {
   const { registerAgentSessionsIpc } = await import('./ipc/agent-sessions.js');
   const agentSessions = new AgentSessionManager({
     launch: (_sessionId, cwd, events) => launchCodexPilot({ cwd, events }),
+    storageFile: () => join(app.getPath('userData'), 'agent-sessions.json'),
   });
   const agentSessionsIpc = registerAgentSessionsIpc(ipcCtx, agentSessions);
   const offPtyExit = shellPtyCtrl.onPtyExit((ptyId) => {
     orchestrationService.markPtyExited(ptyId);
   });
   stopCodexWorkersOnQuit = () => {
-    const sessions = agentSessions.list().length > 0 ? agentSessions.dispose() : null;
+    // Always disposed so the final state is saved; sessions resume on the next launch.
+    const sessions = agentSessions.dispose();
     const workers = orchestrationService.hasCodexWorkers()
       ? orchestrationService.stopCodexWorkers().then(() => orchestrationService.waitForPendingWrites())
       : null;
-    return sessions || workers ? Promise.all([sessions, workers]).then(() => undefined) : null;
+    return Promise.all([sessions, workers]).then(() => undefined);
   };
   disposeOrchestration = () => {
     offPtyExit();
