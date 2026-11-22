@@ -2,7 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { resolve as resolveFsPath } from 'node:path';
 import { runGitCommand } from '../git/git-exec.js';
-import type { AgentSessionDriver, AgentSessionEvents, AgentTurnResult, TurnDelivery } from './agent-session-driver.js';
+import type {
+  AgentSessionDriver, AgentSessionEvents, AgentSessionPolicy, AgentTurnResult, TurnDelivery,
+} from './agent-session-driver.js';
 import { SESSION_WAKE_HEADER } from './coordinator-prompt.js';
 import { AGENT_SESSION_ID } from './agent-session-manager.js';
 import { CODEX_WORKER_ID } from './codex-app-server-pilot.js';
@@ -272,8 +274,9 @@ export interface OrchestrationSessionCoordinators {
   /**
    * `active`: the session exists, is in orchestration mode, and has not closed or failed.
    * `idle`: active, between turns, and not waiting on the person.
+   * `network`: whether sandboxed commands in this session may reach the network.
    */
-  get(sessionId: string): { cwd: string; provider: string; active: boolean; idle?: boolean } | null;
+  get(sessionId: string): { cwd: string; provider: string; active: boolean; idle?: boolean; network?: boolean } | null;
   /** Starts a system turn (never counted as the person's message); omitted means sessions are never woken. */
   wake?(sessionId: string, prompt: string): Promise<TurnDelivery>;
 }
@@ -738,9 +741,11 @@ export class OrchestrationService {
     return { dispatch: this.store.getDispatchContext(dispatch.id) ?? dispatch, interrupted };
   }
 
-  private createWorkerTimeline(workerId: string, model: string | null, redact: (text: string) => string): WorkerTimeline {
+  private createWorkerTimeline(
+    workerId: string, model: string | null, readOnly: boolean, redact: (text: string) => string,
+  ): WorkerTimeline {
     const timeline = new WorkerTimeline({
-      workerHandle: workerId, cliId: 'codex', model, readOnly: true,
+      workerHandle: workerId, cliId: 'codex', model, readOnly,
       redact: (text) => this.store.redactDispatchCredentials(redact(text)),
       now: this.clock,
       onPatch: (change) => {
@@ -5054,15 +5059,26 @@ export class OrchestrationService {
           reusingTerminalCwd,
         });
 
-    // A run a session coordinates sends read-only Codex tasks to the headless pilot even when the
-    // pilot setting is off; terminal-coordinated runs still need it.
+    // A run a session coordinates runs every non-reused Codex task as a headless Worker, even when
+    // the pilot setting is off; terminal-coordinated runs keep the read-only pilot gate.
     const runIsSessionCoordinated =
       AGENT_SESSION_ID.test(run.coordinatorPaneId ?? '') || this.isActiveSessionCoordinator(from);
-    const usePilot = !reusingTerminal && launchConfig.cliId === 'codex' &&
-      (input.readOnly === true || Boolean(reviewTarget || reviewRunTarget)) &&
-      Boolean(this.codexPilot && (this.codexPilot.enabled() || runIsSessionCoordinated));
+    const readOnlyTask = input.readOnly === true || Boolean(reviewTarget || reviewRunTarget);
+    const usePilot = !reusingTerminal && launchConfig.cliId === 'codex' && Boolean(
+      this.codexPilot && (runIsSessionCoordinated || (readOnlyTask && this.codexPilot.enabled())),
+    );
+    const workerPolicy: AgentSessionPolicy = readOnlyTask ? 'read-only' : 'workspace-write';
+    const coordinatorSession =
+      (run.coordinatorPaneId && this.isActiveSessionCoordinator(run.coordinatorPaneId)
+        ? this.sessionCoordinator(run.coordinatorPaneId)
+        : null) ??
+      (this.isActiveSessionCoordinator(from) ? this.sessionCoordinator(from) : null);
+    const workerNetwork = runIsSessionCoordinated && Boolean(coordinatorSession?.network);
     const pilot = usePilot
-      ? await this.openCodexWorker(placement.cwd ?? process.cwd(), launchConfig.model)
+      ? await this.openCodexWorker(placement.cwd ?? process.cwd(), launchConfig.model, {
+          policy: workerPolicy,
+          network: workerNetwork,
+        })
       : null;
 
     const spawnPane = async (): Promise<string> => {
@@ -5072,7 +5088,7 @@ export class OrchestrationService {
           task,
           cliId: launchConfig.cliId,
           cwd: placement.cwd,
-          extraArgs: usePilot
+          extraArgs: usePilot && readOnlyTask
             ? [...launchConfig.extraArgs, '--sandbox', 'read-only', '--ask-for-approval', 'on-request']
             : launchConfig.extraArgs,
         });
@@ -5353,11 +5369,15 @@ export class OrchestrationService {
     };
   }
 
-  private async openCodexWorker(cwd: string, model: string | null) {
+  private async openCodexWorker(
+    cwd: string, model: string | null, options: { policy: AgentSessionPolicy; network: boolean },
+  ) {
     if (this.disposed || !this.codexPilot) return null;
     const id = `codex-worker-${randomUUID()}`;
     let session: AgentSessionDriver | undefined;
-    const timeline = this.createWorkerTimeline(id, model, (text) => session?.redactText(text) ?? text);
+    const timeline = this.createWorkerTimeline(
+      id, model, options.policy === 'read-only', (text) => session?.redactText(text) ?? text,
+    );
     try {
       session = this.codexPilot.launch(id, cwd, {
         onTimeline: (dispatchId, event) => {
@@ -5396,7 +5416,7 @@ export class OrchestrationService {
         },
       });
       this.codexWorkers.set(id, session);
-      const sessionId = await session.open({ cwd, model, policy: 'read-only' });
+      const sessionId = await session.open({ cwd, model, policy: options.policy, network: options.network });
       if (!session.alive || this.disposed) throw new Error('Codex app-server closed during initialization');
       timeline.setMeta({ providerSessionId: sessionId });
       return { id, session, sessionId };

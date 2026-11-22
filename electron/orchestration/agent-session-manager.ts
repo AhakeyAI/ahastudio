@@ -233,14 +233,14 @@ export class AgentSessionManager {
   }
 
   /** Coordinator state the orchestration service checks before trusting the session's MCP calls. */
-  coordinatorState(id: string): { cwd: string; provider: string; active: boolean; idle: boolean } | null {
+  coordinatorState(id: string): { cwd: string; provider: string; active: boolean; idle: boolean; network: boolean } | null {
     const session = this.sessions.get(id);
     if (!session) return null;
     const { info, driver } = session;
     const live = info.status === 'starting' || info.status === 'idle' || info.status === 'running';
     const active = info.orchestration && live;
     const idle = active && info.status === 'idle' && Boolean(driver?.alive) && !driver?.busy && session.requests.size === 0;
-    return { cwd: info.cwd, provider: info.provider, active, idle };
+    return { cwd: info.cwd, provider: info.provider, active, idle, network: info.network };
   }
 
   /**

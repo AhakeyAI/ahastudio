@@ -44,26 +44,39 @@ async function mcpRequest(env, method, params, spawnCwd = cwd) {
   }
 }
 
-async function setup(t, { confirmMode = 'auto', stallThresholdMs, pilotEnabled = true } = {}) {
+async function setup(t, {
+  confirmMode = 'auto', stallThresholdMs, pilotEnabled = true, scenario = 'normal', allowPtySpawn = false,
+} = {}) {
   const dir = mkdtempSync(join(cwd, '.session-coordinator-test-'));
+  const workerTrace = join(dir, 'worker-rpc.jsonl');
   const agentStatusStore = new AgentStatusStore();
   const store = new OrchestrationStore({ resolveFile: () => join(dir, 'state.json') });
   const hook = new AgentHookServer(agentStatusStore);
   const launches = [];
+  const spawnCalls = [];
   const sessions = new Map();
   const service = new OrchestrationService({
     store, agentStatusStore, getDefaultCwd: () => cwd,
     settleDelayMs: 0, turnStartObserveTimeoutMs: 250, turnStopSettleMs: 10_000,
     getConfirmMode: () => confirmMode,
     ...(stallThresholdMs ? { stallThresholdMs } : {}),
-    writePty: async () => ({ ok: true }),
-    spawnWorkerPty: async () => { throw new Error('Session Coordinator tests expect headless Workers'); },
-    isPtyAlive: (id) => id === 'coordinator-pane',
+    writePty: async (id) => {
+      if (allowPtySpawn) agentStatusStore.ingestHookEvent({ ptyId: id, agentId: 'codex', state: 'working' });
+      return { ok: true };
+    },
+    spawnWorkerPty: async (opts) => {
+      spawnCalls.push(opts);
+      if (!allowPtySpawn) throw new Error('Session Coordinator tests expect headless Workers');
+      const ptyId = `fallback-pane-${spawnCalls.length}`;
+      agentStatusStore.registerPane(ptyId, { agentId: opts.cliId ?? 'codex' });
+      return { ptyId };
+    },
+    isPtyAlive: (id) => id === 'coordinator-pane' || (allowPtySpawn && id.startsWith('fallback-pane-')),
     codexPilot: {
       enabled: () => pilotEnabled,
       launch(workerId, workdir, events) {
         launches.push({ workerId, workdir });
-        const child = spawn(process.execPath, [join(cwd, 'tests/fixtures/mock-codex-app-server.mjs'), 'normal'], {
+        const child = spawn(process.execPath, [join(cwd, 'tests/fixtures/mock-codex-app-server.mjs'), scenario, workerTrace], {
           cwd: workdir, stdio: 'pipe', windowsHide: true,
         });
         return new CodexAppServerPilot(child, events, 850, []);
@@ -84,7 +97,15 @@ async function setup(t, { confirmMode = 'auto', stallThresholdMs, pilotEnabled =
   const call = (caller, action, payload = {}) =>
     dispatchOrchestrationHttpAction(service, action, payload, { signal: new AbortController().signal, callerPaneId: caller })
       .then((reply) => reply.body);
-  return { dir, hook, service, store, sessions, launches, call };
+  const workerSent = (method) => {
+    try {
+      return readFileSync(workerTrace, 'utf8').trim().split('\n').map(JSON.parse)
+        .filter((message) => message.method === method).map((message) => message.params);
+    } catch {
+      return [];
+    }
+  };
+  return { dir, hook, service, store, sessions, launches, spawnCalls, workerSent, call };
 }
 
 test('session MCP launch carries session credentials and keeps destructive Coordinator tools behind a prompt', async (t) => {
@@ -247,6 +268,88 @@ test('a session Coordinator sends read-only Codex tasks to the headless pilot ev
   assert.equal(app.launches.length, 1, 'the terminal Coordinator never reaches the pilot');
 });
 
+test('session-coordinated writable Codex tasks run headless with workspace-write, follow network, and never full-auto', async (t) => {
+  const app = await setup(t, { pilotEnabled: false });
+  const sessions = sessionSetup(t);
+  app.service.setSessionCoordinators({ get: (id) => sessions.manager.coordinatorState(id) });
+  const sessionCwd = mkdtempSync(join(sessions.dir, 'session-cwd-'));
+  const session = await sessions.manager.create({ cwd: sessionCwd, policy: 'full-auto', network: true });
+  assert.deepEqual(await sessions.manager.setOrchestration(session.id, true), { ok: true });
+  assert.equal(sessions.manager.coordinatorState(session.id).network, true);
+
+  // Writable task under a full-auto, network-on session Coordinator uses workspace-write (never full-auto) + network.
+  const writable = await app.call(session.id, 'delegate-task', {
+    role: 'builder', task: 'Implement feature', agent: 'codex', taskKind: 'implementation', worktree: false,
+  });
+  assert.equal(writable.ok, true, writable.error);
+  assert.equal(writable.result.dispatch.executionMode, 'codex-app-server');
+  assert.equal(writable.result.dispatch.assigneePaneId, null);
+  assert.equal(writable.result.dispatch.ownsPane, false);
+  assert.equal(app.service.getWorkerTimeline({ dispatchId: writable.result.dispatch.id }).readOnly, false);
+
+  // Flip the Coordinator's network off; subsequent Workers follow it.
+  assert.equal((await sessions.manager.send(session.id, { text: 'Turn network off', network: false })).status, 'accepted');
+  await settle(() => sessions.info(session.id).status === 'idle');
+  assert.equal(sessions.manager.coordinatorState(session.id).network, false);
+
+  const offlineWritable = await app.call(session.id, 'delegate-task', {
+    role: 'editor', task: 'Edit another file', agent: 'codex', worktree: false,
+  });
+  assert.equal(offlineWritable.ok, true, offlineWritable.error);
+  assert.equal(app.service.getWorkerTimeline({ dispatchId: offlineWritable.result.dispatch.id }).readOnly, false);
+
+  const readOnly = await app.call(session.id, 'delegate-task', {
+    role: 'scout', task: 'Read the repository', agent: 'codex', taskKind: 'research', worktree: false,
+  });
+  assert.equal(readOnly.ok, true, readOnly.error);
+  assert.equal(app.service.getWorkerTimeline({ dispatchId: readOnly.result.dispatch.id }).readOnly, true);
+
+  const threadStarts = app.workerSent('thread/start');
+  const turnStarts = app.workerSent('turn/start');
+  assert.equal(threadStarts.length, 3);
+  assert.equal(turnStarts.length, 3);
+  assert.deepEqual([threadStarts[0].sandbox, threadStarts[0].approvalPolicy], ['workspace-write', 'on-request']);
+  assert.deepEqual(turnStarts[0].sandboxPolicy, {
+    type: 'workspaceWrite', writableRoots: [], networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false,
+  });
+  assert.equal(turnStarts[0].approvalPolicy, 'on-request');
+
+  assert.deepEqual([threadStarts[1].sandbox, threadStarts[1].approvalPolicy], ['workspace-write', 'on-request']);
+  assert.equal(turnStarts[1].sandboxPolicy.type, 'workspaceWrite');
+  assert.equal(turnStarts[1].sandboxPolicy.networkAccess, false);
+  assert.equal(turnStarts[1].approvalPolicy, 'on-request');
+
+  assert.deepEqual([threadStarts[2].sandbox, threadStarts[2].approvalPolicy], ['read-only', 'on-request']);
+  assert.deepEqual(turnStarts[2].sandboxPolicy, { type: 'readOnly', networkAccess: false });
+  assert.equal(turnStarts[2].approvalPolicy, 'on-request');
+});
+
+test('writable Codex PTY fallback keeps original extraArgs while read-only fallback adds read-only sandbox flags', async (t) => {
+  const app = await setup(t, { pilotEnabled: false, scenario: 'rejected', allowPtySpawn: true });
+  const sessionCwd = mkdtempSync(join(app.dir, 'session-cwd-'));
+  app.sessions.set(SESSION_A, { cwd: sessionCwd, provider: 'codex', active: true, network: false });
+
+  const writable = await app.call(SESSION_A, 'delegate-task', {
+    role: 'builder', task: 'Write code', agent: 'codex', worktree: false,
+  });
+  assert.equal(writable.ok, true, writable.error);
+  assert.equal(writable.result.dispatch.executionMode, undefined);
+  assert.equal(app.spawnCalls.length, 1);
+  assert.ok(!app.spawnCalls[0].extraArgs.includes('--sandbox'), JSON.stringify(app.spawnCalls[0].extraArgs));
+  assert.ok(!app.spawnCalls[0].extraArgs.includes('read-only'), JSON.stringify(app.spawnCalls[0].extraArgs));
+
+  const readOnly = await app.call(SESSION_A, 'delegate-task', {
+    role: 'scout', task: 'Read code', agent: 'codex', taskKind: 'research', worktree: false,
+  });
+  assert.equal(readOnly.ok, true, readOnly.error);
+  assert.equal(readOnly.result.dispatch.executionMode, undefined);
+  assert.equal(app.spawnCalls.length, 2);
+  assert.ok(app.spawnCalls[1].extraArgs.includes('--sandbox'));
+  assert.ok(app.spawnCalls[1].extraArgs.includes('read-only'));
+  assert.ok(app.spawnCalls[1].extraArgs.includes('--ask-for-approval'));
+  assert.ok(app.spawnCalls[1].extraArgs.includes('on-request'));
+});
+
 test('Aha MCP server exposes Coordinator tools to a session and delegates through its identity', async (t) => {
   const app = await setup(t);
   const sessionCwd = mkdtempSync(join(app.dir, 'session-cwd-'));
@@ -345,7 +448,7 @@ test('orchestration mode switches only between turns and resumes the same thread
   assert.match(resumed[0].developerInstructions, /Orchestration Mode Active/);
   assert.equal(app.sent('thread/start')[0].developerInstructions, undefined);
   assert.equal(app.sent('mcpServerStatus/list').length, 1, 'an orchestrating thread must expose delegate_task');
-  assert.deepEqual(app.manager.coordinatorState(session.id), { cwd, provider: 'codex', active: true, idle: true });
+  assert.deepEqual(app.manager.coordinatorState(session.id), { cwd, provider: 'codex', active: true, idle: true, network: false });
   // The replaced process must not close the session or leave a failed turn behind.
   assert.equal(app.manager.getTimeline(session.id).turns.at(-1).status, 'interrupted');
   assert.equal((await app.manager.send(session.id, { text: 'Plan the work' })).status, 'accepted');

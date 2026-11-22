@@ -58,6 +58,7 @@ async function setup(t, scenario = 'normal', enabled = true) {
   const children = [];
   const exits = [];
   const writes = [];
+  const spawnCalls = [];
   let ptyStarts = 0;
   let codexStarts = 0;
   const service = new OrchestrationService({
@@ -68,8 +69,9 @@ async function setup(t, scenario = 'normal', enabled = true) {
       agentStatusStore.ingestHookEvent({ ptyId: id, agentId: 'codex', state: 'working' });
       return { ok: true };
     },
-    spawnWorkerPty: async () => {
+    spawnWorkerPty: async (opts) => {
       ptyStarts++;
+      spawnCalls.push(opts);
       agentStatusStore.registerPane('fallback-pane', { agentId: 'codex' });
       return { ptyId: 'fallback-pane' };
     },
@@ -128,7 +130,7 @@ async function setup(t, scenario = 'normal', enabled = true) {
     return response.json();
   };
   return {
-    dir, service, store, statePath, start, run, getTrace, writes, workers, workerHttp, children, exits,
+    dir, service, store, statePath, start, run, getTrace, writes, spawnCalls, workers, workerHttp, children, exits,
     ptyStarts: () => ptyStarts, codexStarts: () => codexStarts,
   };
 }
@@ -474,6 +476,8 @@ for (const scenario of ['initialize-error', 'rejected']) {
     assert.equal(started.ptyId, 'fallback-pane');
     assert.equal(started.dispatch.executionMode, undefined);
     assert.equal(app.ptyStarts(), 1);
+    assert.ok(app.spawnCalls[0].extraArgs.includes('--sandbox'));
+    assert.ok(app.spawnCalls[0].extraArgs.includes('read-only'));
     assert.ok(app.writes.length);
   });
 }
@@ -492,10 +496,19 @@ for (const scenario of ['timeout', 'disconnect', 'started-then-error']) {
 }
 
 test('PTY remains default, including selected Codex when not read-only', async (t) => {
-  const app = await setup(t, 'normal', false);
-  const started = await app.start('Return from the unchanged PTY path');
+  const disabled = await setup(t, 'normal', false);
+  const started = await disabled.start('Return from the unchanged PTY path');
   assert.equal(started.ptyId, 'fallback-pane');
-  assert.equal(app.codexStarts(), 0);
+  assert.equal(disabled.codexStarts(), 0);
+
+  // Even when the pilot setting is on, a terminal-coordinated writable Codex task still uses PTY.
+  const enabled = await setup(t, 'normal', true);
+  const writable = await enabled.start('Writable task from terminal coordinator', { readOnly: false });
+  assert.equal(writable.ptyId, 'fallback-pane');
+  assert.equal(writable.dispatch.executionMode, undefined);
+  assert.equal(enabled.codexStarts(), 0);
+  assert.equal(enabled.ptyStarts(), 1);
+  assert.ok(!enabled.spawnCalls[0].extraArgs.includes('--sandbox'));
 });
 
 test('approval denial, mailbox turn, interrupt, and archive', async (t) => {
