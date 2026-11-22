@@ -181,7 +181,7 @@ export interface SessionComposerProps {
   cwd: string | null;
   branch: string | null;
   model: string | null;
-  readOnly: boolean;
+  readOnly?: boolean;
   /** Direct sessions only: the permission level, switchable between turns. */
   policy?: AgentSessionPolicy;
   onPolicyChange?: (policy: AgentSessionPolicy) => void;
@@ -278,7 +278,9 @@ export function SessionComposer(props: SessionComposerProps) {
               ))}
             </select>
           </label>
-        ) : props.readOnly && <Chip icon={<Lock size={12} />}>只读</Chip>}
+        ) : !props.direct && props.readOnly !== undefined ? (
+          <Chip icon={<Lock size={12} />}>{props.readOnly ? POLICY_LABELS['read-only'] : POLICY_LABELS['workspace-write']}</Chip>
+        ) : props.readOnly && <Chip icon={<Lock size={12} />}>{POLICY_LABELS['read-only']}</Chip>}
         {props.onNetworkChange && (
           <button type="button" className={`asv-chip asv-chip-toggle${props.network ? ' is-on' : ''}`}
             disabled={props.running} aria-pressed={Boolean(props.network)}

@@ -433,7 +433,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             cwd={cwd}
             branch={dispatch?.branch ?? null}
             model={timeline?.model ?? dispatch?.model ?? null}
-            readOnly={timeline?.readOnly ?? true}
+            readOnly={timeline?.readOnly}
             direct={direct}
             {...(direct && policy ? { policy, onPolicyChange: setNextPolicy } : {})}
             {...(direct ? {
