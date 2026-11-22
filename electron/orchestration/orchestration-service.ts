@@ -4773,6 +4773,7 @@ export class OrchestrationService {
         if (placement.ownsWorktree && placement.worktreePath) {
           await this.rollbackWorkerResources(undefined, placement.worktreePath);
         }
+        if (reviewDetachedWorktree) this.failReviewTaskIfReady(task.id);
         if (err instanceof OrchestrationError) {
           if (err.code === 'terminal_unavailable' && !err.data?.taskId) {
             throw new OrchestrationError(err.code, err.message, {
@@ -4856,6 +4857,7 @@ export class OrchestrationService {
         ownsPane ? ptyId : undefined,
         placement.ownsWorktree ? placement.worktreePath : null,
       );
+      if (reviewDetachedWorktree) this.failReviewTaskIfReady(task.id);
       throw err;
     }
 
@@ -4911,6 +4913,7 @@ export class OrchestrationService {
       this.store.failDispatch(ctx.id, reason);
       if (ctx.reviewOfDispatchId || ctx.reviewOfRunId) {
         this.store.updateDispatchReviewState(ctx.id, { reviewStatus: 'rejected' });
+        this.failReviewTaskIfReady(task.id);
         this.reconcileAnyReviewBatch(ctx.id, {
           overrideVerdict: 'reject',
           failedReason: 'Reviewer prompt delivery failed',
@@ -7299,7 +7302,11 @@ export class OrchestrationService {
           from,
           runId: dispatchRunId,
           callerPaneId: input.callerPaneId,
-          ...(reusableTaskId ? { taskId: reusableTaskId } : { spec: taskText }),
+          ...(reusableTaskId
+            ? { taskId: reusableTaskId }
+            : isReviewDispatch && !input.task?.trim()
+              ? {}
+              : { spec: taskText }),
           ...(reviewTargetDispatch ? { reviewOf: reviewTargetDispatch.id } : {}),
           ...(reviewRunTarget ? { reviewRun: reviewRunTarget.id } : {}),
           ...(reviewFocus ? { reviewFocus } : {}),
@@ -7349,7 +7356,7 @@ export class OrchestrationService {
         if (fallbackFrom === null) {
           fallbackFrom = resolvedAgent;
         }
-        if (typeof err.data?.taskId === 'string' && err.data.taskId) {
+        if (!isReviewDispatch && typeof err.data?.taskId === 'string' && err.data.taskId) {
           reusableTaskId = err.data.taskId;
         }
       }
