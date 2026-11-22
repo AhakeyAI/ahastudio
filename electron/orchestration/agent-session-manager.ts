@@ -57,6 +57,11 @@ export interface AgentSessionManagerDependencies {
   coordinatorInstructions?: (sessionId: string) => string;
   /** A session stopped coordinating (switched off or closed); its pending orchestration state can go. */
   onCoordinatorEnded?: (sessionId: string) => void;
+  /**
+   * A message the person typed started a turn in an orchestrating session. Only these turns can
+   * confirm the Coordinator's dispatch proposals; turns AhaStation starts itself never call this.
+   */
+  onUserTurn?: (sessionId: string) => void;
   /** Where sessions are kept across restarts; omitted keeps them in memory only. */
   storageFile?: () => string;
   now?: () => number;
@@ -153,6 +158,7 @@ export class AgentSessionManager {
       if (input.policy) info.policy = input.policy;
       if (input.network !== undefined) info.network = input.network;
       timeline.setMeta({ model: info.model, readOnly: info.policy === 'read-only' });
+      if (info.orchestration) this.deps.onUserTurn?.(id);
     } else {
       timeline.endActiveTurn('failed', delivery.reason);
       // Unknown acceptance leaves the provider thread in an unknown state; do not send into it again.

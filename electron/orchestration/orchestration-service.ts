@@ -6493,6 +6493,7 @@ export class OrchestrationService {
 
   recordUserPromptTurn(ptyId: string, source: UserTurnSource = 'hook'): number {
     const cleanId = ptyId.trim();
+    if (source === 'session' && !AGENT_SESSION_ID.test(cleanId)) return this.proposals.getUserTurn(cleanId);
     if (
       source === 'pty' &&
       this.agentStatusStore.get(cleanId)?.state === 'working' &&

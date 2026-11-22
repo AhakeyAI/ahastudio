@@ -44,7 +44,7 @@ async function mcpRequest(env, method, params, spawnCwd = cwd) {
   }
 }
 
-async function setup(t) {
+async function setup(t, { confirmMode = 'auto' } = {}) {
   const dir = mkdtempSync(join(cwd, '.session-coordinator-test-'));
   const agentStatusStore = new AgentStatusStore();
   const store = new OrchestrationStore({ resolveFile: () => join(dir, 'state.json') });
@@ -54,7 +54,7 @@ async function setup(t) {
   const service = new OrchestrationService({
     store, agentStatusStore, getDefaultCwd: () => cwd,
     settleDelayMs: 0, turnStartObserveTimeoutMs: 250, turnStopSettleMs: 10_000,
-    getConfirmMode: () => 'auto',
+    getConfirmMode: () => confirmMode,
     writePty: async () => ({ ok: true }),
     spawnWorkerPty: async () => { throw new Error('Session Coordinator tests expect headless Workers'); },
     isPtyAlive: (id) => id === 'coordinator-pane',
@@ -247,7 +247,9 @@ test('Aha MCP server exposes Coordinator tools to a session and delegates throug
   assert.deepEqual((await mcpRequest(env, 'tools/list', {})).tools, []);
 });
 
-function sessionSetup(t, { dir = mkdtempSync(join(cwd, '.session-coordinator-test-')), failOrchestration = false, owner = true } = {}) {
+function sessionSetup(t, {
+  dir = mkdtempSync(join(cwd, '.session-coordinator-test-')), failOrchestration = false, owner = true, onUserTurn,
+} = {}) {
   const trace = join(dir, 'rpc.jsonl');
   const launches = [];
   const ended = [];
@@ -264,6 +266,7 @@ function sessionSetup(t, { dir = mkdtempSync(join(cwd, '.session-coordinator-tes
     },
     coordinatorInstructions: (id) => `[AhaStation Orchestration Mode Active — Coordinator] for ${id}`,
     onCoordinatorEnded: (id) => ended.push(id),
+    onUserTurn,
     storageFile: () => join(dir, 'agent-sessions.json'),
   });
   if (owner) {
@@ -356,4 +359,37 @@ test('a failed switch keeps the previous mode so the next message resumes the pl
   assert.deepEqual(app.ended, [session.id]);
   assert.equal((await app.manager.send(session.id, { text: 'Still here?' })).status, 'accepted');
   assert.deepEqual(app.launches.map((launch) => launch.orchestration), [false, true, false]);
+});
+
+test('only a message the person sent confirms a session Coordinator\'s dispatch', async (t) => {
+  const app = await setup(t, { confirmMode: 'chat-and-guard' });
+  const sessions = sessionSetup(t, { onUserTurn: (id) => app.service.recordUserPromptTurn(id, 'session') });
+  app.service.setSessionCoordinators({ get: (id) => sessions.manager.coordinatorState(id) });
+  // Inside the session harness's folder, which is removed only after the session process stops.
+  const session = await sessions.manager.create({ cwd: mkdtempSync(join(sessions.dir, 'session-cwd-')), policy: 'read-only' });
+  assert.deepEqual(await sessions.manager.setOrchestration(session.id, true), { ok: true });
+  const delegate = (extra = {}) => app.call(session.id, 'delegate-task', {
+    role: 'scout', task: 'Survey the repository', agent: 'codex', taskKind: 'research', worktree: false, ...extra,
+  });
+
+  assert.equal((await sessions.manager.send(session.id, { text: 'Plan the survey' })).status, 'accepted');
+  await settle(() => sessions.info(session.id).status === 'idle');
+  const proposed = await delegate();
+  assert.equal(proposed.result.status, 'confirmation_required', proposed.error);
+  const proposalId = proposed.result.proposal.id;
+  assert.equal((await delegate({ confirmed: true, proposalId })).result.status, 'confirmation_required',
+    'the Coordinator cannot confirm its own proposal without a new message from the person');
+
+  // Neither a message that never started a turn nor the pane-side sources count for a session.
+  assert.equal((await sessions.manager.send(session.id, { text: '   ' })).status, 'not_accepted');
+  app.service.recordUserPromptTurn(session.id, 'hook');
+  app.service.recordUserPromptTurn('coordinator-pane', 'session');
+  const stillHeld = await delegate({ confirmed: true, proposalId });
+  assert.equal(stillHeld.result.status, 'confirmation_required');
+
+  assert.equal((await sessions.manager.send(session.id, { text: 'Yes, go ahead' })).status, 'accepted');
+  await settle(() => sessions.info(session.id).status === 'idle');
+  const started = await delegate({ confirmed: true, proposalId: stillHeld.result.proposal.id });
+  assert.equal(started.result?.status, 'started', started.error ?? JSON.stringify(started.result));
+  assert.equal(app.store.getDispatchContext(started.result.dispatch.id).parentPaneId, session.id);
 });
