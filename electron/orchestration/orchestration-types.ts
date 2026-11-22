@@ -56,6 +56,7 @@ export type OrchestrationDeliveryStatus = 'pending' | 'acknowledged' | 'fenced';
 
 export const DISPATCH_CIRCUIT_BREAK_FAILURES = 3;
 export const DEFAULT_NESTED_WORKER_MAX_DEPTH = 2;
+export const DEFAULT_MAX_ACTIVE_WORKERS = 8;
 export const UNBOUND_RUN_ID = 'run_unbound';
 export const ORCHESTRATION_MESSAGE_WAIT_DEFAULT_TIMEOUT_MS = 120_000;
 export const ORCHESTRATION_DELIVERY_BATCH_LIMIT = 50;
@@ -240,6 +241,7 @@ export type OrchestrationErrorCode =
   | 'dispatch_fenced'
   | 'circuit_broken'
   | 'worker_busy'
+  | 'worker_limit_reached'
   | 'consumer_fenced'
   | 'answer_conflict'
   | 'stale_delivery'
@@ -309,6 +311,10 @@ export interface OrchestrationTaskRecord {
   deps: string[];
   priority: OrchestrationMessagePriority;
   status: OrchestrationTaskStatus;
+  /** Set while `blocked` for a reason the store resolves on its own, e.g. `dependency_failed:<taskId>`. */
+  blockedReason?: string | null;
+  /** Created together with its worker; nothing re-dispatches it, so a failed dispatch fails it. */
+  singleShot?: boolean;
   worktreePath: string | null;
   createdAt: string;
   updatedAt: string;

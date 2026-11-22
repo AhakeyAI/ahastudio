@@ -606,15 +606,33 @@ export async function dispatchOrchestrationHttpAction(
           ...(context.callerPaneId !== undefined ? { callerPaneId: requireCallerPane() } : {}),
         });
         break;
-      case 'coordinator-start':
-        result = service.coordinatorStart(coordinatorStartSchema.parse(payload));
+      case 'coordinator-start': {
+        const parsed = coordinatorStartSchema.parse(payload);
+        const pane = httpCallerPane();
+        if (pane !== undefined) {
+          service.assertCanControlCoordinatorLoop(pane, parsed.runId);
+        }
+        result = service.coordinatorStart(pane === undefined ? parsed : { ...parsed, from: pane });
         break;
-      case 'coordinator-stop':
+      }
+      case 'coordinator-stop': {
+        const pane = httpCallerPane();
+        if (pane !== undefined) {
+          service.assertCanControlCoordinatorLoop(pane, service.coordinatorLoopRunId());
+        }
         result = service.coordinatorStop();
         break;
-      case 'coordinator-tick':
-        result = await service.coordinatorTick(coordinatorTickSchema.parse(payload).runId);
+      }
+      case 'coordinator-tick': {
+        const parsed = coordinatorTickSchema.parse(payload);
+        const pane = httpCallerPane();
+        if (pane !== undefined) {
+          const runId = service.coordinatorLoopRunId(parsed.runId) ?? service.authorizeRunAccess(undefined, pane);
+          service.assertCanControlCoordinatorLoop(pane, runId);
+        }
+        result = await service.coordinatorTick(parsed.runId);
         break;
+      }
       case 'coordinator-status':
         result = service.coordinatorStatus(coordinatorStatusSchema.parse(payload));
         break;

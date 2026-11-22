@@ -716,6 +716,8 @@ export interface OrchestrationTaskRecord {
   deps: string[];
   priority: OrchestrationMessagePriority;
   status: OrchestrationTaskStatus;
+  blockedReason?: string | null;
+  singleShot?: boolean;
   worktreePath: string | null;
   createdAt: string;
   updatedAt: string;

@@ -36,6 +36,17 @@ export const ACTIVE_DISPATCH_STATUSES: ReadonlySet<OrchestrationDispatchStatus> 
   'dispatched',
 ]);
 
+export const DEPENDENCY_FAILED_REASON = 'dependency_failed';
+
+export function isBlockedByFailedDependency(task: { status: OrchestrationTaskStatus; blockedReason?: string | null }): boolean {
+  return task.status === 'blocked' && Boolean(task.blockedReason?.startsWith(DEPENDENCY_FAILED_REASON));
+}
+
+/** No further work can happen on the task without a person retrying something. */
+export function isTaskSettled(task: { status: OrchestrationTaskStatus; blockedReason?: string | null }): boolean {
+  return TERMINAL_TASK_STATUSES.has(task.status) || isBlockedByFailedDependency(task);
+}
+
 export function canTransitionTask(
   from: OrchestrationTaskStatus,
   to: OrchestrationTaskStatus

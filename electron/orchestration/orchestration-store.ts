@@ -5,8 +5,11 @@ import { AtomicSnapshotWriter } from '../persistence/atomic-snapshot-writer.js';
 import { cloneTaskContext, listWorkerBriefFiles, mergeTaskContext, normalizeTaskContext, removeWorkerBriefFile } from './worker-brief-context.js';
 import {
   ACTIVE_DISPATCH_STATUSES,
+  DEPENDENCY_FAILED_REASON,
   assertDispatchTransition,
   assertTaskTransition,
+  isBlockedByFailedDependency,
+  isTaskSettled,
   reportCorrectsUnobservedPrompt,
   reportCorrectsUnresponsiveWorker,
 } from './orchestration-lifecycle-graph.js';
@@ -146,6 +149,7 @@ export class OrchestrationStore {
   private readonly maxMessages: number;
   private readonly maxDeliveries: number;
   private readonly maxRuns: number;
+  private maxActiveDispatches = Number.POSITIVE_INFINITY;
 
   private nextSequence = 1;
   private currentRunByConsumer = new Map<string, string>();
@@ -196,6 +200,29 @@ export class OrchestrationStore {
   configureBriefsDir(directory: string): void {
     this.briefsDirOverride = directory;
     this.reconcileBriefFiles();
+  }
+
+  /** Upper bound on simultaneously active dispatches across every run. */
+  configureMaxActiveDispatches(limit: number): void {
+    this.maxActiveDispatches = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : Number.POSITIVE_INFINITY;
+  }
+
+  getRemainingDispatchCapacity(): number {
+    let active = 0;
+    for (const d of this.dispatches.values()) {
+      if (ACTIVE_DISPATCH_STATUSES.has(d.status)) active += 1;
+    }
+    return Math.max(0, this.maxActiveDispatches - active);
+  }
+
+  assertDispatchCapacity(): void {
+    if (this.getRemainingDispatchCapacity() <= 0) {
+      throw new OrchestrationError(
+        'worker_limit_reached',
+        `At most ${this.maxActiveDispatches} workers may be active at once. Wait for one to finish or stop one first.`,
+        { maxActiveDispatches: this.maxActiveDispatches },
+      );
+    }
   }
 
   reconcileBriefFiles(): void {
@@ -558,9 +585,15 @@ export class OrchestrationStore {
 
     for (const run of this.runs.values()) {
       if (run.id === UNBOUND_RUN_ID || run.status !== 'active') continue;
+      // Workers live in the terminal daemon or their own processes and can outlast the app; their
+      // runs stay open so late reports land, and exit reconciliation settles them otherwise.
+      const hasLiveWork = [...this.dispatches.values()].some(
+        (d) => d.runId === run.id && ACTIVE_DISPATCH_STATUSES.has(d.status),
+      );
+      if (hasLiveWork) continue;
       const runTasks = [...this.tasks.values()].filter((t) => t.runId === run.id);
-      if (runTasks.length > 0 && runTasks.every((t) => t.status === 'completed' || t.status === 'failed')) {
-        run.status = runTasks.some((t) => t.status === 'failed') ? 'failed' : 'completed';
+      if (runTasks.length > 0 && runTasks.every(isTaskSettled)) {
+        run.status = runTasks.some((t) => t.status === 'failed' || isBlockedByFailedDependency(t)) ? 'failed' : 'completed';
       } else {
         run.status = 'stopped';
       }
@@ -1032,6 +1065,7 @@ export class OrchestrationStore {
     deps?: string[];
     priority?: OrchestrationMessagePriority;
     worktreePath?: string | null;
+    singleShot?: boolean;
   }): OrchestrationTaskRecord {
     const run = this.requireRun(input.runId);
     if (run.id === UNBOUND_RUN_ID) {
@@ -1083,6 +1117,7 @@ export class OrchestrationStore {
       deps: dedupedDeps,
       priority: input.priority ?? 'normal',
       status: allDepsCompleted ? 'ready' : 'pending',
+      ...(input.singleShot ? { singleShot: true } : {}),
       worktreePath: input.worktreePath ?? null,
       createdAt: now,
       updatedAt: now,
@@ -1158,9 +1193,14 @@ export class OrchestrationStore {
     }));
   }
 
+  /**
+   * Moves the DAG forward after any task change: blocks dependents of failed tasks (and unblocks
+   * them once the dependency is retried) and promotes pending tasks whose deps completed.
+   */
   promoteReadyTasks(runId?: string): OrchestrationTaskRecord[] {
     const promoted: OrchestrationTaskRecord[] = [];
     const now = this.now();
+    const changed = this.reconcileDependencyBlocks(runId, now);
     for (const task of this.tasks.values()) {
       if (runId && task.runId !== runId) continue;
       if (task.status !== 'pending') continue;
@@ -1172,10 +1212,41 @@ export class OrchestrationStore {
       task.updatedAt = now;
       promoted.push({ ...task, deps: [...task.deps] });
     }
-    if (promoted.length > 0) {
+    if (promoted.length > 0 || changed) {
       this.persist();
     }
     return promoted;
+  }
+
+  private reconcileDependencyBlocks(runId: string | undefined, now: string): boolean {
+    let changed = false;
+    for (let pass = 0, moved = true; moved && pass <= this.tasks.size; pass += 1) {
+      moved = false;
+      for (const task of this.tasks.values()) {
+        if (runId && task.runId !== runId) continue;
+        if (task.status !== 'blocked' && task.blockedReason) {
+          task.blockedReason = null;
+          changed = true;
+        }
+        const failedDep = task.deps.find((depId) => {
+          const dep = this.tasks.get(depId);
+          return Boolean(dep && (dep.status === 'failed' || isBlockedByFailedDependency(dep)));
+        });
+        if (task.status === 'pending' && failedDep) {
+          task.status = 'blocked';
+          task.blockedReason = `${DEPENDENCY_FAILED_REASON}:${failedDep}`;
+          task.updatedAt = now;
+          moved = true;
+        } else if (isBlockedByFailedDependency(task) && !failedDep && !this.hasPendingGates(task.id)) {
+          task.status = 'pending';
+          task.blockedReason = null;
+          task.updatedAt = now;
+          moved = true;
+        }
+      }
+      changed ||= moved;
+    }
+    return changed;
   }
 
   mergeTaskContext(taskId: string, override: OrchestrationTaskContext): OrchestrationTaskRecord {
@@ -1207,6 +1278,7 @@ export class OrchestrationStore {
     assertTaskTransition(task.id, task.status, status);
     const now = this.now();
     task.status = status;
+    task.blockedReason = null;
     task.updatedAt = now;
 
     if (status === 'completed' || status === 'failed') {
@@ -1216,9 +1288,7 @@ export class OrchestrationStore {
         `Task marked ${status}`
       );
     }
-    if (status === 'completed') {
-      this.promoteReadyTasks(task.runId);
-    }
+    this.promoteReadyTasks(task.runId);
     this.persist();
     return { ...task, deps: [...task.deps] };
   }
@@ -1319,6 +1389,8 @@ export class OrchestrationStore {
     followUpOfDispatchId?: string | null;
     retained?: boolean;
     maxDepth?: number;
+    /** Depth of the caller's own lineage when it is no longer an active dispatch. */
+    parentDepth?: number;
     startObservation?: OrchestrationStartObservation;
     startObservationReason?: string | null;
     promptSentAt?: string | null;
@@ -1348,7 +1420,7 @@ export class OrchestrationStore {
         ? input.creatorDispatchId.slice('dispatch:'.length)
         : input.creatorDispatchId
       : null;
-    const depth = this.resolveChildDispatchDepth(cleanCreatorDispatchId);
+    const depth = Math.max(this.resolveChildDispatchDepth(cleanCreatorDispatchId), (input.parentDepth ?? 0) + 1);
     if (depth > maxDepth) {
       throw new OrchestrationError(
         'operation_rejected',
@@ -1365,6 +1437,7 @@ export class OrchestrationStore {
       assertTaskTransition(task.id, task.status, 'failed');
       task.status = 'failed';
       task.updatedAt = this.now();
+      this.promoteReadyTasks(task.runId);
       this.persist();
       throw new OrchestrationError(
         'circuit_broken',
@@ -1384,8 +1457,16 @@ export class OrchestrationStore {
         { activeDispatchId: activeForAssignee.id, assigneeHandle: input.assigneeHandle }
       );
     }
+    this.assertDispatchCapacity();
 
     const now = this.now();
+    // New work reopens a run that had already settled.
+    const run = this.runs.get(task.runId);
+    if (run && run.id !== UNBOUND_RUN_ID && run.status !== 'active') {
+      run.status = 'active';
+      run.endedAt = null;
+      run.updatedAt = now;
+    }
     const resolvedWorktreePath = input.worktreePath ?? task.worktreePath ?? null;
     if (resolvedWorktreePath && !task.worktreePath) {
       task.worktreePath = resolvedWorktreePath;
@@ -1836,7 +1917,9 @@ export class OrchestrationStore {
     }
     const now = this.now();
     task.status = 'ready';
+    task.blockedReason = null;
     task.updatedAt = now;
+    this.promoteReadyTasks(task.runId);
     this.persist();
     return { ...task, deps: [...task.deps] };
   }
@@ -2162,18 +2245,21 @@ export class OrchestrationStore {
 
     const task = this.tasks.get(ctx.taskId);
     if (task && task.status !== 'completed' && task.status !== 'failed') {
+      // `ready` invites another dispatch; a task made for one specific worker never gets one.
       const nextTaskStatus: OrchestrationTaskStatus = this.hasPendingGates(task.id)
         ? 'blocked'
-        : circuitBroken || options?.forceFailTask
+        : circuitBroken || options?.forceFailTask || task.singleShot
           ? 'failed'
           : 'ready';
       if (task.status !== nextTaskStatus) {
         assertTaskTransition(task.id, task.status, nextTaskStatus);
         task.status = nextTaskStatus;
+        task.blockedReason = null;
         task.updatedAt = now;
       }
     }
 
+    this.promoteReadyTasks(ctx.runId);
     this.persist();
     return { ...ctx };
   }
@@ -2336,6 +2422,7 @@ export class OrchestrationStore {
       this.routeUnreadDispatchMailboxToRun(ctx.id, ctx.runId);
     }
 
+    this.promoteReadyTasks(ctx.runId);
     this.persist();
     return {
       action: 'settled',
