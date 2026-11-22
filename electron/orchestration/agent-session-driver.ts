@@ -2,7 +2,11 @@ import type { WorkerTimelineEvent } from './worker-timeline.js';
 
 export type AgentProvider = 'codex' | 'claude' | 'acp';
 
-/** What the agent may do without asking: nothing but read, write inside the workspace, or anything. */
+/**
+ * How much the agent may do on its own. `read-only` cannot change files; `workspace-write` may edit
+ * inside the workspace and asks before leaving it; `full-auto` stays in the same sandbox but never
+ * stops to ask. None of them lifts the sandbox.
+ */
 export type AgentSessionPolicy = 'read-only' | 'workspace-write' | 'full-auto';
 
 /**
@@ -29,7 +33,7 @@ export interface AgentRuntimeRequest {
   method: string;
   toolInput: string;
   message?: string;
-  questions?: { id: string; prompt: string; options?: string[] }[];
+  questions?: { id: string; header: string; prompt: string; options: { label: string; description: string }[] }[];
   /** Aborts when the session ends, so a held request stops waiting. */
   signal: AbortSignal;
 }
@@ -73,8 +77,14 @@ export interface AgentSessionDriver {
   readonly sessionId: string | null;
   readonly latestTurnKey: string | null;
 
-  open(input: { cwd: string; model: string | null; policy: AgentSessionPolicy }): Promise<string>;
-  startTurn(input: { turnKey: string; prompt: string; effort?: string | null }): Promise<TurnDelivery>;
+  /** Starts a conversation, or continues `resumeSessionId` where the provider left it. */
+  open(input: {
+    cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string;
+  }): Promise<string>;
+  /** `model`, `effort`, and `policy` apply to this turn and stay in effect for later ones. */
+  startTurn(input: {
+    turnKey: string; prompt: string; effort?: string | null; model?: string | null; policy?: AgentSessionPolicy;
+  }): Promise<TurnDelivery>;
   /** Asks the provider to stop the running turn; the turn then completes as interrupted. */
   interrupt(): Promise<boolean>;
   waitForIdle(timeoutMs: number): Promise<boolean>;

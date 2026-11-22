@@ -59,10 +59,14 @@ for await (const line of history) {
     send(scenario === 'initialize-error'
       ? { id, error: { code: -32602, message: 'mock initialization rejected' } }
       : { id, result: { userAgent: 'mock-codex' } });
-  } else if (method === 'thread/start') {
-    assert.equal(params.sandbox, 'read-only');
-    assert.equal(params.approvalPolicy, 'on-request');
-    send({ id, result: { thread: { id: threadId }, sandbox: { type: 'readOnly' }, approvalPolicy: 'on-request' } });
+  } else if (method === 'thread/start' || method === 'thread/resume') {
+    if (method === 'thread/resume') assert.equal(params.threadId, threadId);
+    const granted = scenario === 'sandbox-mismatch' ? 'workspace-write' : params.sandbox;
+    send({ id, result: {
+      thread: { id: threadId },
+      sandbox: { type: granted === 'read-only' ? 'readOnly' : 'workspaceWrite' },
+      approvalPolicy: params.approvalPolicy,
+    } });
   } else if (method === 'mcpServerStatus/list') {
     assert.equal(params.threadId, threadId);
     assert.equal(params.serverName, 'aha');
@@ -70,8 +74,6 @@ for await (const line of history) {
     send({ id, result: { data: [{ name: 'aha', tools: { report_done: { name: 'report_done' } } }] } });
   } else if (method === 'turn/start') {
     assert.equal(params.threadId, threadId);
-    assert.deepEqual(params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
-    assert.equal(params.approvalPolicy, 'on-request');
     const prompt = params.input[0].text;
     if (scenario === 'timeout') continue;
     if (scenario === 'rejected') {
@@ -100,6 +102,16 @@ for await (const line of history) {
         params: { threadId, turnId, serverName: 'aha', message: 'Approve tool call?',
           mode: 'form', requestedSchema: { type: 'object', properties: {} } },
       });
+    } else if (prompt.includes('ASK_A_QUESTION')) {
+      approvalId = 'question-' + turnNumber;
+      send({
+        id: approvalId, method: 'item/tool/requestUserInput',
+        params: { threadId, turnId, itemId: 'ask', isBlocking: true, autoResolutionMs: null, questions: [{
+          id: 'db', header: 'Database', question: 'Which database?', isOther: false,
+          isSecret: prompt.includes('SECRET'),
+          options: [{ label: 'SQLite', description: 'Local file' }, { label: 'Postgres', description: 'Server' }],
+        }] },
+      });
     } else if (prompt.includes('ASK_FOR_APPROVAL')) {
       approvalId = 'approval-' + turnNumber;
       send({
@@ -115,6 +127,10 @@ for await (const line of history) {
     send({ id, result: {} });
     completed('interrupted', '');
   } else if (id === approvalId && result) {
-    completed('completed', 'approval decision: ' + (result.decision ?? result.action));
+    completed('completed', result.answers
+      ? 'answer: ' + JSON.stringify(result.answers)
+      : 'approval decision: ' + (result.decision ?? result.action));
+  } else if (id === approvalId) {
+    completed('completed', 'request refused');
   }
 }

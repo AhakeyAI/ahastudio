@@ -12,7 +12,12 @@ import type {
 } from './worker-timeline.js';
 
 export const CODEX_WORKER_ID = /^codex-worker-[a-f0-9-]{36}$/;
-const APPROVALS = { approvalPolicy: 'on-request', approvalsReviewer: 'user' };
+const POLICIES: Record<AgentSessionPolicy, { sandbox: string; sandboxType: string; approvalPolicy: string }> = {
+  'read-only': { sandbox: 'read-only', sandboxType: 'readOnly', approvalPolicy: 'on-request' },
+  'workspace-write': { sandbox: 'workspace-write', sandboxType: 'workspaceWrite', approvalPolicy: 'on-request' },
+  // Still sandboxed to the workspace; it only stops asking.
+  'full-auto': { sandbox: 'workspace-write', sandboxType: 'workspaceWrite', approvalPolicy: 'never' },
+};
 const OUTPUT_LIMIT = 512 * 1024;
 const STDERR_LIMIT = 4 * 1024;
 const CHILD_CLOSE_TIMEOUT_MS = 3_000;
@@ -24,7 +29,8 @@ interface ActiveTurn {
   turnKey: string;
   id: string | null;
   messages: Map<string, string>;
-  usageBaseline: Record<string, number>;
+  /** Thread token total before this turn; null when unknown (first turn after a resume). */
+  usageBaseline: Record<string, number> | null;
   diff: string | null;
   usage: Record<string, number> | null;
   idle: Promise<void>;
@@ -252,12 +258,15 @@ export function launchCodexPilot(options: {
 
 export class CodexAppServerPilot implements AgentSessionDriver {
   readonly provider = 'codex' as const;
-  // Writable policies, resume, and steering are not wired to the app-server yet.
-  readonly capabilities = { resume: false, steer: false, policies: ['read-only'] as readonly AgentSessionPolicy[] };
+  readonly capabilities = {
+    resume: true, steer: false,
+    policies: ['read-only', 'workspace-write', 'full-auto'] as readonly AgentSessionPolicy[],
+  };
   private readonly pending = new Map<number, (error: Error | null, value?: unknown) => void>();
   private readonly disconnect = new AbortController();
   private seq = 0;
-  private tokenTotal: Record<string, number> = {};
+  private tokenTotal: Record<string, number> | null = {};
+  private policy: AgentSessionPolicy = 'read-only';
   private threadId: string | null = null;
   private active: ActiveTurn | null = null;
   private output = '';
@@ -318,23 +327,31 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   get closing(): boolean { return this.stopping; }
   get latestTurnKey(): string | null { return this.outputTurnKey; }
 
-  async open({ cwd, model, policy }: { cwd: string; model: string | null; policy: AgentSessionPolicy }): Promise<string> {
-    if (!this.capabilities.policies.includes(policy)) {
-      throw new Error(`Codex sessions do not support the ${policy} policy yet`);
-    }
+  async open({ cwd, model, policy, resumeSessionId }: {
+    cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string;
+  }): Promise<string> {
+    const wanted = POLICIES[policy];
     try {
       await this.request('initialize', {
         clientInfo: { name: 'ahastation', title: 'AhaStation', version: '0.1.0' },
       });
       this.write({ method: 'initialized' });
-      const result = object(await this.request('thread/start', {
-        cwd, ...(model ? { model } : {}), sandbox: 'read-only', ...APPROVALS,
-      }));
+      const settings = {
+        cwd, ...(model ? { model } : {}), sandbox: wanted.sandbox,
+        approvalPolicy: wanted.approvalPolicy, approvalsReviewer: 'user',
+      };
+      const result = object(resumeSessionId
+        ? await this.request('thread/resume', { threadId: resumeSessionId, ...settings, excludeTurns: true })
+        : await this.request('thread/start', settings));
       const id = string(object(result.thread).id);
       if (!id) throw new Error('Codex did not return a thread ID');
-      if (object(result.sandbox).type !== 'readOnly' || result.approvalPolicy !== 'on-request') {
-        throw new Error('Codex did not confirm the requested read-only sandbox and approvals');
+      if (resumeSessionId && id !== resumeSessionId) throw new Error('Codex resumed a different thread');
+      if (object(result.sandbox).type !== wanted.sandboxType || result.approvalPolicy !== wanted.approvalPolicy) {
+        throw new Error(`Codex did not confirm the requested ${policy} sandbox and approvals`);
       }
+      this.policy = policy;
+      // The resumed thread's running token total is unknown until Codex reports it.
+      if (resumeSessionId) this.tokenTotal = null;
       this.threadId = id;
       // Codex may cache an empty MCP catalog prepared before the first turn.
       const inventory = object(await this.request('mcpServerStatus/list', {
@@ -365,10 +382,13 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     });
   }
 
-  async startTurn({ turnKey, prompt, effort }: { turnKey: string; prompt: string; effort?: string | null }): Promise<TurnDelivery> {
+  async startTurn({ turnKey, prompt, effort, model, policy }: {
+    turnKey: string; prompt: string; effort?: string | null; model?: string | null; policy?: AgentSessionPolicy;
+  }): Promise<TurnDelivery> {
     if (!this.alive || !this.threadId || this.active) {
       return { status: 'not_accepted', reason: 'Codex thread is closed or busy' };
     }
+    const wanted = POLICIES[policy ?? this.policy];
     let finish!: () => void;
     const idle = new Promise<void>((resolve) => { finish = resolve; });
     const turn: ActiveTurn = {
@@ -385,11 +405,15 @@ export class CodexAppServerPilot implements AgentSessionDriver {
         threadId: this.threadId,
         input: [{ type: 'text', text: prompt, text_elements: [] }],
         ...(effort ? { effort } : {}),
-        sandboxPolicy: { type: 'readOnly', networkAccess: false },
-        ...APPROVALS,
+        ...(model ? { model } : {}),
+        sandboxPolicy: wanted.sandboxType === 'readOnly'
+          ? { type: 'readOnly', networkAccess: false }
+          : { type: 'workspaceWrite', writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
+        approvalPolicy: wanted.approvalPolicy, approvalsReviewer: 'user',
       }));
       const id = string(object(result.turn).id);
       if (!id) throw new Error('Codex did not acknowledge a turn ID');
+      if (policy) this.policy = policy;
       this.observeStart(turn, id);
       return { status: 'accepted' };
     } catch (error) {
@@ -550,9 +574,10 @@ export class CodexAppServerPilot implements AgentSessionDriver {
       const tokenUsage = object(params.tokenUsage);
       const total = numericFields(tokenUsage.total);
       const last = numericFields(tokenUsage.last);
-      turn.usage = Object.keys(total).length === 0 ? last : Object.fromEntries(
+      const before = turn.usageBaseline;
+      turn.usage = Object.keys(total).length === 0 || !before ? last : Object.fromEntries(
         Object.entries(total).map(([key, count]) => {
-          const baseline = turn.usageBaseline[key] ?? 0;
+          const baseline = before[key] ?? 0;
           return [key, count >= baseline ? count - baseline : last[key] ?? count];
         }),
       );
@@ -646,8 +671,40 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     }
   }
 
+  private async askUser(turn: ActiveTurn, method: string, params: Obj): Promise<Record<string, string[]> | null> {
+    const asked = (Array.isArray(params.questions) ? params.questions : []).map(object);
+    // A secret typed into the question lane would land in the transcript.
+    if (asked.length === 0 || asked.some((question) => question.isSecret === true)) return null;
+    const questions = asked.map((question) => ({
+      id: string(question.id) ?? '', header: this.redact(string(question.header) ?? ''),
+      prompt: this.redact(string(question.question) ?? ''),
+      options: (Array.isArray(question.options) ? question.options : []).map(object).map((option) => ({
+        label: string(option.label) ?? '', description: string(option.description) ?? '',
+      })),
+    }));
+    try {
+      const response = await this.events.onRequest(turn.turnKey, {
+        kind: 'question', method, toolInput: '', questions, signal: this.disconnect.signal,
+      });
+      return 'answers' in response ? response.answers : null;
+    } catch {
+      return null;
+    }
+  }
+
   private async replyToServer(id: RpcId, method: string, params: Obj): Promise<void> {
     const turn = this.active;
+    if (method === 'item/tool/requestUserInput' && turn && !this.stopping &&
+      params.threadId === this.threadId && (!turn.id || params.turnId === turn.id)) {
+      const answers = await this.askUser(turn, method, params);
+      if (this.disconnected) return;
+      if (answers) {
+        this.write({ id, result: {
+          answers: Object.fromEntries(Object.entries(answers).map(([key, value]) => [key, { answers: value }])),
+        } });
+        return;
+      }
+    }
     const mcpConfirmation = method === 'mcpServer/elicitation/request';
     const approval = method === 'item/commandExecution/requestApproval' ||
       method === 'item/fileChange/requestApproval' || method === 'item/permissions/requestApproval' ||

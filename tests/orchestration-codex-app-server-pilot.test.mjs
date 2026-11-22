@@ -186,6 +186,10 @@ test('independent Worker auth, long stdin input, pending turn and same-thread re
   assert.equal(app.service.workerShow({ dispatchId: first.dispatch.id }).stage, 'awaiting_review');
   const submitted = app.getTrace().filter((message) => message.method === 'turn/start');
   assert.equal(submitted.length, 1);
+  assert.deepEqual(submitted[0].params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+  assert.equal(submitted[0].params.approvalPolicy, 'on-request');
+  const opened = app.getTrace().find((message) => message.method === 'thread/start').params;
+  assert.deepEqual([opened.sandbox, opened.approvalPolicy], ['read-only', 'on-request']);
   assert.ok(submitted[0].params.input[0].text.includes(spec));
   const read = app.service.workerRead({ dispatchId: first.dispatch.id, limit: 3 });
   assert.equal(read.text, '模拟输');
@@ -275,15 +279,102 @@ test('close reuses a bounded wait when neither child error nor close arrives', {
   assert.match(exits[0].reason, /Timed out waiting for Codex app-server to close/);
 });
 
-test('a policy the driver does not list is refused before anything is sent to Codex', async () => {
-  const child = fakeCodexChild();
-  const sent = [];
-  child.stdin.on('data', (chunk) => sent.push(chunk));
-  const session = new CodexAppServerPilot(child, recordCodexExit([]));
-  assert.deepEqual(session.capabilities.policies, ['read-only']);
-  await assert.rejects(session.open({ cwd, model: null, policy: 'workspace-write' }), /workspace-write/);
-  assert.equal(sent.length, 0);
-  await session.close();
+async function openDriver(t, { scenario = 'normal', onRequest, ...open } = {}) {
+  const dir = mkdtempSync(join(cwd, '.codex-driver-test-'));
+  const trace = join(dir, 'rpc.jsonl');
+  const child = spawn(process.execPath, [join(cwd, 'tests/fixtures/mock-codex-app-server.mjs'), scenario, trace], {
+    cwd, stdio: 'pipe', windowsHide: true,
+  });
+  const turns = [];
+  const requests = [];
+  const session = new CodexAppServerPilot(child, {
+    onTurnStarted() {},
+    onTurnCompleted: (turnKey, result) => turns.push({ turnKey, ...result }),
+    onRequest: async (turnKey, request) => {
+      requests.push(request);
+      return onRequest ? onRequest(request) : { decision: 'decline' };
+    },
+    onExit() {},
+  }, 850);
+  t.after(async () => {
+    await session.close();
+    rmSync(dir, { force: true, recursive: true });
+  });
+  const opened = session.open({ cwd, model: null, policy: 'read-only', ...open });
+  const sent = (method) => readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse)
+    .filter((message) => message.method === method).map((message) => message.params);
+  return { session, opened, turns, requests, sent };
+}
+
+test('each policy maps to a sandbox and approval mode, and a turn can switch policy and model', async (t) => {
+  const { session, opened, turns, sent } = await openDriver(t, { policy: 'workspace-write', model: 'gpt-a' });
+  await opened;
+  const start = sent('thread/start')[0];
+  assert.deepEqual([start.sandbox, start.approvalPolicy, start.model], ['workspace-write', 'on-request', 'gpt-a']);
+
+  assert.equal((await session.startTurn({ turnKey: 'one', prompt: 'first' })).status, 'accepted');
+  await until(() => turns.length === 1);
+  assert.equal((await session.startTurn({
+    turnKey: 'two', prompt: 'second', policy: 'full-auto', model: 'gpt-b', effort: 'high',
+  })).status, 'accepted');
+  await until(() => turns.length === 2);
+  assert.equal((await session.startTurn({ turnKey: 'three', prompt: 'third' })).status, 'accepted');
+  await until(() => turns.length === 3);
+
+  const [first, second, third] = sent('turn/start');
+  assert.deepEqual([first.sandboxPolicy.type, first.approvalPolicy, first.model], ['workspaceWrite', 'on-request', undefined]);
+  assert.deepEqual(
+    [second.sandboxPolicy.type, second.sandboxPolicy.networkAccess, second.approvalPolicy, second.model, second.effort],
+    ['workspaceWrite', false, 'never', 'gpt-b', 'high'],
+    'full-auto stops asking but stays inside the workspace sandbox',
+  );
+  assert.equal(third.approvalPolicy, 'never', 'a policy set on one turn stays in effect');
+});
+
+test('a sandbox Codex did not grant as requested fails the session before any turn', async (t) => {
+  const { session, opened, sent } = await openDriver(t, { scenario: 'sandbox-mismatch', policy: 'read-only' });
+  await assert.rejects(opened, /did not confirm the requested read-only sandbox/);
+  assert.equal(session.sessionId, null);
+  assert.equal((await session.startTurn({ turnKey: 'one', prompt: 'nope' })).status, 'not_accepted');
+  assert.equal(sent('turn/start').length, 0);
+});
+
+test('resume continues the given thread and reports per-turn usage without a baseline', async (t) => {
+  const { session, opened, turns, sent } = await openDriver(t, { resumeSessionId: 'mock-thread-id', policy: 'workspace-write' });
+  assert.equal(await opened, 'mock-thread-id');
+  assert.equal(sent('thread/start').length, 0);
+  const resume = sent('thread/resume')[0];
+  assert.deepEqual([resume.threadId, resume.sandbox, resume.excludeTurns], ['mock-thread-id', 'workspace-write', true]);
+
+  await session.startTurn({ turnKey: 'one', prompt: 'continue' });
+  await until(() => turns.length === 1);
+  // The thread total (23/7) includes turns from before the resume; only this turn's share is known.
+  assert.deepEqual(turns[0].usage, { inputTokens: 11, outputTokens: 3 });
+});
+
+test('a question from Codex is answered through onRequest; secret or unanswered ones are refused', async (t) => {
+  const { session, opened, turns, requests } = await openDriver(t, {
+    onRequest: (request) => (request.kind === 'question' && requests.length === 1
+      ? { answers: { db: ['SQLite'] } } : { decision: 'decline' }),
+  });
+  await opened;
+  await session.startTurn({ turnKey: 'one', prompt: 'ASK_A_QUESTION' });
+  await until(() => turns.length === 1);
+  assert.equal(requests[0].kind, 'question');
+  assert.deepEqual(requests[0].questions, [{
+    id: 'db', header: 'Database', prompt: 'Which database?',
+    options: [{ label: 'SQLite', description: 'Local file' }, { label: 'Postgres', description: 'Server' }],
+  }]);
+  assert.equal(turns[0].finalText, 'answer: {"db":{"answers":["SQLite"]}}');
+
+  await session.startTurn({ turnKey: 'two', prompt: 'ASK_A_QUESTION' });
+  await until(() => turns.length === 2);
+  assert.equal(turns[1].finalText, 'request refused');
+
+  await session.startTurn({ turnKey: 'three', prompt: 'ASK_A_QUESTION SECRET' });
+  await until(() => turns.length === 3);
+  assert.equal(requests.length, 2, 'a secret question is never forwarded');
+  assert.equal(turns[2].finalText, 'request refused');
 });
 
 test('bounded stderr is included and redacted on startup failure and process exit', async () => {
