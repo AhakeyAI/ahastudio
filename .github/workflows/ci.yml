@@ -24,22 +24,20 @@ jobs:
     name: Typecheck & Build
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      VIBE_MEET_CACHE_DIR: ${{ runner.temp }}/vibe-meet-cache
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
       - name: Cache speaker model asset
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
-          path: ${{ env.VIBE_MEET_CACHE_DIR }}
+          path: ${{ runner.temp }}/vibe-meet-cache
           key: speaker-model-campplus-v1
 
       - name: Install dependencies
@@ -49,6 +47,8 @@ jobs:
         run: npm run typecheck
 
       - name: Production build (Vite & Electron)
+        env:
+          VIBE_MEET_CACHE_DIR: ${{ runner.temp }}/vibe-meet-cache
         run: npm run build
 
       - name: Verify build outputs
@@ -83,14 +83,12 @@ jobs:
           - ubuntu-latest
           - macos-latest
           - windows-latest
-    env:
-      electron_config_cache: ${{ runner.temp }}/electron-cache
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -106,15 +104,17 @@ jobs:
 
       - name: Cache Electron binary download (Windows)
         if: runner.os == 'Windows'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
-          path: ${{ env.electron_config_cache }}
+          path: ${{ runner.temp }}/electron-cache
           key: electron-bin-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
           restore-keys: |
             electron-bin-${{ runner.os }}-
 
       - name: Ensure Electron binary is present for Windows daemon tests
         if: runner.os == 'Windows'
+        env:
+          electron_config_cache: ${{ runner.temp }}/electron-cache
         run: node node_modules/electron/install.js
 
       - name: Run fast test suite

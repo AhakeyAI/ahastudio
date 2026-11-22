@@ -46,10 +46,10 @@ jobs:
       should_publish: ${{ steps.version.outputs.should_publish }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -96,32 +96,28 @@ jobs:
           - platform_id: linux-x64
             label: Linux AppImage x64
             os: ubuntu-latest
-    env:
-      VIBE_MEET_CACHE_DIR: ${{ runner.temp }}/vibe-meet-cache
-      electron_config_cache: ${{ runner.temp }}/electron-cache
-      ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
       - name: Cache speaker model asset
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
-          path: ${{ env.VIBE_MEET_CACHE_DIR }}
+          path: ${{ runner.temp }}/vibe-meet-cache
           key: speaker-model-campplus-v1
 
       - name: Cache Electron and electron-builder downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
-            ${{ env.electron_config_cache }}
-            ${{ env.ELECTRON_BUILDER_CACHE }}
+            ${{ runner.temp }}/electron-cache
+            ${{ runner.temp }}/electron-builder-cache
           key: electron-builder-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
           restore-keys: |
             electron-builder-${{ runner.os }}-
@@ -130,15 +126,21 @@ jobs:
         run: npm ci
 
       - name: Fetch speaker ONNX model (strict)
+        env:
+          VIBE_MEET_CACHE_DIR: ${{ runner.temp }}/vibe-meet-cache
         run: node scripts/fetch-speaker-model.mjs
 
       - name: Build renderer and Electron main
+        env:
+          VIBE_MEET_CACHE_DIR: ${{ runner.temp }}/vibe-meet-cache
         run: npm run build
 
       - name: Package Windows NSIS installer
         if: matrix.platform_id == 'win-x64'
         shell: pwsh
         env:
+          electron_config_cache: ${{ runner.temp }}/electron-cache
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
         run: |
@@ -157,6 +159,8 @@ jobs:
         if: matrix.platform_id == 'mac-arm64'
         shell: bash
         env:
+          electron_config_cache: ${{ runner.temp }}/electron-cache
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
           MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -188,6 +192,9 @@ jobs:
       - name: Package Linux x64 AppImage
         if: matrix.platform_id == 'linux-x64'
         shell: bash
+        env:
+          electron_config_cache: ${{ runner.temp }}/electron-cache
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
         run: |
           set -euo pipefail
           npx electron-builder --linux AppImage --x64 --publish never
@@ -196,7 +203,7 @@ jobs:
         run: node scripts/stage-release-artifacts.mjs release "${{ runner.temp }}/release-artifacts"
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: installer-${{ matrix.platform_id }}
           path: ${{ runner.temp }}/release-artifacts
@@ -215,7 +222,7 @@ jobs:
       contents: write
     steps:
       - name: Download all installer artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: installer-*
           merge-multiple: true
