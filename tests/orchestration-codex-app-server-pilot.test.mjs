@@ -899,3 +899,27 @@ test('git fallback diff is redacted before it is stored, announced, or shown', a
   await app.service.waitForPendingWrites();
   assert.doesNotMatch(readFileSync(app.statePath, 'utf8'), new RegExp(stderrSecret));
 });
+
+test('git fallback diff includes untracked new files without modifying the git index', async (t) => {
+  const app = await setup(t);
+  const repo = join(app.dir, 'repo-untracked');
+  const git = (...args) => execFileSync('git', args, { cwd: app.dir, encoding: 'utf8', windowsHide: true });
+  git('clone', '--quiet', '--shared', '--no-checkout', cwd, repo);
+  git('-C', repo, 'sparse-checkout', 'set', '--no-cone', '/README.md');
+  git('-C', repo, 'checkout', '--quiet');
+  writeFileSync(join(repo, 'brand-new-note.txt'), 'hello from worker\n');
+  writeFileSync(join(repo, `secret-${stderrSecret}.txt`), 'secret filename\n');
+  const statusBefore = git('-C', repo, 'status', '--porcelain');
+
+  const { dispatch } = await app.start('Check untracked files in fallback diff', { cwd: repo });
+  const settled = await until(() => app.service.getWorkerTimeline({ dispatchId: dispatch.id })
+    ?.turns[0]?.items.find((item) => item.kind === 'settlement'));
+  assert.equal(settled.diffSource, 'git');
+  assert.match(settled.diff, /brand-new-note\.txt/);
+  assert.match(settled.diff, /secret-<redacted>\.txt/);
+  assert.doesNotMatch(settled.diff, new RegExp(stderrSecret));
+  assert.match(app.store.getDispatchContext(dispatch.id).codexTurn.diff, /brand-new-note\.txt/);
+  // Read-only inspection must never stage or intent-to-add untracked files.
+  assert.equal(git('-C', repo, 'status', '--porcelain'), statusBefore);
+  assert.equal(git('-C', repo, 'diff', '--cached', '--name-only').trim(), '');
+});

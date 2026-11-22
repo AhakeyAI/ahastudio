@@ -239,6 +239,13 @@ test('dispatch prompts split into the task body and the orchestration wrapper', 
   assert.match(mcp.system, /report_done/);
   assert.match(mcp.system, /delegate_task/);
 
+  const writable = model.splitDispatchPrompt(buildDispatchPreamble({
+    ...base, taskSpec: spec, mcpEnabled: true, headless: true, leaveUncommitted: true, role: 'builder',
+    worktreePath: 'C:/repo/wt', branch: 'aha/worker/x',
+  }));
+  assert.equal(writable.body, spec);
+  assert.match(writable.system, /Do not run `git commit`/);
+
   const followUp = model.splitDispatchPrompt(buildDispatchPreamble({
     ...base, taskSpec: 'Also check tests', mcpEnabled: true, headless: true, role: 'reviewer', isFollowUp: true,
   }));

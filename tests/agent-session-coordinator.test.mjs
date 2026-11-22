@@ -126,7 +126,7 @@ test('session MCP launch carries session credentials and keeps destructive Coord
     assert.ok(!approved.includes(tool), tool);
   }
   const worker = codexMcpConfigArgs('node', { serverPath: 'x', env: {} }).filter((arg) => arg.endsWith('"approve"'));
-  assert.deepEqual(worker.map((arg) => arg.split('.')[3]), ['report_done', 'read_board']);
+  assert.deepEqual(worker.map((arg) => arg.split('.')[3]), ['report_done', 'read_board', 'ask_coordinator', 'post_message']);
 });
 
 test('session credentials authenticate only as that session and only on orchestration routes', async (t) => {
@@ -322,6 +322,10 @@ test('session-coordinated writable Codex tasks run headless with workspace-write
   assert.deepEqual([threadStarts[2].sandbox, threadStarts[2].approvalPolicy], ['read-only', 'on-request']);
   assert.deepEqual(turnStarts[2].sandboxPolicy, { type: 'readOnly', networkAccess: false });
   assert.equal(turnStarts[2].approvalPolicy, 'on-request');
+
+  assert.match(turnStarts[0].input[0].text, /Do not run `git commit`;.*report_done/);
+  assert.match(turnStarts[1].input[0].text, /Do not run `git commit`;.*report_done/);
+  assert.doesNotMatch(turnStarts[2].input[0].text, /Do not run `git commit`/);
 });
 
 test('writable Codex PTY fallback keeps original extraArgs while read-only fallback adds read-only sandbox flags', async (t) => {

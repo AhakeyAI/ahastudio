@@ -216,8 +216,8 @@ export function enabledCodexPilot(platform: NodeJS.Platform, setting: boolean, o
   return platform === 'win32' && (override === '1' || (override !== '0' && setting));
 }
 
-// These two calls are part of the dispatch contract and still use Worker-scoped auth.
-const WORKER_APPROVED_MCP_TOOLS = ['report_done', 'read_board'] as const;
+// These calls are part of the Worker dispatch contract and still use Worker-scoped auth.
+const WORKER_APPROVED_MCP_TOOLS = ['report_done', 'read_board', 'ask_coordinator', 'post_message'] as const;
 
 /**
  * Coordinator tools a session runs without a Codex prompt: reads, plus calls the orchestration
@@ -261,7 +261,7 @@ export function launchCodexPilot(options: {
   /**
    * Aha MCP wiring for an orchestration Worker or an orchestrating session; a plain session runs
    * without it. `requiredTool` must be listed before the thread is usable (default report_done) and
-   * `approvedTools` run without a Codex approval prompt (default report_done and read_board).
+   * `approvedTools` run without a Codex approval prompt (default report_done, read_board, ask_coordinator, and post_message).
    */
   mcp?: { serverPath: string; env: Record<string, string>; requiredTool?: string; approvedTools?: readonly string[] };
   events: AgentSessionEvents;

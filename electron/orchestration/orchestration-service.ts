@@ -5238,6 +5238,7 @@ export class OrchestrationService {
       canDispatchSubWorkers: ctx.executionMode !== 'codex-app-server' && ctx.depth < this.maxDepth,
       mcpEnabled: ctx.executionMode === 'codex-app-server' || effectiveMcpEnabled,
       headless: ctx.executionMode === 'codex-app-server',
+      leaveUncommitted: ctx.executionMode === 'codex-app-server' && !readOnlyTask,
       role: preambleRole,
     });
 
@@ -5483,9 +5484,31 @@ export class OrchestrationService {
     } else {
       // Working-tree files can contain Worker credentials; redact before the diff is stored or published.
       const redactDiff = (diff: string) => this.store.redactDispatchCredentials(session?.redactText(diff) ?? diff);
-      void runGitCommand(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], {
-        cwd, readOnly: true, maxBytes: 128 * 1024, timeoutMs: 3_000,
-      }).then((git) => announce(git.exitCode === 0 ? redactDiff(git.stdout) : null), () => announce(null));
+      void Promise.all([
+        runGitCommand(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], {
+          cwd, readOnly: true, maxBytes: 128 * 1024, timeoutMs: 3_000,
+        }),
+        runGitCommand(['ls-files', '--others', '--exclude-standard', '-z'], {
+          cwd, readOnly: true, maxBytes: 32 * 1024, timeoutMs: 3_000,
+        }),
+      ]).then(([git, untracked]) => {
+        if (git.exitCode !== 0) {
+          announce(null);
+          return;
+        }
+        const rawUntracked = untracked.exitCode === 0 || untracked.truncated ? untracked.stdout : '';
+        const safeUntracked = untracked.truncated
+          ? rawUntracked.slice(0, Math.max(0, rawUntracked.lastIndexOf('\0')))
+          : rawUntracked;
+        const untrackedPaths = safeUntracked.split('\0').filter(Boolean);
+        const untrackedDiff = untrackedPaths
+          .map((file) => `diff --git a/${file} b/${file}\nnew file (untracked)\n--- /dev/null\n+++ b/${file}`)
+          .join('\n');
+        const combined = untrackedPaths.length === 0
+          ? git.stdout
+          : `${[git.stdout.trimEnd(), untrackedDiff].filter(Boolean).join('\n')}\n`;
+        announce(redactDiff(combined));
+      }, () => announce(null));
     }
   }
 
@@ -5809,6 +5832,7 @@ export class OrchestrationService {
       previousDispatchId: settledDispatch.id,
       mcpEnabled: Boolean(session) || followUpMcpEnabled,
       headless: Boolean(session),
+      leaveUncommitted: Boolean(session) && this.workerTimelines.get(targetPtyId)?.getHeader().readOnly === false,
       role: followUpRole,
     });
 
