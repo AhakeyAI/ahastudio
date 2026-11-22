@@ -339,6 +339,8 @@ test('orchestration mode survives a restart and applies when the conversation re
   const dir = mkdtempSync(join(cwd, '.session-coordinator-test-'));
   const first = sessionSetup(t, { dir, owner: false });
   const session = await first.manager.create({ cwd, policy: 'read-only' });
+  assert.equal((await first.manager.send(session.id, { text: 'Plan the work' })).status, 'accepted');
+  await settle(() => first.info(session.id).status === 'idle');
   await first.manager.setOrchestration(session.id, true);
   await first.manager.dispose();
 
@@ -350,6 +352,21 @@ test('orchestration mode survives a restart and applies when the conversation re
   assert.deepEqual(second.launches.map((launch) => launch.orchestration), [true]);
   assert.match(second.sent('thread/resume').at(-1).developerInstructions, /Orchestration Mode Active/);
   assert.equal(second.manager.coordinatorState(session.id).active, true);
+});
+
+test('a session that never took a turn switches by opening a new thread, since Codex has nothing saved to resume', async (t) => {
+  const app = sessionSetup(t);
+  const session = await app.manager.create({ cwd, policy: 'read-only' });
+  assert.deepEqual(await app.manager.setOrchestration(session.id, true), { ok: true });
+  assert.equal(app.sent('thread/resume').length, 0);
+  const started = app.sent('thread/start');
+  assert.equal(started.length, 2);
+  assert.match(started[1].developerInstructions, /Orchestration Mode Active/);
+  assert.deepEqual([app.info(session.id).status, app.info(session.id).orchestration], ['idle', true]);
+  assert.equal((await app.manager.send(session.id, { text: 'Plan the work' })).status, 'accepted');
+  await settle(() => app.info(session.id).status === 'idle');
+  assert.deepEqual(await app.manager.setOrchestration(session.id, false), { ok: true });
+  assert.equal(app.sent('thread/resume').length, 1, 'once a turn ran, the thread is resumed');
 });
 
 test('a failed switch keeps the previous mode so the next message resumes the plain conversation', async (t) => {

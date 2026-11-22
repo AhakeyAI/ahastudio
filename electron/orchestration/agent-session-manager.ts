@@ -47,6 +47,8 @@ interface Session {
   requests: Map<string, PendingRequest>;
   /** Bumped for each provider process, so a replaced process cannot change the session. */
   generation: number;
+  /** The provider accepted a turn; Codex saves a thread only then, so before it there is nothing to resume. */
+  hasTurns: boolean;
 }
 
 export interface AgentSessionManagerDependencies {
@@ -178,6 +180,7 @@ export class AgentSessionManager {
       ...(input.network !== undefined && input.network !== info.network ? { network: input.network } : {}),
     });
     if (delivery.status === 'accepted') {
+      session.hasTurns = true;
       if (input.model) info.model = input.model;
       if (input.effort !== undefined) info.effort = input.effort;
       if (input.policy) info.policy = input.policy;
@@ -298,6 +301,8 @@ export class AgentSessionManager {
     const session: Session = {
       info, driver: null, requests: new Map(), generation: 0,
       turns: initial?.turns.length ?? 0,
+      // A turn that never reached the provider ends failed with no turn id and no output.
+      hasTurns: initial?.turns.some((turn) => turn.status !== 'failed' || turn.turnId !== null || turn.items.length > 0) ?? false,
       timeline: new WorkerTimeline({
         workerHandle: info.id, cliId: info.provider, model: info.model, readOnly: info.policy === 'read-only',
         redact: (text) => session.driver?.redactText(text) ?? text,
@@ -317,9 +322,13 @@ export class AgentSessionManager {
     return Boolean(providerSessionId) && !session.driver?.alive && (status === 'suspended' || status === 'failed');
   }
 
-  /** Starts the provider process and opens (or, with `resume`, rejoins) the conversation. */
+  /**
+   * Starts the provider process and opens (or, with `resume`, rejoins) the conversation. A thread
+   * that never took a turn cannot be rejoined, so it is replaced by a new one.
+   */
   private async connect(session: Session, resume = false): Promise<void> {
     const { info, timeline } = session;
+    const rejoin = resume && Boolean(info.providerSessionId) && session.hasTurns;
     info.status = 'starting';
     info.error = null;
     if (resume) this.sessionsChanged();
@@ -332,7 +341,7 @@ export class AgentSessionManager {
       info.providerSessionId = await session.driver.open({
         cwd: info.cwd, model: info.model, policy: info.policy, network: info.network,
         ...(developerInstructions ? { developerInstructions } : {}),
-        ...(resume && info.providerSessionId ? { resumeSessionId: info.providerSessionId } : {}),
+        ...(rejoin && info.providerSessionId ? { resumeSessionId: info.providerSessionId } : {}),
       });
       if (!session.driver.alive) throw new Error(info.error ?? 'The agent closed while starting');
       info.status = 'idle';
@@ -340,7 +349,7 @@ export class AgentSessionManager {
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       info.status = 'failed';
-      info.error = resume ? `无法恢复会话：${reason}` : reason;
+      info.error = rejoin ? `无法恢复会话：${reason}` : reason;
       timeline.setMeta({ alive: false });
       await session.driver?.close();
     }
