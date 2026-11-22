@@ -570,7 +570,7 @@ export async function dispatchOrchestrationHttpAction(
     if (codexCaller) {
       requireCallerPane();
       if (!CODEX_WORKER_ACTIONS.has(action)) {
-        throw new OrchestrationError('operation_rejected', 'This action is unavailable to headless read-only Workers.');
+        throw new OrchestrationError('operation_rejected', 'This action is unavailable to headless Workers.');
       }
     }
     if (sessionCaller) {

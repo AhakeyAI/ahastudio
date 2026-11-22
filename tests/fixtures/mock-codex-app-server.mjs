@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const [scenario, trace] = process.argv.slice(2);
 const history = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const threadId = 'mock-thread-id';
+let threadCwd = process.cwd();
 let turnNumber = 0;
 let turnId;
 let approvalId;
@@ -61,6 +63,7 @@ for await (const line of history) {
       : { id, result: { userAgent: 'mock-codex' } });
   } else if (method === 'thread/start' || method === 'thread/resume') {
     if (method === 'thread/resume') assert.equal(params.threadId, threadId);
+    if (typeof params.cwd === 'string' && params.cwd) threadCwd = params.cwd;
     const granted = scenario === 'sandbox-mismatch' ? 'workspace-write' : params.sandbox;
     send({ id, result: {
       thread: { id: threadId },
@@ -120,6 +123,11 @@ for await (const line of history) {
         id: approvalId, method: 'item/commandExecution/requestApproval',
         params: { threadId, turnId, command: 'Get-Location', availableDecisions: ['accept', 'decline'] },
       });
+    } else if (prompt.includes('WRITE_FILE')) {
+      const match = /WRITE_FILE:([^\s]+)/.exec(prompt);
+      const target = basename(match?.[1] ?? 'worker-output.txt') || 'worker-output.txt';
+      writeFileSync(join(threadCwd, target), `written by mock headless worker (${target})\n`, 'utf8');
+      completed('completed', `Wrote ${target}`);
     } else {
       completed('completed', '模拟输出 ' + turnNumber);
     }

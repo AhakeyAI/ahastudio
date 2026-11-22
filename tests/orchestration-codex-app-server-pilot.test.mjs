@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -47,7 +48,7 @@ async function until(read, timeout = 4_000) {
   assert.fail('Expected pilot state did not appear');
 }
 
-async function setup(t, scenario = 'normal', enabled = true) {
+async function setup(t, scenario = 'normal', enabled = true, { confirmMode } = {}) {
   const dir = mkdtempSync(join(cwd, '.codex-pilot-test-'));
   const trace = join(dir, 'rpc.jsonl');
   const agentStatusStore = new AgentStatusStore();
@@ -64,6 +65,7 @@ async function setup(t, scenario = 'normal', enabled = true) {
   const service = new OrchestrationService({
     store, agentStatusStore, getDefaultCwd: () => cwd,
     settleDelayMs: 0, turnStartObserveTimeoutMs: 250, turnStopSettleMs: 10_000,
+    ...(confirmMode ? { getConfirmMode: () => confirmMode } : {}),
     writePty: async (id, data) => {
       writes.push({ id, data });
       agentStatusStore.ingestHookEvent({ ptyId: id, agentId: 'codex', state: 'working' });
@@ -922,4 +924,124 @@ test('git fallback diff includes untracked new files without modifying the git i
   // Read-only inspection must never stage or intent-to-add untracked files.
   assert.equal(git('-C', repo, 'status', '--porcelain'), statusBefore);
   assert.equal(git('-C', repo, 'diff', '--cached', '--name-only').trim(), '');
+});
+
+test('session Coordinator runs a writable headless Worker in a worktree, integrates via squash and run-finalize, and reaps it', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'aha-codex-e2e-'));
+  const repo = join(root, 'repo');
+  const git = (workdir, ...args) => execFileSync('git', args, { cwd: workdir, encoding: 'utf8', windowsHide: true }).trim();
+  git(root, 'init', '-b', 'main', 'repo');
+  git(repo, 'config', 'user.name', 'Test User');
+  git(repo, 'config', 'user.email', 'test@example.com');
+  writeFileSync(join(repo, 'README.md'), '# Demo\n', 'utf8');
+  git(repo, 'add', '.');
+  git(repo, 'commit', '-m', 'initial commit');
+  const baseHead = git(repo, 'rev-parse', 'HEAD');
+
+  const app = await setup(t, 'normal', false, { confirmMode: 'auto' });
+  t.after(async () => {
+    await app.service.stopCodexWorkers();
+    rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  });
+  const SESSION = 'agent-session-00000000-0000-0000-0000-0000000000e2';
+  app.service.setSessionCoordinators({
+    get: (id) => (id === SESSION ? { cwd: repo, provider: 'codex', active: true, idle: true, network: false } : null),
+  });
+  const callSession = (action, payload) =>
+    dispatchOrchestrationHttpAction(app.service, action, payload, {
+      signal: new AbortController().signal, callerPaneId: SESSION,
+    }).then((reply) => reply.body);
+  const processDead = (pid) => {
+    if (!pid) return true;
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error) {
+      if (error.code !== 'ESRCH') throw error;
+      return true;
+    }
+  };
+
+  // 1. Direct squash integration into main.
+  const started = await callSession('delegate-task', {
+    role: 'writer', task: 'Create hello.txt via WRITE_FILE:hello.txt', agent: 'codex', worktree: true,
+  });
+  assert.equal(started.ok, true, started.error);
+  assert.equal(started.result.status, 'started', JSON.stringify(started.result));
+  const dispatch = started.result.dispatch;
+  const workerId = dispatch.assigneeHandle;
+  const worktreePath = dispatch.worktreePath;
+  const workerBranch = dispatch.branch;
+  const workerChild = app.children[0];
+  assert.equal(dispatch.executionMode, 'codex-app-server');
+  assert.equal(dispatch.assigneePaneId, null);
+  assert.equal(dispatch.ownsPane, false);
+  assert.equal(dispatch.ownsWorktree, true);
+  assert.ok(worktreePath && worktreePath !== repo);
+  assert.ok(workerBranch && workerBranch.startsWith('aha/worker/'));
+  assert.equal(app.ptyStarts(), 0);
+  assert.equal(app.service.getWorkerTimeline({ dispatchId: dispatch.id }).readOnly, false);
+
+  const settled = await until(() => app.service.getWorkerTimeline({ dispatchId: dispatch.id })
+    ?.turns[0]?.items.find((item) => item.kind === 'settlement'));
+  assert.equal(existsSync(join(worktreePath, 'hello.txt')), true);
+  assert.equal(existsSync(join(repo, 'hello.txt')), false);
+  assert.equal(settled.diffSource, 'git');
+  assert.match(settled.diff ?? '', /hello\.txt/);
+  assert.match(app.store.getDispatchContext(dispatch.id).codexTurn.diff ?? '', /hello\.txt/);
+
+  const done = await reportDone(app.workers.get(workerId), 'Wrote hello.txt');
+  assert.equal(done.isError, undefined);
+  assert.equal(app.store.getDispatchContext(dispatch.id).status, 'completed');
+
+  const integrated = await callSession('worker-integrate', { dispatchId: dispatch.id, mode: 'squash' });
+  assert.equal(integrated.ok, true, integrated.error);
+  assert.equal(integrated.result.integrated, true);
+  assert.equal(integrated.result.mode, 'squash');
+  assert.equal(integrated.result.released, true);
+  assert.equal(readFileSync(join(repo, 'hello.txt'), 'utf8'), 'written by mock headless worker (hello.txt)\n');
+  assert.equal(git(repo, 'rev-list', '--count', `${baseHead}..HEAD`), '1');
+
+  const releasedDispatch = app.store.getDispatchContext(dispatch.id);
+  assert.ok(releasedDispatch.releasedAt);
+  assert.equal(releasedDispatch.stage, 'released');
+  assert.equal(releasedDispatch.ownsWorktree, false);
+  assert.equal(existsSync(worktreePath), false);
+  assert.equal(git(repo, 'branch', '--list', workerBranch), '');
+  assert.equal(app.service.hasCodexWorkers(), false);
+  assert.equal(app.service.isPaneAlive(workerId), false);
+  assert.ok(workerChild.exitCode !== null || workerChild.signalCode !== null);
+  assert.equal(processDead(workerChild.pid), true);
+  assert.equal(app.ptyStarts(), 0);
+
+  // 2. Dirty main routes to aha/run/* integration branch, then run-finalize promotes it cleanly.
+  writeFileSync(join(repo, 'user-wip.txt'), 'unsaved local edit\n', 'utf8');
+  const second = await callSession('delegate-task', {
+    role: 'writer-two', task: 'Create staged.txt via WRITE_FILE:staged.txt', agent: 'codex', worktree: true,
+  });
+  assert.equal(second.ok, true, second.error);
+  const secondDispatch = second.result.dispatch;
+  const secondChild = app.children[1];
+  await until(() => app.store.getDispatchContext(secondDispatch.id)?.codexTurn);
+  const secondDone = await reportDone(app.workers.get(secondDispatch.assigneeHandle), 'Wrote staged.txt');
+  assert.equal(secondDone.isError, undefined);
+
+  const staged = await callSession('worker-integrate', { dispatchId: secondDispatch.id, mode: 'squash' });
+  assert.equal(staged.ok, true, staged.error);
+  assert.equal(staged.result.integrated, true);
+  assert.equal(staged.result.usedRunIntegrationBranch, true);
+  assert.equal(staged.result.released, true);
+  assert.equal(existsSync(join(repo, 'staged.txt')), false, 'dirty main stays untouched until finalize');
+  assert.equal(existsSync(secondDispatch.worktreePath), false);
+  assert.equal(app.service.hasCodexWorkers(), false);
+  assert.equal(processDead(secondChild.pid), true);
+
+  rmSync(join(repo, 'user-wip.txt'));
+  const finalized = await callSession('run-finalize', { runId: secondDispatch.runId, mode: 'squash' });
+  assert.equal(finalized.ok, true, finalized.error);
+  assert.equal(finalized.result.integrated, true);
+  assert.equal(finalized.result.removedWorktree, true);
+  assert.equal(finalized.result.removedBranch, true);
+  assert.equal(readFileSync(join(repo, 'staged.txt'), 'utf8'), 'written by mock headless worker (staged.txt)\n');
+  assert.equal(app.ptyStarts(), 0);
 });

@@ -4492,7 +4492,7 @@ export class OrchestrationService {
     briefBoardSeq?: number;
   }> {
     const from = input.from?.trim() || 'coordinator';
-    if (CODEX_WORKER_ID.test(from)) throw new OrchestrationError('operation_rejected', 'Headless read-only Workers cannot start other Workers.');
+    if (CODEX_WORKER_ID.test(from)) throw new OrchestrationError('operation_rejected', 'Headless Workers cannot start other Workers.');
     const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
     this.assertCanDelegateFrom(from);
     this.store.assertDispatchCapacity();
@@ -6150,7 +6150,8 @@ export class OrchestrationService {
     const repoRootPath =
       dispatch.repoRootPath ??
       (dispatch.parentPaneId
-        ? this.terminalTracker?.getTerminal(dispatch.parentPaneId)?.cwd
+        ? this.terminalTracker?.getTerminal(dispatch.parentPaneId)?.cwd ??
+          this.sessionCoordinator(dispatch.parentPaneId)?.cwd
         : undefined) ??
       this.getDefaultCwd?.() ??
       null;
@@ -6390,8 +6391,10 @@ export class OrchestrationService {
     }
 
     const repoRootPath =
+      dispatch.repoRootPath ??
       (dispatch.parentPaneId
-        ? this.terminalTracker?.getTerminal(dispatch.parentPaneId)?.cwd
+        ? this.terminalTracker?.getTerminal(dispatch.parentPaneId)?.cwd ??
+          this.sessionCoordinator(dispatch.parentPaneId)?.cwd
         : undefined) ??
       this.getDefaultCwd?.() ??
       null;
