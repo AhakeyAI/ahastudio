@@ -216,10 +216,42 @@ export function enabledCodexPilot(platform: NodeJS.Platform, setting: boolean, o
   return platform === 'win32' && (override === '1' || (override !== '0' && setting));
 }
 
+// These two calls are part of the dispatch contract and still use Worker-scoped auth.
+const WORKER_APPROVED_MCP_TOOLS = ['report_done', 'read_board'] as const;
+
+/**
+ * Coordinator tools a session runs without a Codex prompt: reads, plus calls the orchestration
+ * service already gates (delegate_task waits for the person's confirmation in chat or in the UI).
+ * Tools that stop Workers or write Git history keep Codex's approval prompt.
+ */
+export const COORDINATOR_APPROVED_MCP_TOOLS = [
+  'delegate_task', 'team_status', 'list_coding_agents', 'read_board', 'board_wait', 'team_wait',
+  'post_message', 'message_worker', 'inspect_worker_diff', 'inspect_run_diff',
+] as const;
+
+export function codexMcpConfigArgs(
+  node: string, mcp: { serverPath: string; env: Record<string, string>; approvedTools?: readonly string[] },
+): string[] {
+  const mcpEnv = Object.entries(mcp.env).map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join(', ');
+  return [
+    '-c', `mcp_servers.aha.command=${JSON.stringify(node)}`,
+    '-c', `mcp_servers.aha.args=${JSON.stringify([mcp.serverPath])}`,
+    '-c', `mcp_servers.aha.env={ ${mcpEnv} }`,
+    '-c', 'mcp_servers.aha.enabled=true',
+    '-c', 'mcp_servers.aha.required=true',
+    ...(mcp.approvedTools ?? WORKER_APPROVED_MCP_TOOLS)
+      .flatMap((tool) => ['-c', `mcp_servers.aha.tools.${tool}.approval_mode="approve"`]),
+  ];
+}
+
 export function launchCodexPilot(options: {
   cwd: string;
-  /** Aha MCP wiring for an orchestration Worker; a plain session runs without it. */
-  mcp?: { serverPath: string; env: Record<string, string> };
+  /**
+   * Aha MCP wiring for an orchestration Worker or an orchestrating session; a plain session runs
+   * without it. `requiredTool` must be listed before the thread is usable (default report_done) and
+   * `approvedTools` run without a Codex approval prompt (default report_done and read_board).
+   */
+  mcp?: { serverPath: string; env: Record<string, string>; requiredTool?: string; approvedTools?: readonly string[] };
   events: AgentSessionEvents;
 }): CodexAppServerPilot {
   const codex = resolveBinaryFromPath('codex');
@@ -229,21 +261,7 @@ export function launchCodexPilot(options: {
   const entry = join(dirname(codex), 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
   if (wrapper && !existsSync(entry)) throw new Error('Codex npm entry point was not found');
 
-  const args = ['app-server', '--stdio'];
-  if (options.mcp) {
-    const mcpEnv = Object.entries(options.mcp.env)
-      .map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join(', ');
-    args.push(
-      '-c', `mcp_servers.aha.command=${JSON.stringify(node)}`,
-      '-c', `mcp_servers.aha.args=${JSON.stringify([options.mcp.serverPath])}`,
-      '-c', `mcp_servers.aha.env={ ${mcpEnv} }`,
-      '-c', 'mcp_servers.aha.enabled=true',
-      '-c', 'mcp_servers.aha.required=true',
-      // These two calls are part of the dispatch contract and still use Worker-scoped auth.
-      '-c', 'mcp_servers.aha.tools.report_done.approval_mode="approve"',
-      '-c', 'mcp_servers.aha.tools.read_board.approval_mode="approve"',
-    );
-  }
+  const args = ['app-server', '--stdio', ...(options.mcp ? codexMcpConfigArgs(node, options.mcp) : [])];
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath() };
   for (const key of Object.keys(env)) {
     if (key.toUpperCase().startsWith('AHA_')) delete env[key];
@@ -254,8 +272,8 @@ export function launchCodexPilot(options: {
     ? spawnWindowsCodexJob(executable, argv, options.cwd, env)
     : spawn(executable, argv, { cwd: options.cwd, env, windowsHide: true, stdio: 'pipe' });
   return new CodexAppServerPilot(child, options.events, 30_000, [
-    options.mcp?.env.AHA_WORKER_TOKEN, options.mcp?.env.AHA_AGENT_HOOK_TOKEN,
-  ].filter((value): value is string => Boolean(value)), options.mcp ? 'report_done' : null);
+    options.mcp?.env.AHA_WORKER_TOKEN, options.mcp?.env.AHA_SESSION_TOKEN, options.mcp?.env.AHA_AGENT_HOOK_TOKEN,
+  ].filter((value): value is string => Boolean(value)), options.mcp ? options.mcp.requiredTool ?? 'report_done' : null);
 }
 
 export class CodexAppServerPilot implements AgentSessionDriver {

@@ -10,6 +10,7 @@ import {
   type NormalizedAgentHookEvent,
 } from './agent-status-store.js';
 import { CODEX_WORKER_ID } from '../orchestration/codex-app-server-pilot.js';
+import { AGENT_SESSION_ID } from '../orchestration/agent-session-manager.js';
 import { isProgramStatusKind, normalizeAgentId } from './program-status-osc.js';
 
 const PTY_ID_RE = /^[a-zA-Z0-9._-]{1,128}$/;
@@ -746,6 +747,7 @@ export class AgentHookServer {
   private readonly token = randomBytes(32).toString('hex');
   private paneKey = randomBytes(32);
   private readonly workerKey = randomBytes(32);
+  private readonly sessionKey = randomBytes(32);
   private server: Server | null = null;
   private boundPort: number | null = null;
   private orchestrationHandler: OrchestrationHttpHandler | null = null;
@@ -777,6 +779,23 @@ export class AgentHookServer {
     return createHmac('sha256', this.workerKey).update(`${purpose}:${workerId}`).digest('hex');
   }
 
+  private sessionToken(sessionId: string, purpose: 'identity' | 'transport'): string {
+    return createHmac('sha256', this.sessionKey).update(`${purpose}:${sessionId}`).digest('hex');
+  }
+
+  /** Credentials for an Agent session acting as a Coordinator; they cannot pass as a Worker or a pane. */
+  envForSession(sessionId: string): Record<string, string> {
+    if (this.boundPort === null || !AGENT_SESSION_ID.test(sessionId)) {
+      throw new Error('Cannot configure authentication for the Agent session');
+    }
+    return {
+      AHA_SESSION_ID: sessionId,
+      AHA_SESSION_TOKEN: this.sessionToken(sessionId, 'identity'),
+      AHA_ORCHESTRATION_URL: `http://127.0.0.1:${this.boundPort}/orchestration`,
+      AHA_AGENT_HOOK_TOKEN: this.sessionToken(sessionId, 'transport'),
+    };
+  }
+
   envForWorker(workerId: string): Record<string, string> {
     if (this.boundPort === null || !CODEX_WORKER_ID.test(workerId)) {
       throw new Error('Cannot configure authentication for the headless Worker');
@@ -795,7 +814,17 @@ export class AgentHookServer {
 
     const workerId = req.headers['x-aha-worker-id'];
     const workerToken = req.headers['x-aha-worker-token'];
-    if (workerId !== undefined || workerToken !== undefined) {
+    const sessionId = req.headers['x-aha-session-id'];
+    const sessionToken = req.headers['x-aha-session-token'];
+    const claimsWorker = workerId !== undefined || workerToken !== undefined;
+    if (sessionId !== undefined || sessionToken !== undefined) {
+      return !claimsWorker && url.startsWith('/orchestration/') && typeof sessionId === 'string' &&
+        AGENT_SESSION_ID.test(sessionId) && typeof sessionToken === 'string' &&
+        tokensEqual(this.sessionToken(sessionId, 'identity'), sessionToken) &&
+        tokensEqual(this.sessionToken(sessionId, 'transport'), candidate)
+        ? sessionId : undefined;
+    }
+    if (claimsWorker) {
       // A Worker must not be able to use its transport token with the identity headers removed.
       return url.startsWith('/orchestration/') && typeof workerId === 'string' && CODEX_WORKER_ID.test(workerId) &&
         typeof workerToken === 'string' && tokensEqual(this.workerToken(workerId, 'identity'), workerToken) &&
@@ -807,6 +836,7 @@ export class AgentHookServer {
     const ptyId = req.headers['x-aha-pty-id'];
     const credential = req.headers['x-aha-pane-token'];
     return typeof ptyId === 'string' && PTY_ID_RE.test(ptyId) && !CODEX_WORKER_ID.test(ptyId) &&
+      !AGENT_SESSION_ID.test(ptyId) &&
       typeof credential === 'string' && tokensEqual(this.paneToken(ptyId), credential)
       ? ptyId : null;
   }

@@ -1,0 +1,246 @@
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { createInterface } from 'node:readline';
+import test from 'node:test';
+import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
+import { AgentHookServer } from '../dist-electron/agent/agent-hook-server.js';
+import {
+  COORDINATOR_APPROVED_MCP_TOOLS, CodexAppServerPilot, codexMcpConfigArgs,
+} from '../dist-electron/orchestration/codex-app-server-pilot.js';
+import { OrchestrationService } from '../dist-electron/orchestration/orchestration-service.js';
+import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
+import { dispatchOrchestrationHttpAction } from '../dist-electron/orchestration/orchestration-http-router.js';
+
+const cwd = process.cwd();
+const SESSION_A = 'agent-session-00000000-0000-0000-0000-00000000000a';
+const SESSION_B = 'agent-session-00000000-0000-0000-0000-00000000000b';
+const WORKER = 'codex-worker-00000000-0000-0000-0000-000000000001';
+
+async function mcpRequest(env, method, params, spawnCwd = cwd) {
+  const child = spawn(process.execPath, [join(cwd, 'electron/orchestration/aha-mcp-server.cjs')], {
+    cwd: spawnCwd, env: { ...process.env, AHA_TERMINAL_ID: '', AHA_WORKER_ID: '', ...env }, stdio: 'pipe', windowsHide: true,
+  });
+  const closed = new Promise((resolve) => child.once('close', resolve));
+  const lines = createInterface({ input: child.stdout });
+  try {
+    const answer = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      lines.on('line', (line) => {
+        const message = JSON.parse(line);
+        if (message.id === 1) resolve(message.result);
+      });
+      child.once('close', () => reject(new Error('MCP server exited before responding')));
+    });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) + '\n');
+    return await answer;
+  } finally {
+    child.stdin.end();
+    child.kill();
+    await closed;
+  }
+}
+
+async function setup(t) {
+  const dir = mkdtempSync(join(cwd, '.session-coordinator-test-'));
+  const agentStatusStore = new AgentStatusStore();
+  const store = new OrchestrationStore({ resolveFile: () => join(dir, 'state.json') });
+  const hook = new AgentHookServer(agentStatusStore);
+  const launches = [];
+  const sessions = new Map();
+  const service = new OrchestrationService({
+    store, agentStatusStore, getDefaultCwd: () => cwd,
+    settleDelayMs: 0, turnStartObserveTimeoutMs: 250, turnStopSettleMs: 10_000,
+    getConfirmMode: () => 'auto',
+    writePty: async () => ({ ok: true }),
+    spawnWorkerPty: async () => { throw new Error('Session Coordinator tests expect headless Workers'); },
+    isPtyAlive: (id) => id === 'coordinator-pane',
+    codexPilot: {
+      enabled: () => true,
+      launch(workerId, workdir, events) {
+        launches.push({ workerId, workdir });
+        const child = spawn(process.execPath, [join(cwd, 'tests/fixtures/mock-codex-app-server.mjs'), 'normal'], {
+          cwd: workdir, stdio: 'pipe', windowsHide: true,
+        });
+        return new CodexAppServerPilot(child, events, 850, []);
+      },
+    },
+  });
+  service.setSessionCoordinators({ get: (id) => sessions.get(id) ?? null });
+  hook.setOrchestrationHandler((action, payload, context) => dispatchOrchestrationHttpAction(service, action, payload, context));
+  await hook.start();
+  agentStatusStore.registerPane('coordinator-pane', { agentId: 'codex' });
+  t.after(async () => {
+    await hook.stop();
+    await service.stopCodexWorkers();
+    service.dispose();
+    await service.waitForPendingWrites();
+    rmSync(dir, { force: true, recursive: true, maxRetries: 20, retryDelay: 100 });
+  });
+  const call = (caller, action, payload = {}) =>
+    dispatchOrchestrationHttpAction(service, action, payload, { signal: new AbortController().signal, callerPaneId: caller })
+      .then((reply) => reply.body);
+  return { dir, hook, service, store, sessions, launches, call };
+}
+
+test('session MCP launch carries session credentials and keeps destructive Coordinator tools behind a prompt', async (t) => {
+  const hook = new AgentHookServer(new AgentStatusStore());
+  await hook.start();
+  t.after(() => hook.stop());
+  const env = hook.envForSession(SESSION_A);
+  const args = codexMcpConfigArgs('node', {
+    serverPath: 'aha-mcp-server.cjs', env, approvedTools: COORDINATOR_APPROVED_MCP_TOOLS,
+  }).filter((arg) => arg !== '-c');
+  const envArg = args.find((arg) => arg.startsWith('mcp_servers.aha.env='));
+  assert.match(envArg, new RegExp('AHA_SESSION_ID = "' + SESSION_A + '"'));
+  assert.doesNotMatch(envArg, /AHA_WORKER_ID|AHA_TERMINAL_ID/);
+  const approved = args.filter((arg) => arg.endsWith('.approval_mode="approve"'))
+    .map((arg) => arg.split('.')[3]);
+  assert.ok(approved.includes('delegate_task'));
+  for (const tool of ['manage_worker', 'integrate_worker', 'finalize_run_integration', 'report_done']) {
+    assert.ok(!approved.includes(tool), tool);
+  }
+  const worker = codexMcpConfigArgs('node', { serverPath: 'x', env: {} }).filter((arg) => arg.endsWith('"approve"'));
+  assert.deepEqual(worker.map((arg) => arg.split('.')[3]), ['report_done', 'read_board']);
+});
+
+test('session credentials authenticate only as that session and only on orchestration routes', async (t) => {
+  const hook = new AgentHookServer(new AgentStatusStore());
+  const seen = [];
+  hook.setOrchestrationHandler(async (_action, _payload, context) => {
+    seen.push(context.callerPaneId);
+    return { status: 200, body: { ok: true } };
+  });
+  hook.setCompanionHandler(async () => ({ status: 200, body: { ok: true } }));
+  assert.throws(() => hook.envForSession(SESSION_A), /Cannot configure/);
+  await hook.start();
+  t.after(() => hook.stop());
+  assert.throws(() => hook.envForSession('not-a-session'), /Cannot configure/);
+  const a = hook.envForSession(SESSION_A);
+  const b = hook.envForSession(SESSION_B);
+  const worker = hook.envForWorker(WORKER);
+  assert.deepEqual(Object.keys(a).sort(), ['AHA_AGENT_HOOK_TOKEN', 'AHA_ORCHESTRATION_URL', 'AHA_SESSION_ID', 'AHA_SESSION_TOKEN']);
+  assert.notEqual(a.AHA_SESSION_TOKEN, b.AHA_SESSION_TOKEN);
+  assert.notEqual(a.AHA_AGENT_HOOK_TOKEN, hook.authToken);
+  const origin = new URL(a.AHA_ORCHESTRATION_URL).origin;
+  const post = async (path, headers) => {
+    const response = await fetch(origin + path, { method: 'POST', headers, body: '{}' });
+    await response.text();
+    return response.status;
+  };
+  const asSession = (env, id = env.AHA_SESSION_ID, token = env.AHA_SESSION_TOKEN) => ({
+    'x-aha-agent-hook-token': env.AHA_AGENT_HOOK_TOKEN, 'x-aha-session-id': id, 'x-aha-session-token': token,
+  });
+
+  assert.equal(await post('/orchestration/mcp-context', asSession(a)), 200);
+  assert.deepEqual(seen, [SESSION_A]);
+  // Not on companion routes, not with another session's identity, and never mixed with Worker credentials.
+  assert.equal(await post('/terminal/send', asSession(a)), 403);
+  assert.equal(await post('/orchestration/mcp-context', asSession(a, SESSION_B)), 403);
+  assert.equal(await post('/orchestration/mcp-context', asSession(a, SESSION_A, b.AHA_SESSION_TOKEN)), 403);
+  assert.equal(await post('/orchestration/mcp-context', { ...asSession(a), 'x-aha-agent-hook-token': b.AHA_AGENT_HOOK_TOKEN }), 403);
+  assert.equal(await post('/orchestration/mcp-context', {
+    ...asSession(a), 'x-aha-worker-id': WORKER, 'x-aha-worker-token': worker.AHA_WORKER_TOKEN,
+  }), 403);
+  // Worker credentials cannot be replayed as a session, nor session credentials as a Worker.
+  assert.equal(await post('/orchestration/mcp-context', asSession(worker, SESSION_A, worker.AHA_WORKER_TOKEN)), 403);
+  assert.equal(await post('/orchestration/mcp-context', {
+    'x-aha-agent-hook-token': a.AHA_AGENT_HOOK_TOKEN, 'x-aha-worker-id': WORKER, 'x-aha-worker-token': a.AHA_SESSION_TOKEN,
+  }), 403);
+  assert.equal(await post('/orchestration/mcp-context', { 'x-aha-agent-hook-token': a.AHA_AGENT_HOOK_TOKEN }), 403);
+  // A pane credential minted for a session id does not make the session id a pane caller.
+  const pane = hook.envForPane(SESSION_A);
+  assert.equal(await post('/orchestration/mcp-context', {
+    'x-aha-agent-hook-token': pane.AHA_AGENT_HOOK_TOKEN, 'x-aha-pty-id': SESSION_A, 'x-aha-pane-token': pane.AHA_ORCHESTRATION_PANE_TOKEN,
+  }), 200);
+  assert.deepEqual(seen, [SESSION_A, null]);
+});
+
+test('an orchestrating session gets Coordinator actions only, and only while orchestration mode is on', async (t) => {
+  const app = await setup(t);
+  const sessionCwd = mkdtempSync(join(app.dir, 'session-cwd-'));
+  assert.equal((await app.call(SESSION_A, 'mcp-context')).code, 'operation_rejected');
+  app.sessions.set(SESSION_A, { cwd: sessionCwd, provider: 'codex', active: false });
+  const off = await app.call(SESSION_A, 'mcp-context');
+  assert.equal(off.code, 'operation_rejected');
+  assert.match(off.error, /not in orchestration mode/);
+
+  app.sessions.set(SESSION_A, { cwd: sessionCwd, provider: 'codex', active: true });
+  const context = await app.call(SESSION_A, 'mcp-context');
+  assert.equal(context.ok, true);
+  assert.equal(context.result.role, 'coordinator');
+  assert.equal(context.result.orchestrationMode, true);
+  assert.equal(context.result.canDelegate, true);
+
+  for (const action of [
+    'worker-start', 'dispatch', 'run-create', 'run-use', 'task-create', 'task-update', 'approve', 'deny', 'reset',
+    'pane-mode-set', 'worker-done-self', 'ask-self', 'ask', 'reply', 'gate-create', 'gate-resolve', 'coordinator-start',
+    'coordinator-stop', 'coordinator-tick', 'send', 'worker-stop', 'worker-release', 'worker-abandon',
+    'proposal-approve', 'proposal-reject', 'snapshot', 'worker-done',
+  ]) {
+    assert.equal((await app.call(SESSION_A, action, {})).code, 'operation_rejected', action);
+  }
+
+  const started = await app.call(SESSION_A, 'delegate-task', {
+    role: 'scout', task: 'Survey the repository', agent: 'codex', taskKind: 'research', worktree: false,
+  });
+  assert.equal(started.ok, true, started.error);
+  assert.equal(started.result.status, 'started');
+  const dispatch = app.store.getDispatchContext(started.result.dispatch.id);
+  assert.equal(dispatch.parentPaneId, SESSION_A);
+  assert.equal(dispatch.creator, SESSION_A);
+  const run = app.store.getRun(dispatch.runId);
+  assert.equal(run.coordinatorPaneId, SESSION_A);
+  assert.equal(app.launches.at(-1).workdir, sessionCwd);
+  assert.equal(app.service.isCoordinatorTerminal(SESSION_A), true);
+
+  const team = await app.call(SESSION_A, 'mcp-context');
+  assert.deepEqual(team.result.workers.map((w) => w.role), ['scout']);
+  const inbox = await app.call(SESSION_A, 'inbox', { from: 'coordinator-pane' });
+  assert.equal(inbox.ok, true);
+  assert.notEqual(inbox.result.mailbox, 'coordinator-pane');
+
+  // A session is never a Worker terminal: not for another session, not for a terminal Coordinator.
+  app.sessions.set(SESSION_B, { cwd: sessionCwd, provider: 'codex', active: true });
+  const hijack = await app.call(SESSION_B, 'delegate-task', {
+    role: 'hijack', task: 'Use the other session', agent: 'codex', terminal: SESSION_A,
+  });
+  assert.equal(hijack.code, 'terminal_is_coordinator', hijack.error);
+  assert.equal((await app.call(SESSION_B, 'delegate-task', {
+    role: 'self', task: 'Use myself', agent: 'codex', terminal: SESSION_B,
+  })).code, 'terminal_is_coordinator');
+  const paneRun = app.service.runCreate({ objective: 'Pane run', from: 'coordinator-pane', paneId: 'coordinator-pane' }).run;
+  const task = app.service.taskCreate({ runId: paneRun.id, spec: 'Direct dispatch' }).task;
+  const direct = await app.call('coordinator-pane', 'dispatch', { taskId: task.id, to: SESSION_B });
+  assert.equal(direct.code, 'terminal_is_coordinator', direct.error);
+
+  app.sessions.set(SESSION_A, { cwd: sessionCwd, provider: 'codex', active: false });
+  assert.equal((await app.call(SESSION_A, 'team-status')).code, 'operation_rejected');
+  assert.equal((await app.call(SESSION_A, 'board-read')).code, 'operation_rejected');
+  assert.equal(app.service.isPaneAlive(SESSION_A), false);
+});
+
+test('Aha MCP server exposes Coordinator tools to a session and delegates through its identity', async (t) => {
+  const app = await setup(t);
+  const sessionCwd = mkdtempSync(join(app.dir, 'session-cwd-'));
+  app.sessions.set(SESSION_A, { cwd: sessionCwd, provider: 'codex', active: true });
+  const env = app.hook.envForSession(SESSION_A);
+  const listed = await mcpRequest(env, 'tools/list', {});
+  const names = listed.tools.map((tool) => tool.name);
+  assert.ok(names.includes('delegate_task'), names.join(','));
+  assert.ok(names.includes('team_status'));
+  assert.ok(!names.includes('report_done'));
+
+  const result = await mcpRequest(env, 'tools/call', {
+    name: 'delegate_task',
+    arguments: { role: 'reader', task: 'Read the README', agent: 'codex', taskKind: 'research', worktree: false },
+  }, sessionCwd);
+  assert.notEqual(result.isError, true, result.content?.[0]?.text);
+  const [dispatch] = app.store.listDispatches();
+  assert.equal(dispatch.parentPaneId, SESSION_A);
+  assert.equal(app.store.getRun(dispatch.runId).coordinatorPaneId, SESSION_A);
+
+  app.sessions.set(SESSION_A, { cwd: sessionCwd, provider: 'codex', active: false });
+  assert.deepEqual((await mcpRequest(env, 'tools/list', {})).tools, []);
+});

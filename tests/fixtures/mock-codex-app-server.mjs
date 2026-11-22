@@ -71,7 +71,9 @@ for await (const line of history) {
     assert.equal(params.threadId, threadId);
     assert.equal(params.serverName, 'aha');
     if (scenario === 'catalog-wait') await delay(250);
-    send({ id, result: { data: [{ name: 'aha', tools: { report_done: { name: 'report_done' } } }] } });
+    send({ id, result: { data: [{ name: 'aha', tools: {
+      report_done: { name: 'report_done' }, delegate_task: { name: 'delegate_task' },
+    } }] } });
   } else if (method === 'turn/start') {
     assert.equal(params.threadId, threadId);
     const prompt = params.input[0].text;

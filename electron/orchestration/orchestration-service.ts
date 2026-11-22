@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { resolve as resolveFsPath } from 'node:path';
 import { runGitCommand } from '../git/git-exec.js';
 import type { AgentSessionDriver, AgentSessionEvents, AgentTurnResult } from './agent-session-driver.js';
+import { AGENT_SESSION_ID } from './agent-session-manager.js';
 import { CODEX_WORKER_ID } from './codex-app-server-pilot.js';
 import {
   WorkerTimeline, type WorkerTimelineChange, type WorkerTimelineSnapshot, type WorkerTimelineTurnStatus,
@@ -265,6 +266,12 @@ export interface OrchestrationMcpContext {
   pendingProposals: OrchestrationDispatchProposal[];
 }
 
+/** Agent sessions (no PTY) that a person switched into orchestration mode to act as Coordinators. */
+export interface OrchestrationSessionCoordinators {
+  /** The session exists, is in orchestration mode, and has not closed or failed. */
+  get(sessionId: string): { cwd: string; provider: string; active: boolean } | null;
+}
+
 export interface OrchestrationServiceDependencies {
   store: OrchestrationStore;
   agentStatusStore: AgentStatusStore;
@@ -341,6 +348,7 @@ export class OrchestrationService {
   private readonly spawnWorkerPty?: OrchestrationServiceDependencies['spawnWorkerPty'];
   private readonly codexPilot?: OrchestrationServiceDependencies['codexPilot'];
   private readonly codexWorkers = new Map<string, AgentSessionDriver>();
+  private sessionCoordinators: OrchestrationSessionCoordinators | null = null;
   private readonly codexSubmitting = new Set<string>();
   /** Pending wake-ups per headless Worker; `opaque` means at least one wake carried no message record. */
   private readonly codexMailbox = new Map<string, { messages: OrchestrationMessageRecord[]; opaque: boolean }>();
@@ -611,13 +619,32 @@ export class OrchestrationService {
     }
   }
 
+  setSessionCoordinators(registry: OrchestrationSessionCoordinators | null): void {
+    this.sessionCoordinators = registry;
+  }
+
+  private sessionCoordinator(id: string): { cwd: string; provider: string; active: boolean } | null {
+    return AGENT_SESSION_ID.test(id) ? this.sessionCoordinators?.get(id) ?? null : null;
+  }
+
+  private isActiveSessionCoordinator(id: string): boolean {
+    return this.sessionCoordinator(id)?.active ?? false;
+  }
+
+  /** Whether a caller owns a live surface (terminal pane or orchestrating Agent session) to bind runs to. */
+  private isCallerSurface(id: string): boolean {
+    return this.agentStatusStore.get(id) !== null || this.isActiveSessionCoordinator(id);
+  }
+
   isAuthenticatedCallerActive(id: string, discoverTools = false): boolean {
+    if (AGENT_SESSION_ID.test(id)) return this.isActiveSessionCoordinator(id);
     return !CODEX_WORKER_ID.test(id) ||
       (this.isPaneAlive(id) && (discoverTools || Boolean(this.store.getActiveDispatchForIdentity(id, null))));
   }
 
   isPaneAlive(ptyId: string): boolean {
     if (CODEX_WORKER_ID.test(ptyId)) return this.codexWorkers.get(ptyId)?.alive ?? false;
+    if (AGENT_SESSION_ID.test(ptyId)) return this.isActiveSessionCoordinator(ptyId);
     if (this.exitedPanes.has(ptyId)) {
       return false;
     }
@@ -813,7 +840,7 @@ export class OrchestrationService {
     paneId?: string;
   }): { run: OrchestrationRunRecord } {
     const handle = input.from?.trim() || 'coordinator';
-    const paneId = input.paneId?.trim() || (this.agentStatusStore.get(handle) ? handle : null);
+    const paneId = input.paneId?.trim() || (this.isCallerSurface(handle) ? handle : null);
     const run = this.store.createRun({
       id: input.id,
       objective: input.objective,
@@ -836,7 +863,7 @@ export class OrchestrationService {
     paneId?: string;
   }): { run: OrchestrationRunRecord } {
     const handle = input.from?.trim() || 'coordinator';
-    const paneId = input.paneId?.trim() || (this.agentStatusStore.get(handle) ? handle : null);
+    const paneId = input.paneId?.trim() || (this.isCallerSurface(handle) ? handle : null);
     const run = this.store.bindRun({
       runId: input.id,
       coordinatorHandle: handle,
@@ -1990,6 +2017,9 @@ export class OrchestrationService {
       );
     }
 
+    if (AGENT_SESSION_ID.test(assignee)) {
+      throw new OrchestrationError('terminal_is_coordinator', 'An Agent session coordinates runs; choose a worker terminal.');
+    }
     if (inject && !this.isPaneAlive(assignee)) {
       throw new OrchestrationError(
         'no_agent_detected',
@@ -2000,7 +2030,7 @@ export class OrchestrationService {
     const paneStatus = this.agentStatusStore.get(assignee);
 
     const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
-    const parentPaneId = this.agentStatusStore.get(from)
+    const parentPaneId = this.isCallerSurface(from)
       ? from
       : (callerDispatch?.assigneePaneId ?? this.store.getRun(task.runId)?.coordinatorPaneId ?? null);
     const ctx = this.store.createDispatchContext({
@@ -4460,6 +4490,12 @@ export class OrchestrationService {
         `Terminal ${reusingTerminal} is the caller's own terminal. Choose a different worker terminal.`
       );
     }
+    if (reusingTerminal && AGENT_SESSION_ID.test(reusingTerminal)) {
+      throw new OrchestrationError(
+        'terminal_is_coordinator',
+        `${reusingTerminal} is an Agent session, not a worker terminal.`
+      );
+    }
     if (reusingTerminal && (CODEX_WORKER_ID.test(reusingTerminal) || !this.isPaneAlive(reusingTerminal))) {
       throw new OrchestrationError(
         'terminal_unavailable',
@@ -4894,7 +4930,7 @@ export class OrchestrationService {
           run = this.store.updateRunStatus(run.id, 'active');
         }
       } else {
-        const callerPane = callerStatus ? from : undefined;
+        const callerPane = callerStatus || this.isActiveSessionCoordinator(from) ? from : undefined;
         run = this.runCreate({
           objective: input.taskTitle?.trim() || input.spec.trim().slice(0, 120),
           from,
@@ -4926,7 +4962,7 @@ export class OrchestrationService {
       );
     }
 
-    const parentPaneId = callerStatus
+    const parentPaneId = callerStatus || this.isActiveSessionCoordinator(from)
       ? from
       : (callerDispatch?.assigneePaneId ?? run.coordinatorPaneId ?? null);
     const parentTerminal = parentPaneId ? this.terminalTracker?.getTerminal(parentPaneId) : null;
@@ -4936,6 +4972,7 @@ export class OrchestrationService {
       callerDispatch?.worktreePath ||
       input.callerCwd?.trim() ||
       parentTerminal?.cwd ||
+      (parentPaneId ? this.sessionCoordinator(parentPaneId)?.cwd : undefined) ||
       this.getDefaultCwd?.() ||
       process.cwd();
 
@@ -6439,7 +6476,9 @@ export class OrchestrationService {
   }
 
   isPaneOrchestrationMode(ptyId: string): boolean {
-    return this.orchestrationModePanes.has(ptyId.trim());
+    const cleanId = ptyId.trim();
+    if (AGENT_SESSION_ID.test(cleanId)) return this.isActiveSessionCoordinator(cleanId);
+    return this.orchestrationModePanes.has(cleanId);
   }
 
   recordUserPromptTurn(ptyId: string, source: UserTurnSource = 'hook'): number {
@@ -7624,6 +7663,7 @@ export class OrchestrationService {
     const coordinatorCliId =
       this.agentStatusStore.get(from)?.agentId ??
       this.terminalTracker?.getTerminal(from)?.cliId ??
+      this.sessionCoordinator(from)?.provider ??
       null;
     const authorCliId = reviewTargetDispatch?.cliId ?? null;
     const authorCliIds = reviewRunTarget
@@ -8191,7 +8231,7 @@ export class OrchestrationService {
 
   private isMcpEnabledForPane(ptyId: string): boolean {
     const clean = ptyId.trim();
-    if (CODEX_WORKER_ID.test(clean)) return this.isPaneAlive(clean);
+    if (CODEX_WORKER_ID.test(clean) || AGENT_SESSION_ID.test(clean)) return this.isPaneAlive(clean);
     if (!clean || !this.isMcpEnabledForCliDep) return false;
     const cliId =
       this.agentStatusStore.get(clean)?.agentId ??

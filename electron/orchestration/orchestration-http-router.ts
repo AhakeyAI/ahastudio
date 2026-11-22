@@ -1,3 +1,4 @@
+import { AGENT_SESSION_ID } from './agent-session-manager.js';
 import { CODEX_WORKER_ID } from './codex-app-server-pilot.js';
 import { z } from 'zod';
 import { OrchestrationService } from './orchestration-service.js';
@@ -479,6 +480,34 @@ const CODEX_WORKER_ACTIONS = new Set([
   'worker-diff',
 ]);
 
+// What the Coordinator MCP tools call, plus scoped reads. Raw starts (worker-start, dispatch) and
+// run binding stay closed so every new Worker passes through delegate-task and its user-confirmation gate.
+const AGENT_SESSION_COORDINATOR_ACTIONS = new Set([
+  'mcp-context',
+  'agents',
+  'delegate-task',
+  'role-message',
+  'role-manage',
+  'board-post',
+  'board-read',
+  'board-wait',
+  'check',
+  'inbox',
+  'worker-diff',
+  'worker-integrate',
+  'run-diff',
+  'run-finalize',
+  'run-current',
+  'run-show',
+  'task-list',
+  'task-show',
+  'dispatch-show',
+  'worker-list',
+  'worker-show',
+  'worker-read',
+  'coordinator-status',
+]);
+
 const READ_ONLY_ORCHESTRATION_ACTIONS = new Set([
   'run-current',
   'run-list',
@@ -513,11 +542,15 @@ export async function dispatchOrchestrationHttpAction(
   const full = payload.full === true;
   const codexCaller = context.callerPaneId && CODEX_WORKER_ID.test(context.callerPaneId)
     ? context.callerPaneId : null;
+  const sessionCaller = context.callerPaneId && AGENT_SESSION_ID.test(context.callerPaneId)
+    ? context.callerPaneId : null;
   const requireCallerPane = (): string => {
     if (!context.callerPaneId || !service.isAuthenticatedCallerActive(context.callerPaneId, action === 'mcp-context')) {
       throw new OrchestrationError(
         'operation_rejected',
-        'This action requires an authenticated AhaStation terminal or an active headless Worker.'
+        sessionCaller
+          ? 'This Agent session is not in orchestration mode.'
+          : 'This action requires an authenticated AhaStation terminal or an active headless Worker.'
       );
     }
     return context.callerPaneId;
@@ -538,6 +571,12 @@ export async function dispatchOrchestrationHttpAction(
       requireCallerPane();
       if (!CODEX_WORKER_ACTIONS.has(action)) {
         throw new OrchestrationError('operation_rejected', 'This action is unavailable to headless read-only Workers.');
+      }
+    }
+    if (sessionCaller) {
+      requireCallerPane();
+      if (!AGENT_SESSION_COORDINATOR_ACTIONS.has(action)) {
+        throw new OrchestrationError('operation_rejected', 'This action is unavailable to an Agent session Coordinator.');
       }
     }
     let result: unknown;
@@ -776,10 +815,14 @@ export async function dispatchOrchestrationHttpAction(
         break;
       }
       case 'check':
-        result = await service.check({ ...checkSchema.parse(payload), callerPaneId: httpCallerPane() }, context.signal);
+        result = await service.check({
+          ...checkSchema.parse(payload), ...(sessionCaller ? { from: sessionCaller } : {}), callerPaneId: httpCallerPane(),
+        }, context.signal);
         break;
       case 'inbox':
-        result = service.inbox({ ...inboxSchema.parse(payload), callerPaneId: httpCallerPane() });
+        result = service.inbox({
+          ...inboxSchema.parse(payload), ...(sessionCaller ? { from: sessionCaller } : {}), callerPaneId: httpCallerPane(),
+        });
         break;
       case 'ask':
         result = await service.ask(askSchema.parse(payload), context.signal);
@@ -815,7 +858,7 @@ export async function dispatchOrchestrationHttpAction(
       case 'agents': {
         const parsed = agentsSchema.parse(payload);
         result = {
-          agents: service.listCodingAgents(parsed.callerPaneId ?? context.callerPaneId ?? null),
+          agents: service.listCodingAgents(sessionCaller ?? parsed.callerPaneId ?? context.callerPaneId ?? null),
         };
         break;
       }
