@@ -57,6 +57,8 @@ const BOOLEAN_FLAGS = new Set([
   'releaseAfter',
   'deleteBranch',
   'reviewRun',
+  'confirmed',
+  'authorizeReviews',
   'tasks',
   'messages',
   'help',
@@ -755,6 +757,13 @@ function buildPayload(verb, flags, positional, namespace = 'orchestration') {
             ? { reviewRun: typeof flags.reviewRun === 'string' ? flags.reviewRun : true }
             : {}),
           ...(flags.reviewFocus ? { reviewFocus: String(flags.reviewFocus) } : {}),
+          ...(flags.confirmed !== undefined ? { confirmed: toBoolean(flags.confirmed) } : {}),
+          ...(flags.proposalId || flags.proposal
+            ? { proposalId: String(flags.proposalId ?? flags.proposal) }
+            : {}),
+          ...(flags.authorizeReviews !== undefined
+            ? { authorizeReviews: toBoolean(flags.authorizeReviews) }
+            : {}),
           ...(workerCli ? { cliId: String(workerCli) } : {}),
           ...(flags.model ? { model: String(flags.model) } : {}),
           ...(flags.effort ? { effort: String(flags.effort) } : {}),

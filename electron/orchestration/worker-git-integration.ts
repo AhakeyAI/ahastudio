@@ -496,6 +496,12 @@ export async function inspectWorkerDiff(opts: {
   baseCommit?: string | null;
   files?: readonly string[];
   maxDiffBytes?: number;
+  pinnedSnapshot?: {
+    headCommit: string | null;
+    snapshotOid: string;
+    dirtyFiles: string[];
+    stagedDivergentFiles: string[];
+  } | null;
 }): Promise<WorkerDiffInspection> {
   const inspected = await inspectGitRepo(opts.worktreePath);
   if (!inspected.ok || !inspected.isGitRepo || !inspected.head) {
@@ -521,7 +527,8 @@ export async function inspectWorkerDiff(opts: {
 
   const baseCommit = await resolveEffectiveBaseCommit(opts.worktreePath, opts.baseCommit);
   const { headCommit, snapshotOid, dirtyFiles, stagedDivergentFiles } =
-    await captureWorkerSnapshotOid(opts.worktreePath, { rejectStagedDivergence: false });
+    opts.pinnedSnapshot ??
+    (await captureWorkerSnapshotOid(opts.worktreePath, { rejectStagedDivergence: false }));
   const rangeBase = baseCommit ?? headCommit;
   const targetOid = snapshotOid ?? headCommit;
 
@@ -1207,6 +1214,7 @@ async function prepareIntegrationCommit(
   check: WorkerIntegrationCheckResult,
   mode: 'squash' | 'merge',
   commitMessage: string,
+  options?: { strictReviewedTree?: boolean },
 ): Promise<{ commit: string; changedFiles: string[]; cleanupWarning?: string }> {
   const root = mkdtempSync(join(tmpdir(), 'aha-integration-'));
   const workspace = join(root, 'worktree');
@@ -1259,7 +1267,59 @@ async function prepareIntegrationCommit(
     }
     const preparedTreeOid = tree.stdout.trim();
     if (preparedTreeOid !== check.mergedTreeOid) {
-      // Allow legitimate auto-formatting pre-commit hooks, but re-verify no ignored files would be overwritten.
+      const hookDiffRes = check.mergedTreeOid
+        ? await runGitCommand(['diff', '--name-only', '-z', check.mergedTreeOid, preparedTreeOid], {
+            cwd: workspace,
+            readOnly: true,
+          })
+        : null;
+      const hookTouchedFiles =
+        hookDiffRes && hookDiffRes.exitCode === 0 && !hookDiffRes.truncated
+          ? parseNullDelimitedPaths(hookDiffRes.stdout)
+          : null;
+
+      if (options?.strictReviewedTree) {
+        const fileDetail = hookTouchedFiles?.length
+          ? ` (${hookTouchedFiles.slice(0, 10).join(', ')})`
+          : '';
+        throw new OrchestrationError(
+          'operation_rejected',
+          `Integration blocked: a Git hook modified the commit tree outside the approved review snapshot${fileDetail}. Apply hook/formatter changes inside the worker worktree and re-review before integrating.`,
+          {
+            expectedTreeOid: check.mergedTreeOid ?? null,
+            actualTreeOid: preparedTreeOid,
+            hookTouchedFiles: hookTouchedFiles ?? [],
+          },
+        );
+      }
+
+      // Even for unpinned direct calls, a pre-commit hook may only reformat files already in the
+      // incoming diff and must never introduce or modify unrelated files outside the merge diff.
+      const incomingDiffRes = check.mergedTreeOid
+        ? await runGitCommand(['diff', '--name-only', '-z', check.targetHead!, check.mergedTreeOid], {
+            cwd: workspace,
+            readOnly: true,
+          })
+        : null;
+      const incomingFiles =
+        incomingDiffRes && incomingDiffRes.exitCode === 0 && !incomingDiffRes.truncated
+          ? new Set(parseNullDelimitedPaths(incomingDiffRes.stdout))
+          : null;
+      if (!hookTouchedFiles || !incomingFiles) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          'Integration blocked: a Git hook altered the commit tree and its modified file list could not be verified.',
+        );
+      }
+      const outOfScopeHookFiles = hookTouchedFiles.filter((file) => !incomingFiles.has(file));
+      if (outOfScopeHookFiles.length > 0) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          `Integration blocked: a Git hook modified file(s) outside the integration diff: ${outOfScopeHookFiles.slice(0, 10).join(', ')}.`,
+          { outOfScopeHookFiles },
+        );
+      }
+
       const hookIgnoredCollisions = await detectIgnoredFileCollisions(
         check.targetRepoPath,
         check.targetHead!,
@@ -1332,6 +1392,7 @@ async function integrateWorkerChangesUnlocked(opts: {
   recordedBaseCommit?: string | null;
   expectedSnapshotOid?: string | null;
   expectedTargetRef?: string | null;
+  strictReviewedTree?: boolean;
   mode: 'squash' | 'merge';
   commitMessage: string;
 }): Promise<WorkerIntegrationResult> {
@@ -1399,7 +1460,12 @@ async function integrateWorkerChangesUnlocked(opts: {
     });
   }
 
-  const { commit, changedFiles, cleanupWarning } = await prepareIntegrationCommit(check, mode, opts.commitMessage);
+  const { commit, changedFiles, cleanupWarning } = await prepareIntegrationCommit(
+    check,
+    mode,
+    opts.commitMessage,
+    { strictReviewedTree: opts.strictReviewedTree ?? Boolean(opts.expectedSnapshotOid) },
+  );
   const noChanges = commit === check.targetHead;
   if (!noChanges) await publishIntegrationCommit(check, commit);
   else await assertTargetUnchanged(check);
@@ -1431,6 +1497,7 @@ export async function integrateWorkerChanges(opts: {
   recordedBaseCommit?: string | null;
   expectedSnapshotOid?: string | null;
   expectedTargetRef?: string | null;
+  strictReviewedTree?: boolean;
   mode?: WorkerIntegrateMode;
   commitMessage: string;
 }): Promise<WorkerIntegrationResult> {
@@ -1473,6 +1540,7 @@ export async function integrateWorkerChanges(opts: {
       recordedBaseCommit: opts.recordedBaseCommit,
       expectedSnapshotOid: opts.expectedSnapshotOid,
       expectedTargetRef: opts.expectedTargetRef,
+      strictReviewedTree: opts.strictReviewedTree,
       mode,
       commitMessage: opts.commitMessage,
     }),
@@ -1528,6 +1596,13 @@ async function inspectAndValidateRunBranchTarget(opts: {
   }
 
   const expectedBaseBranch = opts.existingBaseBranch?.trim() || null;
+  if (!matchedWt && !existingBranchOid && !inspectedMain.branch) {
+    throw new OrchestrationError(
+      'operation_rejected',
+      `Main repository is on detached HEAD; checkout a named target branch (such as "main") before creating Run integration branch ${opts.branchName}.`,
+      { integrationBranch: opts.branchName },
+    );
+  }
   if (!matchedWt && expectedBaseBranch && inspectedMain.branch !== expectedBaseBranch) {
     throw new OrchestrationError(
       'operation_rejected',
@@ -1568,6 +1643,7 @@ export async function integrateWorkerIntoRunBranch(opts: {
   baseCommit?: string | null;
   recordedBaseCommit?: string | null;
   expectedSnapshotOid?: string | null;
+  strictReviewedTree?: boolean;
   mode?: WorkerIntegrateMode;
   commitMessage: string;
 }): Promise<RunBranchIntegrationResult> {
@@ -1725,6 +1801,7 @@ export async function integrateWorkerIntoRunBranch(opts: {
         recordedBaseCommit: opts.recordedBaseCommit,
         expectedSnapshotOid: opts.expectedSnapshotOid,
         expectedTargetRef: `refs/heads/${branchName}`,
+        strictReviewedTree: opts.strictReviewedTree,
         mode,
         commitMessage: opts.commitMessage,
       });
@@ -1792,6 +1869,7 @@ export async function finalizeRunIntegrationBranch(opts: {
   baseCommit?: string | null;
   expectedTargetRef?: string | null;
   expectedSnapshotOid?: string | null;
+  strictReviewedTree?: boolean;
   mode?: WorkerIntegrateMode;
   commitMessage: string;
   deleteBranch?: boolean;
@@ -1850,6 +1928,7 @@ export async function finalizeRunIntegrationBranch(opts: {
       baseCommit: opts.baseCommit,
       expectedSnapshotOid: opts.expectedSnapshotOid,
       expectedTargetRef: opts.expectedTargetRef,
+      strictReviewedTree: opts.strictReviewedTree ?? true,
       mode,
       commitMessage: opts.commitMessage,
     });

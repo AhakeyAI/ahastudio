@@ -257,6 +257,11 @@ export function selectAgentForTask(opts: SelectAgentForTaskOptions): SelectedAge
   const rawRequested = opts.requestedAgent?.trim();
   const normalizedRequested = rawRequested ? normalizeAgentCliAlias(rawRequested) : '';
 
+  const heterogeneousReviewPool =
+    opts.taskKind === 'review' && authorCliIds.size > 0
+      ? availableEntries.filter((item) => !authorCliIds.has(item.cliId))
+      : [];
+
   if (normalizedRequested && normalizedRequested !== 'auto') {
     const entry = opts.roster.find((item) => item.cliId === normalizedRequested);
     if (!entry) {
@@ -278,10 +283,25 @@ export function selectAgentForTask(opts: SelectAgentForTaskOptions): SelectedAge
     if (excluded.has(entry.cliId)) {
       throw new Error(`指定的 Coding Agent "${entry.label}" (${entry.cliId}) 已被排除，无法选用`);
     }
-    const fallbacks = rankCandidates(
-      availableEntries.filter((item) => item.cliId !== entry.cliId),
-      { taskKind: opts.taskKind, coordinatorCliId, authorCliIds, preferIdle: opts.preferIdle },
-    ).map((item) => item.entry.cliId);
+    if (
+      opts.taskKind === 'review' &&
+      authorCliIds.has(entry.cliId) &&
+      heterogeneousReviewPool.length > 0
+    ) {
+      throw new Error(
+        `异构审查必须避开作者使用的 Coding Agent (${entry.cliId})；当前仍有可用异构 Agent：${heterogeneousReviewPool.map((item) => item.cliId).join(', ')}。请使用 "auto" 或选择其他可用 Agent`,
+      );
+    }
+    const fallbackPool =
+      heterogeneousReviewPool.length > 0
+        ? heterogeneousReviewPool.filter((item) => item.cliId !== entry.cliId)
+        : availableEntries.filter((item) => item.cliId !== entry.cliId);
+    const fallbacks = rankCandidates(fallbackPool, {
+      taskKind: opts.taskKind,
+      coordinatorCliId,
+      authorCliIds,
+      preferIdle: opts.preferIdle,
+    }).map((item) => item.entry.cliId);
 
     return {
       cliId: entry.cliId,
@@ -306,7 +326,8 @@ export function selectAgentForTask(opts: SelectAgentForTaskOptions): SelectedAge
     throw new Error('没有可用的 Coding Agent（候选 Agent 已被排除或不可用）');
   }
 
-  const ranked = rankCandidates(availableEntries, {
+  const autoPool = heterogeneousReviewPool.length > 0 ? heterogeneousReviewPool : availableEntries;
+  const ranked = rankCandidates(autoPool, {
     taskKind: opts.taskKind,
     coordinatorCliId,
     authorCliIds,

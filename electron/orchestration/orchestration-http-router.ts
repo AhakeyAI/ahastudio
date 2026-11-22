@@ -152,6 +152,9 @@ const workerStartSchema = z.object({
   reviewOf: z.string().trim().min(1).max(128).optional(),
   reviewRun: z.union([z.boolean(), z.string().trim().min(1).max(128)]).optional(),
   reviewFocus: z.string().trim().min(1).max(400).optional(),
+  confirmed: z.boolean().optional(),
+  proposalId: z.string().trim().min(1).max(128).optional(),
+  authorizeReviews: z.boolean().optional(),
   cliId: z.string().trim().min(1).optional(),
   agent: z.string().trim().min(1).optional(),
   model: z.string().trim().min(1).optional(),
@@ -604,7 +607,51 @@ export async function dispatchOrchestrationHttpAction(
         const parsed = workerStartSchema.parse(payload);
         assertWorkerTarget(parsed.terminal);
         const pane = httpCallerPane();
-        result = await service.workerStart(pane === undefined ? parsed : { ...parsed, from: pane, callerPaneId: pane });
+        const isReviewStart = Boolean(
+          parsed.reviewOf?.trim() ||
+            parsed.reviewRun === true ||
+            (typeof parsed.reviewRun === 'string' && parsed.reviewRun.trim().length > 0),
+        );
+        if (isReviewStart) {
+          const delegated = await service.delegateTask(
+            {
+              from: pane ?? parsed.from ?? 'coordinator',
+              callerPaneId: pane,
+              runId: parsed.runId,
+              role: parsed.displayName || parsed.name,
+              task: parsed.spec,
+              reviewOf: parsed.reviewOf,
+              reviewRun: parsed.reviewRun,
+              reviewFocus: parsed.reviewFocus,
+              confirmed: parsed.confirmed,
+              proposalId: parsed.proposalId,
+              authorizeReviews: parsed.authorizeReviews,
+              agent: parsed.cliId ?? parsed.agent,
+              model: parsed.model,
+              effort: parsed.effort,
+              terminal: parsed.terminal,
+              worktree: parsed.noWorktree ? false : undefined,
+              callerCwd: parsed.callerCwd ?? parsed.cwd,
+              userInitiated: false,
+            },
+            context.signal,
+          );
+          if (delegated.status !== 'started') {
+            const proposalHint = delegated.proposal?.id
+              ? ` (proposalId=${delegated.proposal.id}; after user confirmation retry with --confirmed --proposal-id ${delegated.proposal.id})`
+              : '';
+            throw new OrchestrationError(
+              'operation_rejected',
+              `${delegated.message || 'Review dispatch requires user confirmation before starting.'}${proposalHint}`,
+              delegated.proposal ? { proposal: delegated.proposal } : undefined,
+            );
+          }
+          result = delegated;
+        } else {
+          result = await service.workerStart(
+            pane === undefined ? parsed : { ...parsed, from: pane, callerPaneId: pane },
+          );
+        }
         break;
       }
       case 'worker-list': {

@@ -361,6 +361,7 @@ export class OrchestrationService {
   private readonly workerMutations = new Set<string>();
   private readonly reviewStartLocks = new Map<string, Promise<void>>();
   private readonly runIntegrationLocks = new Map<string, Promise<void>>();
+  private readonly inFlightReviewStarts = new Map<string, number>();
   private readonly retiringPanes = new Set<string>();
   private readonly disposeStatusListener: () => void;
   private readonly disposeActivityListener: () => void;
@@ -464,7 +465,10 @@ export class OrchestrationService {
       isDeliveryInFlight: (dispatchId) => this.inFlightObservationDispatches.has(dispatchId),
       resolveRoleName: (dispatch) => this.resolveRoleNameForDispatch(dispatch) || null,
       notifyMailbox: (mailbox, type) => this.notifyTargetAndAliases(mailbox, type),
-      onTurnStopEscalated: (_dispatchId, runId) => this.emitChanged('worker:turn-stopped', runId),
+      onTurnStopEscalated: (_dispatchId, runId, stopReason) => {
+        if (stopReason === 'exited') this.settleUnreportedReviewDispatches();
+        this.emitChanged('worker:turn-stopped', runId);
+      },
       cliCommand: this.cliCommand,
       settleMs: deps.turnStopSettleMs,
     });
@@ -1021,11 +1025,12 @@ export class OrchestrationService {
       );
     };
 
+    const hasInFlightPeerStart = (this.inFlightReviewStarts.get(`dispatch:${targetDispatch.id}`) ?? 0) > 0;
     const anyRejected = batchReviews.some(isEffectiveReject);
     const allSettled = batchReviews.every((d) =>
       d.id === reviewDispatch.id ? true : !ACTIVE_DISPATCH_STATUSES.has(d.status),
     );
-    const allExplicitlyPassed = allSettled && batchReviews.every(isEffectivePass);
+    const allExplicitlyPassed = !hasInFlightPeerStart && allSettled && batchReviews.every(isEffectivePass);
     const mergedFindings = batchReviews.flatMap((d) =>
       d.id === reviewDispatch.id && opts?.overrideFindings
         ? opts.overrideFindings
@@ -1133,11 +1138,12 @@ export class OrchestrationService {
       );
     };
 
+    const hasInFlightPeerStart = (this.inFlightReviewStarts.get(`run:${targetRun.id}`) ?? 0) > 0;
     const anyRejected = batchReviews.some(isEffectiveReject);
     const allSettled = batchReviews.every((d) =>
       d.id === reviewDispatch.id ? true : !ACTIVE_DISPATCH_STATUSES.has(d.status),
     );
-    const allExplicitlyPassed = allSettled && batchReviews.every(isEffectivePass);
+    const allExplicitlyPassed = !hasInFlightPeerStart && allSettled && batchReviews.every(isEffectivePass);
     const mergedFindings = batchReviews.flatMap((d) =>
       d.id === reviewDispatch.id && opts?.overrideFindings
         ? opts.overrideFindings
@@ -1176,6 +1182,56 @@ export class OrchestrationService {
     return { escalated: false, reviewRound: batchRound, staleBatch: false };
   }
 
+  private async withInFlightReviewStart<T>(
+    targetKey: `dispatch:${string}` | `run:${string}`,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    this.inFlightReviewStarts.set(targetKey, (this.inFlightReviewStarts.get(targetKey) ?? 0) + 1);
+    try {
+      return await fn();
+    } finally {
+      const nextCount = (this.inFlightReviewStarts.get(targetKey) ?? 1) - 1;
+      if (nextCount <= 0) {
+        this.inFlightReviewStarts.delete(targetKey);
+      } else {
+        this.inFlightReviewStarts.set(targetKey, nextCount);
+      }
+      if (nextCount <= 0) {
+        // Reconcile whenever the last in-flight start exits (whether it failed OR a fast reviewer
+        // already submitted a PASS verdict before workerStart returned), so batches never strand in pending.
+        if (targetKey.startsWith('dispatch:')) {
+          const targetId = targetKey.slice('dispatch:'.length);
+          const target = this.store.getDispatchContext(targetId);
+          if (target?.reviewBatchId && target.reviewStatus === 'pending') {
+            const peers = this.store.listReviewDispatchesForBatch(targetId, target.reviewBatchId);
+            const settledPeer = peers.find((d) => !ACTIVE_DISPATCH_STATUSES.has(d.status));
+            if (settledPeer) {
+              this.reconcileTargetReviewBatch(settledPeer.id);
+              const updated = this.store.getDispatchContext(targetId);
+              if (updated && updated.reviewStatus !== target.reviewStatus) {
+                this.emitChanged('worker:review-reconciled', updated.runId);
+              }
+            }
+          }
+        } else if (targetKey.startsWith('run:')) {
+          const runId = targetKey.slice('run:'.length);
+          const run = this.store.getRun(runId);
+          if (run?.runReviewBatchId && run.runReviewStatus === 'pending') {
+            const peers = this.store.listReviewDispatchesForRunBatch(runId, run.runReviewBatchId);
+            const settledPeer = peers.find((d) => !ACTIVE_DISPATCH_STATUSES.has(d.status));
+            if (settledPeer) {
+              this.reconcileRunReviewBatch(settledPeer.id);
+              const updated = this.store.getRun(runId);
+              if (updated && updated.runReviewStatus !== run.runReviewStatus) {
+                this.emitChanged('run:review-reconciled', updated.id);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   private reconcileAnyReviewBatch(
     reviewDispatchId: string,
     opts?: {
@@ -1189,6 +1245,35 @@ export class OrchestrationService {
       return this.reconcileRunReviewBatch(reviewDispatchId, opts);
     }
     return this.reconcileTargetReviewBatch(reviewDispatchId, opts);
+  }
+
+  private failReviewTaskIfReady(taskId: string): void {
+    // A review task only makes sense inside its detached review worktree; left `ready`, the
+    // coordinator loop would re-dispatch it as ordinary work.
+    if (this.store.getTask(taskId)?.status === 'ready') {
+      this.store.updateTaskStatus(taskId, 'failed');
+    }
+  }
+
+  /**
+   * Rejects the batch of every review dispatch that settled without a verdict. Reviewers can be
+   * failed straight through the store (pane exit, coordinator loop, restart recovery), so this is
+   * the one place that guarantees their target never stays `pending`.
+   */
+  private settleUnreportedReviewDispatches(): void {
+    for (const dispatch of this.store.listDispatches()) {
+      if (!dispatch.reviewOfDispatchId && !dispatch.reviewOfRunId) continue;
+      if (ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) continue;
+      if (dispatch.reviewStatus && dispatch.reviewStatus !== 'none' && dispatch.reviewStatus !== 'pending') {
+        continue;
+      }
+      this.store.updateDispatchReviewState(dispatch.id, { reviewStatus: 'rejected' });
+      this.failReviewTaskIfReady(dispatch.taskId);
+      this.reconcileAnyReviewBatch(dispatch.id, {
+        failedReason: `Reviewer exited or timed out (${dispatch.lastFailureReason || dispatch.status})`,
+      });
+      this.emitChanged('worker:review-reconciled', dispatch.runId);
+    }
   }
 
   private resolveTargetRunForOperation(
@@ -2569,10 +2654,23 @@ export class OrchestrationService {
       if (reportedDispatchId) {
         this.store.assertDispatchCapability(reportedDispatchId, input.capability);
       }
+      const targetDispatchForDone = reportedDispatchId
+        ? this.store.getDispatchContext(reportedDispatchId)
+        : this.store.getActiveDispatchForIdentity(from, from);
+      if (
+        input.type === 'worker_done' &&
+        !onSettled &&
+        targetDispatchForDone &&
+        (targetDispatchForDone.reviewOfDispatchId || targetDispatchForDone.reviewOfRunId)
+      ) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          `Review dispatch ${targetDispatchForDone.id} must report completion via report_done / worker-done with an explicit verdict ("pass" or "reject"), not generic send(type="worker_done").`,
+          { dispatchId: targetDispatchForDone.id },
+        );
+      }
       if (!rawTo) {
-        const inferredDispatch = reportedDispatchId
-          ? this.store.getDispatchContext(reportedDispatchId)
-          : this.store.getActiveDispatchForIdentity(from, from);
+        const inferredDispatch = targetDispatchForDone;
         if (inferredDispatch) {
           rawTo = this.resolveActiveParentMailbox(inferredDispatch);
         } else {
@@ -2654,7 +2752,29 @@ export class OrchestrationService {
         ? reconcileLifecycleMessage(this.store, msg)
         : undefined;
 
-    if (lifecycle?.action === 'settled') onSettled?.();
+    if (lifecycle?.action === 'settled') {
+      if (onSettled) {
+        onSettled();
+      } else if (msg.payload) {
+        try {
+          const parsedDone = JSON.parse(msg.payload) as { dispatchId?: unknown };
+          const settledId = typeof parsedDone?.dispatchId === 'string' ? parsedDone.dispatchId : '';
+          const settledDispatch = settledId ? this.store.getDispatchContext(settledId) : undefined;
+          if (
+            settledDispatch &&
+            (settledDispatch.reviewOfDispatchId || settledDispatch.reviewOfRunId) &&
+            (!settledDispatch.reviewStatus || settledDispatch.reviewStatus === 'pending' || settledDispatch.reviewStatus === 'none')
+          ) {
+            this.store.updateDispatchReviewState(settledDispatch.id, { reviewStatus: 'rejected' });
+            this.reconcileAnyReviewBatch(settledDispatch.id, {
+              failedReason: 'Review dispatch settled without a structured verdict',
+            });
+          }
+        } catch {
+          /* ignore malformed payload */
+        }
+      }
+    }
     const latestMsg = this.store.getMessageById(msg.id) ?? msg;
     if (lifecycle?.action === 'settled' && latestMsg.payload) {
       try {
@@ -2884,6 +3004,17 @@ export class OrchestrationService {
       }
     }
 
+    const reportMentions = ['coordinator'];
+    if (resolvedDispatch.reviewOfDispatchId) {
+      const reviewedTarget = this.store.getDispatchContext(resolvedDispatch.reviewOfDispatchId);
+      const reviewedRole = reviewedTarget
+        ? this.resolveRoleNameForDispatch(reviewedTarget).trim().replace(/^@+/, '').toLowerCase()
+        : '';
+      if (reviewedRole && !reportMentions.includes(reviewedRole)) {
+        reportMentions.push(reviewedRole);
+      }
+    }
+
     const sent = this.sendMailSync({
       from,
       to,
@@ -2902,7 +3033,7 @@ export class OrchestrationService {
       },
       capability: input.capability,
       fromRole: workerRole,
-      mentions: ['coordinator'],
+      mentions: reportMentions,
       kind: 'report',
       artifacts: effectiveArtifacts,
     }, settleReview);
@@ -4141,16 +4272,20 @@ export class OrchestrationService {
       );
     }
 
-    // Serialize concurrent adversarial review starts for the same target dispatch or run
-    // so reviewRound / reviewBatchId assignment is strictly atomic.
+    // Serialize concurrent adversarial review starts with per-Run integration locks and track
+    // in-flight starts so an earlier peer's PASS cannot finalize or merge while a parallel peer is still booting.
     if (input.reviewOf?.trim()) {
       const targetPreview = this.resolveDispatchByRoleOrTarget(
         input.reviewOf.trim(),
         input.callerPaneId ?? from,
         input.runId,
       );
-      return this.withReviewStartLock(targetPreview.id, () =>
-        this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig),
+      return this.withInFlightReviewStart(`dispatch:${targetPreview.id}`, () =>
+        this.withRunIntegrationLock(targetPreview.runId, () =>
+          this.withReviewStartLock(targetPreview.id, () =>
+            this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig),
+          ),
+        ),
       );
     }
     if (isReviewRunRequest) {
@@ -4163,8 +4298,10 @@ export class OrchestrationService {
       );
       // Share the per-Run integration lock so runFinalizeIntegration / workerIntegrate cannot
       // race ahead while a Run-level review terminal is booting and before runReviewStatus="pending" is persisted.
-      return this.withRunIntegrationLock(runPreview.id, () =>
-        this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig),
+      return this.withInFlightReviewStart(`run:${runPreview.id}`, () =>
+        this.withRunIntegrationLock(runPreview.id, () =>
+          this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig),
+        ),
       );
     }
     return this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig);
@@ -4210,6 +4347,21 @@ export class OrchestrationService {
           `Target worker ${target.id} is still active (${target.status}). Wait for it to report done before starting an adversarial review.`,
         );
       }
+      if (target.cliId && this.listCodingAgentsDep) {
+        const authorCli = normalizeWorkerCliId(target.cliId);
+        const reviewerCli = normalizeWorkerCliId(launchConfig.cliId);
+        if (authorCli && reviewerCli === authorCli) {
+          const available = this.listCodingAgents(from).filter((entry) => entry.available);
+          const heterogeneous = available.filter((entry) => entry.cliId !== authorCli);
+          if (heterogeneous.length > 0) {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Heterogeneous review must avoid the author's Coding Agent (${authorCli}); available alternative(s): ${heterogeneous.map((e) => e.cliId).join(', ')}.`,
+              { authorCliId: authorCli, requestedCliId: reviewerCli },
+            );
+          }
+        }
+      }
       reviewTarget = target;
       run = this.store.requireRun(target.runId);
       if (run.status !== 'active') {
@@ -4251,6 +4403,12 @@ export class OrchestrationService {
         worktreePath: targetPath,
         baseCommit: effectiveReviewBase,
         maxDiffBytes: 16 * 1024,
+        pinnedSnapshot: {
+          headCommit: snap.headCommit,
+          snapshotOid: snap.snapshotOid,
+          dirtyFiles: snap.dirtyFiles,
+          stagedDivergentFiles: snap.stagedDivergentFiles,
+        },
       });
       reviewBaseCommit = diff.baseCommit ?? effectiveReviewBase ?? null;
 
@@ -4268,6 +4426,13 @@ export class OrchestrationService {
       } else {
         reviewRoundForTarget = (target.reviewRound ?? 0) + 1;
         if (reviewRoundForTarget > MAX_ADVERSARIAL_REVIEW_ROUNDS) {
+          if (target.reviewStatus === 'passed' && target.reviewSnapshotOid === reviewSnapshotOid) {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Adversarial review limit reached (${MAX_ADVERSARIAL_REVIEW_ROUNDS} rounds) for ${target.id}, and this exact snapshot already passed. Integrate it instead of requesting another review.`,
+              { targetDispatchId: target.id, maxRounds: MAX_ADVERSARIAL_REVIEW_ROUNDS },
+            );
+          }
           this.store.updateDispatchReviewState(target.id, { reviewStatus: 'escalated' });
           throw new OrchestrationError(
             'operation_rejected',
@@ -4328,6 +4493,25 @@ export class OrchestrationService {
       const resolvedTarget = await this.resolveRunCombinedDiffTarget(targetRun, {
         requireCleanIntegrationWorktree: true,
       });
+      if (this.listCodingAgentsDep) {
+        const integratedAuthorClis = new Set<string>(
+          resolvedTarget.integratedWorkers
+            .map((w) => (w.cliId ? normalizeWorkerCliId(w.cliId) : ''))
+            .filter(Boolean),
+        );
+        const reviewerCli = normalizeWorkerCliId(launchConfig.cliId);
+        if (integratedAuthorClis.has(reviewerCli)) {
+          const available = this.listCodingAgents(from).filter((entry) => entry.available);
+          const heterogeneous = available.filter((entry) => !integratedAuthorClis.has(entry.cliId));
+          if (heterogeneous.length > 0) {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Heterogeneous Run-level review must avoid integrated author Coding Agent(s) (${[...integratedAuthorClis].join(', ')}); available alternative(s): ${heterogeneous.map((e) => e.cliId).join(', ')}.`,
+              { authorCliIds: [...integratedAuthorClis], requestedCliId: reviewerCli },
+            );
+          }
+        }
+      }
       if (!resolvedTarget.hasChanges || !resolvedTarget.mainRepoRoot || !resolvedTarget.baseCommit || !resolvedTarget.targetCommit) {
         throw new OrchestrationError(
           'operation_rejected',
@@ -4371,6 +4555,13 @@ export class OrchestrationService {
           targetRun.runReviewSnapshotOid !== reviewSnapshotOid;
         reviewRoundForTarget = isFreshPostPassSnapshot ? 1 : (targetRun.runReviewRound ?? 0) + 1;
         if (reviewRoundForTarget > MAX_ADVERSARIAL_REVIEW_ROUNDS) {
+          if (targetRun.runReviewStatus === 'passed' && targetRun.runReviewSnapshotOid === reviewSnapshotOid) {
+            throw new OrchestrationError(
+              'operation_rejected',
+              `Run-level adversarial review limit reached (${MAX_ADVERSARIAL_REVIEW_ROUNDS} rounds) for ${targetRun.id}, and this exact snapshot already passed. Finalize it instead of requesting another review.`,
+              { runId: targetRun.id, maxRounds: MAX_ADVERSARIAL_REVIEW_ROUNDS },
+            );
+          }
           this.store.updateRunReviewState(targetRun.id, { runReviewStatus: 'escalated' });
           throw new OrchestrationError(
             'operation_rejected',
@@ -4633,8 +4824,13 @@ export class OrchestrationService {
         maxDepth: this.maxDepth,
       });
       if (reviewTarget) {
+        const latestTarget = this.store.getDispatchContext(reviewTarget.id);
+        const alreadyRejectedSameBatch =
+          Boolean(reviewBatchId) &&
+          latestTarget?.reviewBatchId === reviewBatchId &&
+          (latestTarget.reviewStatus === 'rejected' || latestTarget.reviewStatus === 'escalated');
         this.store.updateDispatchReviewState(reviewTarget.id, {
-          reviewStatus: 'pending',
+          reviewStatus: alreadyRejectedSameBatch ? latestTarget!.reviewStatus : 'pending',
           reviewRound: reviewRoundForTarget,
           reviewBatchId,
           reviewSnapshotOid,
@@ -4642,8 +4838,13 @@ export class OrchestrationService {
         });
       }
       if (reviewRunTarget) {
+        const latestRunTarget = this.store.getRun(reviewRunTarget.id);
+        const alreadyRejectedSameRunBatch =
+          Boolean(reviewBatchId) &&
+          latestRunTarget?.runReviewBatchId === reviewBatchId &&
+          (latestRunTarget.runReviewStatus === 'rejected' || latestRunTarget.runReviewStatus === 'escalated');
         this.store.updateRunReviewState(reviewRunTarget.id, {
-          runReviewStatus: 'pending',
+          runReviewStatus: alreadyRejectedSameRunBatch ? latestRunTarget!.runReviewStatus : 'pending',
           runReviewRound: reviewRoundForTarget,
           runReviewBatchId: reviewBatchId,
           runReviewSnapshotOid: reviewSnapshotOid,
@@ -6212,6 +6413,7 @@ export class OrchestrationService {
           baseCommit: effectiveIntegrationBaseCommit,
           recordedBaseCommit: latestDispatch.baseCommit,
           expectedSnapshotOid: authoritativeExpectedOid,
+          strictReviewedTree: true,
           mode,
           commitMessage,
         });
@@ -6228,6 +6430,7 @@ export class OrchestrationService {
           recordedBaseCommit: latestDispatch.baseCommit,
           expectedSnapshotOid: authoritativeExpectedOid,
           expectedTargetRef: expectedMainRef,
+          strictReviewedTree: true,
           mode,
           commitMessage,
         });
@@ -6623,10 +6826,15 @@ export class OrchestrationService {
         }
       }
 
-      const expectedTargetRef =
-        !manualUserOverride && run.integrationBaseBranch
-          ? `refs/heads/${run.integrationBaseBranch}`
-          : undefined;
+      const expectedBaseBranch = run.integrationBaseBranch?.trim() || '';
+      if (!expectedBaseBranch) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          `Run ${run.id} has no recorded target branch (started from detached HEAD); refusing to finalize ${run.integrationBranch} into an arbitrary checked-out branch. Checkout the intended branch and merge ${run.integrationBranch} manually.`,
+          { runId: run.id, integrationBranch: run.integrationBranch },
+        );
+      }
+      const expectedTargetRef = `refs/heads/${expectedBaseBranch}`;
       const commitMessage =
         input.commitMessage?.trim() ||
         `chore(orchestration): finalize run ${run.id} (${run.objective.slice(0, 72)})`;
@@ -6638,6 +6846,7 @@ export class OrchestrationService {
         baseCommit: run.integrationBaseCommit ?? null,
         expectedTargetRef,
         expectedSnapshotOid: authoritativeExpectedOid,
+        strictReviewedTree: true,
         mode,
         commitMessage,
         deleteBranch: input.deleteBranch,
@@ -9045,13 +9254,9 @@ export class OrchestrationService {
   /** Reconcile stale dispatches for every run, including runs without a coordinator loop. */
   reconcileStaleDispatches(): void {
     const runIds = new Set<string>();
-    const activeReviewIdsBefore = new Set<string>();
     for (const dispatch of this.store.listDispatches()) {
       if (ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) {
         runIds.add(dispatch.runId);
-        if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
-          activeReviewIdsBefore.add(dispatch.id);
-        }
       }
     }
     for (const runId of runIds) {
@@ -9071,17 +9276,11 @@ export class OrchestrationService {
         isDeliberatelyWaiting: (d) => this.isDispatchDeliberatelyWaiting(d),
         onEvent: (reason, id) => this.emitChanged(reason, id),
       });
-      for (const reviewId of activeReviewIdsBefore) {
-        const after = this.store.getDispatchContext(reviewId);
-        if (after && after.runId === runId && !ACTIVE_DISPATCH_STATUSES.has(after.status)) {
-          if (after.reviewStatus !== 'passed' && after.reviewStatus !== 'rejected') {
-            this.store.updateDispatchReviewState(after.id, { reviewStatus: 'rejected' });
-          }
-          this.reconcileAnyReviewBatch(after.id, {
-            failedReason: `Reviewer exited or timed out (${after.lastFailureReason || after.status})`,
-          });
-        }
-      }
+    }
+    // Runs before retirement and outside the loop: a run whose only reviewer was already failed
+    // elsewhere has no active dispatch left to put it in `runIds`.
+    this.settleUnreportedReviewDispatches();
+    for (const runId of runIds) {
       this.retireFinishedSpawnedWorkers(runId);
     }
   }
