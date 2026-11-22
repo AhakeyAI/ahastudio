@@ -682,13 +682,27 @@ export function OrchestrationBoardPanel({
     return [...seen.entries()];
   }, [model.coordinator, model.members, model.posts]);
 
+  const reviewerRolesByTarget = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    for (const m of model.members) {
+      if (m.reviewerRoles.length > 0) {
+        map.set(m.role.toLowerCase(), new Set(m.reviewerRoles));
+      }
+    }
+    return map;
+  }, [model.members]);
+
   const filteredPosts = useMemo(() => {
     const q = boardSearch.trim().toLowerCase();
+    const reviewerRolesForFilter =
+      roleFilter !== 'all' ? reviewerRolesByTarget.get(roleFilter) : undefined;
     return model.posts.filter((post) => {
       if (roleFilter !== 'all') {
-        const matchesAuthor = post.fromRole.toLowerCase() === roleFilter;
+        const postAuthorLower = post.fromRole.toLowerCase();
+        const matchesAuthor = postAuthorLower === roleFilter;
         const matchesMention = post.mentions.includes(roleFilter);
-        if (!matchesAuthor && !matchesMention) return false;
+        const matchesReviewerForTarget = Boolean(reviewerRolesForFilter?.has(postAuthorLower));
+        if (!matchesAuthor && !matchesMention && !matchesReviewerForTarget) return false;
       }
       if (kindFilter !== 'all' && post.kind !== kindFilter) return false;
       if (q) {
@@ -697,7 +711,7 @@ export function OrchestrationBoardPanel({
       }
       return true;
     });
-  }, [model.posts, boardSearch, roleFilter, kindFilter]);
+  }, [model.posts, boardSearch, roleFilter, kindFilter, reviewerRolesByTarget]);
 
   // Match open approvals / questions to posts so actions render inline where possible
   const questionByMessageId = useMemo(
@@ -1876,6 +1890,8 @@ export function OrchestrationBoardPanel({
                             className="wrp-btn obp-btn-sm"
                             title="在协作板查看审查意见"
                             onClick={() => {
+                              setBoardSearch('');
+                              setKindFilter('all');
                               setRoleFilter(member.role.toLowerCase());
                               setSubTab('board');
                             }}

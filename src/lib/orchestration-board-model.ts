@@ -93,6 +93,7 @@ export interface BoardMemberCard {
   canTriggerReview: boolean;
   canIntegrate: boolean;
   canForceIntegrate: boolean;
+  reviewerRoles: string[];
   verificationBadge?: { label: string; tone: StatusTone } | null;
 }
 
@@ -748,6 +749,21 @@ export function buildBoardViewModel(
         reviewStatus !== 'pending';
       const canForceIntegrate =
         canIntegrate && (reviewStatus === 'escalated' || reviewStatus === 'rejected');
+      const taskDispatchIds = new Set(
+        runDispatches.filter((d) => d.taskId === dispatch.taskId).map((d) => d.id),
+      );
+      const reviewerRoles = [
+        ...new Set(
+          runDispatches
+            .filter(
+              (d) =>
+                d.reviewOfDispatchId &&
+                (d.reviewOfDispatchId === dispatch.id || taskDispatchIds.has(d.reviewOfDispatchId)),
+            )
+            .map((d) => dispatchRole(d).toLowerCase())
+            .filter(Boolean),
+        ),
+      ];
 
       return {
         key: dispatch.id,
@@ -782,6 +798,7 @@ export function buildBoardViewModel(
         canTriggerReview,
         canIntegrate,
         canForceIntegrate,
+        reviewerRoles,
         verificationBadge,
       };
     })

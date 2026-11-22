@@ -948,3 +948,75 @@ test('Phase 2 review scope invariants: block evil-merge main reverts and block m
   assert.equal(mainHistory.includes(f1Sha), false, 'F1 must not enter main history');
   assert.equal(mainHistory.includes(f2Sha), false, 'F2 must not enter main history');
 });
+
+test('P1 #4: pre-commit hook cannot smuggle out-of-scope 3rd file or mutate a pinned reviewed snapshot', async (t) => {
+  const { root, repo } = await initTempRepo(t);
+  const baseHead = await git(repo, 'rev-parse', 'HEAD');
+  const hooksDir = join(root, 'smuggle-hooks');
+  mkdirSync(hooksDir, { recursive: true });
+  const hookPath = join(hooksDir, 'pre-commit');
+  writeFileSync(
+    hookPath,
+    '#!/bin/sh\nprintf "export const smuggled = true;\\n" > third-file.ts\ngit add third-file.ts\nexit 0\n',
+    'utf8',
+  );
+  try {
+    chmodSync(hookPath, 0o755);
+  } catch {
+    /* windows */
+  }
+  const w = await prepareWorkerWorktreePlacement({ baseCwd: repo, taskId: 'hook_3rd', name: 'hook3' });
+  writeFileSync(join(w.worktreePath, 'task.ts'), 'export const task = 1;\n', 'utf8');
+  await git(w.worktreePath, 'add', 'task.ts');
+  await git(w.worktreePath, 'commit', '-m', 'feat: add task.ts');
+  const snap = await captureWorkerSnapshotOid(w.worktreePath);
+
+  // Enable the pre-commit hook AFTER the worker snapshot was captured (simulating post-review hook mutation).
+  await git(repo, 'config', 'core.hooksPath', hooksDir);
+
+  // Even without expectedSnapshotOid, modifying a 3rd file outside the integration diff MUST be blocked!
+  await assert.rejects(
+    () =>
+      integrateWorkerChanges({
+        targetRepoPath: repo,
+        worktreePath: w.worktreePath,
+        baseCommit: w.baseCommit,
+        mode: 'squash',
+        commitMessage: 'must block 3rd file hook',
+      }),
+    /outside the integration diff.*third-file\.ts/i,
+  );
+  assert.equal(await git(repo, 'rev-parse', 'HEAD'), baseHead);
+  assert.equal(existsSync(join(repo, 'third-file.ts')), false);
+
+  // With expectedSnapshotOid (reviewed snapshot pinned), EVEN modifying the already-changed file MUST be blocked!
+  writeFileSync(
+    hookPath,
+    '#!/bin/sh\nprintf "export const task = 999; // tampered\\n" > task.ts\ngit add task.ts\nexit 0\n',
+    'utf8',
+  );
+  await assert.rejects(
+    () =>
+      integrateWorkerChanges({
+        targetRepoPath: repo,
+        worktreePath: w.worktreePath,
+        baseCommit: w.baseCommit,
+        expectedSnapshotOid: snap.snapshotOid,
+        mode: 'squash',
+        commitMessage: 'must block hook mutation on reviewed snapshot',
+      }),
+    /outside the approved review snapshot/i,
+  );
+  assert.equal(await git(repo, 'rev-parse', 'HEAD'), baseHead);
+  assert.equal(existsSync(join(repo, 'task.ts')), false);
+
+  // P2 #6: inspectWorkerDiff with pinnedSnapshot ignores later author workspace edits (exact snapshot parity).
+  writeFileSync(join(w.worktreePath, 'late-author-edit.ts'), 'export const late = true;\n', 'utf8');
+  const pinnedDiff = await inspectWorkerDiff({
+    worktreePath: w.worktreePath,
+    baseCommit: w.baseCommit,
+    pinnedSnapshot: snap,
+  });
+  assert.equal(pinnedDiff.snapshotOid, snap.snapshotOid);
+  assert.deepEqual(pinnedDiff.changedFiles, ['task.ts']);
+});
