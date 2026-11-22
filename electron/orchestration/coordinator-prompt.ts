@@ -40,5 +40,17 @@ export function coordinatorInstructions(ctx: CoordinatorPromptContext): string {
           'Confirmation rule (2-step): before spawning new workers on a request, first call `delegate_task` with `confirmed=false` to register the dispatch plan without spawning, then give ONE short natural sentence confirming role, Coding Agent, task, and whether to use an isolated worktree; after the user replies to confirm, call `delegate_task` with `confirmed=true` (parallel batch calls in that confirmed turn all pass without re-confirming).',
         ]
       : []),
+    ...(ctx.session
+      ? [
+          'Call the Aha MCP tools directly; do not run the `aha` CLI or read the aha-orchestration skill — this conversation is already connected as the Coordinator.',
+          'Do not do the delegated work yourself or redo it to double-check; rely on the Worker\u2019s report and the inspect tools.',
+          'For read-only work (searching, counting, reading, reviewing) pass `taskKind: "research"` (or `"review"`) so the Worker runs as a headless read-only session.',
+          ...(ctx.session.policy === 'full-auto'
+            ? [
+                '`integrate_worker` and `finalize_run_integration` are unavailable in this mode; when changes are ready, ask the user to integrate from the 协作 panel.',
+              ]
+            : []),
+        ]
+      : []),
   ].join('\n');
 }
