@@ -218,8 +218,8 @@ export function enabledCodexPilot(platform: NodeJS.Platform, setting: boolean, o
 
 export function launchCodexPilot(options: {
   cwd: string;
-  mcpServerPath: string;
-  mcpEnv: Record<string, string>;
+  /** Aha MCP wiring for an orchestration Worker; a plain session runs without it. */
+  mcp?: { serverPath: string; env: Record<string, string> };
   events: AgentSessionEvents;
 }): CodexAppServerPilot {
   const codex = resolveBinaryFromPath('codex');
@@ -229,19 +229,21 @@ export function launchCodexPilot(options: {
   const entry = join(dirname(codex), 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
   if (wrapper && !existsSync(entry)) throw new Error('Codex npm entry point was not found');
 
-  const mcpEnv = Object.entries(options.mcpEnv)
-    .map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join(', ');
-  const args = [
-    'app-server', '--stdio',
-    '-c', `mcp_servers.aha.command=${JSON.stringify(node)}`,
-    '-c', `mcp_servers.aha.args=${JSON.stringify([options.mcpServerPath])}`,
-    '-c', `mcp_servers.aha.env={ ${mcpEnv} }`,
-    '-c', 'mcp_servers.aha.enabled=true',
-    '-c', 'mcp_servers.aha.required=true',
-    // These two calls are part of the dispatch contract and still use Worker-scoped auth.
-    '-c', 'mcp_servers.aha.tools.report_done.approval_mode="approve"',
-    '-c', 'mcp_servers.aha.tools.read_board.approval_mode="approve"',
-  ];
+  const args = ['app-server', '--stdio'];
+  if (options.mcp) {
+    const mcpEnv = Object.entries(options.mcp.env)
+      .map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join(', ');
+    args.push(
+      '-c', `mcp_servers.aha.command=${JSON.stringify(node)}`,
+      '-c', `mcp_servers.aha.args=${JSON.stringify([options.mcp.serverPath])}`,
+      '-c', `mcp_servers.aha.env={ ${mcpEnv} }`,
+      '-c', 'mcp_servers.aha.enabled=true',
+      '-c', 'mcp_servers.aha.required=true',
+      // These two calls are part of the dispatch contract and still use Worker-scoped auth.
+      '-c', 'mcp_servers.aha.tools.report_done.approval_mode="approve"',
+      '-c', 'mcp_servers.aha.tools.read_board.approval_mode="approve"',
+    );
+  }
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath() };
   for (const key of Object.keys(env)) {
     if (key.toUpperCase().startsWith('AHA_')) delete env[key];
@@ -252,8 +254,8 @@ export function launchCodexPilot(options: {
     ? spawnWindowsCodexJob(executable, argv, options.cwd, env)
     : spawn(executable, argv, { cwd: options.cwd, env, windowsHide: true, stdio: 'pipe' });
   return new CodexAppServerPilot(child, options.events, 30_000, [
-    options.mcpEnv.AHA_WORKER_TOKEN, options.mcpEnv.AHA_AGENT_HOOK_TOKEN,
-  ].filter((value): value is string => Boolean(value)));
+    options.mcp?.env.AHA_WORKER_TOKEN, options.mcp?.env.AHA_AGENT_HOOK_TOKEN,
+  ].filter((value): value is string => Boolean(value)), options.mcp ? 'report_done' : null);
 }
 
 export class CodexAppServerPilot implements AgentSessionDriver {
@@ -283,6 +285,8 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     private readonly events: AgentSessionEvents,
     private readonly requestTimeoutMs = 30_000,
     private readonly secrets: readonly string[] = [],
+    /** Aha MCP tool the thread must expose before it is usable; null for sessions without Aha MCP. */
+    private readonly requiredMcpTool: string | null = 'report_done',
   ) {
     this.childClosed = new Promise((resolve) => {
       child.once('close', (code, signal) => {
@@ -353,6 +357,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
       // The resumed thread's running token total is unknown until Codex reports it.
       if (resumeSessionId) this.tokenTotal = null;
       this.threadId = id;
+      if (!this.requiredMcpTool) return id;
       // Codex may cache an empty MCP catalog prepared before the first turn.
       const inventory = object(await this.request('mcpServerStatus/list', {
         threadId: id, serverName: 'aha', detail: 'toolsAndAuthOnly',
@@ -360,8 +365,9 @@ export class CodexAppServerPilot implements AgentSessionDriver {
       const servers: unknown[] = Array.isArray(inventory.data) ? inventory.data : [];
       const aha = servers.map(object).find((server) => server.name === 'aha');
       const tools = Object.values(object(aha?.tools)).map(object);
-      if (!tools.some((tool) => tool.name === 'report_done' || tool.name === 'mcp__aha__report_done')) {
-        throw new Error('Aha MCP did not expose report_done to the Codex thread');
+      const required = this.requiredMcpTool;
+      if (!tools.some((tool) => tool.name === required || tool.name === `mcp__aha__${required}`)) {
+        throw new Error(`Aha MCP did not expose ${required} to the Codex thread`);
       }
       return id;
     } catch (error) {

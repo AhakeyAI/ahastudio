@@ -32,7 +32,7 @@ const service = new OrchestrationService({
     launch: (id, workdir, events) => {
       sessions++;
       return launchCodexPilot({
-        cwd: workdir, mcpServerPath, mcpEnv: hook.envForWorker(id),
+        cwd: workdir, mcp: { serverPath: mcpServerPath, env: hook.envForWorker(id) },
         events: {
           ...events,
           onExit(reason, code) {

@@ -410,7 +410,7 @@ export class WorkerTimeline {
     return this.turns.some((turn) => turn.dispatchId === dispatchId);
   }
 
-  setMeta(meta: Partial<Pick<WorkerTimelineHeader, 'alive' | 'providerSessionId' | 'model'>>): void {
+  setMeta(meta: Partial<Pick<WorkerTimelineHeader, 'alive' | 'providerSessionId' | 'model' | 'readOnly'>>): void {
     Object.assign(this.header, meta);
     this.changed(null, null);
   }
