@@ -62,6 +62,8 @@ export interface AgentSessionManagerDependencies {
    * confirm the Coordinator's dispatch proposals; turns AhaStation starts itself never call this.
    */
   onUserTurn?: (sessionId: string) => void;
+  /** An orchestrating session became idle and can take a system turn (see `wake`). */
+  onCoordinatorIdle?: (sessionId: string) => void;
   /** Where sessions are kept across restarts; omitted keeps them in memory only. */
   storageFile?: () => string;
   now?: () => number;
@@ -139,13 +141,36 @@ export class AgentSessionManager {
     if (!session.driver?.alive || session.info.status !== 'idle') {
       return { status: 'not_accepted', reason: `Session is ${session.info.status}` };
     }
+    if (!session.info.title) session.info.title = text.split('\n')[0]!.slice(0, 60);
+    const delivery = await this.startTurn(session, text, input);
+    if (delivery.status === 'accepted' && session.info.orchestration) this.deps.onUserTurn?.(id);
+    return delivery;
+  }
+
+  /**
+   * Starts a system turn in an idle orchestrating session, for Worker news and stall reminders. It
+   * never resumes a stopped conversation and never counts as the person's message.
+   */
+  async wake(id: string, prompt: string): Promise<TurnDelivery> {
+    const session = this.sessions.get(id);
+    const text = prompt.trim();
+    if (!session || !text) return { status: 'not_accepted', reason: 'Nothing to deliver' };
+    if (!this.coordinatorState(id)?.idle) return { status: 'not_accepted', reason: 'Session is not an idle Coordinator' };
+    return this.startTurn(session, text, {}, 'system');
+  }
+
+  private async startTurn(
+    session: Session, text: string,
+    input: { model?: string | null; effort?: string | null; policy?: AgentSessionPolicy; network?: boolean },
+    origin?: 'system',
+  ): Promise<TurnDelivery> {
     const { info, timeline } = session;
-    const turnKey = `${id}:${++session.turns}`;
-    if (!info.title) info.title = text.split('\n')[0]!.slice(0, 60);
+    const driver = session.driver!;
+    const turnKey = `${info.id}:${++session.turns}`;
     info.status = 'running';
-    timeline.beginTurn({ dispatchId: turnKey, prompt: text });
+    timeline.beginTurn({ dispatchId: turnKey, prompt: text, ...(origin ? { origin } : {}) });
     this.sessionsChanged();
-    const delivery = await session.driver.startTurn({
+    const delivery = await driver.startTurn({
       turnKey, prompt: text,
       effort: input.effort ?? info.effort,
       ...(input.model && input.model !== info.model ? { model: input.model } : {}),
@@ -158,27 +183,30 @@ export class AgentSessionManager {
       if (input.policy) info.policy = input.policy;
       if (input.network !== undefined) info.network = input.network;
       timeline.setMeta({ model: info.model, readOnly: info.policy === 'read-only' });
-      if (info.orchestration) this.deps.onUserTurn?.(id);
     } else {
       timeline.endActiveTurn('failed', delivery.reason);
       // Unknown acceptance leaves the provider thread in an unknown state; do not send into it again.
       if (delivery.status === 'unknown_acceptance') {
         info.error = delivery.reason;
-        await session.driver.close();
+        await driver.close();
       } else if (info.status === 'running') {
         info.status = 'idle';
       }
     }
     this.sessionsChanged();
+    if (delivery.status !== 'accepted') this.coordinatorSettled(session);
     return delivery;
   }
 
   /** Coordinator state the orchestration service checks before trusting the session's MCP calls. */
-  coordinatorState(id: string): { cwd: string; provider: string; active: boolean } | null {
-    const info = this.sessions.get(id)?.info;
-    if (!info) return null;
+  coordinatorState(id: string): { cwd: string; provider: string; active: boolean; idle: boolean } | null {
+    const session = this.sessions.get(id);
+    if (!session) return null;
+    const { info, driver } = session;
     const live = info.status === 'starting' || info.status === 'idle' || info.status === 'running';
-    return { cwd: info.cwd, provider: info.provider, active: info.orchestration && live };
+    const active = info.orchestration && live;
+    const idle = active && info.status === 'idle' && Boolean(driver?.alive) && !driver?.busy && session.requests.size === 0;
+    return { cwd: info.cwd, provider: info.provider, active, idle };
   }
 
   /**
@@ -317,6 +345,11 @@ export class AgentSessionManager {
       await session.driver?.close();
     }
     this.sessionsChanged();
+    this.coordinatorSettled(session);
+  }
+
+  private coordinatorSettled(session: Session): void {
+    if (session.info.orchestration && session.info.status === 'idle') this.deps.onCoordinatorIdle?.(session.info.id);
   }
 
   private eventsFor(session: Session, generation: number): AgentSessionEvents {
@@ -337,6 +370,7 @@ export class AgentSessionManager {
         });
         if (info.status === 'running') info.status = 'idle';
         this.sessionsChanged();
+        this.coordinatorSettled(session);
       },
       onRequest: (turnKey, request) => {
         if (!current() || request.signal.aborted) return Promise.resolve(DECLINE);

@@ -542,9 +542,13 @@ app.whenReady().then(async () => {
       coordinatorInstructions(orchestrationService.getMcpContextForPane(sessionId)),
     onCoordinatorEnded: (sessionId) => orchestrationService.endSessionCoordinator(sessionId),
     onUserTurn: (sessionId) => orchestrationService.recordUserPromptTurn(sessionId, 'session'),
+    onCoordinatorIdle: (sessionId) => orchestrationService.sessionCoordinatorIdle(sessionId),
     storageFile: () => join(app.getPath('userData'), 'agent-sessions.json'),
   });
-  orchestrationService.setSessionCoordinators({ get: (id) => agentSessions.coordinatorState(id) });
+  orchestrationService.setSessionCoordinators({
+    get: (id) => agentSessions.coordinatorState(id),
+    wake: (id, prompt) => agentSessions.wake(id, prompt),
+  });
   const agentSessionsIpc = registerAgentSessionsIpc(ipcCtx, agentSessions);
   const offPtyExit = shellPtyCtrl.onPtyExit((ptyId) => {
     orchestrationService.markPtyExited(ptyId);

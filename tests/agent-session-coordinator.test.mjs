@@ -44,7 +44,7 @@ async function mcpRequest(env, method, params, spawnCwd = cwd) {
   }
 }
 
-async function setup(t, { confirmMode = 'auto' } = {}) {
+async function setup(t, { confirmMode = 'auto', stallThresholdMs } = {}) {
   const dir = mkdtempSync(join(cwd, '.session-coordinator-test-'));
   const agentStatusStore = new AgentStatusStore();
   const store = new OrchestrationStore({ resolveFile: () => join(dir, 'state.json') });
@@ -55,6 +55,7 @@ async function setup(t, { confirmMode = 'auto' } = {}) {
     store, agentStatusStore, getDefaultCwd: () => cwd,
     settleDelayMs: 0, turnStartObserveTimeoutMs: 250, turnStopSettleMs: 10_000,
     getConfirmMode: () => confirmMode,
+    ...(stallThresholdMs ? { stallThresholdMs } : {}),
     writePty: async () => ({ ok: true }),
     spawnWorkerPty: async () => { throw new Error('Session Coordinator tests expect headless Workers'); },
     isPtyAlive: (id) => id === 'coordinator-pane',
@@ -249,6 +250,7 @@ test('Aha MCP server exposes Coordinator tools to a session and delegates throug
 
 function sessionSetup(t, {
   dir = mkdtempSync(join(cwd, '.session-coordinator-test-')), failOrchestration = false, owner = true, onUserTurn,
+  onCoordinatorIdle,
 } = {}) {
   const trace = join(dir, 'rpc.jsonl');
   const launches = [];
@@ -267,6 +269,7 @@ function sessionSetup(t, {
     coordinatorInstructions: (id) => `[AhaStation Orchestration Mode Active — Coordinator] for ${id}`,
     onCoordinatorEnded: (id) => ended.push(id),
     onUserTurn,
+    onCoordinatorIdle,
     storageFile: () => join(dir, 'agent-sessions.json'),
   });
   if (owner) {
@@ -319,7 +322,7 @@ test('orchestration mode switches only between turns and resumes the same thread
   assert.match(resumed[0].developerInstructions, /Orchestration Mode Active/);
   assert.equal(app.sent('thread/start')[0].developerInstructions, undefined);
   assert.equal(app.sent('mcpServerStatus/list').length, 1, 'an orchestrating thread must expose delegate_task');
-  assert.deepEqual(app.manager.coordinatorState(session.id), { cwd, provider: 'codex', active: true });
+  assert.deepEqual(app.manager.coordinatorState(session.id), { cwd, provider: 'codex', active: true, idle: true });
   // The replaced process must not close the session or leave a failed turn behind.
   assert.equal(app.manager.getTimeline(session.id).turns.at(-1).status, 'interrupted');
   assert.equal((await app.manager.send(session.id, { text: 'Plan the work' })).status, 'accepted');
@@ -392,4 +395,55 @@ test('only a message the person sent confirms a session Coordinator\'s dispatch'
   const started = await delegate({ confirmed: true, proposalId: stillHeld.result.proposal.id });
   assert.equal(started.result?.status, 'started', started.error ?? JSON.stringify(started.result));
   assert.equal(app.store.getDispatchContext(started.result.dispatch.id).parentPaneId, session.id);
+});
+
+test('Worker news and stall reminders wake an idle session Coordinator with a system turn, after any running turn', async (t) => {
+  const app = await setup(t, { stallThresholdMs: 50 });
+  const sessions = sessionSetup(t, {
+    onUserTurn: (id) => app.service.recordUserPromptTurn(id, 'session'),
+    onCoordinatorIdle: (id) => app.service.sessionCoordinatorIdle(id),
+  });
+  app.service.setSessionCoordinators({
+    get: (id) => sessions.manager.coordinatorState(id),
+    wake: (id, prompt) => sessions.manager.wake(id, prompt),
+  });
+  const session = await sessions.manager.create({ cwd: mkdtempSync(join(sessions.dir, 'session-cwd-')), policy: 'read-only' });
+  assert.deepEqual(await sessions.manager.setOrchestration(session.id, true), { ok: true });
+  const turns = () => sessions.manager.getTimeline(session.id).turns;
+  const systemTurns = () => turns().filter((turn) => turn.origin === 'system');
+
+  // The person's turn is still running when the Worker's turn ends.
+  assert.equal((await sessions.manager.send(session.id, { text: 'WAIT_FOR_INTERRUPT' })).status, 'accepted');
+  const userTurn = app.service.recordUserPromptTurn(session.id, 'hook');
+  const started = await app.call(session.id, 'delegate-task', {
+    role: 'scout', task: 'Survey the repository', agent: 'codex', taskKind: 'research', worktree: false,
+  });
+  assert.equal(started.result?.status, 'started', started.error);
+  const runId = started.result.run.id;
+  await settle(() => app.store.listBoardPosts(runId).some((post) => post.subject?.startsWith('Codex turn ended')), 8_000);
+  await delay(300);
+  assert.equal(systemTurns().length, 0, 'a running turn is never interrupted or overlapped');
+  assert.equal(sessions.info(session.id).status, 'running');
+  assert.deepEqual(app.service.stallWatchdog.sweep(), [], 'a working session Coordinator is not stalled');
+
+  await sessions.manager.interrupt(session.id);
+  await settle(() => systemTurns().length === 1);
+  const wake = systemTurns()[0];
+  assert.match(wake.prompt, /AhaStation/);
+  assert.match(wake.prompt, /not a message from the user/);
+  assert.match(wake.prompt, /Codex turn ended|read_board/);
+  assert.equal(turns().at(-1).key, wake.key);
+  await settle(() => sessions.info(session.id).status === 'idle');
+  assert.equal(app.service.recordUserPromptTurn(session.id, 'hook'), userTurn, 'a system turn is not the person answering');
+
+  await delay(100);
+  assert.equal(app.service.stallWatchdog.sweep().length, 1);
+  await settle(() => systemTurns().length === 2);
+  assert.match(systemTurns()[1].prompt, /Board stall detected|read_board/);
+  await settle(() => sessions.info(session.id).status === 'idle');
+
+  // Out of orchestration mode nothing wakes the session.
+  assert.deepEqual(await sessions.manager.setOrchestration(session.id, false), { ok: true });
+  assert.equal((await sessions.manager.wake(session.id, 'News')).status, 'not_accepted');
+  assert.equal(systemTurns().length, 2);
 });

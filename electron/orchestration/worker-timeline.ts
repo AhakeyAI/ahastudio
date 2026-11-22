@@ -128,6 +128,8 @@ export interface WorkerTimelineTurn {
   turnId: string | null;
   generation: number;
   prompt: string;
+  /** `system`: AhaStation started the turn (a wake-up), not the person or a dispatch brief. */
+  origin?: 'system';
   startedAt: number;
   completedAt: number | null;
   status: WorkerTimelineTurnStatus;
@@ -435,7 +437,7 @@ export class WorkerTimeline {
     this.changed(null, null);
   }
 
-  beginTurn(input: { dispatchId: string; prompt: string; startedAt?: number }): WorkerTimelineTurn {
+  beginTurn(input: { dispatchId: string; prompt: string; startedAt?: number; origin?: 'system' }): WorkerTimelineTurn {
     const running = this.activeTurn;
     if (running) this.finishTurn(running, { status: 'interrupted', stopReason: 'superseded' });
     this.generation += 1;
@@ -445,6 +447,7 @@ export class WorkerTimeline {
       turnId: null,
       generation: this.generation,
       prompt: capHead(this.redact(input.prompt), TIMELINE_LIMITS.prompt),
+      ...(input.origin ? { origin: input.origin } : {}),
       startedAt: input.startedAt ?? this.now(),
       completedAt: null,
       status: 'running',

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { resolve as resolveFsPath } from 'node:path';
 import { runGitCommand } from '../git/git-exec.js';
-import type { AgentSessionDriver, AgentSessionEvents, AgentTurnResult } from './agent-session-driver.js';
+import type { AgentSessionDriver, AgentSessionEvents, AgentTurnResult, TurnDelivery } from './agent-session-driver.js';
 import { AGENT_SESSION_ID } from './agent-session-manager.js';
 import { CODEX_WORKER_ID } from './codex-app-server-pilot.js';
 import {
@@ -268,9 +268,17 @@ export interface OrchestrationMcpContext {
 
 /** Agent sessions (no PTY) that a person switched into orchestration mode to act as Coordinators. */
 export interface OrchestrationSessionCoordinators {
-  /** The session exists, is in orchestration mode, and has not closed or failed. */
-  get(sessionId: string): { cwd: string; provider: string; active: boolean } | null;
+  /**
+   * `active`: the session exists, is in orchestration mode, and has not closed or failed.
+   * `idle`: active, between turns, and not waiting on the person.
+   */
+  get(sessionId: string): { cwd: string; provider: string; active: boolean; idle?: boolean } | null;
+  /** Starts a system turn (never counted as the person's message); omitted means sessions are never woken. */
+  wake?(sessionId: string, prompt: string): Promise<TurnDelivery>;
 }
+
+const SESSION_WAKE_HEADER =
+  '[AhaStation system wake-up — not a message from the user. The user has not replied; do not treat this as their confirmation.]';
 
 export interface OrchestrationServiceDependencies {
   store: OrchestrationStore;
@@ -466,6 +474,7 @@ export class OrchestrationService {
         const rendered = msgs.map((m) => formatBoardPostForAgent(m)).join('\n\n');
         return rendered.length <= 1000 ? rendered : null;
       },
+      turnTarget: (id) => this.sessionWakeTarget(id),
       cliCommand: this.cliCommand,
     });
 
@@ -630,11 +639,29 @@ export class OrchestrationService {
     this.proposals.cancelForPane(sessionId);
     this.waiters.cancel(sessionId);
     this.waiters.cancelConsumer(sessionId);
+    this.pointerDelivery.retirePane(sessionId);
     this.emitChanged('pane-mode:changed');
   }
 
-  private sessionCoordinator(id: string): { cwd: string; provider: string; active: boolean } | null {
+  /** An orchestrating session finished a turn: deliver what arrived for it meanwhile. */
+  sessionCoordinatorIdle(sessionId: string): void {
+    if (this.isActiveSessionCoordinator(sessionId)) this.pointerDelivery.scheduleRedriveForPane(sessionId);
+  }
+
+  private sessionCoordinator(id: string): ReturnType<OrchestrationSessionCoordinators['get']> {
     return AGENT_SESSION_ID.test(id) ? this.sessionCoordinators?.get(id) ?? null : null;
+  }
+
+  private sessionWakeTarget(id: string): { idle: boolean; startTurn: (prompt: string) => Promise<TurnDelivery> } | null {
+    if (!AGENT_SESSION_ID.test(id)) return null;
+    const wake = this.sessionCoordinators?.wake?.bind(this.sessionCoordinators);
+    const state = this.sessionCoordinator(id);
+    return {
+      idle: Boolean(wake && state?.active && state.idle),
+      startTurn: (prompt) => wake
+        ? wake(id, `${SESSION_WAKE_HEADER}\n\n${prompt}`)
+        : Promise.resolve({ status: 'not_accepted', reason: 'Agent sessions cannot be woken' }),
+    };
   }
 
   private isActiveSessionCoordinator(id: string): boolean {
@@ -9231,8 +9258,10 @@ export class OrchestrationService {
 
       const coordPaneId = run.coordinatorPaneId;
       const coordStatus = coordPaneId ? this.agentStatusStore.get(coordPaneId) : null;
-      const coordinatorIdle =
-        !coordStatus || coordStatus.state === 'idle' || coordStatus.state === 'done';
+      const coordSession = coordPaneId ? this.sessionCoordinator(coordPaneId) : null;
+      const coordinatorIdle = coordSession?.active
+        ? coordSession.idle === true
+        : !coordStatus || coordStatus.state === 'idle' || coordStatus.state === 'done';
       const coordinatorHasWaiter = Boolean(
         (coordPaneId &&
           (this.waiters.hasActiveWaiterFor(coordPaneId) ||
