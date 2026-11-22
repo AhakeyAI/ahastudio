@@ -33,6 +33,7 @@ import {
 } from './orchestration-messaging.js';
 import { OrchestrationStore } from './orchestration-store.js';
 import {
+  DEFAULT_MAX_ACTIVE_WORKERS,
   DEFAULT_NESTED_WORKER_MAX_DEPTH,
   ORCHESTRATION_MESSAGE_WAIT_DEFAULT_TIMEOUT_MS,
   OrchestrationError,
@@ -311,6 +312,8 @@ export interface OrchestrationServiceDependencies {
   cliCommand?: string;
   briefsDir?: string | null;
   maxDepth?: number;
+  /** Simultaneously active workers across all runs (default 8). */
+  maxActiveWorkers?: number;
   turnStartObserveTimeoutMs?: number;
   startConfirmationTimeoutMs?: number;
   heartbeatTimeoutMs?: number;
@@ -414,6 +417,7 @@ export class OrchestrationService {
     this.cliCommand = deps.cliCommand ?? 'aha';
     if (deps.briefsDir?.trim()) this.store.configureBriefsDir(deps.briefsDir.trim());
     this.maxDepth = deps.maxDepth ?? DEFAULT_NESTED_WORKER_MAX_DEPTH;
+    this.store.configureMaxActiveDispatches(deps.maxActiveWorkers ?? DEFAULT_MAX_ACTIVE_WORKERS);
     this.turnStartObserveTimeoutMs = deps.turnStartObserveTimeoutMs ?? 0;
     this.startConfirmationTimeoutMs = deps.startConfirmationTimeoutMs ?? 60_000;
     this.heartbeatTimeoutMs = deps.heartbeatTimeoutMs ?? 300_000;
@@ -1367,9 +1371,9 @@ export class OrchestrationService {
     return this.reconcileTargetReviewBatch(reviewDispatchId, opts);
   }
 
-  private failReviewTaskIfReady(taskId: string): void {
-    // A review task only makes sense inside its detached review worktree; left `ready`, the
-    // coordinator loop would re-dispatch it as ordinary work.
+  private failTaskIfReady(taskId: string): void {
+    // A task created for a worker that never started has nobody to run it; left `ready`, the
+    // coordinator loop would later dispatch it as ordinary work (and a review outside its worktree).
     if (this.store.getTask(taskId)?.status === 'ready') {
       this.store.updateTaskStatus(taskId, 'failed');
     }
@@ -1388,7 +1392,7 @@ export class OrchestrationService {
         continue;
       }
       this.store.updateDispatchReviewState(dispatch.id, { reviewStatus: 'rejected' });
-      this.failReviewTaskIfReady(dispatch.taskId);
+      this.failTaskIfReady(dispatch.taskId);
       this.reconcileAnyReviewBatch(dispatch.id, {
         failedReason: `Reviewer exited or timed out (${dispatch.lastFailureReason || dispatch.status})`,
       });
@@ -1621,13 +1625,62 @@ export class OrchestrationService {
     }
   }
 
-  assertNotActiveWorker(callerPaneId: string): void {
-    if (this.store.getActiveDispatchesForPane(callerPaneId).length > 0) {
+  /**
+   * Depth of the lineage a caller acts in: its active dispatch, or the latest dispatch it ran in a
+   * run that is still open. Reporting done must not turn a worker pane back into a coordinator.
+   */
+  private resolveCallerDepth(callerPaneId: string): number {
+    const active = this.store.getActiveDispatchForIdentity(callerPaneId, callerPaneId);
+    if (active) return active.depth;
+    const latest = this.store
+      .listDispatches()
+      .filter((d) => d.assigneePaneId === callerPaneId || d.assigneeHandle === callerPaneId)
+      .at(-1);
+    return latest && this.store.getRun(latest.runId)?.status === 'active' ? latest.depth : 0;
+  }
+
+  private assertCanDelegateFrom(callerPaneId: string): void {
+    const nextDepth = this.resolveCallerDepth(callerPaneId) + 1;
+    if (nextDepth > this.maxDepth) {
       throw new OrchestrationError(
         'operation_rejected',
-        'An active worker cannot reset global orchestration state.'
+        `Nested worker dispatch depth ${nextDepth} exceeds max depth ${this.maxDepth}.`,
+        { depth: nextDepth, maxDepth: this.maxDepth }
       );
     }
+  }
+
+  /** Whether a pane has ever been the assignee of a dispatch; such panes act with worker rights. */
+  private hasWorkerHistory(callerPaneId: string): boolean {
+    return this.store
+      .listDispatches()
+      .some((d) => d.assigneePaneId === callerPaneId || d.assigneeHandle === callerPaneId);
+  }
+
+  assertNotActiveWorker(callerPaneId: string): void {
+    if (this.hasWorkerHistory(callerPaneId)) {
+      throw new OrchestrationError(
+        'operation_rejected',
+        'A worker terminal cannot reset global orchestration state.'
+      );
+    }
+  }
+
+  /** Coordinator-loop control over HTTP: never from a worker, and stop/tick only by the run's coordinator. */
+  assertCanControlCoordinatorLoop(callerPaneId: string, runId?: string): void {
+    if (this.hasWorkerHistory(callerPaneId)) {
+      throw new OrchestrationError('operation_rejected', 'A worker terminal cannot control the coordinator loop.');
+    }
+    if (!runId) return;
+    const run = this.store.requireRun(runId);
+    if (run.coordinatorPaneId !== callerPaneId && run.coordinatorHandle !== callerPaneId) {
+      throw new OrchestrationError('operation_rejected', 'Only this run’s coordinator may control its coordinator loop.');
+    }
+  }
+
+  /** Run the active (or given) coordinator loop belongs to, for authorization. */
+  coordinatorLoopRunId(runId?: string): string | undefined {
+    return runId?.trim() || this.store.getActiveCoordinatorRun()?.runId;
   }
 
   isCoordinatorTerminal(ptyId: string): boolean {
@@ -1958,6 +2011,7 @@ export class OrchestrationService {
       creator: from,
       creatorRunId: task.runId,
       creatorDispatchId: callerDispatch?.id ?? null,
+      parentDepth: this.resolveCallerDepth(from),
       parentPaneId,
       cliId: paneStatus?.agentId ?? null,
       ownsPane: false,
@@ -4371,14 +4425,8 @@ export class OrchestrationService {
     const from = input.from?.trim() || 'coordinator';
     if (CODEX_WORKER_ID.test(from)) throw new OrchestrationError('operation_rejected', 'Headless read-only Workers cannot start other Workers.');
     const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
-    const nextDepth = this.store.resolveChildDispatchDepth(callerDispatch?.id ?? null);
-    if (nextDepth > this.maxDepth) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        `Nested worker dispatch depth ${nextDepth} exceeds max depth ${this.maxDepth}.`,
-        { depth: nextDepth, maxDepth: this.maxDepth }
-      );
-    }
+    this.assertCanDelegateFrom(from);
+    this.store.assertDispatchCapacity();
 
     const reusingTerminal = input.terminal?.trim() || undefined;
     const isReviewRunRequest =
@@ -4498,6 +4546,8 @@ export class OrchestrationService {
     // Resolve or create Run and Task.
     const normalizedInputContext = this.redactTaskContext(normalizeTaskContext(input));
     let task: OrchestrationTaskRecord;
+    // Only a task made by this call may be failed when its worker never starts.
+    let createdTask = false;
     let run: OrchestrationRunRecord;
     let reviewTarget: OrchestrationDispatchRecord | null = null;
     let reviewRunTarget: OrchestrationRunRecord | null = null;
@@ -4648,7 +4698,9 @@ export class OrchestrationService {
       reviewDetachedWorktree = { worktreePath: detached.worktreePath, mainRepoRoot };
 
       const reviewLabel = input.role?.trim() || input.displayName?.trim() || `review-${targetRole}`;
+      createdTask = true;
       task = this.store.createTask({
+        singleShot: true,
         runId: run.id,
         spec: builtReview.taskSpec,
         taskContext: builtReview.taskContext,
@@ -4777,7 +4829,9 @@ export class OrchestrationService {
       };
 
       const reviewLabel = input.role?.trim() || input.displayName?.trim() || 'review-run';
+      createdTask = true;
       task = this.store.createTask({
+        singleShot: true,
         runId: run.id,
         spec: builtRunReview.taskSpec,
         taskContext: builtRunReview.taskContext,
@@ -4798,7 +4852,9 @@ export class OrchestrationService {
       const priorTask = this.store.requireTask(prior.taskId);
       if (priorTask.status === 'completed') {
         const retryContext = mergeTaskContext(priorTask.taskContext, normalizedInputContext);
+        createdTask = true;
         task = this.store.createTask({
+          singleShot: true,
           runId: run.id,
           spec: input.spec?.trim() || priorTask.spec,
           ...(retryContext ? { taskContext: retryContext } : {}),
@@ -4846,7 +4902,9 @@ export class OrchestrationService {
           paneId: callerPane,
         }).run;
       }
+      createdTask = true;
       task = this.store.createTask({
+        singleShot: true,
         runId: run.id,
         spec: input.spec.trim(),
         ...(normalizedInputContext ? { taskContext: normalizedInputContext } : {}),
@@ -4955,7 +5013,7 @@ export class OrchestrationService {
         if (placement.ownsWorktree && placement.worktreePath) {
           await this.rollbackWorkerResources(undefined, placement.worktreePath);
         }
-        if (reviewDetachedWorktree) this.failReviewTaskIfReady(task.id);
+        if (createdTask) this.failTaskIfReady(task.id);
         if (err instanceof OrchestrationError) {
           if (err.code === 'terminal_unavailable' && !err.data?.taskId) {
             throw new OrchestrationError(err.code, err.message, {
@@ -4986,6 +5044,7 @@ export class OrchestrationService {
         creator: from,
         creatorRunId: run.id,
         creatorDispatchId: callerDispatch?.id ?? null,
+        parentDepth: this.resolveCallerDepth(from),
         parentPaneId,
         worktreePath: placement.worktreePath,
         branch: placement.branch,
@@ -5043,7 +5102,7 @@ export class OrchestrationService {
         ownsPane ? ptyId ?? undefined : undefined,
         placement.ownsWorktree ? placement.worktreePath : null,
       );
-      if (reviewDetachedWorktree) this.failReviewTaskIfReady(task.id);
+      if (createdTask) this.failTaskIfReady(task.id);
       throw err;
     }
 
@@ -5136,7 +5195,7 @@ export class OrchestrationService {
       this.store.failDispatch(ctx.id, reason);
       if (ctx.reviewOfDispatchId || ctx.reviewOfRunId) {
         this.store.updateDispatchReviewState(ctx.id, { reviewStatus: 'rejected' });
-        this.failReviewTaskIfReady(task.id);
+        this.failTaskIfReady(task.id);
         this.reconcileAnyReviewBatch(ctx.id, {
           overrideVerdict: 'reject',
           failedReason: 'Reviewer prompt delivery failed',
@@ -5490,6 +5549,7 @@ export class OrchestrationService {
       ? ['### Follow-up Instructions', followUpInstructions, '### Original Task', originalTask.spec].join('\n\n')
       : followUpInstructions;
     const followUpTask = this.store.createTask({
+      singleShot: true,
       runId: settledDispatch.runId,
       spec: followUpSpec,
       taskContext: prevTask?.taskContext ?? originalTask?.taskContext,
@@ -7538,15 +7598,7 @@ export class OrchestrationService {
     }
     let normalizedTaskContext = this.redactTaskContext(normalizeTaskContext(input));
 
-    const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
-    const nextDepth = this.store.resolveChildDispatchDepth(callerDispatch?.id ?? null);
-    if (nextDepth > this.maxDepth) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        `Nested worker dispatch depth ${nextDepth} exceeds max depth ${this.maxDepth}.`,
-        { depth: nextDepth, maxDepth: this.maxDepth }
-      );
-    }
+    this.assertCanDelegateFrom(from);
     const defaultReviewRole = reviewTargetDispatch
       ? `review-${reviewTargetRole.replace(/^@+/, '')}`
       : reviewRunTarget
@@ -8095,7 +8147,7 @@ export class OrchestrationService {
     const role: 'worker' | 'coordinator' = activeDispatch || CODEX_WORKER_ID.test(cleanCaller) ? 'worker' : 'coordinator';
     const orchestrationMode = this.isPaneOrchestrationMode(cleanCaller);
     const confirmMode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
-    const canDelegate = !CODEX_WORKER_ID.test(cleanCaller) && (activeDispatch ? activeDispatch.depth < this.maxDepth : true);
+    const canDelegate = !CODEX_WORKER_ID.test(cleanCaller) && this.resolveCallerDepth(cleanCaller) < this.maxDepth;
     const roster = this.listCodingAgents(cleanCaller);
     const managed = this.listManagedDispatchesForCaller(cleanCaller);
     const workers: OrchestrationMcpWorkerBrief[] = managed.map((d) => {

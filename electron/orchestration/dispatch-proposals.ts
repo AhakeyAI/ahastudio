@@ -10,7 +10,6 @@ import { normalizeWorkerCliId } from './worker-launch-catalog.js';
 
 export const DEFAULT_PROPOSAL_HOLD_TIMEOUT_MS = 120_000;
 export const DEFAULT_PROPOSAL_TTL_MS = 10 * 60_000;
-export const DEFAULT_USER_TURN_DEDUPE_WINDOW_MS = 1_500;
 
 export type UserTurnSource = 'hook' | 'pty';
 
@@ -54,14 +53,12 @@ export interface DispatchProposalManagerOptions {
   onChanged?: (reason: string, runId?: string) => void;
   holdTimeoutMs?: number;
   proposalTtlMs?: number;
-  turnDedupeWindowMs?: number;
   now?: () => number;
 }
 
 interface PaneTurnState {
   userTurn: number;
   lastTurnAt: number;
-  lastUnpairedSource: UserTurnSource | null;
   chatProposals: Map<string, ChatProposal>;
 }
 
@@ -89,7 +86,6 @@ export class DispatchProposalManager {
   private readonly onChanged?: (reason: string, runId?: string) => void;
   private readonly holdTimeoutMs: number;
   private readonly proposalTtlMs: number;
-  private readonly turnDedupeWindowMs: number;
   private readonly clock: () => number;
 
   constructor(options: DispatchProposalManagerOptions = {}) {
@@ -102,10 +98,6 @@ export class DispatchProposalManager {
       1_000,
       Math.floor(options.proposalTtlMs ?? DEFAULT_PROPOSAL_TTL_MS)
     );
-    this.turnDedupeWindowMs = Math.max(
-      0,
-      Math.floor(options.turnDedupeWindowMs ?? DEFAULT_USER_TURN_DEDUPE_WINDOW_MS)
-    );
     this.clock = options.now ?? (() => Date.now());
   }
 
@@ -115,7 +107,6 @@ export class DispatchProposalManager {
       state = {
         userTurn: 0,
         lastTurnAt: Number.NEGATIVE_INFINITY,
-        lastUnpairedSource: null,
         chatProposals: new Map(),
       };
       this.paneStates.set(ptyId, state);
@@ -135,30 +126,21 @@ export class DispatchProposalManager {
   }
 
   /**
-   * Advance the user-turn counter for a pane while deduplicating a paired PTY Enter + hook
-   * UserPromptSubmit/BeforeAgent/PreInvocation pair arriving within the dedupe window.
+   * Advance the user-turn counter for a pane. Only Enter typed in the renderer ('pty') counts:
+   * prompt-submit hooks also fire for text AhaStation itself types into the terminal (mailbox
+   * pointers, stall nudges, `aha terminal send`), so a hook alone never proves a person answered.
    */
   recordUserTurn(ptyId: string, source: UserTurnSource = 'hook'): number {
     const cleanId = ptyId.trim();
     if (!cleanId) return 0;
-    const now = this.clock();
     const state = this.getOrCreatePaneState(cleanId);
-
-    if (
-      state.lastUnpairedSource !== null &&
-      state.lastUnpairedSource !== source &&
-      now - state.lastTurnAt <= this.turnDedupeWindowMs
-    ) {
-      state.lastUnpairedSource = null;
-      return state.userTurn;
-    }
+    if (source !== 'pty') return state.userTurn;
 
     state.userTurn += 1;
     for (const [id, entry] of state.chatProposals) {
       if (entry.turn < state.userTurn - 1) state.chatProposals.delete(id);
     }
-    state.lastTurnAt = now;
-    state.lastUnpairedSource = source;
+    state.lastTurnAt = this.clock();
     return state.userTurn;
   }
 
@@ -212,7 +194,6 @@ export class DispatchProposalManager {
       }
     }
     state.chatProposals.set(proposal.id, { proposal, turn: state.userTurn, createdAt: now });
-    state.lastUnpairedSource = null;
     return { allowed: false, proposal, changed: confirmed && Boolean(prior || proposalId || eligible.some((entry) => sameRole(entry.proposal))) };
   }
 

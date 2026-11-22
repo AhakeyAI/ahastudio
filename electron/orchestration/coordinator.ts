@@ -1,6 +1,6 @@
 import type { CoordinatorRuntime, WorkerPaneCandidate } from './coordinator-runtime.js';
 import { reconcileLifecycleMessage } from './lifecycle-reconciliation.js';
-import { ACTIVE_DISPATCH_STATUSES } from './orchestration-lifecycle-graph.js';
+import { ACTIVE_DISPATCH_STATUSES, isBlockedByFailedDependency, isTaskSettled } from './orchestration-lifecycle-graph.js';
 import type { OrchestrationStore } from './orchestration-store.js';
 import {
   AGENT_PROMPT_STALLED_ERROR,
@@ -29,8 +29,7 @@ export function evaluateDagConvergence(
   if (tasks.length === 0) {
     return 'empty';
   }
-  const allTerminal = tasks.every((t) => t.status === 'completed' || t.status === 'failed');
-  return allTerminal ? 'all-done' : 'active';
+  return tasks.every(isTaskSettled) ? 'all-done' : 'active';
 }
 
 function parseJsonObject(raw: string | null): Record<string, unknown> | null {
@@ -334,7 +333,7 @@ export class Coordinator {
         if (this.stopRequested) break;
         if (converged) {
           const tasks = this.store.listTasks({ runId: this.options.runId });
-          const hasFailed = tasks.some((t) => t.status === 'failed');
+          const hasFailed = tasks.some((t) => t.status === 'failed' || isBlockedByFailedDependency(t));
           const terminalStatus = hasFailed ? 'failed' : 'completed';
           const endedAt = new Date(this.clock()).toISOString();
           this.store.updateCoordinatorRun(coordinatorRunId, {
@@ -493,7 +492,10 @@ export class Coordinator {
     const activeDispatches = this.store
       .listDispatches({ runId })
       .filter((d) => ACTIVE_DISPATCH_STATUSES.has(d.status));
-    let availableSlots = this.maxConcurrent - activeDispatches.length;
+    let availableSlots = Math.min(
+      this.maxConcurrent - activeDispatches.length,
+      this.store.getRemainingDispatchCapacity(),
+    );
     if (availableSlots <= 0) {
       return;
     }
