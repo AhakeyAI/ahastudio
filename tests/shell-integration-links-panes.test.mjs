@@ -649,10 +649,15 @@ test('StageWindowStore splitPane inherits live OSC 7 CWD and closePane closes on
   const { terminalSessionStore } = await import(storeUrl);
   const { stageWindowStore } = await import(stageUrl);
 
+  const isWin = process.platform === 'win32';
+  const initialCwd = isWin ? 'C:\\initial' : '/initial';
+  const liveOsc7Uri = isWin ? 'file:///C:/live/subdir' : 'file:///live/subdir';
+  const expectedLiveCwd = isWin ? 'C:\\live\\subdir' : '/live/subdir';
+
   await stageWindowStore.createWindow('terminal', {
     localCliId: 'shell',
     shellId: 'pwsh',
-    cwd: 'C:\\initial',
+    cwd: initialCwd,
     title: 'PowerShell',
   });
   const win = stageWindowStore.getSnapshot().windows.at(-1);
@@ -665,7 +670,7 @@ test('StageWindowStore splitPane inherits live OSC 7 CWD and closePane closes on
     attach: async () => ({
       ok: true,
       ptyId: `local-${win.id}`,
-      replay: Buffer.from('\x1b]7;file:///C:/live/subdir\x07').toString('base64'),
+      replay: Buffer.from(`\x1b]7;${liveOsc7Uri}\x07`).toString('base64'),
     }),
     input() {},
     resize() {},
@@ -677,12 +682,12 @@ test('StageWindowStore splitPane inherits live OSC 7 CWD and closePane closes on
   sessionA.mount(fakeHost);
   await sessionA.connection;
 
-  // Splitting pane A must inherit its live OSC 7 cwd (`C:\live\subdir`) instead of stale `C:\initial`.
+  // Splitting pane A must inherit its live OSC 7 cwd instead of stale initialCwd.
   const paneB = stageWindowStore.splitPane(win.id, win.id, 'horizontal');
   assert.ok(paneB);
   const afterSplit = stageWindowStore.getSnapshot().windows.find((w) => w.id === win.id);
   assert.equal(afterSplit.activeLeafId, paneB);
-  assert.equal(afterSplit.panes[paneB].cwd, 'C:\\live\\subdir');
+  assert.equal(afterSplit.panes[paneB].cwd, expectedLiveCwd);
 
   const sessionB = terminalSessionStore.acquire(paneB, {
     expectedPtyId: `local-${paneB}`,
