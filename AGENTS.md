@@ -12,6 +12,8 @@ Tailwind. UI text is Chinese; code comments are English.
 | `npm run typecheck` | Renderer (`tsconfig.json`) and main process (`tsconfig.electron.json`) |
 | `npm run build:electron` | Compile main process to `dist-electron/` (tests import from here) |
 | `npx vite build` | Renderer production build only |
+| `npm run test:fast` | `build:electron` + all `tests/*.test.mjs` except the long adversarial-review E2E |
+| `npm run test:e2e` | `build:electron` + `tests/orchestration-adversarial-review.test.mjs` (12–15 min) |
 | `npm test` | `build:electron` + every `tests/*.test.mjs` (includes the long E2E below) |
 
 Run a subset after `npm run build:electron`:
@@ -28,12 +30,15 @@ node --import ./tests/register-electron-stub.mjs --test --test-concurrency=2 tes
 
 ## Environment gotchas (Windows)
 
-- Install with `npm install`, not `npm ci`. npm 11 does not run unapproved install scripts, so a
-  clean `npm ci` leaves `node_modules/electron/dist/electron.exe` missing and Electron-based tests
-  fail with `ENOENT`. If it is missing (e.g. in a new worktree), copy `node_modules/electron/dist/`
-  and `path.txt` from a checkout with the same Electron version.
+- Electron 45 downloads its binary lazily instead of via a `postinstall` script, so a clean
+  `npm ci` or `npm install` leaves `node_modules/electron/dist/electron.exe` missing until you run
+  `node node_modules/electron/install.js` (or copy `node_modules/electron/dist/` and `path.txt`
+  from another checkout with the same Electron version).
 - If the shell has `ELECTRON_RUN_AS_NODE=1`, unset it before launching `electron.exe` directly.
-- No CI is configured; run typecheck and the relevant tests locally before merging.
+- GitHub Actions CI/CD lives in `.github/workflows/` (`ci.yml` for PR/push typecheck, build, and
+  3-OS fast tests; `e2e-adversarial-review.yml` for `main`/daily/manual real-Git E2E; `release.yml`
+  for `v*` tag packaging across Windows NSIS, macOS arm64 DMG, and Linux AppImage). Run typecheck
+  and relevant tests locally before pushing.
 
 ## Git workflow
 

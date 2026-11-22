@@ -1,0 +1,64 @@
+name: E2E (Adversarial Review)
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+  schedule:
+    # Run daily at 02:30 UTC (10:30 Asia/Shanghai)
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Target runner OS matrix
+        type: choice
+        default: ubuntu-and-windows
+        options:
+          - ubuntu-and-windows
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+          - all
+
+concurrency:
+  group: e2e-adversarial-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24'
+
+jobs:
+  adversarial-review-e2e:
+    name: Real-Git E2E (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.os == 'all' && '["ubuntu-latest","macos-latest","windows-latest"]' || inputs.os == 'ubuntu-latest' && '["ubuntu-latest"]' || inputs.os == 'windows-latest' && '["windows-latest"]' || inputs.os == 'macos-latest' && '["macos-latest"]' || '["ubuntu-latest","windows-latest"]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Configure git defaults for test repos
+        run: |
+          git config --global user.name "AhaStudio CI"
+          git config --global user.email "ci@ahastudio.local"
+          git config --global init.defaultBranch main
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run adversarial-review E2E suite
+        run: npm run test:e2e

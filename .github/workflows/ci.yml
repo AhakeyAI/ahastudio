@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24'
+
+jobs:
+  typecheck-and-build:
+    name: Typecheck & Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VIBE_MEET_CACHE_DIR: ${{ runner.temp }}/vibe-meet-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Cache speaker model asset
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VIBE_MEET_CACHE_DIR }}
+          key: speaker-model-campplus-v1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck (renderer & electron main)
+        run: npm run typecheck
+
+      - name: Production build (Vite & Electron)
+        run: npm run build
+
+      - name: Verify build outputs
+        run: |
+          node -e "
+            const fs = require('node:fs');
+            const required = [
+              'dist/index.html',
+              'dist-electron/main.js',
+              'dist-electron/preload.cjs',
+              'dist-electron/agent/agent-hook-relay.cjs',
+              'dist-electron/orchestration/aha-mcp-server.cjs',
+              'dist-electron/orchestration/aha-orchestration-cli.cjs',
+              'dist-electron/terminal-daemon/windows-pipe-acl.ps1',
+            ];
+            const missing = required.filter((p) => !fs.existsSync(p));
+            if (missing.length > 0) {
+              console.error('Missing build outputs:', missing);
+              process.exit(1);
+            }
+            console.log('Verified build outputs:', required.length);
+          "
+
+  test:
+    name: Fast Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    env:
+      electron_config_cache: ${{ runner.temp }}/electron-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Configure git defaults for test repos
+        run: |
+          git config --global user.name "AhaStudio CI"
+          git config --global user.email "ci@ahastudio.local"
+          git config --global init.defaultBranch main
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Electron binary download (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.electron_config_cache }}
+          key: electron-bin-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            electron-bin-${{ runner.os }}-
+
+      - name: Ensure Electron binary is present for Windows daemon tests
+        if: runner.os == 'Windows'
+        run: node node_modules/electron/install.js
+
+      - name: Run fast test suite
+        run: npm run test:fast
