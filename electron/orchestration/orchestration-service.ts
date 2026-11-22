@@ -4735,7 +4735,7 @@ export class OrchestrationService {
         });
 
     const usePilot = !reusingTerminal && launchConfig.cliId === 'codex' &&
-      (input.readOnly === true || Boolean(reviewTarget)) && this.codexPilot?.enabled();
+      (input.readOnly === true || Boolean(reviewTarget || reviewRunTarget)) && this.codexPilot?.enabled();
     const pilot = usePilot
       ? await this.openCodexWorker(placement.cwd ?? process.cwd(), launchConfig.model)
       : null;
@@ -5145,9 +5145,9 @@ export class OrchestrationService {
     this.waiters.cancel(`dispatch:${dispatch.id}`);
     this.waiters.notifyPrefix(`question:${dispatch.id}:`, 'status');
     this.store.cleanupDispatchBrief(dispatch.id);
-    if (dispatch.reviewOfDispatchId) {
+    if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
       this.store.updateDispatchReviewState(dispatch.id, { reviewStatus: 'rejected' });
-      this.reconcileTargetReviewBatch(dispatch.id, { overrideVerdict: 'reject', failedReason: reason });
+      this.reconcileAnyReviewBatch(dispatch.id, { overrideVerdict: 'reject', failedReason: reason });
     }
   }
 
