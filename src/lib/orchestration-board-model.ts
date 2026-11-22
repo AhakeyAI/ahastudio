@@ -121,6 +121,8 @@ export interface BoardViewModel {
   pendingProposals: OrchestrationDispatchProposal[];
   attentionCount: number;
   durationLabel: string;
+  /** Set when the focused Agent session is a Coordinator with no run of its own yet. */
+  focusedSessionCoordinator: { provider: string; state: SessionCoordinatorState } | null;
 }
 
 export interface BoardGraphNode {
@@ -388,7 +390,7 @@ function runStatusDisplayLabel(status: OrchestrationRunRecord['status']): string
 
 function pickTargetRun(
   snapshot: OrchestrationSnapshot,
-  opts: { runId?: string | null; activePtyId?: string | null },
+  opts: { runId?: string | null; activePtyId?: string | null; sessionFocus?: boolean },
 ): OrchestrationRunRecord | null {
   const sorted = sortRuns(snapshot.runs);
   if (sorted.length === 0) return null;
@@ -434,6 +436,10 @@ function pickTargetRun(
       const activeForPane = findBoundRunForPty(opts.activePtyId, activeRuns);
       if (activeForPane) return activeForPane;
     }
+    if (opts.sessionFocus) {
+      // A focused session Coordinator shows only its own runs, never an unrelated one.
+      return opts.activePtyId ? findBoundRunForPty(opts.activePtyId, sorted) : null;
+    }
     const activeCoordRunId = snapshot.activeCoordinatorRun?.runId;
     if (activeCoordRunId) {
       const found = activeRuns.find((r) => r.id === activeCoordRunId);
@@ -446,6 +452,7 @@ function pickTargetRun(
     const historicalForPane = findBoundRunForPty(opts.activePtyId, sorted);
     if (historicalForPane) return historicalForPane;
   }
+  if (opts.sessionFocus) return null;
   const activeCoordRunId = snapshot.activeCoordinatorRun?.runId;
   if (activeCoordRunId) {
     const found = sorted.find((r) => r.id === activeCoordRunId);
@@ -478,7 +485,13 @@ export function buildBoardViewModel(
 ): BoardViewModel {
   const runs = sortRuns(snapshot.runs);
   const hasAnyActiveRun = runs.some((r) => r.status === 'active');
-  const run = pickTargetRun(snapshot, opts);
+  const focusedSessionCoordinator =
+    (opts.activePtyId ? opts.sessionCoordinators?.get(opts.activePtyId) : undefined) ?? null;
+  const run = pickTargetRun(snapshot, {
+    runId: opts.runId,
+    activePtyId: opts.activePtyId,
+    sessionFocus: Boolean(focusedSessionCoordinator),
+  });
   const pendingProposalsAll = (snapshot.pendingProposals ?? []).filter(
     (p) => p.status === 'pending',
   );
@@ -505,6 +518,7 @@ export function buildBoardViewModel(
       pendingProposals: pendingProposalsAll,
       attentionCount: pendingProposalsAll.length,
       durationLabel: '0 posts',
+      focusedSessionCoordinator,
     };
   }
 
@@ -898,6 +912,7 @@ export function buildBoardViewModel(
     pendingProposals,
     attentionCount,
     durationLabel: formatPostsDurationLabel(posts, run.createdAt),
+    focusedSessionCoordinator: null,
   };
 }
 

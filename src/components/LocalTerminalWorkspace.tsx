@@ -153,6 +153,7 @@ export function LocalTerminalWorkspace({
     orchestrationClient.getSnapshot,
   );
   const agents = useAgentStatuses();
+  const agentSessions = useSyncExternalStore(agentSessionClient.subscribe, agentSessionClient.getSnapshot);
   const fontSize = terminalSessionStore.getFontSize();
   const appearance = terminalSessionStore.getAppearance();
   const appearancePreference = terminalSessionStore.getAppearancePreference();
@@ -233,6 +234,15 @@ export function LocalTerminalWorkspace({
         status,
       };
     });
+  });
+
+  // Orchestrating Agent sessions in this folder are workspace Coordinators, not prompt targets.
+  const sessionTargets = folderWindows.flatMap((win) => {
+    if (win.type !== 'agent-session' || !win.workerId) return [];
+    const session = agentSessions.find((item) => item.id === win.workerId);
+    return session?.orchestration
+      ? [{ sessionId: session.id, windowId: win.id, title: win.title, isActive: win.id === active?.id }]
+      : [];
   });
 
   const panelCwd = activePaneCwd ?? selectedCwd;
@@ -1145,7 +1155,9 @@ export function LocalTerminalWorkspace({
           onClose={() => toggleRightPanel(false)}
           worktreeActions={worktreeActions}
           agentTargets={agentTargets}
+          sessionTargets={sessionTargets}
           onAgentPromptSent={focusAgentTarget}
+          onFocusAgentSession={selectTab}
           activePtyId={activePtyId ?? (activeIsSession ? active?.workerId : undefined)}
         />
       )}

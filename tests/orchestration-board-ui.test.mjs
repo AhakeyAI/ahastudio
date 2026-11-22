@@ -654,3 +654,49 @@ test('a session Coordinator\'s run follows the focused session and its card show
     ['working', 'waiting', 'idle', 'working', 'offline', 'offline'],
   );
 });
+
+test('a focused session Coordinator with no run of its own shows no run instead of an unrelated fallback', () => {
+  const SESSION = 'agent-session-00000000-0000-0000-0000-00000000000a';
+  const coordinators = new Map([[SESSION, { provider: 'codex', state: 'idle' }]]);
+  const snapshot = {
+    ...view.EMPTY_SNAPSHOT,
+    runs: [
+      makeRun('run_live', { status: 'active' }),
+      makeRun('run_old', {
+        status: 'stopped',
+        coordinatorHandle: 'local-old-coord',
+        coordinatorPaneId: 'local-old-coord',
+        createdAt: isoAt(30),
+      }),
+    ],
+  };
+
+  const vm = board.buildBoardViewModel(snapshot, { activePtyId: SESSION, sessionCoordinators: coordinators });
+  assert.equal(vm.run, null);
+  assert.deepEqual(vm.focusedSessionCoordinator, { provider: 'codex', state: 'idle' });
+
+  // An explicit dropdown selection still opens that run.
+  const picked = board.buildBoardViewModel(snapshot, {
+    activePtyId: SESSION, runId: 'run_live', sessionCoordinators: coordinators,
+  });
+  assert.equal(picked.run.id, 'run_live');
+  assert.equal(picked.focusedSessionCoordinator, null);
+
+  // A run bound to the session, even historical, is still found.
+  const bound = board.buildBoardViewModel(
+    {
+      ...snapshot,
+      runs: [...snapshot.runs, makeRun('run_session', {
+        status: 'stopped', coordinatorHandle: SESSION, coordinatorPaneId: SESSION, createdAt: isoAt(20),
+      })],
+    },
+    { activePtyId: SESSION, sessionCoordinators: coordinators },
+  );
+  assert.equal(bound.run.id, 'run_session');
+  assert.equal(bound.focusedSessionCoordinator, null);
+
+  // A focused terminal pane keeps the generic fallback.
+  const pane = board.buildBoardViewModel(snapshot, { activePtyId: 'local-other', sessionCoordinators: coordinators });
+  assert.equal(pane.run.id, 'run_live');
+  assert.equal(pane.focusedSessionCoordinator, null);
+});

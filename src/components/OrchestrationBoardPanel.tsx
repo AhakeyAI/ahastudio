@@ -90,6 +90,31 @@ function isLongPost(body: string): boolean {
   return body.length > 420 || body.split(/\r?\n/).length > 6;
 }
 
+type LiveWorkspaceAgentItem =
+  | {
+      kind: 'pane';
+      target: AgentPromptTarget;
+      ptyId: string;
+      label: string;
+      cliId: string | null;
+      tone: string;
+      stageLabel: string;
+      detail: string;
+      isOrchestrationMode: boolean;
+      isActive: boolean;
+    }
+  | {
+      kind: 'session';
+      sessionId: string;
+      windowId: string;
+      label: string;
+      cliId: string;
+      tone: string;
+      stageLabel: string;
+      detail: string;
+      isActive: boolean;
+    };
+
 function renderAvatarContent(role: string, cliId: string | null) {
   if (cliId) return <TerminalProfileIcon id={cliId} size={14} />;
   const lower = role.toLowerCase();
@@ -101,12 +126,17 @@ function renderAvatarContent(role: string, cliId: string | null) {
 export function OrchestrationBoardPanel({
   activePtyId,
   agentTargets = [],
+  sessionTargets = [],
   onFocusAgentTarget,
+  onFocusAgentSession,
   onNotify,
 }: {
   activePtyId?: string;
   agentTargets?: AgentPromptTarget[];
+  /** Orchestrating Agent sessions open in this workspace folder (no PTY, not prompt targets). */
+  sessionTargets?: { sessionId: string; windowId: string; title: string; isActive: boolean }[];
   onFocusAgentTarget?: (target: AgentPromptTarget) => void;
+  onFocusAgentSession?: (windowId: string) => void;
   onNotify?: (message: string) => void;
 }) {
   const snapshot = useSyncExternalStore(
@@ -878,7 +908,7 @@ export function OrchestrationBoardPanel({
   );
 
   // Live open Agent CLI terminals in the current workspace, synced with agentStatusClient & orchestration mode.
-  const liveWorkspaceAgents = useMemo(() => {
+  const liveWorkspaceAgents: LiveWorkspaceAgentItem[] = useMemo(() => {
     const runPaneIds = new Set<string>();
     if (model.isLive) {
       if (model.coordinator?.ptyId) runPaneIds.add(model.coordinator.ptyId);
@@ -886,7 +916,7 @@ export function OrchestrationBoardPanel({
         if (m.ptyId && !m.released) runPaneIds.add(m.ptyId);
       }
     }
-    return agentTargets
+    const panes = agentTargets
       .filter((target) => target.isAgent && !runPaneIds.has(target.ptyId))
       .map((target) => {
         const liveStatus = agents.get(target.ptyId) ?? target.status ?? null;
@@ -904,6 +934,7 @@ export function OrchestrationBoardPanel({
         const stageLabel = liveStatus ? agentStatusLabel(liveStatus) : '空闲';
         const detail = liveStatus ? agentStatusDetail(liveStatus) : '';
         return {
+          kind: 'pane' as const,
           target,
           ptyId: target.ptyId,
           label: target.label,
@@ -915,7 +946,31 @@ export function OrchestrationBoardPanel({
           isActive: target.isActive,
         };
       });
-  }, [agentTargets, agents, agentStatusRev, model.isLive, model.coordinator?.ptyId, model.members, orchestrationModeSet]);
+    // Orchestrating Agent sessions in this folder appear alongside the terminals; they are the
+    // same kind of Coordinator the panes are, so a live run's coordinator is skipped identically.
+    const sessions = sessionTargets
+      .filter((target) => !runPaneIds.has(target.sessionId))
+      .map((target) => {
+        const coordinator = sessionCoordinators.get(target.sessionId);
+        const state = coordinator?.state ?? 'offline';
+        const tone =
+          state === 'working' ? 'accent' : state === 'waiting' ? 'warn' : state === 'idle' ? 'ok' : 'neutral';
+        const stageLabel =
+          state === 'working' ? '执行中' : state === 'waiting' ? '待回答' : state === 'idle' ? '在线' : '离线';
+        return {
+          kind: 'session' as const,
+          sessionId: target.sessionId,
+          windowId: target.windowId,
+          label: target.title,
+          cliId: coordinator?.provider ?? 'codex',
+          tone,
+          stageLabel,
+          detail: '',
+          isActive: target.isActive,
+        };
+      });
+    return [...sessions, ...panes];
+  }, [agentTargets, sessionTargets, agents, agentStatusRev, model.isLive, model.coordinator?.ptyId, model.members, orchestrationModeSet, sessionCoordinators]);
 
   const filteredLiveAgents = useMemo(() => {
     const q = memberSearch.trim().toLowerCase();
@@ -931,45 +986,76 @@ export function OrchestrationBoardPanel({
   ) => (
     <div className="obp-live-section">
       {compactHeading && <div className="obp-team-heading">{compactHeading}</div>}
-      {items.map((item) => (
-        <div
-          key={item.ptyId}
-          className={`obp-member-card is-worker is-workspace-live ${item.isActive ? 'is-focused-pane' : ''}`}
-        >
-          <button
-            type="button"
-            className="obp-member-card-body"
-            onClick={() => onFocusAgentTarget?.(item.target)}
+      {items.map((item) =>
+        item.kind === 'session' ? (
+          <div
+            key={item.sessionId}
+            className={`obp-member-card is-worker is-workspace-live ${item.isActive ? 'is-focused-pane' : ''}`}
           >
-            <div className="obp-member-card-top">
-              <span className="obp-avatar-wrap">
-                <span className={`obp-avatar obp-avatar-c${roleColorIndex(item.cliId ?? item.label)}`}>
-                  {renderAvatarContent(item.label, item.cliId)}
-                </span>
-                <span className={`obp-status-dot tone-${item.tone}`} />
-              </span>
-              <div className="obp-member-title-col">
-                <div className="obp-member-name-row">
-                  <strong>{item.label}</strong>
-                  <span className={`obp-stage-pill tone-${item.tone}`}>{item.stageLabel}</span>
-                </div>
-                {item.detail && <p className="obp-member-live-activity">{item.detail}</p>}
-              </div>
-            </div>
-          </button>
-          <div className="obp-member-actions">
             <button
               type="button"
-              className={`obp-mode-chip ${item.isOrchestrationMode ? 'is-on' : ''}`}
-              title={item.isOrchestrationMode ? '点击关闭该终端编排模式' : '点击开启该终端编排模式'}
-              disabled={busyId === `mode:${item.ptyId}`}
-              onClick={() => void handleTogglePaneMode(item.ptyId, item.isOrchestrationMode)}
+              className="obp-member-card-body"
+              onClick={() => onFocusAgentSession?.(item.windowId)}
             >
-              {item.isOrchestrationMode ? '编排中' : '编排'}
+              <div className="obp-member-card-top">
+                <span className="obp-avatar-wrap">
+                  <span className={`obp-avatar obp-avatar-c${roleColorIndex(item.cliId ?? item.label)}`}>
+                    {renderAvatarContent(item.label, item.cliId)}
+                  </span>
+                  <span className={`obp-status-dot tone-${item.tone}`} />
+                </span>
+                <div className="obp-member-title-col">
+                  <div className="obp-member-name-row">
+                    <strong>{item.label}</strong>
+                    <span className={`obp-stage-pill tone-${item.tone}`}>{item.stageLabel}</span>
+                  </div>
+                </div>
+              </div>
             </button>
+            <div className="obp-member-actions">
+              <span className="obp-mode-chip is-on">协调者</span>
+            </div>
           </div>
-        </div>
-      ))}
+        ) : (
+          <div
+            key={item.ptyId}
+            className={`obp-member-card is-worker is-workspace-live ${item.isActive ? 'is-focused-pane' : ''}`}
+          >
+            <button
+              type="button"
+              className="obp-member-card-body"
+              onClick={() => onFocusAgentTarget?.(item.target)}
+            >
+              <div className="obp-member-card-top">
+                <span className="obp-avatar-wrap">
+                  <span className={`obp-avatar obp-avatar-c${roleColorIndex(item.cliId ?? item.label)}`}>
+                    {renderAvatarContent(item.label, item.cliId)}
+                  </span>
+                  <span className={`obp-status-dot tone-${item.tone}`} />
+                </span>
+                <div className="obp-member-title-col">
+                  <div className="obp-member-name-row">
+                    <strong>{item.label}</strong>
+                    <span className={`obp-stage-pill tone-${item.tone}`}>{item.stageLabel}</span>
+                  </div>
+                  {item.detail && <p className="obp-member-live-activity">{item.detail}</p>}
+                </div>
+              </div>
+            </button>
+            <div className="obp-member-actions">
+              <button
+                type="button"
+                className={`obp-mode-chip ${item.isOrchestrationMode ? 'is-on' : ''}`}
+                title={item.isOrchestrationMode ? '点击关闭该终端编排模式' : '点击开启该终端编排模式'}
+                disabled={busyId === `mode:${item.ptyId}`}
+                onClick={() => void handleTogglePaneMode(item.ptyId, item.isOrchestrationMode)}
+              >
+                {item.isOrchestrationMode ? '编排中' : '编排'}
+              </button>
+            </div>
+          </div>
+        ),
+      )}
     </div>
   );
 
@@ -979,10 +1065,16 @@ export function OrchestrationBoardPanel({
         <div className="obp-empty-wrap">
           <div className="wrp-empty obp-empty">
             <Network size={22} />
-            <p>暂无进行中的协作任务</p>
-            <small>
-              开启任一终端的「编排」模式（或按 {shortcutLabel}），即可自动派发多 Agent 协作
-            </small>
+            {model.focusedSessionCoordinator ? (
+              <p>此会话是协调者，还没有协作。发消息让它派发 Worker。</p>
+            ) : (
+              <>
+                <p>暂无进行中的协作任务</p>
+                <small>
+                  开启任一终端的「编排」模式（或按 {shortcutLabel}），即可自动派发多 Agent 协作
+                </small>
+              </>
+            )}
           </div>
           {liveWorkspaceAgents.length > 0 && (
             <div className="obp-members-list">

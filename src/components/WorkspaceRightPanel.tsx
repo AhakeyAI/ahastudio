@@ -82,7 +82,9 @@ export function WorkspaceRightPanel({
   onClose,
   worktreeActions,
   agentTargets,
+  sessionTargets,
   onAgentPromptSent,
+  onFocusAgentSession,
   activePtyId,
 }: {
   cwd: string | undefined;
@@ -97,7 +99,10 @@ export function WorkspaceRightPanel({
   worktreeActions: WorktreeHostActions;
   /** Terminal panes in the current project that can receive file/diff context. */
   agentTargets: AgentPromptTarget[];
+  /** Orchestrating Agent sessions open in this project folder. */
+  sessionTargets?: { sessionId: string; windowId: string; title: string; isActive: boolean }[];
   onAgentPromptSent: (target: AgentPromptTarget) => void;
+  onFocusAgentSession?: (windowId: string) => void;
   activePtyId?: string;
 }) {
   const { status, loading, token, refresh } = useGitStatus(cwd);
@@ -263,7 +268,9 @@ export function WorkspaceRightPanel({
       <OrchestrationBoardPanel
         activePtyId={activePtyId}
         agentTargets={agentTargets}
+        sessionTargets={sessionTargets}
         onFocusAgentTarget={onAgentPromptSent}
+        onFocusAgentSession={onFocusAgentSession}
         onNotify={onNotify}
       />
     );
