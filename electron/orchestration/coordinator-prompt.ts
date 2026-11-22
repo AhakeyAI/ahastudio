@@ -1,3 +1,10 @@
+/**
+ * First line of every system turn AhaStation starts in an orchestrating Agent session. The session
+ * view hides it (src/lib/worker-timeline-model.ts `splitSystemWake`) and labels the turn instead.
+ */
+export const SESSION_WAKE_HEADER =
+  '[AhaStation system wake-up — not a message from the user. The user has not replied; do not treat this as their confirmation.]';
+
 /** What the Coordinator prompt needs from the caller's MCP context. */
 export interface CoordinatorPromptContext {
   confirmMode: string;

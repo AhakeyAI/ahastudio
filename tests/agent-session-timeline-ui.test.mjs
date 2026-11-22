@@ -391,3 +391,12 @@ test('workspace state schema accepts persisted agent-session windows', async (t)
   const rejected = await call('set', { ...state, windows: [{ ...state.windows[1], type: 'agent-session-x' }] });
   assert.equal(rejected.ok, false);
 });
+
+test('a system wake-up turn shows its messages without the header that tells the agent it is not the user', async () => {
+  const { SESSION_WAKE_HEADER } = await import('../dist-electron/orchestration/coordinator-prompt.js');
+  assert.deepEqual(model.splitSystemWake(`${SESSION_WAKE_HEADER}\r\n\n@api 已完成\n下一步？`), {
+    body: '@api 已完成\n下一步？', header: SESSION_WAKE_HEADER,
+  });
+  assert.deepEqual(model.splitSystemWake('[AhaStation system] note'), { body: '[AhaStation system] note', header: null });
+  assert.deepEqual(model.splitSystemWake(SESSION_WAKE_HEADER), { body: SESSION_WAKE_HEADER, header: null });
+});

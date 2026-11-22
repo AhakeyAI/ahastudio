@@ -1134,6 +1134,8 @@ export interface WorkerTimelineTurn {
   turnId: string | null;
   generation: number;
   prompt: string;
+  /** `system`: AhaStation started the turn (a wake-up), not the person or a dispatch brief. */
+  origin?: 'system';
   startedAt: number;
   completedAt: number | null;
   status: WorkerTimelineTurnStatus;

@@ -618,3 +618,39 @@ test('buildBoardViewModel prefers active runs over stale stopped runs and reflec
   assert.equal(stoppedVm.coordinator?.stageLabel, '已结束');
   assert.equal(stoppedVm.coordinator?.liveActivity, null);
 });
+
+test('a session Coordinator\'s run follows the focused session and its card shows the session\'s live state', () => {
+  const SESSION = 'agent-session-00000000-0000-0000-0000-00000000000a';
+  const snapshot = {
+    ...view.EMPTY_SNAPSHOT,
+    runs: [
+      makeRun('run_term', { createdAt: isoAt(20) }),
+      makeRun('run_1', { coordinatorHandle: SESSION, coordinatorPaneId: SESSION, createdAt: isoAt(10) }),
+    ],
+    tasks: [makeTask('t_scout', { displayName: 'scout' })],
+    dispatches: [makeDispatch('d_scout', 't_scout', {
+      creator: SESSION, parentPaneId: SESSION,
+      assigneeHandle: 'codex-worker-00000000-0000-0000-0000-000000000001', assigneePaneId: null,
+    })],
+  };
+  const card = (session) => {
+    const vm = board.buildBoardViewModel(snapshot, {
+      activePtyId: SESSION,
+      sessionCoordinators: new Map(session ? [[SESSION, session]] : []),
+    });
+    assert.equal(vm.run.id, 'run_1');
+    return [vm.coordinator.status, vm.coordinator.stageLabel, vm.coordinator.cliId];
+  };
+  assert.deepEqual(card({ provider: 'codex', state: 'working' }), ['working', '执行中', 'codex']);
+  assert.deepEqual(card({ provider: 'codex', state: 'waiting' }), ['waiting', '待回答', 'codex']);
+  assert.deepEqual(card({ provider: 'codex', state: 'idle' }), ['idle', '在线', 'codex']);
+  assert.deepEqual(card({ provider: 'codex', state: 'offline' }), ['offline', '离线', 'codex']);
+  assert.deepEqual(card(null), ['offline', '离线', null]);
+  assert.deepEqual(board.buildBoardViewModel(snapshot, { activePtyId: SESSION }).members.map((m) => m.role), ['scout']);
+
+  const state = (status, pendingQuestions = []) => board.sessionCoordinatorState({ status, pendingQuestions });
+  assert.deepEqual(
+    [state('running'), state('running', [{ requestId: 'q' }]), state('idle'), state('starting'), state('suspended'), state('failed')],
+    ['working', 'waiting', 'idle', 'working', 'offline', 'offline'],
+  );
+});

@@ -1,5 +1,5 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { ArrowDown, ChevronRight, CircleAlert, CircleCheck, Hourglass, Square, Workflow } from 'lucide-react';
+import { ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Hourglass, Square, Workflow } from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
 import { countDiffStats, parseUnifiedDiff } from '../lib/git-panel-model';
@@ -14,6 +14,7 @@ import {
   pendingApprovals,
   splitDiffByFile,
   splitDispatchPrompt,
+  splitSystemWake,
   totalTokenUsage,
   turnHasLiveItem,
 } from '../lib/worker-timeline-model';
@@ -156,6 +157,21 @@ const TimelineItem = memo(function TimelineItem({ item }: { item: WorkerTimeline
   );
 });
 
+/** A turn AhaStation started (Worker news, stall reminder): shown apart from what the person typed. */
+function SystemWakeRow({ text, generation }: { text: string; generation: number }) {
+  const body = useMemo(() => splitSystemWake(text).body, [text]);
+  return (
+    <div className="asv-wake" data-asv-row>
+      <div className="asv-wake-head">
+        <BellRing size={12} aria-hidden="true" />
+        <span className="asv-wake-label">系统唤醒</span>
+        <span>第 {generation} 轮 · AhaStation 自动发送，不算你的回复</span>
+      </div>
+      <SessionMarkdown text={body} variant="bubble" />
+    </div>
+  );
+}
+
 function turnFootText(turn: WorkerTimelineTurn): string {
   const elapsed = turn.completedAt ? formatDuration(turn.completedAt - turn.startedAt) : '';
   const label = turn.status === 'interrupted' ? '已中断' : turn.status === 'failed' ? '失败' : '';
@@ -168,7 +184,9 @@ const TurnView = memo(function TurnView({ turn, minHeight }: { turn: WorkerTimel
   const foot = running ? '' : turnFootText(turn);
   return (
     <section className={`asv-turn is-${turn.status}`} aria-label={`第 ${turn.generation} 轮`} style={minHeight ? { minHeight } : undefined}>
-      <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} />
+      {turn.origin === 'system'
+        ? <SystemWakeRow text={turn.prompt} generation={turn.generation} />
+        : <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} />}
       {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}
       {blocks.map((block) =>
         block.type === 'group' ? <WorkGroup key={block.id} block={block} /> : <TimelineItem key={block.item.id} item={block.item} />,

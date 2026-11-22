@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { resolve as resolveFsPath } from 'node:path';
 import { runGitCommand } from '../git/git-exec.js';
 import type { AgentSessionDriver, AgentSessionEvents, AgentTurnResult, TurnDelivery } from './agent-session-driver.js';
+import { SESSION_WAKE_HEADER } from './coordinator-prompt.js';
 import { AGENT_SESSION_ID } from './agent-session-manager.js';
 import { CODEX_WORKER_ID } from './codex-app-server-pilot.js';
 import {
@@ -276,9 +277,6 @@ export interface OrchestrationSessionCoordinators {
   /** Starts a system turn (never counted as the person's message); omitted means sessions are never woken. */
   wake?(sessionId: string, prompt: string): Promise<TurnDelivery>;
 }
-
-const SESSION_WAKE_HEADER =
-  '[AhaStation system wake-up — not a message from the user. The user has not replied; do not treat this as their confirmation.]';
 
 export interface OrchestrationServiceDependencies {
   store: OrchestrationStore;

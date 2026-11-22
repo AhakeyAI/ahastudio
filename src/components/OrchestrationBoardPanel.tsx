@@ -29,6 +29,7 @@ import type {
   OrchestrationDispatchProposal,
 } from '../types';
 import { agentStatusDetail, agentStatusLabel } from '../lib/agent-status-view';
+import { agentSessionClient } from '../lib/agent-session-client';
 import { agentStatusClient } from '../lib/agent-status-client';
 import { orchestrationClient } from '../lib/orchestration-client';
 import {
@@ -36,6 +37,7 @@ import {
   buildBoardViewModel,
   parseInlineBoardTokens,
   roleColorIndex,
+  sessionCoordinatorState,
   type BoardGraphNode,
   type BoardMemberCard,
   type BoardPostView,
@@ -164,6 +166,13 @@ export function OrchestrationBoardPanel({
     () => new Set(agentTargets.map((target) => target.ptyId)),
     [agentTargets],
   );
+  const agentSessions = useSyncExternalStore(agentSessionClient.subscribe, agentSessionClient.getSnapshot);
+  const sessionCoordinators = useMemo(
+    () => new Map(agentSessions.filter((session) => session.orchestration).map((session) => (
+      [session.id, { provider: session.provider, state: sessionCoordinatorState(session) }] as const
+    ))),
+    [agentSessions],
+  );
 
   // Sync fresh orchestration & agent statuses whenever the Board tab mounts.
   useEffect(() => {
@@ -194,8 +203,9 @@ export function OrchestrationBoardPanel({
         agentStatuses: agents,
         activePtyId: activePtyId ?? null,
         livePaneIds,
+        sessionCoordinators,
       }),
-    [snapshot, selectedRunId, agents, agentStatusRev, activePtyId, livePaneIds],
+    [snapshot, selectedRunId, agents, agentStatusRev, activePtyId, livePaneIds, sessionCoordinators],
   );
 
   useEffect(() => {

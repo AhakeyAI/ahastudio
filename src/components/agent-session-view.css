@@ -162,6 +162,22 @@
   overflow-wrap: anywhere;
 }
 
+.asv-wake {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  margin-bottom: 6px;
+  padding: 9px 12px;
+  border-left: 2px solid color-mix(in srgb, var(--workspace-accent) 55%, transparent);
+  border-radius: 4px 10px 10px 4px;
+  background: var(--asv-tint);
+  color: var(--asv-ink);
+  overflow-wrap: anywhere;
+}
+.asv-wake-head { display: flex; align-items: center; gap: 6px; color: var(--asv-ink-2); font-size: 12px; }
+.asv-wake-label { color: var(--asv-ink-strong); font-weight: 600; }
+
 /* ---- Assistant prose ---- */
 
 .asv-assistant { min-width: 0; padding: 2px 0; }

@@ -1146,7 +1146,7 @@ export function LocalTerminalWorkspace({
           worktreeActions={worktreeActions}
           agentTargets={agentTargets}
           onAgentPromptSent={focusAgentTarget}
-          activePtyId={activePtyId}
+          activePtyId={activePtyId ?? (activeIsSession ? active?.workerId : undefined)}
         />
       )}
 
