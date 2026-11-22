@@ -11,7 +11,7 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -120,4 +120,10 @@ jobs:
         run: node node_modules/electron/install.js
 
       - name: Run fast test suite
+        env:
+          # Avoid Windows 8.3 RUNNER~1 short paths and macOS /var -> /private/var symlinks
+          # mismatching canonical paths returned by `git worktree list`.
+          TMPDIR: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: npm run test:fast

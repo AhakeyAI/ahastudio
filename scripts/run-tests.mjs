@@ -92,7 +92,7 @@ function main() {
     fileCount: files.length,
   });
 
-  const nodeArgs = ['--import', './tests/register-electron-stub.mjs', '--test'];
+  const nodeArgs = ['--import', './tests/register-electron-stub.mjs', '--test', '--test-force-exit'];
   if (resolvedConcurrency != null) {
     nodeArgs.push(`--test-concurrency=${resolvedConcurrency}`);
   }
