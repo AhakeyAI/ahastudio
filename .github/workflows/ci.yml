@@ -98,6 +98,8 @@ jobs:
           git config --global user.name "AhaStudio CI"
           git config --global user.email "ci@ahastudio.local"
           git config --global init.defaultBranch main
+          git config --global core.autocrlf input
+          git config --global core.longpaths true
 
       - name: Install dependencies
         run: npm ci

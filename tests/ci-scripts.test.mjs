@@ -16,6 +16,7 @@ import {
   resolveReleasePlan,
 } from '../scripts/verify-release-version.mjs';
 import { stageReleaseArtifacts } from '../scripts/stage-release-artifacts.mjs';
+import ghTestReporter from '../scripts/gh-test-reporter.mjs';
 
 test('run-tests splits fast suite from long real-Git E2E and applies Windows concurrency default', () => {
   const files = [
@@ -155,4 +156,36 @@ test('stage-release-artifacts copies installers with spaces and ignores unpacked
     () => stageReleaseArtifacts({ releaseDir: emptyReleaseDir, outputDir }),
     /No distributable installer/,
   );
+});
+
+test('gh-test-reporter emits GitHub Actions annotations for leaf failures and skips aggregate wrappers', async () => {
+  async function* events() {
+    yield { type: 'test:pass', data: { name: 'ok' } };
+    yield {
+      type: 'test:fail',
+      data: {
+        name: 'parent suite',
+        file: join(process.cwd(), 'tests', 'example.test.mjs'),
+        line: 1,
+        details: { error: { failureType: 'subtestsFailed', message: '1 subtest failed' } },
+      },
+    };
+    yield {
+      type: 'test:fail',
+      data: {
+        name: 'checks a, b: c',
+        file: join(process.cwd(), 'tests', 'example.test.mjs'),
+        line: 42,
+        details: { error: { code: 'ERR_TEST_FAILURE', message: 'boom\nline2' } },
+      },
+    };
+  }
+
+  const lines = [];
+  for await (const chunk of ghTestReporter(events())) {
+    lines.push(chunk);
+  }
+  assert.deepEqual(lines, [
+    '::error file=tests/example.test.mjs,line=42,title=checks a%2C b%3A c::[ERR_TEST_FAILURE] boom%0Aline2\n',
+  ]);
 });

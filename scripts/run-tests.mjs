@@ -96,6 +96,19 @@ function main() {
   if (resolvedConcurrency != null) {
     nodeArgs.push(`--test-concurrency=${resolvedConcurrency}`);
   }
+  const hasExplicitTimeout = extraNodeArgs.some((arg) => arg.startsWith('--test-timeout'));
+  if (mode === 'fast' && explicitFiles.length === 0 && !hasExplicitTimeout) {
+    nodeArgs.push('--test-timeout=90000');
+  }
+  const hasExplicitReporter = extraNodeArgs.some((arg) => arg.startsWith('--test-reporter'));
+  if (process.env.GITHUB_ACTIONS === 'true' && !hasExplicitReporter) {
+    nodeArgs.push(
+      '--test-reporter=spec',
+      '--test-reporter-destination=stdout',
+      '--test-reporter=./scripts/gh-test-reporter.mjs',
+      '--test-reporter-destination=stdout',
+    );
+  }
   nodeArgs.push(...extraNodeArgs, ...files);
 
   const env = { ...process.env };
