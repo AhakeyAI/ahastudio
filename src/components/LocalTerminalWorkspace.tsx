@@ -1,4 +1,5 @@
 import { agentSessionClient, isStandaloneSession } from '../lib/agent-session-client';
+import { SessionHistoryPanel } from './agent-session/SessionHistoryPanel';
 import {
   useCallback,
   useEffect,
@@ -139,6 +140,7 @@ export function LocalTerminalWorkspace({
   const [query, setQuery] = useState('');
   const [defaultCwd, setDefaultCwd] = useState<string>();
   const [searchOpen, setSearchOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [pendingClosePane, setPendingClosePane] = useState<{ windowId: string; leafId: string } | null>(null);
   const [rightPanel, setRightPanel] = useState(() => localStorage.getItem('aha.rightPanel.open') === '1');
@@ -1075,6 +1077,7 @@ export function LocalTerminalWorkspace({
           }}
           localOnly
           renderTabBadge={(win) => (win.type === 'agent-session' ? null : <AgentStatusBadge status={windowAgentStatus(win)} />)}
+          {...(selectedCwd && window.vibeMeet?.agentSessions?.history ? { onOpenHistory: () => setHistoryOpen(true) } : {})}
           onCreate={(type, opts) => {
             const cwd = selectedCwd ?? opts?.cwd;
             if (type !== 'agent-session') return stage.createWindow(type, { ...opts, cwd });
@@ -1199,6 +1202,15 @@ export function LocalTerminalWorkspace({
               选择项目目录
             </button>
           </div>
+        )}
+        {historyOpen && selectedCwd && (
+          <SessionHistoryPanel
+            className="is-floating"
+            cwd={selectedCwd}
+            onClose={() => setHistoryOpen(false)}
+            onOpened={() => setHistoryOpen(false)}
+            onNotify={handleNotify}
+          />
         )}
         {pendingClosePane && (
           <div

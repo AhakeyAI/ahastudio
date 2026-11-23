@@ -19,11 +19,13 @@ const POLICIES: Record<AgentSessionPolicy, { sandbox: string; sandboxType: strin
   'full-auto': { sandbox: 'workspace-write', sandboxType: 'workspaceWrite', approvalPolicy: 'never' },
 };
 /**
- * Requests a client may make outside a conversation: catalogs, file search, usage limits, and the skill switch.
- * Anything else (threads, config writes, installs) goes through the methods of this class.
+ * Requests a client may make outside a conversation: catalogs, file search, usage limits, the skill
+ * switch, and the conversation history (listing, reading, archiving stored threads). Anything that
+ * runs a thread (start, resume, turns) or writes config goes through the methods of this class.
  */
 export const CODEX_QUERY_METHODS = new Set([
   'model/list', 'skills/list', 'skills/config/write', 'plugin/installed', 'fuzzyFileSearch', 'account/rateLimits/read',
+  'thread/list', 'thread/read', 'thread/archive', 'thread/unarchive',
 ]);
 const OUTPUT_LIMIT = 512 * 1024;
 const STDERR_LIMIT = 4 * 1024;

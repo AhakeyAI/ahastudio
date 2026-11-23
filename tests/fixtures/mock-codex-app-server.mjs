@@ -110,6 +110,30 @@ for await (const line of history) {
     send({ id, result: { ordinaryUsageAllowed: true, rateLimitsByLimitId: null, rateLimitResetCredits: null, accountId: null, rateLimitUpsell: null,
       rateLimits: { limitId: 'codex', limitName: null, normalModelSlug: null, credits: null, individualLimit: null, spendControlReached: null,
         primary: { usedPercent: 37, windowDurationMins: 300, resetsAt: 1_700_000_000 }, secondary: null, planType: 'plus', rateLimitReachedType: null } } });
+  } else if (method === 'thread/list') {
+    const thread = (id, extra) => ({ id, cwd: params.cwd, createdAt: 1_700_000_000, updatedAt: 1_700_000_100, recencyAt: 1_700_000_200,
+      ephemeral: false, parentThreadId: null, source: 'vscode', name: null, preview: '', model: 'mock-large', reasoningEffort: 'high', ...extra });
+    send({ id, result: { nextCursor: params.cursor ? null : 'page-2', data: params.cursor ? [] : [
+      thread(threadId, { name: 'Earlier talk', preview: 'Fix the bug\nin detail' }),
+      thread('worker-thread', { preview: '[Worker @api] Implement the endpoint' }),
+      thread('temp-thread', { preview: 'scratch', ephemeral: true }),
+    ] } });
+  } else if (method === 'thread/read') {
+    send({ id, result: { thread: {
+      id: params.threadId, cwd: threadCwd, name: 'Earlier talk', preview: 'Fix the bug', model: 'mock-large', reasoningEffort: 'high',
+      turns: params.includeTurns ? [
+        { id: 'old-turn-1', status: 'completed', startedAt: 1_700_000_000, completedAt: 1_700_000_010, error: null, items: [
+          { id: 'u1', type: 'userMessage', content: [{ type: 'text', text: 'Fix the bug' }] },
+          { id: 'a1', type: 'agentMessage', text: 'Fixed it', startedAtMs: 1_700_000_005_000, completedAtMs: 1_700_000_009_000 },
+        ] },
+        { id: 'old-turn-2', status: 'interrupted', startedAt: 1_700_000_020, completedAt: 1_700_000_030, error: null, items: [
+          { id: 'u2', type: 'userMessage', content: [{ type: 'text', text: 'Run the tests' }] },
+          { id: 'c2', type: 'commandExecution', command: 'npm test', cwd: threadCwd, status: 'inProgress' },
+        ] },
+      ] : [],
+    } } });
+  } else if (method === 'thread/archive' || method === 'thread/unarchive') {
+    send({ id, result: {} });
   } else if (method === 'turn/start') {
     assert.equal(params.threadId, threadId);
     const prompt = params.input.find((item) => item.type === 'text')?.text ?? '';

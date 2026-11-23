@@ -173,6 +173,19 @@ export interface CodexRateLimits {
   reached: boolean;
 }
 
+// Mirrors CodexThreadSummary in electron/orchestration/codex-thread-history.ts.
+export interface CodexThreadSummary {
+  id: string;
+  title: string;
+  preview: string;
+  cwd: string;
+  /** Epoch milliseconds. */
+  createdAt: number;
+  updatedAt: number;
+  model: string | null;
+  effort: string | null;
+}
+
 export interface CodexFileMatch {
   path: string;
   fileName: string;
@@ -209,6 +222,12 @@ export interface AgentSessionsApi {
   setOrchestration: (opts: { id: string; enabled: boolean }) => AgentSessionResult;
   /** `synced` is false when Codex was not running; it is renamed there once the session resumes. */
   rename: (opts: { id: string; title: string }) => AgentSessionResult<{ synced: boolean }>;
+  /** Past Codex conversations in a folder, newest first, without Worker threads. */
+  history?: (opts: { cwd: string; search?: string; archived?: boolean; cursor?: string | null }) =>
+    AgentSessionResult<{ threads: CodexThreadSummary[]; nextCursor: string | null }>;
+  /** Opens a past conversation as a suspended session; one already open is returned as it is. */
+  openHistory?: (opts: { threadId: string; policy: AgentSessionPolicy }) => AgentSessionResult<{ session: AgentSessionInfo }>;
+  archiveHistory?: (opts: { threadId: string; archived: boolean }) => AgentSessionResult;
   onChanged: (cb: (sessions: AgentSessionInfo[]) => void) => () => void;
 }
 

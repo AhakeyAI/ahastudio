@@ -52,6 +52,20 @@ export const agentSessionClient = {
     if (!sessions.some((session) => session.id === res.session.id)) publish([...sessions, res.session]);
     return res;
   },
+  /**
+   * Opens a past Codex conversation as a session (the one already open, if any). No process
+   * starts until the first message.
+   */
+  async openHistory(threadId: string): Promise<{ ok: true; session: AgentSessionInfo } | { ok: false; error: string }> {
+    const api = window.vibeMeet?.agentSessions;
+    if (!api?.openHistory) return { ok: false, error: '当前环境不支持会话历史' };
+    start();
+    const res = await api.openHistory({ threadId, policy: 'workspace-write' })
+      .catch((error: unknown) => ({ ok: false as const, error: error instanceof Error ? error.message : String(error) }));
+    if (!res.ok) return res;
+    if (!sessions.some((session) => session.id === res.session.id)) publish([...sessions, res.session]);
+    return res;
+  },
 };
 
 const LIMITS_CACHE_MS = 60_000;

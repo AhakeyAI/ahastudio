@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
-  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Cpu, FileText, Folder, Hourglass, Image as ImageIcon, PencilLine, Sparkles,
+  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Cpu, FileText, Folder, History, Hourglass, Image as ImageIcon, PencilLine, Sparkles,
   Square, Workflow,
 } from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
@@ -41,6 +41,7 @@ import { SessionComposer, type ComposerHandle } from './agent-session/SessionCom
 import { SessionMarkdown } from './agent-session/SessionMarkdown';
 import { SessionTitle } from './agent-session/SessionTitle';
 import { SessionEmptyState } from './agent-session/SessionEmptyState';
+import { SessionHistoryPanel } from './agent-session/SessionHistoryPanel';
 import { FileChangeRows, LiveTimer, WorkGroup, WorkItemRow } from './agent-session/SessionWorkLog';
 import { AgentSessionContext, useAgentSession } from './agent-session/session-context';
 import { TurnChangesCard } from './agent-session/TurnChangesCard';
@@ -435,6 +436,9 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     return true;
   }, [sessionId, onNotify, win.id]);
 
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const closeHistory = useCallback(() => setHistoryOpen(false), []);
+
   // The header names the model the way the composer's picker does, once the catalog is loaded.
   const headerModelId = direct ? info?.model ?? null : timeline?.model ?? dispatch?.model ?? null;
   const [modelName, setModelName] = useState<string | null>(null);
@@ -506,6 +510,17 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               <i className="asv-stage-dot" aria-hidden="true" />
               {stageLabel}
             </span>
+          )}
+          {direct && cwd && window.vibeMeet?.agentSessions?.history && (
+            <button
+              type="button"
+              className={`asv-btn is-ghost${historyOpen ? ' is-pressed' : ''}`}
+              aria-pressed={historyOpen}
+              title="这个文件夹里以前的 Codex 会话"
+              onClick={() => setHistoryOpen((value) => !value)}
+            >
+              <History size={13} /> 历史
+            </button>
           )}
           {direct && info && info.status !== 'closed' && (
             <button
@@ -597,6 +612,9 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             handleRef={composerRef}
           />
         </div>
+        {historyOpen && direct && cwd && (
+          <SessionHistoryPanel cwd={cwd} onClose={closeHistory} onOpened={closeHistory} {...(onNotify ? { onNotify } : {})} />
+        )}
       </div>
     </AgentSessionContext.Provider>
   );

@@ -5,6 +5,7 @@ import { z } from 'zod';
 import type { AgentTurnAttachment } from '../orchestration/agent-session-driver.js';
 import { AGENT_SESSION_ID, type AgentSessionManager } from '../orchestration/agent-session-manager.js';
 import type { CodexCatalog } from '../orchestration/codex-catalog.js';
+import { codexThreadTimeline } from '../orchestration/codex-thread-history.js';
 import { WorkerTimelinePatchCoalescer } from '../orchestration/worker-timeline.js';
 import type { IpcContext } from './context.js';
 import { handleSecure, mainWindowSenderPolicy } from './validators.js';
@@ -63,6 +64,13 @@ const targetSchema = z.object({ id }).strict();
 // Matches MAX_SESSION_TITLE in src/lib/session-title.ts; the renderer checks it in characters first.
 const renameSchema = z.object({ id, title: z.string().max(400).refine((value) => [...value.trim()].length <= 80, '标题最多 80 个字') }).strict();
 const orchestrationSchema = z.object({ id, enabled: z.boolean() }).strict();
+const threadId = z.string().min(1).max(200).regex(/^[\w-]+$/u);
+const historySchema = z.object({
+  cwd: absolutePath, search: z.string().max(200).optional(), archived: z.boolean().optional(),
+  cursor: z.string().min(1).max(2048).nullish(),
+}).strict();
+const openHistorySchema = z.object({ threadId, policy }).strict();
+const archiveSchema = z.object({ threadId, archived: z.boolean() }).strict();
 const respondSchema = z.object({
   id, requestId: z.string().min(1).max(64), allow: z.boolean(), reason: z.string().max(2_000).optional(),
 }).strict();
@@ -211,6 +219,27 @@ export function registerAgentSessionsIpc(
     const result = await manager.rename(input.id, input.title);
     if (!result.ok) throw new Error(result.error);
     return { synced: result.synced };
+  });
+  secure('history', historySchema, async (input) => requireCatalog().listThreads(input));
+  secure('open-history', openHistorySchema, async (input) => {
+    const thread = await requireCatalog().readThread(input.threadId);
+    const cwd = typeof thread.cwd === 'string' ? thread.cwd : '';
+    if (!cwd || !isAbsolute(cwd) || !existsSync(cwd)) throw new Error('这个会话的项目文件夹已不存在');
+    const name = typeof thread.name === 'string' ? thread.name.trim() : '';
+    const preview = typeof thread.preview === 'string' ? thread.preview : '';
+    const title = name || preview.split(/\r?\n/u).map((line) => line.trim()).find(Boolean)?.slice(0, 60) || '';
+    const model = typeof thread.model === 'string' && thread.model ? thread.model : null;
+    const effort = typeof thread.reasoningEffort === 'string' && thread.reasoningEffort ? thread.reasoningEffort : null;
+    return {
+      session: manager.adopt({
+        providerSessionId: input.threadId, cwd, title, policy: input.policy, model, effort,
+        timeline: (sessionId) => codexThreadTimeline(sessionId, thread, { model, readOnly: input.policy === 'read-only' }),
+      }),
+    };
+  });
+  secure('archive-history', archiveSchema, async (input) => {
+    await requireCatalog().setThreadArchived(input.threadId, input.archived);
+    return {};
   });
   secure('timeline', targetSchema, (input) => ({ timeline: manager.getTimeline(input.id) }));
 

@@ -132,6 +132,33 @@ export class AgentSessionManager {
   }
 
   /**
+   * Reopens a stored provider conversation without starting a process: the session is suspended
+   * with the replayed history, and the first message resumes the thread. A conversation already
+   * open here is returned as it is.
+   */
+  adopt(input: {
+    providerSessionId: string; cwd: string; title: string; policy: AgentSessionPolicy;
+    model?: string | null; effort?: string | null;
+    timeline: (sessionId: string) => WorkerTimelineSnapshot;
+  }): AgentSessionInfo {
+    const open = [...this.sessions.values()].find((session) => session.info.providerSessionId === input.providerSessionId);
+    if (open) return structuredClone(open.info);
+    const id = `agent-session-${randomUUID()}`;
+    const info: AgentSessionInfo = {
+      id, provider: 'codex', title: input.title.trim(), cwd: input.cwd,
+      model: input.model ?? null, effort: input.effort ?? null, policy: input.policy, network: false,
+      orchestration: false, providerSessionId: input.providerSessionId, status: 'suspended', error: null,
+      pendingQuestions: [], createdAt: this.now(),
+    };
+    const session = this.track(info, input.timeline(id));
+    // The stored thread exists at the provider, so it is rejoined even if no turn replayed.
+    session.hasTurns = true;
+    session.timeline.setMeta({ alive: false, providerSessionId: input.providerSessionId });
+    this.sessionsChanged();
+    return structuredClone(info);
+  }
+
+  /**
    * Starts a turn with the person's message, resuming the provider conversation first if the
    * session was suspended or its process died. A session takes one turn at a time.
    */

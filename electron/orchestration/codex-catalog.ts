@@ -1,4 +1,5 @@
 import { isAbsolute, normalize } from 'node:path';
+import { codexThreadSummary, type CodexThreadSummary } from './codex-thread-history.js';
 
 /** What the catalog needs from a Codex app-server process; `CodexAppServerPilot` provides it. */
 export interface CodexQueryConnection {
@@ -69,6 +70,7 @@ const MODEL_TTL_MS = 10 * 60_000;
 const LIST_TTL_MS = 60_000;
 const MAX_MODEL_PAGES = 5;
 const MAX_FILE_MATCHES = 30;
+const THREAD_PAGE = 50;
 
 type Obj = Record<string, unknown>;
 const object = (value: unknown): Obj => (value && typeof value === 'object' ? value as Obj : {});
@@ -228,6 +230,34 @@ export class CodexCatalog {
       planType: textOrNull(snapshot.planType),
       reached: Boolean(textOrNull(snapshot.rateLimitReachedType)) || result.ordinaryUsageAllowed === false,
     };
+  }
+
+  /**
+   * Past conversations in `cwd`, newest first, without Worker threads. `cursor` continues a
+   * previous page. A page can come back shorter than `limit` once Worker threads are left out.
+   */
+  async listThreads(input: { cwd: string; search?: string; archived?: boolean; cursor?: string | null; limit?: number }): Promise<{
+    threads: CodexThreadSummary[]; nextCursor: string | null;
+  }> {
+    const result = object(await this.query('thread/list', {
+      cwd: input.cwd, limit: input.limit ?? THREAD_PAGE, sortKey: 'updated_at', archived: input.archived ?? false,
+      ...(input.search?.trim() ? { searchTerm: input.search.trim() } : {}),
+      ...(input.cursor ? { cursor: input.cursor } : {}),
+    }));
+    const threads = array(result.data).map(codexThreadSummary).filter((thread): thread is CodexThreadSummary => Boolean(thread));
+    return { threads, nextCursor: textOrNull(result.nextCursor) };
+  }
+
+  /** A stored thread with its turns, for replaying it into a reopened session. */
+  async readThread(threadId: string): Promise<Record<string, unknown>> {
+    const result = object(await this.query('thread/read', { threadId, includeTurns: true }));
+    const thread = object(result.thread);
+    if (text(thread.id) !== threadId) throw new Error('Codex 没有找到这个会话');
+    return thread;
+  }
+
+  async setThreadArchived(threadId: string, archived: boolean): Promise<void> {
+    await this.query(archived ? 'thread/archive' : 'thread/unarchive', { threadId });
   }
 
   async dispose(): Promise<void> {

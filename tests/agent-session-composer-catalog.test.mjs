@@ -159,6 +159,54 @@ test('usage limits come from the Codex bucket, in milliseconds, and are read fre
   assert.equal(calls.length, 3);
 });
 
+test('history lists only conversations a person had, reopens one without a process, and resumes it on the first message', async (t) => {
+  const { manager, call, trace, catalogTrace } = ipcSetup(t);
+  assert.equal((await call('history', { cwd: 'relative/path' })).ok, false, 'the folder must be absolute');
+  const page = await call('history', { cwd, search: ' bug ' });
+  assert.equal(page.ok, true, page.error);
+  assert.deepEqual(page.threads.map((thread) => thread.id), ['mock-thread-id'], 'Worker and temporary threads are left out');
+  assert.deepEqual(page.threads[0], {
+    id: 'mock-thread-id', title: 'Earlier talk', preview: 'Fix the bug', cwd, createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_200_000, model: 'mock-large', effort: 'high',
+  });
+  assert.equal(page.nextCursor, 'page-2');
+  assert.deepEqual(readTrace(catalogTrace, 'thread/list').at(-1),
+    { cwd, limit: 50, sortKey: 'updated_at', archived: false, searchTerm: 'bug' });
+  assert.deepEqual((await call('history', { cwd, cursor: 'page-2' })).threads, []);
+
+  const opened = await call('open-history', { threadId: 'mock-thread-id', policy: 'workspace-write' });
+  assert.equal(opened.ok, true, opened.error);
+  const { session } = opened;
+  assert.equal(session.status, 'suspended');
+  assert.equal(session.providerSessionId, 'mock-thread-id');
+  assert.equal(session.title, 'Earlier talk');
+  assert.equal(session.model, 'mock-large');
+  assert.equal(readTrace(trace, 'initialize').length, 0, 'opening only reads the record; no session process starts');
+  const turns = manager.getTimeline(session.id).turns;
+  assert.deepEqual(turns.map((turn) => [turn.prompt, turn.status, turn.turnId]),
+    [['Fix the bug', 'completed', 'old-turn-1'], ['Run the tests', 'interrupted', 'old-turn-2']]);
+  assert.equal(turns[0].items.find((item) => item.kind === 'message')?.text, 'Fixed it');
+  assert.equal(turns[1].items.find((item) => item.kind === 'command')?.status, 'failed', 'a stored command that never finished is not running');
+  assert.equal((await call('open-history', { threadId: 'mock-thread-id', policy: 'read-only' })).session.id, session.id,
+    'a conversation already open is returned, not opened twice');
+  assert.equal((await call('open-history', { threadId: '../x', policy: 'read-only' })).ok, false);
+
+  const sent = await call('send', { id: session.id, text: 'Keep going' });
+  assert.equal(sent.ok, true, sent.error);
+  assert.deepEqual(readTrace(trace, 'thread/resume').map((params) => params.threadId), ['mock-thread-id'], 'the stored thread is resumed');
+  assert.equal(readTrace(trace, 'thread/start').length, 0);
+  await until(() => manager.list().find((entry) => entry.id === session.id)?.status === 'idle');
+  const after = manager.getTimeline(session.id).turns;
+  assert.equal(after.length, 3);
+  assert.equal(after[2].prompt, 'Keep going');
+  assert.equal(new Set(after.map((turn) => turn.key)).size, 3, 'the new turn does not reuse a replayed key');
+
+  assert.equal((await call('archive-history', { threadId: 'mock-thread-id', archived: true })).ok, true);
+  assert.equal((await call('archive-history', { threadId: 'mock-thread-id', archived: false })).ok, true);
+  assert.deepEqual(readTrace(catalogTrace, 'thread/archive'), [{ threadId: 'mock-thread-id' }]);
+  assert.deepEqual(readTrace(catalogTrace, 'thread/unarchive'), [{ threadId: 'mock-thread-id' }]);
+});
+
 function ipcSetup(t) {
   const dir = mkdtempSync(join(cwd, '.composer-ipc-test-'));
   const trace = join(dir, 'rpc.jsonl');
@@ -167,7 +215,8 @@ function ipcSetup(t) {
   mkdirSync(orphan, { recursive: true });
   writeFileSync(join(orphan, 'old.png'), 'x');
   const manager = new AgentSessionManager({ launch: (_id, workdir, events) => mockPilot(trace, events, workdir) });
-  const catalog = new CodexCatalog(() => mockPilot(join(dir, 'catalog.jsonl')), 60_000);
+  const catalogTrace = join(dir, 'catalog.jsonl');
+  const catalog = new CodexCatalog(() => mockPilot(catalogTrace), 60_000);
   const handlers = new Map();
   t.mock.method(ipcMain, 'handle', (channel, fn) => handlers.set(channel, fn));
   const contents = Object.assign(new EventEmitter(), { id: 7, send() {}, isDestroyed: () => false });
@@ -182,7 +231,7 @@ function ipcSetup(t) {
     rmSync(dir, { recursive: true, force: true });
   });
   const call = (name, payload) => handlers.get(`agent-sessions:${name}`)({ sender: { id: 7 } }, payload);
-  return { manager, call, trace, attachments, orphan };
+  return { manager, call, trace, catalogTrace, attachments, orphan };
 }
 
 test('a message carries only listed skills and images saved for its session, and closing removes them', async (t) => {
