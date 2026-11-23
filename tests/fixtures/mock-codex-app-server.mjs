@@ -77,9 +77,37 @@ for await (const line of history) {
     send({ id, result: { data: [{ name: 'aha', tools: {
       report_done: { name: 'report_done' }, delegate_task: { name: 'delegate_task' },
     } }] } });
+  } else if (method === 'model/list') {
+    send({ id, result: { nextCursor: params.cursor ? null : 'page-2', data: params.cursor
+      ? [{ id: 'mock-mini', model: 'mock-mini', displayName: 'Mock Mini', description: 'Small', hidden: false, isDefault: false,
+        supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }], defaultReasoningEffort: 'low', inputModalities: ['text'] }]
+      : [
+        { id: 'mock-large', model: 'mock-large', displayName: 'Mock Large', description: 'Big', hidden: false, isDefault: true,
+          supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'high', description: 'Deep' }],
+          defaultReasoningEffort: 'high', inputModalities: ['text', 'image'] },
+        { id: 'mock-hidden', model: 'mock-hidden', displayName: 'Hidden', description: '', hidden: true, isDefault: false,
+          supportedReasoningEfforts: [], defaultReasoningEffort: 'low', inputModalities: ['text'] },
+      ] } });
+  } else if (method === 'skills/list') {
+    const root = params.cwds?.[0] ?? process.cwd();
+    send({ id, result: { data: [{ cwd: root, errors: [], skills: [
+      { name: 'mock-skill', description: 'Long description', interface: { shortDescription: 'Does mock things' },
+        path: join(root, '.agents', 'skills', 'mock-skill', 'SKILL.md'), scope: 'repo', enabled: true, pluginId: null },
+    ] }] } });
+  } else if (method === 'skills/config/write' || method === 'plugin/installed' || method === 'fuzzyFileSearch') {
+    send({ id, result: method === 'plugin/installed'
+      ? { marketplaceLoadErrors: [], marketplaces: [{ name: 'mock-market', path: null, interface: null, plugins: [
+        { id: 'docs@mock-market', name: 'docs', installed: true, enabled: true,
+          interface: { displayName: 'Docs', shortDescription: 'Write docs', developerName: 'Mock', category: 'Productivity',
+            capabilities: ['Write'], defaultPrompt: ['Draft a memo'] } },
+        { id: 'other@mock-market', name: 'other', installed: false, enabled: false, interface: null },
+      ] }] }
+      : method === 'fuzzyFileSearch'
+        ? { files: [{ root: params.roots[0], path: 'src\\demo.ts', match_type: 'file', file_name: 'demo.ts', score: 1, indices: null }] }
+        : {} });
   } else if (method === 'turn/start') {
     assert.equal(params.threadId, threadId);
-    const prompt = params.input[0].text;
+    const prompt = params.input.find((item) => item.type === 'text')?.text ?? '';
     if (scenario === 'timeout') continue;
     if (scenario === 'rejected') {
       send({ id, error: { code: -32602, message: 'mock rejected turn before start' } });

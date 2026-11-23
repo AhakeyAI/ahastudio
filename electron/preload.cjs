@@ -258,6 +258,12 @@ const api = {
     close: (opts) => ipcRenderer.invoke('agent-sessions:close', opts),
     timeline: (opts) => ipcRenderer.invoke('agent-sessions:timeline', opts),
     setOrchestration: (opts) => ipcRenderer.invoke('agent-sessions:set-orchestration', opts),
+    models: () => ipcRenderer.invoke('agent-sessions:models', {}),
+    skills: (opts) => ipcRenderer.invoke('agent-sessions:skills', opts),
+    setSkillEnabled: (opts) => ipcRenderer.invoke('agent-sessions:set-skill-enabled', opts),
+    plugins: (opts) => ipcRenderer.invoke('agent-sessions:plugins', opts),
+    searchFiles: (opts) => ipcRenderer.invoke('agent-sessions:search-files', opts),
+    attachImage: (opts) => ipcRenderer.invoke('agent-sessions:attach-image', opts),
     onChanged: (cb) => {
       const listener = (_, sessions) => cb(sessions);
       ipcRenderer.on('agent-sessions:changed', listener);

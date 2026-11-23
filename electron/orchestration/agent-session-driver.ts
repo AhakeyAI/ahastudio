@@ -18,6 +18,11 @@ export type TurnDelivery =
   | { status: 'accepted' }
   | { status: 'not_accepted' | 'unknown_acceptance'; reason: string };
 
+/** Structured input sent with a message: a skill to invoke, or an image file on disk. */
+export type AgentTurnAttachment =
+  | { type: 'skill'; name: string; path: string }
+  | { type: 'localImage'; path: string; name?: string };
+
 export interface AgentTurnResult {
   turnId: string;
   stopReason: string;
@@ -96,7 +101,7 @@ export interface AgentSessionDriver {
   /** `model`, `effort`, `policy`, and `network` apply to this turn and stay in effect for later ones. */
   startTurn(input: {
     turnKey: string; prompt: string; effort?: string | null; model?: string | null; policy?: AgentSessionPolicy;
-    network?: boolean;
+    network?: boolean; attachments?: readonly AgentTurnAttachment[];
   }): Promise<TurnDelivery>;
   /** Asks the provider to stop the running turn; the turn then completes as interrupted. */
   interrupt(): Promise<boolean>;

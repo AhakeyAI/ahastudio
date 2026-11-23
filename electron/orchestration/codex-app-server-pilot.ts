@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { augmentedPath, resolveBinaryFromPath } from '../bin-resolve.js';
 import type {
-  AgentOutputSlice, AgentSessionDriver, AgentSessionEvents, AgentSessionPolicy, TurnDelivery,
+  AgentOutputSlice, AgentSessionDriver, AgentSessionEvents, AgentSessionPolicy, AgentTurnAttachment, TurnDelivery,
 } from './agent-session-driver.js';
 import { spawnWindowsCodexJob } from './windows-codex-job.js';
 import type {
@@ -18,6 +18,13 @@ const POLICIES: Record<AgentSessionPolicy, { sandbox: string; sandboxType: strin
   // Still sandboxed to the workspace; it only stops asking.
   'full-auto': { sandbox: 'workspace-write', sandboxType: 'workspaceWrite', approvalPolicy: 'never' },
 };
+/**
+ * Requests a client may make outside a conversation: catalogs, file search, and the skill switch.
+ * Anything else (threads, config writes, installs) goes through the methods of this class.
+ */
+export const CODEX_QUERY_METHODS = new Set([
+  'model/list', 'skills/list', 'skills/config/write', 'plugin/installed', 'fuzzyFileSearch',
+]);
 const OUTPUT_LIMIT = 512 * 1024;
 const STDERR_LIMIT = 4 * 1024;
 const CHILD_CLOSE_TIMEOUT_MS = 3_000;
@@ -309,6 +316,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   private disconnected = false;
   private stopping = false;
   private stopPromise: Promise<void> | null = null;
+  private initialized: Promise<void> | null = null;
   private readonly childClosed: Promise<void>;
 
   constructor(
@@ -368,10 +376,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   }): Promise<string> {
     const wanted = POLICIES[policy];
     try {
-      await this.request('initialize', {
-        clientInfo: { name: 'ahastation', title: 'AhaStation', version: '0.1.0' },
-      });
-      this.write({ method: 'initialized' });
+      await this.initialize();
       const settings = {
         cwd, ...(model ? { model } : {}), sandbox: wanted.sandbox,
         approvalPolicy: wanted.approvalPolicy, approvalsReviewer: 'user',
@@ -410,6 +415,31 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     }
   }
 
+  /** One handshake per process, shared by `open` and `query`; a failed one may be retried. */
+  private initialize(): Promise<void> {
+    this.initialized ??= this.request('initialize', {
+      clientInfo: { name: 'ahastation', title: 'AhaStation', version: '0.1.0' },
+    }).then(
+      () => this.write({ method: 'initialized' }),
+      (error: unknown) => {
+        this.initialized = null;
+        throw error;
+      },
+    );
+    return this.initialized;
+  }
+
+  /** A catalog or search request from `CODEX_QUERY_METHODS`; it needs no open conversation. */
+  async query(method: string, params: Obj): Promise<unknown> {
+    if (!CODEX_QUERY_METHODS.has(method)) throw new Error(`Codex request ${method} is not allowed here`);
+    try {
+      await this.initialize();
+      return await this.request(method, params);
+    } catch (error) {
+      throw new Error(this.withStderr(error instanceof Error ? error.message : String(error)));
+    }
+  }
+
   async waitForIdle(timeoutMs: number): Promise<boolean> {
     const active = this.active;
     if (!active) return true;
@@ -422,9 +452,9 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     });
   }
 
-  async startTurn({ turnKey, prompt, effort, model, policy, network }: {
+  async startTurn({ turnKey, prompt, effort, model, policy, network, attachments = [] }: {
     turnKey: string; prompt: string; effort?: string | null; model?: string | null; policy?: AgentSessionPolicy;
-    network?: boolean;
+    network?: boolean; attachments?: readonly AgentTurnAttachment[];
   }): Promise<TurnDelivery> {
     if (!this.alive || !this.threadId || this.active) {
       return { status: 'not_accepted', reason: 'Codex thread is closed or busy' };
@@ -445,7 +475,12 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     try {
       const result = object(await this.request('turn/start', {
         threadId: this.threadId,
-        input: [{ type: 'text', text: prompt, text_elements: [] }],
+        input: [
+          ...(prompt ? [{ type: 'text', text: prompt, text_elements: [] }] : []),
+          ...attachments.map((attachment) => attachment.type === 'skill'
+            ? { type: 'skill', name: attachment.name, path: attachment.path }
+            : { type: 'localImage', path: attachment.path }),
+        ],
         ...(effort ? { effort } : {}),
         ...(model ? { model } : {}),
         sandboxPolicy: wanted.sandboxType === 'readOnly'

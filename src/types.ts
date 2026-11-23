@@ -123,13 +123,64 @@ export interface AgentSessionQuestion {
 
 type AgentSessionResult<T = object> = Promise<({ ok: true } & T) | { ok: false; error: string }>;
 
+// Mirrors electron/orchestration/codex-catalog.ts.
+export interface CodexModelOption {
+  id: string;
+  model: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
+  efforts: { value: string; description: string }[];
+  defaultEffort: string | null;
+  images: boolean;
+}
+
+export interface CodexSkillOption {
+  name: string;
+  description: string;
+  path: string;
+  scope: string;
+  enabled: boolean;
+  pluginId: string | null;
+}
+
+export interface CodexPluginOption {
+  id: string;
+  name: string;
+  displayName: string;
+  description: string;
+  developer: string | null;
+  category: string | null;
+  marketplace: string;
+  enabled: boolean;
+  capabilities: string[];
+  defaultPrompts: string[];
+}
+
+export interface CodexFileMatch {
+  path: string;
+  fileName: string;
+}
+
+export type AgentTurnAttachment =
+  | { type: 'skill'; name: string; path: string }
+  | { type: 'localImage'; path: string; name?: string };
+
 export interface AgentSessionsApi {
   list: () => AgentSessionResult<{ sessions: AgentSessionInfo[] }>;
   create: (opts: { cwd?: string; policy: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean }) =>
     AgentSessionResult<{ session: AgentSessionInfo }>;
   send: (opts: {
     id: string; text: string; policy?: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
+    attachments?: AgentTurnAttachment[];
   }) => AgentSessionResult;
+  models: () => AgentSessionResult<{ models: CodexModelOption[] }>;
+  skills: (opts: { id: string; reload?: boolean }) => AgentSessionResult<{ skills: CodexSkillOption[] }>;
+  setSkillEnabled: (opts: { id: string; path: string; enabled: boolean }) => AgentSessionResult;
+  plugins: (opts: { id: string; reload?: boolean }) => AgentSessionResult<{ plugins: CodexPluginOption[] }>;
+  searchFiles: (opts: { id: string; query: string }) => AgentSessionResult<{ files: CodexFileMatch[] }>;
+  attachImage: (opts: { id: string; name: string; mime: string; data: string }) =>
+    AgentSessionResult<{ attachment: Extract<AgentTurnAttachment, { type: 'localImage' }> }>;
   answer: (opts: { id: string; requestId: string; answers: Record<string, string[]> | null }) => AgentSessionResult;
   interrupt: (opts: { id: string }) => AgentSessionResult<{ interrupted: boolean }>;
   respond: (opts: { id: string; requestId: string; allow: boolean; reason?: string }) => AgentSessionResult;
@@ -1136,6 +1187,8 @@ export interface WorkerTimelineTurn {
   prompt: string;
   /** `system`: AhaStation started the turn (a wake-up), not the person or a dispatch brief. */
   origin?: 'system';
+  /** Skills and images sent with the prompt, by name. */
+  attachments?: { kind: 'skill' | 'image'; name: string }[];
   startedAt: number;
   completedAt: number | null;
   status: WorkerTimelineTurnStatus;

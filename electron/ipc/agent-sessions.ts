@@ -1,7 +1,10 @@
-import { existsSync, statSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import { z } from 'zod';
+import type { AgentTurnAttachment } from '../orchestration/agent-session-driver.js';
 import { AGENT_SESSION_ID, type AgentSessionManager } from '../orchestration/agent-session-manager.js';
+import type { CodexCatalog } from '../orchestration/codex-catalog.js';
 import { WorkerTimelinePatchCoalescer } from '../orchestration/worker-timeline.js';
 import type { IpcContext } from './context.js';
 import { handleSecure, mainWindowSenderPolicy } from './validators.js';
@@ -9,6 +12,16 @@ import { handleSecure, mainWindowSenderPolicy } from './validators.js';
 const id = z.string().regex(AGENT_SESSION_ID);
 const policy = z.enum(['read-only', 'workspace-write', 'full-auto']);
 const optionalName = z.string().trim().min(1).max(200).nullish();
+const absolutePath = z.string().min(1).max(2048).refine((value) => isAbsolute(value), 'Path must be absolute');
+
+const IMAGE_EXTENSIONS = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp' } as const;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENTS = 10;
+
+const attachmentSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('skill'), name: z.string().trim().min(1).max(200), path: absolutePath }).strict(),
+  z.object({ type: z.literal('localImage'), path: absolutePath, name: z.string().trim().min(1).max(200).optional() }).strict(),
+]);
 
 const createSchema = z.object({
   cwd: z.string().min(1).max(1024).optional(),
@@ -18,8 +31,18 @@ const createSchema = z.object({
   network: z.boolean().optional(),
 }).strict();
 const sendSchema = z.object({
-  id, text: z.string().min(1).max(512_000), policy: policy.optional(), model: optionalName, effort: optionalName,
-  network: z.boolean().optional(),
+  id, text: z.string().max(512_000), policy: policy.optional(), model: optionalName, effort: optionalName,
+  network: z.boolean().optional(), attachments: z.array(attachmentSchema).max(MAX_ATTACHMENTS).optional(),
+}).strict().refine((input) => input.text.trim() || input.attachments?.length, 'Message is empty');
+const catalogSchema = z.object({ id, reload: z.boolean().optional() }).strict();
+const searchSchema = z.object({ id, query: z.string().max(200) }).strict();
+const skillSwitchSchema = z.object({ id, path: absolutePath, enabled: z.boolean() }).strict();
+const imageSchema = z.object({
+  id,
+  name: z.string().trim().min(1).max(200),
+  mime: z.enum(Object.keys(IMAGE_EXTENSIONS) as [keyof typeof IMAGE_EXTENSIONS, ...(keyof typeof IMAGE_EXTENSIONS)[]]),
+  // Base64 grows by 4/3; the decoded size is checked again below.
+  data: z.string().min(1).max(Math.ceil(MAX_IMAGE_BYTES / 3) * 4 + 4),
 }).strict();
 const answerSchema = z.object({
   id, requestId: z.string().min(1).max(64),
@@ -33,8 +56,62 @@ const respondSchema = z.object({
 
 const fail = (error: unknown) => ({ ok: false as const, error: error instanceof Error ? error.message : String(error) });
 
-export function registerAgentSessionsIpc(ctx: IpcContext, manager: AgentSessionManager): { dispose: () => void } {
+const isInside = (root: string, path: string) => {
+  const rel = relative(root, path);
+  return Boolean(rel) && !rel.startsWith('..') && !isAbsolute(rel);
+};
+
+export function registerAgentSessionsIpc(
+  ctx: IpcContext,
+  manager: AgentSessionManager,
+  options: {
+    /** Models, skills, plugins, and file search; without it the composer offers none of them. */
+    catalog?: CodexCatalog;
+    /** Where pasted images are kept, one folder per session; without it images cannot be attached. */
+    attachmentsDir?: () => string;
+  } = {},
+): { dispose: () => void } {
   const authorize = mainWindowSenderPolicy(() => ctx.liveWindow()?.webContents.id ?? null);
+  const { catalog } = options;
+  const sessionCwd = (sessionId: string) => {
+    const cwd = manager.list().find((session) => session.id === sessionId)?.cwd;
+    if (!cwd) throw new Error('会话不存在');
+    return cwd;
+  };
+  const requireCatalog = () => {
+    if (!catalog) throw new Error('当前环境无法读取 Codex 目录');
+    return catalog;
+  };
+  const imagesDir = (sessionId: string) => {
+    if (!options.attachmentsDir) throw new Error('当前环境不支持图片附件');
+    return join(options.attachmentsDir(), sessionId);
+  };
+  // A message may only carry skills Codex listed for the session's folder and images saved for it here.
+  const checkAttachments = async (sessionId: string, attachments: readonly AgentTurnAttachment[]) => {
+    const cwd = sessionCwd(sessionId);
+    for (const attachment of attachments) {
+      if (attachment.type === 'skill') {
+        if (!await requireCatalog().findSkill(cwd, attachment.path)) throw new Error(`技能 ${attachment.name} 不可用`);
+      } else {
+        const path = resolve(attachment.path);
+        if (!isInside(imagesDir(sessionId), path) || !existsSync(path)) throw new Error('图片附件已失效，请重新添加');
+      }
+    }
+  };
+
+  // Images of sessions that no longer exist (closed, or dropped from history) are removed at start.
+  if (options.attachmentsDir) {
+    try {
+      const known = new Set(manager.list().map((session) => session.id));
+      for (const entry of readdirSync(options.attachmentsDir(), { withFileTypes: true })) {
+        if (entry.isDirectory() && !known.has(entry.name)) {
+          rmSync(join(options.attachmentsDir(), entry.name), { recursive: true, force: true });
+        }
+      }
+    } catch {
+      // No attachments folder yet.
+    }
+  }
   const secure = <T extends z.ZodTypeAny>(
     channel: string, schema: T, handler: (input: z.infer<T>) => Promise<Record<string, unknown>> | Record<string, unknown>,
   ) => handleSecure(`agent-sessions:${channel}`, {
@@ -57,9 +134,32 @@ export function registerAgentSessionsIpc(ctx: IpcContext, manager: AgentSessionM
     return { session: await manager.create({ cwd, policy: input.policy, model: input.model, effort: input.effort, network: input.network }) };
   });
   secure('send', sendSchema, async ({ id: sessionId, ...message }) => {
+    if (message.attachments?.length) await checkAttachments(sessionId, message.attachments);
     const delivery = await manager.send(sessionId, message);
     if (delivery.status !== 'accepted') throw new Error(delivery.reason);
     return {};
+  });
+  secure('models', z.object({}).strict(), async () => ({ models: await requireCatalog().listModels() }));
+  secure('skills', catalogSchema, async (input) => ({
+    skills: await requireCatalog().listSkills(sessionCwd(input.id), input.reload),
+  }));
+  secure('set-skill-enabled', skillSwitchSchema, async (input) => {
+    await requireCatalog().setSkillEnabled(sessionCwd(input.id), input.path, input.enabled);
+    return {};
+  });
+  secure('plugins', catalogSchema, async (input) => ({ plugins: await requireCatalog().listPlugins(sessionCwd(input.id)) }));
+  secure('search-files', searchSchema, async (input) => ({
+    files: input.query.trim() ? await requireCatalog().searchFiles(sessionCwd(input.id), input.query.trim()) : [],
+  }));
+  secure('attach-image', imageSchema, (input) => {
+    sessionCwd(input.id);
+    const bytes = Buffer.from(input.data, 'base64');
+    if (!bytes.length || bytes.length > MAX_IMAGE_BYTES) throw new Error('图片不能超过 10MB');
+    const dir = imagesDir(input.id);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `${randomUUID()}${IMAGE_EXTENSIONS[input.mime]}`);
+    writeFileSync(path, bytes);
+    return { attachment: { type: 'localImage', path, name: basename(input.name) } };
   });
   secure('interrupt', targetSchema, async (input) => ({ interrupted: await manager.interrupt(input.id) }));
   secure('respond', respondSchema, (input) => {
@@ -72,6 +172,7 @@ export function registerAgentSessionsIpc(ctx: IpcContext, manager: AgentSessionM
   });
   secure('close', targetSchema, async (input) => {
     await manager.close(input.id);
+    if (options.attachmentsDir) rmSync(imagesDir(input.id), { recursive: true, force: true });
     return {};
   });
   secure('set-orchestration', orchestrationSchema, async (input) => {

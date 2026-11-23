@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
+import { basename } from 'node:path';
 import { AtomicSnapshotWriter } from '../persistence/atomic-snapshot-writer.js';
 import type {
   AgentProvider, AgentQuestion, AgentRuntimeRequest, AgentRuntimeResponse, AgentSessionDriver, AgentSessionEvents,
-  AgentSessionPolicy, TurnDelivery,
+  AgentSessionPolicy, AgentTurnAttachment, TurnDelivery,
 } from './agent-session-driver.js';
 import { WorkerTimeline, type WorkerTimelineChange, type WorkerTimelineSnapshot } from './worker-timeline.js';
 
@@ -134,11 +135,12 @@ export class AgentSessionManager {
    */
   async send(id: string, input: {
     text: string; model?: string | null; effort?: string | null; policy?: AgentSessionPolicy; network?: boolean;
+    attachments?: readonly AgentTurnAttachment[];
   }): Promise<TurnDelivery> {
     const session = this.sessions.get(id);
     const text = input.text.trim();
     if (!session) return { status: 'not_accepted', reason: 'Session not found' };
-    if (!text) return { status: 'not_accepted', reason: 'Message is empty' };
+    if (!text && !input.attachments?.length) return { status: 'not_accepted', reason: 'Message is empty' };
     const { info } = session;
     const wanted = input.policy ?? info.policy;
     if (this.resumable(session)) {
@@ -174,7 +176,10 @@ export class AgentSessionManager {
         return { status: 'not_accepted', reason: info.error ?? 'Session did not restart' };
       }
     }
-    if (!session.info.title) session.info.title = text.split('\n')[0]!.slice(0, 60);
+    if (!session.info.title) {
+      const firstSkill = input.attachments?.find((item) => item.type === 'skill');
+      session.info.title = (text.split('\n')[0] || (firstSkill?.type === 'skill' ? `$${firstSkill.name}` : '图片')).slice(0, 60);
+    }
     const delivery = await this.startTurn(session, text, input);
     if (delivery.status === 'accepted' && session.info.orchestration) this.deps.onUserTurn?.(id);
     return delivery;
@@ -194,17 +199,26 @@ export class AgentSessionManager {
 
   private async startTurn(
     session: Session, text: string,
-    input: { model?: string | null; effort?: string | null; policy?: AgentSessionPolicy; network?: boolean },
+    input: {
+      model?: string | null; effort?: string | null; policy?: AgentSessionPolicy; network?: boolean;
+      attachments?: readonly AgentTurnAttachment[];
+    },
     origin?: 'system',
   ): Promise<TurnDelivery> {
     const { info, timeline } = session;
     const driver = session.driver!;
     const turnKey = `${info.id}:${++session.turns}`;
+    const attachments = input.attachments ?? [];
     info.status = 'running';
-    timeline.beginTurn({ dispatchId: turnKey, prompt: text, ...(origin ? { origin } : {}) });
+    timeline.beginTurn({
+      dispatchId: turnKey, prompt: text, ...(origin ? { origin } : {}),
+      attachments: attachments.map((item) => item.type === 'skill'
+        ? { kind: 'skill' as const, name: item.name }
+        : { kind: 'image' as const, name: item.name || basename(item.path) }),
+    });
     this.sessionsChanged();
     const delivery = await driver.startTurn({
-      turnKey, prompt: text,
+      turnKey, prompt: text, ...(attachments.length ? { attachments } : {}),
       effort: input.effort ?? info.effort,
       ...(input.model && input.model !== info.model ? { model: input.model } : {}),
       ...(input.policy && input.policy !== info.policy ? { policy: input.policy } : {}),
