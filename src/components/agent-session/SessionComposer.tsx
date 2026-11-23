@@ -1,8 +1,19 @@
-import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowUp, Cpu, Folder, GitBranch, Globe, Lock, MessageCircleQuestion, ShieldAlert, Square } from 'lucide-react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  ArrowUp, Cpu, FileText, Folder, GitBranch, Globe, ImagePlus, Lock, MessageCircleQuestion, ShieldAlert, Sparkles, Square, X,
+} from 'lucide-react';
 import { formatTokenCount } from '../../lib/worker-timeline-model';
-import { POLICY_LABELS } from '../../lib/agent-session-client';
-import type { AgentSessionInfo, AgentSessionPolicy, OrchestrationQuestionRecord, WorkerTimelineItem } from '../../types';
+import { POLICY_LABELS, codexCatalogClient } from '../../lib/agent-session-client';
+import {
+  applyCompletion, detectTrigger, fileMention, filterSkills, resolveModelChoice, skillMention, skillsInText,
+  type ComposerTrigger,
+} from '../../lib/composer-tokens';
+import type {
+  AgentSessionInfo, AgentSessionPolicy, AgentTurnAttachment, CodexFileMatch, CodexModelOption, CodexSkillOption,
+  OrchestrationQuestionRecord, WorkerTimelineItem,
+} from '../../types';
+import { ComposerCatalogPanel } from './ComposerCatalogPanel';
+import { ComposerModelPicker } from './ComposerModelPicker';
 import { useAgentSession } from './session-context';
 
 type ApprovalItem = Extract<WorkerTimelineItem, { kind: 'approval' }>;
@@ -194,15 +205,83 @@ export interface SessionComposerProps {
   /** Direct sessions take one turn at a time, so sending waits for the running turn. */
   direct?: boolean;
   usage: { input: number; output: number; total: number } | null;
+  /** Direct sessions: model and effort, `$` skills, `@` files, images, and the plugin panel. */
+  toolbar?: ComposerToolbar;
   /** Resolves true once the message was accepted, which clears the draft. */
-  onSend: (text: string) => Promise<boolean>;
+  onSend: (text: string, attachments: AgentTurnAttachment[]) => Promise<boolean>;
   onInterrupt: () => void;
+}
+
+export interface ComposerToolbar {
+  sessionId: string;
+  /** The model and effort the next message uses; null means Codex's default. */
+  modelId: string | null;
+  effort: string | null;
+  onModelChange: (model: CodexModelOption) => void;
+  onEffortChange: (effort: string) => void;
+  onNotify?: (message: string) => void;
+}
+
+interface DraftImage {
+  key: string;
+  name: string;
+  previewUrl: string;
+  attachment: Extract<AgentTurnAttachment, { type: 'localImage' }>;
+}
+
+type Suggestion =
+  | { kind: 'skill'; key: string; skill: CodexSkillOption }
+  | { kind: 'file'; key: string; file: CodexFileMatch };
+
+const IMAGE_MIME = /^image\/(png|jpeg|gif|webp)$/u;
+const MAX_IMAGES = 6;
+const FILE_SEARCH_DELAY_MS = 120;
+
+const readBase64 = (file: File) => new Promise<string>((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve(String(reader.result).replace(/^data:[^,]*,/u, ''));
+  reader.onerror = () => reject(reader.error ?? new Error('读取图片失败'));
+  reader.readAsDataURL(file);
+});
+
+/** Codex's models and the session's skills, loaded once the composer can use them. */
+function useComposerCatalog(sessionId: string | undefined) {
+  const [models, setModels] = useState<CodexModelOption[]>([]);
+  const [skills, setSkills] = useState<CodexSkillOption[] | null>(null);
+  useEffect(() => {
+    if (!sessionId) return;
+    let live = true;
+    void codexCatalogClient.models().then((list) => live && setModels(list), () => {});
+    return () => {
+      live = false;
+    };
+  }, [sessionId]);
+  const loadSkills = useMemo(() => () => {
+    if (!sessionId) return;
+    void codexCatalogClient.skills(sessionId).then(setSkills, () => setSkills([]));
+  }, [sessionId]);
+  return { models, skills, loadSkills };
 }
 
 /** Floating input card with the approvals and questions that block the Worker stacked above it. */
 export function SessionComposer(props: SessionComposerProps) {
+  const { toolbar } = props;
   const [draft, setDraft] = useState('');
+  const [images, setImages] = useState<DraftImage[]>([]);
+  const [trigger, setTrigger] = useState<ComposerTrigger | null>(null);
+  const [files, setFiles] = useState<CodexFileMatch[]>([]);
+  const [active, setActive] = useState(0);
+  const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const searchSeq = useRef(0);
+  const catalog = useComposerCatalog(toolbar?.sessionId);
+  const choice = useMemo(
+    () => resolveModelChoice(catalog.models, toolbar?.modelId ?? null, toolbar?.effort ?? null),
+    [catalog.models, toolbar?.modelId, toolbar?.effort],
+  );
+  const imagesAllowed = Boolean(toolbar) && (choice.model?.images ?? true);
+
   useLayoutEffect(() => {
     const el = inputRef.current;
     if (!el) return;
@@ -210,16 +289,124 @@ export function SessionComposer(props: SessionComposerProps) {
     el.style.height = `${Math.min(COMPOSER_MAX_HEIGHT, el.scrollHeight)}px`;
   }, [draft, props.alive]);
 
+  // Object URLs for previews are released when an image leaves the draft or the composer unmounts.
+  const imagesRef = useRef(images);
+  imagesRef.current = images;
+  useEffect(() => () => imagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl)), []);
+
+  useEffect(() => {
+    if (!toolbar || trigger?.kind !== 'file' || !trigger.query) {
+      setFiles([]);
+      return;
+    }
+    const seq = ++searchSeq.current;
+    const timer = setTimeout(() => {
+      void window.vibeMeet?.agentSessions?.searchFiles({ id: toolbar.sessionId, query: trigger.query }).then((res) => {
+        if (seq === searchSeq.current) setFiles(res?.ok ? res.files : []);
+      });
+    }, FILE_SEARCH_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [toolbar?.sessionId, trigger?.kind, trigger?.query]);
+
+  const suggestions = useMemo<Suggestion[]>(() => {
+    if (!trigger) return [];
+    if (trigger.kind === 'skill') {
+      return filterSkills(catalog.skills ?? [], trigger.query, 12)
+        .map((skill) => ({ kind: 'skill' as const, key: skill.path, skill }));
+    }
+    return files.map((file) => ({ kind: 'file' as const, key: file.path, file }));
+  }, [trigger, catalog.skills, files]);
+  const menuOpen = Boolean(trigger) && (suggestions.length > 0 || (trigger?.kind === 'skill' && !catalog.skills));
+
   const blocked = Boolean(props.direct && props.running);
   const placeholder = props.direct
-    ? (props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : '给 Codex 发消息')
+    ? (props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : toolbar ? '给 Codex 发消息，$ 选技能，@ 引用文件' : '给 Codex 发消息')
     : (props.running ? '补充指令，本轮结束后送达' : '给 Worker 发送追加指令');
+
+  const updateTrigger = (text: string, caret: number) => {
+    if (!toolbar) return;
+    const next = detectTrigger(text, caret);
+    setTrigger(next);
+    setActive(0);
+    if (next?.kind === 'skill' && !catalog.skills) catalog.loadSkills();
+  };
+
+  const insert = (insertion: string) => {
+    if (!trigger) return;
+    const next = applyCompletion(draft, trigger, insertion);
+    setDraft(next.text);
+    setTrigger(null);
+    requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      inputRef.current?.setSelectionRange(next.caret, next.caret);
+    });
+  };
+  const choose = (item: Suggestion) => insert(item.kind === 'skill' ? skillMention(item.skill.name) : fileMention(item.file.path));
+
+  const useSkill = (skill: CodexSkillOption) => {
+    const el = inputRef.current;
+    const caret = el?.selectionStart ?? draft.length;
+    const before = draft.slice(0, caret);
+    const token = `${before && !/\s$/u.test(before) ? ' ' : ''}${skillMention(skill.name)} `;
+    setDraft(before + token + draft.slice(caret));
+    catalog.loadSkills();
+    requestAnimationFrame(() => el?.focus());
+  };
+
+  const addImages = async (list: readonly File[]) => {
+    if (!toolbar) return;
+    const api = window.vibeMeet?.agentSessions;
+    if (!api?.attachImage) return;
+    if (!imagesAllowed) {
+      toolbar.onNotify?.('当前模型不支持图片输入');
+      return;
+    }
+    const room = MAX_IMAGES - imagesRef.current.length;
+    for (const file of list.filter((item) => IMAGE_MIME.test(item.type)).slice(0, Math.max(0, room))) {
+      try {
+        const res = await api.attachImage({
+          id: toolbar.sessionId, name: file.name || 'image.png', mime: file.type, data: await readBase64(file),
+        });
+        if (!res.ok) {
+          toolbar.onNotify?.(res.error);
+          continue;
+        }
+        setImages((current) => [...current, {
+          key: res.attachment.path, name: res.attachment.name ?? file.name, previewUrl: URL.createObjectURL(file), attachment: res.attachment,
+        }]);
+      } catch (error) {
+        toolbar.onNotify?.(error instanceof Error ? error.message : '添加图片失败');
+      }
+    }
+    if (list.length > room) toolbar.onNotify?.(`一条消息最多 ${MAX_IMAGES} 张图片`);
+  };
+  const removeImage = (key: string) => setImages((current) => current.filter((image) => {
+    if (image.key === key) URL.revokeObjectURL(image.previewUrl);
+    return image.key !== key;
+  }));
 
   const send = async () => {
     const text = draft.trim();
-    if (!text || props.sending || blocked) return;
-    if (await props.onSend(text)) setDraft('');
+    if ((!text && images.length === 0) || props.sending || blocked) return;
+    const skills = skillsInText(text, catalog.skills ?? []);
+    const attachments: AgentTurnAttachment[] = [
+      ...skills.map((skill) => ({ type: 'skill' as const, name: skill.name, path: skill.path })),
+      ...images.map((image) => image.attachment),
+    ];
+    if (await props.onSend(text, attachments)) {
+      setDraft('');
+      setTrigger(null);
+      images.forEach((image) => URL.revokeObjectURL(image.previewUrl));
+      setImages([]);
+    }
   };
+
+  // A `$` typed before the skills loaded still finds them once they arrive.
+  const { skills: loadedSkills, loadSkills } = catalog;
+  const hasToolbar = Boolean(toolbar);
+  useEffect(() => {
+    if (hasToolbar && /(^|\s)\$/u.test(draft) && !loadedSkills) loadSkills();
+  }, [hasToolbar, draft, loadedSkills, loadSkills]);
 
   return (
     <div className="asv-dock-inner">
@@ -233,15 +420,95 @@ export function SessionComposer(props: SessionComposerProps) {
         </div>
       )}
       {props.alive ? (
-        <div className="asv-composer">
+        <div
+          className={`asv-composer${dragging ? ' is-dragging' : ''}`}
+          onDragOver={(event) => {
+            if (!imagesAllowed || !event.dataTransfer.types.includes('Files')) return;
+            event.preventDefault();
+            setDragging(true);
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(event) => {
+            setDragging(false);
+            if (!imagesAllowed) return;
+            const dropped = [...event.dataTransfer.files];
+            if (!dropped.some((file) => IMAGE_MIME.test(file.type))) return;
+            event.preventDefault();
+            void addImages(dropped);
+          }}
+        >
+          {menuOpen && (
+            <div className="asv-suggest" role="listbox" aria-label={trigger?.kind === 'skill' ? '技能' : '文件'}>
+              <div className="asv-suggest-head">{trigger?.kind === 'skill' ? '技能' : '文件'}</div>
+              {trigger?.kind === 'skill' && !catalog.skills && <div className="asv-pop-note">正在读取技能…</div>}
+              {suggestions.map((item, index) => (
+                <button
+                  key={item.key}
+                  type="button"
+                  role="option"
+                  aria-selected={index === active}
+                  className={`asv-suggest-row${index === active ? ' is-active' : ''}`}
+                  onMouseEnter={() => setActive(index)}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => choose(item)}
+                >
+                  {item.kind === 'skill' ? <Sparkles size={13} aria-hidden="true" /> : <FileText size={13} aria-hidden="true" />}
+                  <span className="asv-suggest-title">{item.kind === 'skill' ? item.skill.name : item.file.fileName}</span>
+                  <span className="asv-suggest-desc">{item.kind === 'skill' ? item.skill.description : item.file.path}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {images.length > 0 && (
+            <div className="asv-attach-strip">
+              {images.map((image) => (
+                <div key={image.key} className="asv-attach-thumb" title={image.name}>
+                  <img src={image.previewUrl} alt={image.name} />
+                  <button type="button" aria-label={`移除 ${image.name}`} onClick={() => removeImage(image.key)}>
+                    <X size={11} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <textarea
             ref={inputRef}
             className="asv-composer-input"
             placeholder={placeholder}
             value={draft}
             rows={1}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              updateTrigger(event.target.value, event.target.selectionStart ?? event.target.value.length);
+            }}
+            onSelect={(event) => updateTrigger(event.currentTarget.value, event.currentTarget.selectionStart ?? 0)}
+            onBlur={() => setTrigger(null)}
+            onPaste={(event) => {
+              if (!toolbar) return;
+              const pasted = [...event.clipboardData.files].filter((file) => IMAGE_MIME.test(file.type));
+              if (pasted.length === 0) return;
+              event.preventDefault();
+              void addImages(pasted);
+            }}
             onKeyDown={(event) => {
+              if (menuOpen && suggestions.length > 0) {
+                if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                  event.preventDefault();
+                  const step = event.key === 'ArrowDown' ? 1 : -1;
+                  setActive((index) => (index + step + suggestions.length) % suggestions.length);
+                  return;
+                }
+                if ((event.key === 'Enter' || event.key === 'Tab') && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  choose(suggestions[active] ?? suggestions[0]!);
+                  return;
+                }
+              }
+              if (menuOpen && event.key === 'Escape') {
+                event.preventDefault();
+                setTrigger(null);
+                return;
+              }
               if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
                 void send();
@@ -250,13 +517,56 @@ export function SessionComposer(props: SessionComposerProps) {
             aria-label={props.direct ? '消息' : '追加指令'}
           />
           <div className="asv-composer-bar">
-            <span className="asv-composer-hint">Enter 发送 · Shift+Enter 换行</span>
+            {toolbar ? (
+              <div className="asv-composer-tools">
+                <button
+                  type="button"
+                  className="asv-tool-btn is-icon"
+                  disabled={!imagesAllowed}
+                  aria-label="添加图片"
+                  title={imagesAllowed ? '添加图片（也可以粘贴或拖入）' : '当前模型不支持图片输入'}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <ImagePlus size={14} />
+                </button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/gif,image/webp"
+                  multiple
+                  hidden
+                  onChange={(event) => {
+                    void addImages([...(event.target.files ?? [])]);
+                    event.target.value = '';
+                  }}
+                />
+                <ComposerCatalogPanel sessionId={toolbar.sessionId} onNotify={toolbar.onNotify} onUseSkill={useSkill} />
+                <ComposerModelPicker
+                  models={catalog.models}
+                  model={choice.model}
+                  fallbackLabel={toolbar.modelId}
+                  effort={choice.effort}
+                  disabled={props.running}
+                  onModelChange={toolbar.onModelChange}
+                  onEffortChange={toolbar.onEffortChange}
+                />
+              </div>
+            ) : (
+              <span className="asv-composer-hint">Enter 发送 · Shift+Enter 换行</span>
+            )}
             {props.running && (
               <button type="button" className="asv-round-btn" disabled={props.interrupting} onClick={props.onInterrupt} aria-label="中断本轮" title="中断本轮">
                 <Square size={12} fill="currentColor" />
               </button>
             )}
-            <button type="button" className="asv-round-btn is-primary" disabled={!draft.trim() || props.sending || blocked} onClick={() => void send()} aria-label="发送" title="发送">
+            <button
+              type="button"
+              className="asv-round-btn is-primary"
+              disabled={(!draft.trim() && images.length === 0) || props.sending || blocked}
+              onClick={() => void send()}
+              aria-label="发送"
+              title="发送（Enter）· Shift+Enter 换行"
+            >
               <ArrowUp size={15} strokeWidth={2.25} />
             </button>
           </div>
@@ -267,7 +577,7 @@ export function SessionComposer(props: SessionComposerProps) {
       <div className="asv-context-strip">
         {props.cwd && <Chip icon={<Folder size={12} />} title={props.cwd}>{baseName(props.cwd)}</Chip>}
         {props.branch && <Chip icon={<GitBranch size={12} />} title={props.branch}>{props.branch}</Chip>}
-        {props.model && <Chip icon={<Cpu size={12} />}>{props.model}</Chip>}
+        {props.model && !toolbar && <Chip icon={<Cpu size={12} />}>{props.model}</Chip>}
         {props.policy && props.onPolicyChange ? (
           <label className="asv-chip asv-policy" title="权限：下一条消息起生效">
             <Lock size={12} />

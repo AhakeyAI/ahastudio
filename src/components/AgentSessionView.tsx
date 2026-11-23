@@ -1,5 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Hourglass, Square, Workflow } from 'lucide-react';
+import {
+  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Hourglass, Image as ImageIcon, Sparkles, Square, Workflow,
+} from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
 import { countDiffStats, parseUnifiedDiff } from '../lib/git-panel-model';
@@ -21,6 +23,8 @@ import {
 import type {
   AgentSessionInfo,
   AgentSessionPolicy,
+  AgentTurnAttachment,
+  CodexModelOption,
   OrchestrationDispatchRecord,
   OrchestrationDispatchStage,
   WorkerTimelineFileChange,
@@ -54,7 +58,9 @@ const LONG_PROMPT_LINES = 16;
 
 type Item<K extends WorkerTimelineItem['kind']> = Extract<WorkerTimelineItem, { kind: K }>;
 
-function UserBubble({ text, caption }: { text: string; caption?: string }) {
+function UserBubble({ text, caption, attachments }: {
+  text: string; caption?: string; attachments?: WorkerTimelineTurn['attachments'];
+}) {
   const parts = useMemo(() => splitDispatchPrompt(text), [text]);
   const long = parts.body.length > LONG_PROMPT_CHARS || parts.body.split('\n').length > LONG_PROMPT_LINES;
   const [expanded, setExpanded] = useState(false);
@@ -62,9 +68,21 @@ function UserBubble({ text, caption }: { text: string; caption?: string }) {
   const origin = parts.system ? (parts.followUp ? '追加派发' : '编排派发') : null;
   return (
     <div className="asv-user" data-asv-row>
-      <div className={`asv-bubble${long && !expanded ? ' is-clamped' : ''}`}>
-        <SessionMarkdown text={parts.body} variant="bubble" />
-      </div>
+      {parts.body && (
+        <div className={`asv-bubble${long && !expanded ? ' is-clamped' : ''}`}>
+          <SessionMarkdown text={parts.body} variant="bubble" />
+        </div>
+      )}
+      {attachments && attachments.length > 0 && (
+        <div className="asv-user-attachments">
+          {attachments.map((item, index) => (
+            <span key={`${item.kind}:${item.name}:${index}`} className={`asv-attach-pill is-${item.kind}`}>
+              {item.kind === 'skill' ? <Sparkles size={11} aria-hidden="true" /> : <ImageIcon size={11} aria-hidden="true" />}
+              {item.kind === 'skill' ? `$${item.name}` : item.name}
+            </span>
+          ))}
+        </div>
+      )}
       {(long || parts.system || caption) && (
         <div className="asv-user-meta">
           {long && (
@@ -186,7 +204,7 @@ const TurnView = memo(function TurnView({ turn, minHeight }: { turn: WorkerTimel
     <section className={`asv-turn is-${turn.status}`} aria-label={`第 ${turn.generation} 轮`} style={minHeight ? { minHeight } : undefined}>
       {turn.origin === 'system'
         ? <SystemWakeRow text={turn.prompt} generation={turn.generation} />
-        : <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} />}
+        : <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} attachments={turn.attachments} />}
       {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}
       {blocks.map((block) =>
         block.type === 'group' ? <WorkGroup key={block.id} block={block} /> : <TimelineItem key={block.item.id} item={block.item} />,
@@ -226,6 +244,8 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const info = direct ? directSessions.find((entry) => entry.id === win.workerId) : undefined;
   const [nextPolicy, setNextPolicy] = useState<AgentSessionPolicy | null>(null);
   const [nextNetwork, setNextNetwork] = useState<boolean | null>(null);
+  const [nextModel, setNextModel] = useState<string | null>(null);
+  const [nextEffort, setNextEffort] = useState<string | null>(null);
   const policy = nextPolicy ?? info?.policy;
   const network = nextNetwork ?? info?.network ?? false;
   const resumable = Boolean(info?.providerSessionId) && (info?.status === 'suspended' || info?.status === 'failed');
@@ -290,22 +310,28 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     }
   };
 
-  const send = async (text: string) => {
+  const send = async (text: string, attachments: AgentTurnAttachment[] = []) => {
     if (sessionId) {
       const sessions = window.vibeMeet?.agentSessions;
       if (!sessions) return false;
       const ok = await run('send', () => sessions.send({
         id: sessionId, text,
+        ...(attachments.length ? { attachments } : {}),
         ...(nextPolicy && nextPolicy !== info?.policy ? { policy: nextPolicy } : {}),
         ...(nextNetwork !== null && nextNetwork !== info?.network ? { network: nextNetwork } : {}),
+        ...(nextModel && nextModel !== info?.model ? { model: nextModel } : {}),
+        ...(nextEffort && nextEffort !== info?.effort ? { effort: nextEffort } : {}),
       }));
       if (ok) {
         setNextPolicy(null);
         setNextNetwork(null);
+        setNextModel(null);
+        setNextEffort(null);
         scroll.scrollToEnd();
       }
       return ok;
     }
+    if (!text) return false;
     if (!targetDispatchId || !api) return false;
     const [first = '', ...rest] = text.split('\n');
     const long = first.length > 200;
@@ -439,6 +465,20 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             {...(direct ? {
               network, onNetworkChange: setNextNetwork, resumable,
               directQuestions: info?.pendingQuestions ?? [], onAnswer: answer,
+            } : {})}
+            {...(direct && sessionId && info && info.status !== 'closed' ? {
+              toolbar: {
+                sessionId,
+                modelId: nextModel ?? info.model,
+                effort: nextEffort ?? info.effort,
+                onModelChange: (model: CodexModelOption) => {
+                  setNextModel(model.id);
+                  const effort = nextEffort ?? info.effort;
+                  if (!model.efforts.some((option) => option.value === effort)) setNextEffort(model.defaultEffort);
+                },
+                onEffortChange: setNextEffort,
+                onNotify,
+              },
             } : {})}
             usage={usage}
             onSend={send}

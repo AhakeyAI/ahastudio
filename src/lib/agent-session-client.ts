@@ -1,4 +1,4 @@
-import type { AgentSessionInfo, AgentSessionPolicy } from '../types';
+import type { AgentSessionInfo, AgentSessionPolicy, CodexModelOption, CodexSkillOption } from '../types';
 
 const STANDALONE_ID = /^agent-session-[a-f0-9-]{36}$/;
 
@@ -51,5 +51,39 @@ export const agentSessionClient = {
     // The change event can arrive after this call resolves; the view needs the session right away.
     if (!sessions.some((session) => session.id === res.session.id)) publish([...sessions, res.session]);
     return res;
+  },
+};
+
+let modelsRequest: Promise<CodexModelOption[]> | null = null;
+const skillRequests = new Map<string, { at: number; request: Promise<CodexSkillOption[]> }>();
+const SKILL_CACHE_MS = 60_000;
+
+/** Models and skills for the composer, shared by every open session view. */
+export const codexCatalogClient = {
+  models(): Promise<CodexModelOption[]> {
+    const api = window.vibeMeet?.agentSessions;
+    if (!api?.models) return Promise.resolve([]);
+    modelsRequest ??= api.models().then((res) => {
+      if (res.ok) return res.models;
+      modelsRequest = null;
+      throw new Error(res.error);
+    }, (error: unknown) => {
+      modelsRequest = null;
+      throw error;
+    });
+    return modelsRequest;
+  },
+  skills(sessionId: string): Promise<CodexSkillOption[]> {
+    const api = window.vibeMeet?.agentSessions;
+    if (!api?.skills) return Promise.resolve([]);
+    const cached = skillRequests.get(sessionId);
+    if (cached && Date.now() - cached.at < SKILL_CACHE_MS) return cached.request;
+    const request = api.skills({ id: sessionId }).then((res) => {
+      if (res.ok) return res.skills;
+      skillRequests.delete(sessionId);
+      throw new Error(res.error);
+    });
+    skillRequests.set(sessionId, { at: Date.now(), request });
+    return request;
   },
 };

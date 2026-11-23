@@ -318,6 +318,8 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   private stopPromise: Promise<void> | null = null;
   private initialized: Promise<void> | null = null;
   private readonly childClosed: Promise<void>;
+  effectiveModel: string | null = null;
+  effectiveEffort: string | null = null;
 
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
@@ -393,6 +395,8 @@ export class CodexAppServerPilot implements AgentSessionDriver {
       }
       this.policy = policy;
       this.network = network;
+      this.effectiveModel = string(result.model) ?? model;
+      this.effectiveEffort = string(result.reasoningEffort) ?? null;
       // The resumed thread's running token total is unknown until Codex reports it.
       if (resumeSessionId) this.tokenTotal = null;
       this.threadId = id;

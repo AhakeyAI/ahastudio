@@ -89,6 +89,9 @@ export interface AgentSessionDriver {
   readonly closing: boolean;
   /** The provider's own conversation id, once `open` resolved. */
   readonly sessionId: string | null;
+  /** Model and reasoning effort the provider reported for the conversation, once `open` resolved. */
+  readonly effectiveModel?: string | null;
+  readonly effectiveEffort?: string | null;
   readonly latestTurnKey: string | null;
 
   /** Starts a conversation, or continues `resumeSessionId` where the provider left it. */

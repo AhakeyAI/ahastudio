@@ -394,6 +394,9 @@ export class AgentSessionManager {
         ...(rejoin && info.providerSessionId ? { resumeSessionId: info.providerSessionId } : {}),
       });
       if (!session.driver.alive) throw new Error(info.error ?? 'The agent closed while starting');
+      // What the provider actually uses, e.g. a default from the person's own config.
+      info.model = session.driver.effectiveModel ?? info.model;
+      info.effort = session.driver.effectiveEffort ?? info.effort;
       info.status = 'idle';
       timeline.setMeta({ alive: true, providerSessionId: info.providerSessionId });
     } catch (error) {
