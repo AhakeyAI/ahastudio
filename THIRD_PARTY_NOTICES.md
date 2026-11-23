@@ -49,6 +49,9 @@ Certain ported, adapted, or bundled components retain their original upstream co
 - **Ported / adapted files in this repository:**
   - `src/lib/timeline-scroll-anchoring.ts` (`resolveDisclosureRevealScrollDelta`, ported from `apps/web/src/components/chat/timelineScrollAnchoring.ts`)
   - `src/components/agent-session-view.css`, `src/components/agent-session/*` (chat surface layout, work-log row and composer presentation adapted from `apps/web/src/components/chat/WorkLog.tsx`, `ComposerSurface.tsx` and `apps/web/src/index.css`)
+  - `src/lib/image-compression.ts` (attached-image downscaling and re-encoding, adapted from `apps/web/src/lib/imageCompression.ts`)
+  - `src/lib/composer-tokens.ts` (`isCurrencyAmount`, adapted from `packages/shared/src/composerTrigger.ts`)
+  - `electron/ipc/agent-sessions.ts` (attachment paths stated in the message text, adapted from `packages/provider-core/src/server/attachmentPrompt.ts`)
 
 ---
 

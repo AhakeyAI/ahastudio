@@ -122,7 +122,7 @@ export type WorkerTimelineItem =
 export type WorkerTimelineItemKind = WorkerTimelineItem['kind'];
 
 export interface WorkerTimelineAttachment {
-  kind: 'skill' | 'image';
+  kind: 'skill' | 'image' | 'file';
   name: string;
 }
 

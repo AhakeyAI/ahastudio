@@ -173,20 +173,39 @@ test('a message carries only listed skills and images saved for its session, and
   assert.equal(sent.ok, true, sent.error);
   const input = readTrace(trace, 'turn/start').at(-1).input;
   assert.deepEqual(input, [
-    { type: 'text', text: 'Describe this', text_elements: [] },
+    { type: 'text', text: `Describe this\n\n[Attached image "shot.png" is saved at: ${image.attachment.path}]`, text_elements: [] },
     { type: 'skill', name: skill.name, path: skill.path },
     { type: 'localImage', path: image.attachment.path },
-  ]);
+  ], 'the image is sent as an image and its saved path is named in the text');
   await until(idle);
   assert.deepEqual(manager.getTimeline(id).turns.at(-1).attachments, [
     { kind: 'skill', name: skill.name }, { kind: 'image', name: 'shot.png' },
   ]);
 
-  // An image alone is a message too; Codex then receives no text item.
+  // An attachment alone is a message too; the text is just the saved path.
   const only = await call('attach-image', { id, name: 'b.jpg', mime: 'image/jpeg', data: Buffer.from('jpg').toString('base64') });
   assert.equal((await call('send', { id, text: '', attachments: [only.attachment] })).ok, true);
-  assert.deepEqual(readTrace(trace, 'turn/start').at(-1).input, [{ type: 'localImage', path: only.attachment.path }]);
+  assert.deepEqual(readTrace(trace, 'turn/start').at(-1).input, [
+    { type: 'text', text: `[Attached image "b.jpg" is saved at: ${only.attachment.path}]`, text_elements: [] },
+    { type: 'localImage', path: only.attachment.path },
+  ]);
   await until(idle);
+
+  // Any other file keeps a safe version of its own name and reaches the agent only by path.
+  const doc = await call('attach-file', { id, name: '../报告 "v2".md', data: Buffer.from('# notes').toString('base64') });
+  assert.equal(doc.ok, true, doc.error);
+  assert.equal(doc.attachment.name, '报告 _v2_.md', 'path parts and reserved characters are stripped from the name');
+  assert.ok(doc.attachment.path.startsWith(join(attachments, id)));
+  assert.equal(readFileSync(doc.attachment.path, 'utf8'), '# notes');
+  assert.equal((await call('attach-file', { id, name: 'empty.txt', data: '' })).ok, false, 'an empty file is refused');
+  assert.equal((await call('send', { id, text: 'read it', attachments: [doc.attachment] })).ok, true);
+  assert.deepEqual(readTrace(trace, 'turn/start').at(-1).input, [
+    { type: 'text', text: `read it\n\n[Attached file "报告 _v2_.md" is saved at: ${doc.attachment.path}]`, text_elements: [] },
+  ]);
+  await until(idle);
+  assert.deepEqual(manager.getTimeline(id).turns.at(-1).attachments, [{ kind: 'file', name: '报告 _v2_.md' }]);
+  assert.equal((await call('send', { id, text: 'x', attachments: [{ type: 'file', path: join(cwd, 'package.json') }] })).ok, false,
+    'a file outside the session folder is refused');
 
   assert.deepEqual((await call('search-files', { id, query: 'demo' })).files, [{ path: 'src/demo.ts', fileName: 'demo.ts' }]);
   assert.deepEqual((await call('search-files', { id, query: '  ' })).files, []);

@@ -531,6 +531,17 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
   padding: 0; border: 0; border-radius: 50%; background: rgb(0 0 0 / 60%); color: #fff; cursor: pointer; opacity: 0; transition: opacity 100ms ease;
 }
 .asv-attach-thumb:hover > button, .asv-attach-thumb > button:focus-visible { opacity: 1; }
+.asv-attach-thumb.is-preparing { display: inline-flex; align-items: center; justify-content: center; color: var(--asv-ink-2); }
+.asv-spin { animation: asv-spin 900ms linear infinite; }
+@keyframes asv-spin { to { transform: rotate(360deg); } }
+.asv-attach-file {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 240px; height: 34px; padding: 0 6px 0 10px;
+  border: 1px solid var(--asv-line); border-radius: 10px; background: var(--asv-tint); color: var(--asv-ink); font-size: 12.5px;
+}
+.asv-attach-file > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.asv-attach-file > svg { flex: none; color: var(--asv-ink-2); }
+.asv-attach-file > button { display: inline-flex; flex: none; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; background: none; color: var(--asv-ink-2); cursor: pointer; }
+.asv-attach-file > button:hover { background: var(--asv-hover); color: var(--asv-ink); }
 
 .asv-user-attachments { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; max-width: 85%; }
 .asv-attach-pill { display: inline-flex; align-items: center; gap: 4px; max-width: 260px; padding: 2px 8px; overflow: hidden; border: 1px solid var(--asv-line); border-radius: 999px; color: var(--asv-ink-2); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }

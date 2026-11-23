@@ -16,12 +16,18 @@ const absolutePath = z.string().min(1).max(2048).refine((value) => isAbsolute(va
 
 const IMAGE_EXTENSIONS = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp' } as const;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const MAX_ATTACHMENTS = 10;
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_ATTACHMENTS = 20;
 
 const attachmentSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('skill'), name: z.string().trim().min(1).max(200), path: absolutePath }).strict(),
   z.object({ type: z.literal('localImage'), path: absolutePath, name: z.string().trim().min(1).max(200).optional() }).strict(),
+  z.object({ type: z.literal('file'), path: absolutePath, name: z.string().trim().min(1).max(200).optional() }).strict(),
 ]);
+
+/** A file name safe on every platform, keeping the extension the agent will look at. */
+const safeFileName = (name: string) =>
+  basename(name).replace(/[<>:"/\\|?*\u0000-\u001f]/gu, '_').replace(/^\.+/u, '_').slice(0, 120) || 'file';
 
 const createSchema = z.object({
   cwd: z.string().min(1).max(1024).optional(),
@@ -43,6 +49,11 @@ const imageSchema = z.object({
   mime: z.enum(Object.keys(IMAGE_EXTENSIONS) as [keyof typeof IMAGE_EXTENSIONS, ...(keyof typeof IMAGE_EXTENSIONS)[]]),
   // Base64 grows by 4/3; the decoded size is checked again below.
   data: z.string().min(1).max(Math.ceil(MAX_IMAGE_BYTES / 3) * 4 + 4),
+}).strict();
+const fileSchema = z.object({
+  id,
+  name: z.string().trim().min(1).max(200),
+  data: z.string().min(1).max(Math.ceil(MAX_FILE_BYTES / 3) * 4 + 4),
 }).strict();
 const answerSchema = z.object({
   id, requestId: z.string().min(1).max(64),
@@ -94,7 +105,7 @@ export function registerAgentSessionsIpc(
         if (!await requireCatalog().findSkill(cwd, attachment.path)) throw new Error(`技能 ${attachment.name} 不可用`);
       } else {
         const path = resolve(attachment.path);
-        if (!isInside(imagesDir(sessionId), path) || !existsSync(path)) throw new Error('图片附件已失效，请重新添加');
+        if (!isInside(imagesDir(sessionId), path) || !existsSync(path)) throw new Error('附件已失效，请重新添加');
       }
     }
   };
@@ -160,6 +171,19 @@ export function registerAgentSessionsIpc(
     const path = join(dir, `${randomUUID()}${IMAGE_EXTENSIONS[input.mime]}`);
     writeFileSync(path, bytes);
     return { attachment: { type: 'localImage', path, name: basename(input.name) } };
+  });
+  // Any other file keeps its own name (inside a fresh folder), since the agent reads it by path.
+  secure('attach-file', fileSchema, (input) => {
+    sessionCwd(input.id);
+    const bytes = Buffer.from(input.data, 'base64');
+    if (!bytes.length) throw new Error('文件是空的或无法读取');
+    if (bytes.length > MAX_FILE_BYTES) throw new Error('文件不能超过 20MB');
+    const dir = join(imagesDir(input.id), randomUUID());
+    mkdirSync(dir, { recursive: true });
+    const name = safeFileName(input.name);
+    const path = join(dir, name);
+    writeFileSync(path, bytes);
+    return { attachment: { type: 'file', path, name } };
   });
   secure('interrupt', targetSchema, async (input) => ({ interrupted: await manager.interrupt(input.id) }));
   secure('respond', respondSchema, (input) => {

@@ -18,10 +18,11 @@ export type TurnDelivery =
   | { status: 'accepted' }
   | { status: 'not_accepted' | 'unknown_acceptance'; reason: string };
 
-/** Structured input sent with a message: a skill to invoke, or an image file on disk. */
+/** Sent with a message: a skill to invoke, an image to look at, or any other file saved on disk. */
 export type AgentTurnAttachment =
   | { type: 'skill'; name: string; path: string }
-  | { type: 'localImage'; path: string; name?: string };
+  | { type: 'localImage'; path: string; name?: string }
+  | { type: 'file'; path: string; name?: string };
 
 export interface AgentTurnResult {
   turnId: string;

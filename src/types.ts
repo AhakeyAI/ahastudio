@@ -164,7 +164,8 @@ export interface CodexFileMatch {
 
 export type AgentTurnAttachment =
   | { type: 'skill'; name: string; path: string }
-  | { type: 'localImage'; path: string; name?: string };
+  | { type: 'localImage'; path: string; name?: string }
+  | { type: 'file'; path: string; name?: string };
 
 export interface AgentSessionsApi {
   list: () => AgentSessionResult<{ sessions: AgentSessionInfo[] }>;
@@ -181,6 +182,8 @@ export interface AgentSessionsApi {
   searchFiles: (opts: { id: string; query: string }) => AgentSessionResult<{ files: CodexFileMatch[] }>;
   attachImage: (opts: { id: string; name: string; mime: string; data: string }) =>
     AgentSessionResult<{ attachment: Extract<AgentTurnAttachment, { type: 'localImage' }> }>;
+  attachFile: (opts: { id: string; name: string; data: string }) =>
+    AgentSessionResult<{ attachment: Extract<AgentTurnAttachment, { type: 'file' }> }>;
   answer: (opts: { id: string; requestId: string; answers: Record<string, string[]> | null }) => AgentSessionResult;
   interrupt: (opts: { id: string }) => AgentSessionResult<{ interrupted: boolean }>;
   respond: (opts: { id: string; requestId: string; allow: boolean; reason?: string }) => AgentSessionResult;
@@ -1188,7 +1191,7 @@ export interface WorkerTimelineTurn {
   /** `system`: AhaStation started the turn (a wake-up), not the person or a dispatch brief. */
   origin?: 'system';
   /** Skills and images sent with the prompt, by name. */
-  attachments?: { kind: 'skill' | 'image'; name: string }[];
+  attachments?: { kind: 'skill' | 'image' | 'file'; name: string }[];
   startedAt: number;
   completedAt: number | null;
   status: WorkerTimelineTurnStatus;

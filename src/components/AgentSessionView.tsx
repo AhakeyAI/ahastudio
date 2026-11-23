@@ -1,6 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
-  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Hourglass, Image as ImageIcon, Sparkles, Square, Workflow,
+  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, FileText, Hourglass, Image as ImageIcon, Sparkles, Square, Workflow,
 } from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
@@ -77,7 +77,8 @@ function UserBubble({ text, caption, attachments }: {
         <div className="asv-user-attachments">
           {attachments.map((item, index) => (
             <span key={`${item.kind}:${item.name}:${index}`} className={`asv-attach-pill is-${item.kind}`}>
-              {item.kind === 'skill' ? <Sparkles size={11} aria-hidden="true" /> : <ImageIcon size={11} aria-hidden="true" />}
+              {item.kind === 'skill' ? <Sparkles size={11} aria-hidden="true" />
+                : item.kind === 'image' ? <ImageIcon size={11} aria-hidden="true" /> : <FileText size={11} aria-hidden="true" />}
               {item.kind === 'skill' ? `$${item.name}` : item.name}
             </span>
           ))}
@@ -481,6 +482,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               },
             } : {})}
             usage={usage}
+            draftKey={win.workerId ?? win.id}
             onSend={send}
             onInterrupt={interrupt}
           />

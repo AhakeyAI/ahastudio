@@ -264,6 +264,7 @@ const api = {
     plugins: (opts) => ipcRenderer.invoke('agent-sessions:plugins', opts),
     searchFiles: (opts) => ipcRenderer.invoke('agent-sessions:search-files', opts),
     attachImage: (opts) => ipcRenderer.invoke('agent-sessions:attach-image', opts),
+    attachFile: (opts) => ipcRenderer.invoke('agent-sessions:attach-file', opts),
     onChanged: (cb) => {
       const listener = (_, sessions) => cb(sessions);
       ipcRenderer.on('agent-sessions:changed', listener);

@@ -178,7 +178,7 @@ export class AgentSessionManager {
     }
     if (!session.info.title) {
       const firstSkill = input.attachments?.find((item) => item.type === 'skill');
-      session.info.title = (text.split('\n')[0] || (firstSkill?.type === 'skill' ? `$${firstSkill.name}` : '图片')).slice(0, 60);
+      session.info.title = (text.split('\n')[0] || (firstSkill?.type === 'skill' ? `$${firstSkill.name}` : '附件')).slice(0, 60);
     }
     const delivery = await this.startTurn(session, text, input);
     if (delivery.status === 'accepted' && session.info.orchestration) this.deps.onUserTurn?.(id);
@@ -214,7 +214,7 @@ export class AgentSessionManager {
       dispatchId: turnKey, prompt: text, ...(origin ? { origin } : {}),
       attachments: attachments.map((item) => item.type === 'skill'
         ? { kind: 'skill' as const, name: item.name }
-        : { kind: 'image' as const, name: item.name || basename(item.path) }),
+        : { kind: item.type === 'localImage' ? 'image' as const : 'file' as const, name: item.name || basename(item.path) }),
     });
     this.sessionsChanged();
     const delivery = await driver.startTurn({

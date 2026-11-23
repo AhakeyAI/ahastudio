@@ -248,6 +248,26 @@ export function coordinatorApprovedMcpTools(policy: AgentSessionPolicy): readonl
     : COORDINATOR_APPROVED_MCP_TOOLS;
 }
 
+/**
+ * `turn/start` input for a message. Images go as image items; every saved file, images included,
+ * is also named with its path in the text so the agent can open it with its own tools.
+ */
+export function codexTurnInput(prompt: string, attachments: readonly AgentTurnAttachment[]): Obj[] {
+  const saved = attachments.filter((item) => item.type !== 'skill');
+  const notes = saved.map((item) => {
+    const kind = item.type === 'localImage' ? 'image' : 'file';
+    const name = (item.name || item.path.split(/[\\/]/).pop() || kind).replace(/"/g, "'");
+    return `[Attached ${kind} "${name}" is saved at: ${item.path}]`;
+  });
+  const text = [prompt, ...notes].filter(Boolean).join('\n\n');
+  return [
+    ...(text ? [{ type: 'text', text, text_elements: [] }] : []),
+    ...attachments.flatMap((item) => item.type === 'skill'
+      ? [{ type: 'skill', name: item.name, path: item.path }]
+      : item.type === 'localImage' ? [{ type: 'localImage', path: item.path }] : []),
+  ];
+}
+
 export function codexMcpConfigArgs(
   node: string, mcp: { serverPath: string; env: Record<string, string>; approvedTools?: readonly string[] },
 ): string[] {
@@ -479,12 +499,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     try {
       const result = object(await this.request('turn/start', {
         threadId: this.threadId,
-        input: [
-          ...(prompt ? [{ type: 'text', text: prompt, text_elements: [] }] : []),
-          ...attachments.map((attachment) => attachment.type === 'skill'
-            ? { type: 'skill', name: attachment.name, path: attachment.path }
-            : { type: 'localImage', path: attachment.path }),
-        ],
+        input: codexTurnInput(prompt, attachments),
         ...(effort ? { effort } : {}),
         ...(model ? { model } : {}),
         sandboxPolicy: wanted.sandboxType === 'readOnly'

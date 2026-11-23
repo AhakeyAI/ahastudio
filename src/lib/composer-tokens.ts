@@ -10,6 +10,12 @@ export interface ComposerTrigger {
 
 const SKILL_QUERY = /^[\w:.\-]*$/u;
 
+/**
+ * `$5`, `$9.99` and `$10k` are money, not skills, including the punctuation prose puts after one.
+ * Adapted from T3 Code `isCurrencyAmountQuery` (packages/shared/src/composerTrigger.ts, MIT).
+ */
+export const isCurrencyAmount = (query: string) => /^\.?[0-9][0-9,._]*(?:[kKmMbBtT]|[eE][0-9]+)?[.,;:!?)]*$/u.test(query);
+
 /** The trigger token around `caret`; it must start the text or follow whitespace. */
 export function detectTrigger(text: string, caret: number): ComposerTrigger | null {
   let start = caret;
@@ -19,7 +25,7 @@ export function detectTrigger(text: string, caret: number): ComposerTrigger | nu
   let end = caret;
   while (end < text.length && !/\s/u.test(text[end]!)) end++;
   const query = text.slice(start + 1, caret);
-  if (sigil === '$' && !SKILL_QUERY.test(query)) return null;
+  if (sigil === '$' && (!SKILL_QUERY.test(query) || isCurrencyAmount(query))) return null;
   return { kind: sigil === '$' ? 'skill' : 'file', query, start, end };
 }
 

@@ -25,6 +25,10 @@ test('a $ or @ token at the caret opens a trigger only where a word starts', () 
   assert.equal(tokens.detectTrigger('mail me@host', 12), null, 'an @ inside a word is not a trigger');
   assert.equal(tokens.detectTrigger('$a b', 4), null, 'the caret after whitespace has no trigger');
   assert.equal(tokens.detectTrigger('$(rm -rf)', 3), null, 'shell-like $ text is not a skill query');
+  for (const money of ['$5', '$9.99', '$10k', '$1,000']) {
+    assert.equal(tokens.detectTrigger(`costs ${money}`, 6 + money.length), null, `${money} is money, not a skill`);
+  }
+  assert.equal(tokens.detectTrigger('$5x', 3)?.kind, 'skill', 'a name that only starts with a digit is still a skill');
 });
 
 test('a completion replaces the token, adds one space, and puts the caret after it', () => {

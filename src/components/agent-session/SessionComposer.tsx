@@ -1,7 +1,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
-  ArrowUp, Cpu, FileText, Folder, GitBranch, Globe, ImagePlus, Lock, MessageCircleQuestion, ShieldAlert, Sparkles, Square, X,
+  ArrowUp, Cpu, FileText, Folder, GitBranch, Globe, Loader2, Lock, MessageCircleQuestion, Paperclip, ShieldAlert, Sparkles, Square, X,
 } from 'lucide-react';
+import { composerDrafts, type ComposerDraftAttachment } from '../../lib/composer-drafts';
+import { prepareImageForAttachment } from '../../lib/image-compression';
 import { formatTokenCount } from '../../lib/worker-timeline-model';
 import { POLICY_LABELS, codexCatalogClient } from '../../lib/agent-session-client';
 import {
@@ -205,8 +207,10 @@ export interface SessionComposerProps {
   /** Direct sessions take one turn at a time, so sending waits for the running turn. */
   direct?: boolean;
   usage: { input: number; output: number; total: number } | null;
-  /** Direct sessions: model and effort, `$` skills, `@` files, images, and the plugin panel. */
+  /** Direct sessions: model and effort, `$` skills, `@` files, attachments, and the plugin panel. */
   toolbar?: ComposerToolbar;
+  /** Keeps the unsent draft across tab switches (and its text across restarts) under this key. */
+  draftKey?: string;
   /** Resolves true once the message was accepted, which clears the draft. */
   onSend: (text: string, attachments: AgentTurnAttachment[]) => Promise<boolean>;
   onInterrupt: () => void;
@@ -222,27 +226,25 @@ export interface ComposerToolbar {
   onNotify?: (message: string) => void;
 }
 
-interface DraftImage {
-  key: string;
-  name: string;
-  previewUrl: string;
-  attachment: Extract<AgentTurnAttachment, { type: 'localImage' }>;
-}
-
 type Suggestion =
   | { kind: 'skill'; key: string; skill: CodexSkillOption }
   | { kind: 'file'; key: string; file: CodexFileMatch };
 
 const IMAGE_MIME = /^image\/(png|jpeg|gif|webp)$/u;
-const MAX_IMAGES = 6;
+const MAX_ATTACHMENTS = 12;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
+/** A paste longer than this goes out as a text file instead of filling the input. */
+const LARGE_PASTE_CHARS = 20_000;
 const FILE_SEARCH_DELAY_MS = 120;
 
-const readBase64 = (file: File) => new Promise<string>((resolve, reject) => {
+const readBase64 = (file: Blob) => new Promise<string>((resolve, reject) => {
   const reader = new FileReader();
   reader.onload = () => resolve(String(reader.result).replace(/^data:[^,]*,/u, ''));
-  reader.onerror = () => reject(reader.error ?? new Error('读取图片失败'));
+  reader.onerror = () => reject(reader.error ?? new Error('读取文件失败'));
   reader.readAsDataURL(file);
 });
+const formatSize = (bytes: number) => (bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)}MB` : `${Math.ceil(bytes / 1024)}KB`);
 
 /** Codex's models and the session's skills, loaded once the composer can use them. */
 function useComposerCatalog(sessionId: string | undefined) {
@@ -265,9 +267,10 @@ function useComposerCatalog(sessionId: string | undefined) {
 
 /** Floating input card with the approvals and questions that block the Worker stacked above it. */
 export function SessionComposer(props: SessionComposerProps) {
-  const { toolbar } = props;
-  const [draft, setDraft] = useState('');
-  const [images, setImages] = useState<DraftImage[]>([]);
+  const { toolbar, draftKey } = props;
+  const [draft, setDraft] = useState(() => (draftKey ? composerDrafts.get(draftKey).text : ''));
+  const [attached, setAttached] = useState<ComposerDraftAttachment[]>(() => (draftKey ? composerDrafts.get(draftKey).attachments : []));
+  const [preparing, setPreparing] = useState(0);
   const [trigger, setTrigger] = useState<ComposerTrigger | null>(null);
   const [files, setFiles] = useState<CodexFileMatch[]>([]);
   const [active, setActive] = useState(0);
@@ -289,10 +292,12 @@ export function SessionComposer(props: SessionComposerProps) {
     el.style.height = `${Math.min(COMPOSER_MAX_HEIGHT, el.scrollHeight)}px`;
   }, [draft, props.alive]);
 
-  // Object URLs for previews are released when an image leaves the draft or the composer unmounts.
-  const imagesRef = useRef(images);
-  imagesRef.current = images;
-  useEffect(() => () => imagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl)), []);
+  // The draft outlives this view; previews are released only when an attachment leaves the draft.
+  const attachedRef = useRef(attached);
+  attachedRef.current = attached;
+  useEffect(() => {
+    if (draftKey) composerDrafts.set(draftKey, { text: draft, attachments: attached });
+  }, [draftKey, draft, attached]);
 
   useEffect(() => {
     if (!toolbar || trigger?.kind !== 'file' || !trigger.query) {
@@ -353,51 +358,75 @@ export function SessionComposer(props: SessionComposerProps) {
     requestAnimationFrame(() => el?.focus());
   };
 
-  const addImages = async (list: readonly File[]) => {
+  /**
+   * Images are scaled down and re-encoded to fit before they are saved; when the model cannot see
+   * images they go as plain files, which the agent can still open by path. Other files are saved as is.
+   */
+  const addFiles = async (list: readonly File[]) => {
     if (!toolbar) return;
     const api = window.vibeMeet?.agentSessions;
-    if (!api?.attachImage) return;
-    if (!imagesAllowed) {
-      toolbar.onNotify?.('当前模型不支持图片输入');
-      return;
-    }
-    const room = MAX_IMAGES - imagesRef.current.length;
-    for (const file of list.filter((item) => IMAGE_MIME.test(item.type)).slice(0, Math.max(0, room))) {
+    if (!api?.attachImage || !api.attachFile) return;
+    const room = MAX_ATTACHMENTS - attachedRef.current.length;
+    if (list.length > room) toolbar.onNotify?.(`一条消息最多 ${MAX_ATTACHMENTS} 个附件`);
+    const accepted = list.slice(0, Math.max(0, room));
+    setPreparing((count) => count + accepted.length);
+    for (const source of accepted) {
       try {
-        const res = await api.attachImage({
-          id: toolbar.sessionId, name: file.name || 'image.png', mime: file.type, data: await readBase64(file),
-        });
+        const image = IMAGE_MIME.test(source.type) && imagesAllowed;
+        if (image) {
+          const prepared = await prepareImageForAttachment(source, MAX_IMAGE_BYTES);
+          if (!prepared.ok) {
+            toolbar.onNotify?.(prepared.reason === 'too-large' ? `「${source.name}」太大，压缩后仍超过 10MB` : `「${source.name}」无法作为图片读取`);
+            continue;
+          }
+          const file = prepared.file;
+          const res = await api.attachImage({ id: toolbar.sessionId, name: file.name || 'image.png', mime: file.type, data: await readBase64(file) });
+          if (!res.ok) {
+            toolbar.onNotify?.(res.error);
+            continue;
+          }
+          setAttached((current) => [...current, {
+            key: res.attachment.path, kind: 'image', name: res.attachment.name ?? file.name, previewUrl: URL.createObjectURL(file), attachment: res.attachment,
+          }]);
+          continue;
+        }
+        if (source.size > MAX_FILE_BYTES) {
+          toolbar.onNotify?.(`「${source.name}」有 ${formatSize(source.size)}，文件不能超过 20MB`);
+          continue;
+        }
+        const res = await api.attachFile({ id: toolbar.sessionId, name: source.name || 'file', data: await readBase64(source) });
         if (!res.ok) {
           toolbar.onNotify?.(res.error);
           continue;
         }
-        setImages((current) => [...current, {
-          key: res.attachment.path, name: res.attachment.name ?? file.name, previewUrl: URL.createObjectURL(file), attachment: res.attachment,
+        setAttached((current) => [...current, {
+          key: res.attachment.path, kind: 'file', name: res.attachment.name ?? source.name, previewUrl: null, attachment: res.attachment,
         }]);
       } catch (error) {
-        toolbar.onNotify?.(error instanceof Error ? error.message : '添加图片失败');
+        toolbar.onNotify?.(error instanceof Error ? error.message : '添加附件失败');
+      } finally {
+        setPreparing((count) => count - 1);
       }
     }
-    if (list.length > room) toolbar.onNotify?.(`一条消息最多 ${MAX_IMAGES} 张图片`);
   };
-  const removeImage = (key: string) => setImages((current) => current.filter((image) => {
-    if (image.key === key) URL.revokeObjectURL(image.previewUrl);
-    return image.key !== key;
+  const removeAttachment = (key: string) => setAttached((current) => current.filter((item) => {
+    if (item.key === key && item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+    return item.key !== key;
   }));
 
   const send = async () => {
     const text = draft.trim();
-    if ((!text && images.length === 0) || props.sending || blocked) return;
+    if ((!text && attached.length === 0) || props.sending || blocked || preparing > 0) return;
     const skills = skillsInText(text, catalog.skills ?? []);
     const attachments: AgentTurnAttachment[] = [
       ...skills.map((skill) => ({ type: 'skill' as const, name: skill.name, path: skill.path })),
-      ...images.map((image) => image.attachment),
+      ...attached.map((item) => item.attachment),
     ];
     if (await props.onSend(text, attachments)) {
       setDraft('');
       setTrigger(null);
-      images.forEach((image) => URL.revokeObjectURL(image.previewUrl));
-      setImages([]);
+      attached.forEach((item) => item.previewUrl && URL.revokeObjectURL(item.previewUrl));
+      setAttached([]);
     }
   };
 
@@ -423,18 +452,17 @@ export function SessionComposer(props: SessionComposerProps) {
         <div
           className={`asv-composer${dragging ? ' is-dragging' : ''}`}
           onDragOver={(event) => {
-            if (!imagesAllowed || !event.dataTransfer.types.includes('Files')) return;
+            if (!toolbar || !event.dataTransfer.types.includes('Files')) return;
             event.preventDefault();
             setDragging(true);
           }}
           onDragLeave={() => setDragging(false)}
           onDrop={(event) => {
             setDragging(false);
-            if (!imagesAllowed) return;
             const dropped = [...event.dataTransfer.files];
-            if (!dropped.some((file) => IMAGE_MIME.test(file.type))) return;
+            if (!toolbar || dropped.length === 0) return;
             event.preventDefault();
-            void addImages(dropped);
+            void addFiles(dropped);
           }}
         >
           {menuOpen && (
@@ -459,16 +487,29 @@ export function SessionComposer(props: SessionComposerProps) {
               ))}
             </div>
           )}
-          {images.length > 0 && (
+          {(attached.length > 0 || preparing > 0) && (
             <div className="asv-attach-strip">
-              {images.map((image) => (
-                <div key={image.key} className="asv-attach-thumb" title={image.name}>
-                  <img src={image.previewUrl} alt={image.name} />
-                  <button type="button" aria-label={`移除 ${image.name}`} onClick={() => removeImage(image.key)}>
+              {attached.map((item) => item.kind === 'image' && item.previewUrl ? (
+                <div key={item.key} className="asv-attach-thumb" title={item.name}>
+                  <img src={item.previewUrl} alt={item.name} />
+                  <button type="button" aria-label={`移除 ${item.name}`} onClick={() => removeAttachment(item.key)}>
+                    <X size={11} />
+                  </button>
+                </div>
+              ) : (
+                <div key={item.key} className="asv-attach-file" title={item.name}>
+                  <FileText size={14} aria-hidden="true" />
+                  <span>{item.name}</span>
+                  <button type="button" aria-label={`移除 ${item.name}`} onClick={() => removeAttachment(item.key)}>
                     <X size={11} />
                   </button>
                 </div>
               ))}
+              {preparing > 0 && (
+                <div className="asv-attach-thumb is-preparing" aria-label="正在处理附件">
+                  <Loader2 size={16} className="asv-spin" aria-hidden="true" />
+                </div>
+              )}
             </div>
           )}
           <textarea
@@ -485,10 +526,18 @@ export function SessionComposer(props: SessionComposerProps) {
             onBlur={() => setTrigger(null)}
             onPaste={(event) => {
               if (!toolbar) return;
-              const pasted = [...event.clipboardData.files].filter((file) => IMAGE_MIME.test(file.type));
-              if (pasted.length === 0) return;
-              event.preventDefault();
-              void addImages(pasted);
+              const pasted = [...event.clipboardData.files];
+              if (pasted.length > 0) {
+                event.preventDefault();
+                void addFiles(pasted);
+                return;
+              }
+              const text = event.clipboardData.getData('text/plain');
+              if (text.length > LARGE_PASTE_CHARS) {
+                event.preventDefault();
+                void addFiles([new File([text], 'pasted-text.txt', { type: 'text/plain' })]);
+                toolbar.onNotify?.(`粘贴内容较长（${text.length} 字），已作为 pasted-text.txt 附加`);
+              }
             }}
             onKeyDown={(event) => {
               if (menuOpen && suggestions.length > 0) {
@@ -522,21 +571,19 @@ export function SessionComposer(props: SessionComposerProps) {
                 <button
                   type="button"
                   className="asv-tool-btn is-icon"
-                  disabled={!imagesAllowed}
-                  aria-label="添加图片"
-                  title={imagesAllowed ? '添加图片（也可以粘贴或拖入）' : '当前模型不支持图片输入'}
+                  aria-label="添加附件"
+                  title={imagesAllowed ? '添加图片或文件（也可以粘贴或拖入）' : '添加文件（当前模型不支持图片，图片会作为文件附加）'}
                   onClick={() => fileInputRef.current?.click()}
                 >
-                  <ImagePlus size={14} />
+                  <Paperclip size={14} />
                 </button>
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept="image/png,image/jpeg,image/gif,image/webp"
                   multiple
                   hidden
                   onChange={(event) => {
-                    void addImages([...(event.target.files ?? [])]);
+                    void addFiles([...(event.target.files ?? [])]);
                     event.target.value = '';
                   }}
                 />
@@ -562,7 +609,7 @@ export function SessionComposer(props: SessionComposerProps) {
             <button
               type="button"
               className="asv-round-btn is-primary"
-              disabled={(!draft.trim() && images.length === 0) || props.sending || blocked}
+              disabled={(!draft.trim() && attached.length === 0) || props.sending || blocked || preparing > 0}
               onClick={() => void send()}
               aria-label="发送"
               title="发送（Enter）· Shift+Enter 换行"
