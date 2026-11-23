@@ -241,6 +241,7 @@ test('session Markdown keeps raw HTML as text, never emits hrefs or images, and 
   assert.match(html, /<td>a\.ts<\/td>/);
   assert.match(html, /<input type="checkbox" disabled="" checked=""\/>/);
   assert.match(html, /<div class="asv-code" data-lang="ts">/);
+  assert.match(html, /<div class="asv-code-head">[\s\S]*?<button type="button" class="asv-copy" aria-label="复制代码"/, 'code blocks carry a copy button');
   assert.match(html, /const a = &quot;&lt;b&gt;&quot;;/);
 });
 

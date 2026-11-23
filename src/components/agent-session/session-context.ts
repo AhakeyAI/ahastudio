@@ -9,6 +9,8 @@ export interface AgentSessionContextValue {
   onNotify?: (message: string) => void;
   /** Set when approvals are answered somewhere other than the orchestration approval lane. */
   resolveApproval?: (approvalId: string, allow: boolean, reason?: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Direct sessions only: puts an earlier message back in the composer so it can be edited and sent again. */
+  editMessage?: (text: string) => void;
 }
 
 export const AgentSessionContext = createContext<AgentSessionContextValue>({ cwd: null, appearance: 'light' });

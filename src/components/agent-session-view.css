@@ -181,6 +181,20 @@
 /* ---- Assistant prose ---- */
 
 .asv-assistant { min-width: 0; padding: 2px 0; }
+.asv-assistant-foot { display: flex; height: 24px; margin: 4px 0 -8px -4px; }
+
+/* ---- Message actions: revealed on hover or keyboard focus, never per-row state ---- */
+
+.asv-msg-actions { display: inline-flex; align-items: center; gap: 2px; opacity: 0; transition: opacity 120ms ease; }
+:is(.asv-user, .asv-assistant):hover .asv-msg-actions,
+.asv-msg-actions:focus-within { opacity: 1; }
+.asv-act {
+  display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0;
+  border: 0; border-radius: 6px; background: none; color: var(--asv-ink-2); cursor: pointer;
+}
+.asv-act:hover { background: var(--asv-hover); color: var(--asv-ink-strong); }
+.asv-act[data-copied] { color: var(--asv-ok); }
+@media (hover: none) { .asv-msg-actions { opacity: 1; } }
 
 /* ---- Work log ---- */
 
@@ -370,9 +384,10 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-code-lang { font-family: var(--asv-mono); }
 .asv-code pre { margin: 0; padding: 2px 12px 12px; overflow-x: auto; font-family: var(--asv-mono); font-size: 12.5px; line-height: 1.55; overflow-wrap: normal; }
 .asv-code code { font-family: inherit; white-space: pre; }
-.asv-copy { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: 6px; background: none; color: var(--asv-ink-2); cursor: pointer; opacity: 0; transition: opacity 120ms ease; }
-.asv-code:hover .asv-copy, .asv-copy:focus-visible { opacity: 1; }
+.asv-copy { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: 6px; background: none; color: var(--asv-ink-2); cursor: pointer; opacity: 0.55; transition: opacity 120ms ease; }
+.asv-code:hover .asv-copy, .asv-copy:focus-visible, .asv-copy[data-copied] { opacity: 1; }
 .asv-copy:hover { background: var(--asv-hover); color: var(--asv-ink); }
+.asv-copy[data-copied] { color: var(--asv-ok); }
 
 /* ---- Dock: banners, composer, context strip ---- */
 

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref } from 'react';
 import {
   ArrowUp, Cpu, FileText, Folder, GitBranch, Globe, Loader2, Lock, MessageCircleQuestion, Paperclip, ShieldAlert, Sparkles, Square, X,
 } from 'lucide-react';
@@ -214,6 +214,12 @@ export interface SessionComposerProps {
   /** Resolves true once the message was accepted, which clears the draft. */
   onSend: (text: string, attachments: AgentTurnAttachment[]) => Promise<boolean>;
   onInterrupt: () => void;
+  handleRef?: Ref<ComposerHandle>;
+}
+
+export interface ComposerHandle {
+  /** Replaces the draft text and focuses the input with the caret at the end; nothing is sent. */
+  fill: (text: string) => void;
 }
 
 export interface ComposerToolbar {
@@ -284,6 +290,19 @@ export function SessionComposer(props: SessionComposerProps) {
     [catalog.models, toolbar?.modelId, toolbar?.effort],
   );
   const imagesAllowed = Boolean(toolbar) && (choice.model?.images ?? true);
+
+  useImperativeHandle(props.handleRef, () => ({
+    fill: (text: string) => {
+      setDraft(text);
+      setTrigger(null);
+      requestAnimationFrame(() => {
+        const el = inputRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(text.length, text.length);
+      });
+    },
+  }), []);
 
   useLayoutEffect(() => {
     const el = inputRef.current;

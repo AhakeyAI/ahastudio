@@ -1,6 +1,7 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
-  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, FileText, Hourglass, Image as ImageIcon, Sparkles, Square, Workflow,
+  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, FileText, Hourglass, Image as ImageIcon, PencilLine, Sparkles, Square,
+  Workflow,
 } from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
@@ -31,11 +32,11 @@ import type {
   WorkerTimelineItem,
   WorkerTimelineTurn,
 } from '../types';
-import { DiffBlock } from './agent-session/SessionCode';
-import { SessionComposer } from './agent-session/SessionComposer';
+import { CopyButton, DiffBlock } from './agent-session/SessionCode';
+import { SessionComposer, type ComposerHandle } from './agent-session/SessionComposer';
 import { SessionMarkdown } from './agent-session/SessionMarkdown';
 import { FileChangeRows, LiveTimer, WorkGroup, WorkItemRow } from './agent-session/SessionWorkLog';
-import { AgentSessionContext } from './agent-session/session-context';
+import { AgentSessionContext, useAgentSession } from './agent-session/session-context';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
 import './agent-session-view.css';
 
@@ -58,9 +59,25 @@ const LONG_PROMPT_LINES = 16;
 
 type Item<K extends WorkerTimelineItem['kind']> = Extract<WorkerTimelineItem, { kind: K }>;
 
-function UserBubble({ text, caption, attachments }: {
-  text: string; caption?: string; attachments?: WorkerTimelineTurn['attachments'];
+/** Hover actions under a message; shown by CSS so rows hold no hover state. */
+function MessageActions({ text, onEdit }: { text: string; onEdit?: () => void }) {
+  if (!text.trim()) return null;
+  return (
+    <span className="asv-msg-actions">
+      <CopyButton text={text} label="复制" className="asv-act" />
+      {onEdit && (
+        <button type="button" className="asv-act" aria-label="编辑后重发" title="编辑后重发（填回输入框，不会自动发送）" onClick={onEdit}>
+          <PencilLine size={13} />
+        </button>
+      )}
+    </span>
+  );
+}
+
+function UserBubble({ text, caption, attachments, editable = false }: {
+  text: string; caption?: string; attachments?: WorkerTimelineTurn['attachments']; editable?: boolean;
 }) {
+  const { editMessage } = useAgentSession();
   const parts = useMemo(() => splitDispatchPrompt(text), [text]);
   const long = parts.body.length > LONG_PROMPT_CHARS || parts.body.split('\n').length > LONG_PROMPT_LINES;
   const [expanded, setExpanded] = useState(false);
@@ -84,8 +101,12 @@ function UserBubble({ text, caption, attachments }: {
           ))}
         </div>
       )}
-      {(long || parts.system || caption) && (
+      {(parts.body || long || parts.system || caption) && (
         <div className="asv-user-meta">
+          <MessageActions
+            text={parts.body}
+            {...(editable && editMessage && !parts.system ? { onEdit: () => editMessage(parts.body) } : {})}
+          />
           {long && (
             <button type="button" className="asv-text-btn" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
               {expanded ? '收起' : '展开全部'}
@@ -169,9 +190,11 @@ const TimelineItem = memo(function TimelineItem({ item }: { item: WorkerTimeline
   if (item.kind === 'settlement') return <SettlementBlock item={item} />;
   if (item.kind !== 'message') return <WorkItemRow item={item} />;
   if (item.role === 'user') return <UserBubble text={item.text} caption="追加指令" />;
+  const streaming = item.status === 'running';
   return (
     <div className="asv-assistant" data-asv-row>
-      <SessionMarkdown text={item.text} streaming={item.status === 'running'} />
+      <SessionMarkdown text={item.text} streaming={streaming} />
+      {!streaming && <div className="asv-assistant-foot"><MessageActions text={item.text} /></div>}
     </div>
   );
 });
@@ -205,7 +228,7 @@ const TurnView = memo(function TurnView({ turn, minHeight }: { turn: WorkerTimel
     <section className={`asv-turn is-${turn.status}`} aria-label={`第 ${turn.generation} 轮`} style={minHeight ? { minHeight } : undefined}>
       {turn.origin === 'system'
         ? <SystemWakeRow text={turn.prompt} generation={turn.generation} />
-        : <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} attachments={turn.attachments} />}
+        : <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} attachments={turn.attachments} editable />}
       {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}
       {blocks.map((block) =>
         block.type === 'group' ? <WorkGroup key={block.id} block={block} /> : <TimelineItem key={block.item.id} item={block.item} />,
@@ -266,6 +289,9 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   );
   const appearance = useSyncExternalStore(terminalSessionStore.subscribe, terminalSessionStore.getAppearance);
   const sessionId = direct ? win.workerId : undefined;
+  const composerRef = useRef<ComposerHandle>(null);
+  const editMessage = useCallback((text: string) => composerRef.current?.fill(text), []);
+  const canEdit = Boolean(sessionId) && alive;
   const session = useMemo(() => ({
     cwd, appearance, onNotify,
     ...(sessionId ? {
@@ -273,7 +299,8 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
         (await window.vibeMeet?.agentSessions?.respond({ id: sessionId, requestId, allow, ...(reason ? { reason } : {}) }))
           ?? { ok: false, error: '会话接口不可用' },
     } : {}),
-  }), [cwd, appearance, onNotify, sessionId]);
+    ...(canEdit ? { editMessage } : {}),
+  }), [cwd, appearance, onNotify, sessionId, canEdit, editMessage]);
 
   const dockRef = useRef<HTMLDivElement>(null);
   const [dockHeight, setDockHeight] = useState(0);
@@ -485,6 +512,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             draftKey={win.workerId ?? win.id}
             onSend={send}
             onInterrupt={interrupt}
+            handleRef={composerRef}
           />
         </div>
       </div>
