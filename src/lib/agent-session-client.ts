@@ -1,4 +1,4 @@
-import type { AgentSessionInfo, AgentSessionPolicy, CodexModelOption, CodexSkillOption } from '../types';
+import type { AgentSessionInfo, AgentSessionPolicy, CodexModelOption, CodexRateLimits, CodexSkillOption } from '../types';
 
 const STANDALONE_ID = /^agent-session-[a-f0-9-]{36}$/;
 
@@ -51,6 +51,24 @@ export const agentSessionClient = {
     // The change event can arrive after this call resolves; the view needs the session right away.
     if (!sessions.some((session) => session.id === res.session.id)) publish([...sessions, res.session]);
     return res;
+  },
+};
+
+const LIMITS_CACHE_MS = 60_000;
+let limitsRequest: { at: number; request: Promise<CodexRateLimits | null> } | null = null;
+
+/**
+ * The account's Codex usage limits, shared by every session view and read at most once a minute
+ * unless `force`d. Any failure (signed out, API key login, offline) resolves to null.
+ */
+export const usageLimitsClient = {
+  read(force = false): Promise<CodexRateLimits | null> {
+    const api = typeof window !== 'undefined' ? window.vibeMeet?.agentSessions : undefined;
+    if (!api?.rateLimits) return Promise.resolve(null);
+    if (!force && limitsRequest && Date.now() - limitsRequest.at < LIMITS_CACHE_MS) return limitsRequest.request;
+    const request = api.rateLimits().then((res) => (res.ok ? res.limits : null), () => null);
+    limitsRequest = { at: Date.now(), request };
+    return request;
   },
 };
 

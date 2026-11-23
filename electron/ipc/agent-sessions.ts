@@ -153,6 +153,7 @@ export function registerAgentSessionsIpc(
     return {};
   });
   secure('models', z.object({}).strict(), async () => ({ models: await requireCatalog().listModels() }));
+  secure('rate-limits', z.object({}).strict(), async () => ({ limits: await requireCatalog().readRateLimits() }));
   secure('skills', catalogSchema, async (input) => ({
     skills: await requireCatalog().listSkills(sessionCwd(input.id), input.reload),
   }));

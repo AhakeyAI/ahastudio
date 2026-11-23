@@ -505,6 +505,38 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-chip-toggle { padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
 .asv-chip-toggle.is-on { color: var(--asv-ink-strong); }
 .asv-chip-toggle:disabled { cursor: default; opacity: 0.6; }
+.asv-usage { position: relative; border-radius: 4px; cursor: default; outline: none; }
+.asv-usage:focus-visible { box-shadow: 0 0 0 2px var(--workspace-accent); }
+.asv-usage.is-warn { color: var(--asv-warn); }
+.asv-usage.is-bad { color: var(--asv-bad); }
+.asv-usage-pop {
+  position: absolute;
+  right: -8px;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 232px;
+  padding: 10px 12px;
+  border: 1px solid var(--asv-line);
+  border-radius: 10px;
+  background: var(--asv-surface);
+  box-shadow: var(--asv-shadow);
+  color: var(--asv-ink);
+  font-size: 12px;
+  white-space: normal;
+}
+.asv-chip > .asv-usage-pop { overflow: visible; }
+.asv-usage-title { color: var(--asv-ink-strong); font-weight: 600; }
+.asv-usage-row { display: flex; flex-direction: column; gap: 4px; }
+.asv-usage-line { display: flex; justify-content: space-between; gap: 8px; }
+.asv-usage-used { color: var(--asv-ink-strong); font-variant-numeric: tabular-nums; }
+.asv-usage-bar { height: 4px; overflow: hidden; border-radius: 2px; background: color-mix(in srgb, var(--asv-ink) 10%, transparent); }
+.asv-usage-bar > i { display: block; height: 100%; border-radius: inherit; background: var(--asv-ink-2); }
+.asv-usage-bar.is-warn > i { background: var(--asv-warn); }
+.asv-usage-bar.is-bad > i { background: var(--asv-bad); }
+.asv-usage-reset { color: var(--asv-ink-2); font-size: 11.5px; }
 .asv-banner-qa { display: flex; flex-direction: column; gap: 6px; }
 .asv-banner-qa .asv-banner-input { flex: none; width: 100%; }
 /* ---- Composer toolbar: images, plugins, model & effort ---- */

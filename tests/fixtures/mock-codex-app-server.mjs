@@ -106,6 +106,10 @@ for await (const line of history) {
       : method === 'fuzzyFileSearch'
         ? { files: [{ root: params.roots[0], path: 'src\\demo.ts', match_type: 'file', file_name: 'demo.ts', score: 1, indices: null }] }
         : {} });
+  } else if (method === 'account/rateLimits/read') {
+    send({ id, result: { ordinaryUsageAllowed: true, rateLimitsByLimitId: null, rateLimitResetCredits: null, accountId: null, rateLimitUpsell: null,
+      rateLimits: { limitId: 'codex', limitName: null, normalModelSlug: null, credits: null, individualLimit: null, spendControlReached: null,
+        primary: { usedPercent: 37, windowDurationMins: 300, resetsAt: 1_700_000_000 }, secondary: null, planType: 'plus', rateLimitReachedType: null } } });
   } else if (method === 'turn/start') {
     assert.equal(params.threadId, threadId);
     const prompt = params.input.find((item) => item.type === 'text')?.text ?? '';

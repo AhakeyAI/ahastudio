@@ -157,6 +157,22 @@ export interface CodexPluginOption {
   defaultPrompts: string[];
 }
 
+// Mirrors CodexRateLimits in electron/orchestration/codex-catalog.ts.
+export interface CodexRateLimitWindow {
+  usedPercent: number;
+  windowMinutes: number | null;
+  /** Epoch milliseconds. */
+  resetsAt: number | null;
+}
+
+export interface CodexRateLimits {
+  name: string | null;
+  primary: CodexRateLimitWindow | null;
+  secondary: CodexRateLimitWindow | null;
+  planType: string | null;
+  reached: boolean;
+}
+
 export interface CodexFileMatch {
   path: string;
   fileName: string;
@@ -176,6 +192,7 @@ export interface AgentSessionsApi {
     attachments?: AgentTurnAttachment[];
   }) => AgentSessionResult;
   models: () => AgentSessionResult<{ models: CodexModelOption[] }>;
+  rateLimits?: () => AgentSessionResult<{ limits: CodexRateLimits }>;
   skills: (opts: { id: string; reload?: boolean }) => AgentSessionResult<{ skills: CodexSkillOption[] }>;
   setSkillEnabled: (opts: { id: string; path: string; enabled: boolean }) => AgentSessionResult;
   plugins: (opts: { id: string; reload?: boolean }) => AgentSessionResult<{ plugins: CodexPluginOption[] }>;

@@ -117,6 +117,46 @@ test('a pilot query only accepts catalog methods', async (t) => {
   await assert.rejects(pilot.query('thread/start', { cwd }), /not allowed/);
   await assert.rejects(pilot.query('config/value/write', {}), /not allowed/);
   assert.ok(await pilot.query('fuzzyFileSearch', { query: 'demo', roots: [cwd], cancellationToken: null }));
+  assert.equal((await pilot.query('account/rateLimits/read', {})).rateLimits.primary.usedPercent, 37);
+  await assert.rejects(pilot.query('account/rateLimitResetCredit/consume', {}), /not allowed/, 'spending a reset credit is not a query');
+});
+
+test('usage limits come from the Codex bucket, in milliseconds, and are read fresh each time', async (t) => {
+  const window = (usedPercent, windowDurationMins, resetsAt) => ({ usedPercent, windowDurationMins, resetsAt });
+  const replies = [
+    {
+      ordinaryUsageAllowed: true,
+      rateLimits: { limitId: 'other', primary: window(99, 60, 1) },
+      rateLimitsByLimitId: {
+        codex: { limitId: 'codex', limitName: 'Codex', primary: window(37.5, 300, 1_700_000_000), secondary: window(120, 10080, null),
+          planType: 'pro', rateLimitReachedType: null },
+      },
+    },
+    { ordinaryUsageAllowed: null, rateLimits: { primary: window(100, 300, 1_700_000_000), secondary: { usedPercent: 'x' },
+      planType: null, rateLimitReachedType: 'rate_limit_reached' }, rateLimitsByLimitId: null },
+    { ordinaryUsageAllowed: false, rateLimits: { primary: null, secondary: null }, rateLimitsByLimitId: null },
+  ];
+  const calls = [];
+  const catalog = new CodexCatalog(() => ({
+    alive: true,
+    query: async (method, params) => {
+      calls.push([method, params]);
+      return replies[calls.length - 1];
+    },
+    close: async () => {},
+  }), 60_000);
+  t.after(() => catalog.dispose());
+
+  assert.deepEqual(await catalog.readRateLimits(), {
+    name: 'Codex', planType: 'pro', reached: false,
+    primary: { usedPercent: 37.5, windowMinutes: 300, resetsAt: 1_700_000_000_000 },
+    secondary: { usedPercent: 100, windowMinutes: 10080, resetsAt: null },
+  });
+  assert.deepEqual(calls[0], ['account/rateLimits/read', { excludeResetCreditDetails: true }]);
+  const legacy = await catalog.readRateLimits();
+  assert.deepEqual([legacy.primary.usedPercent, legacy.secondary, legacy.reached], [100, null, true], 'older servers send one snapshot');
+  assert.equal((await catalog.readRateLimits()).reached, true, 'blocked ordinary usage counts as reached');
+  assert.equal(calls.length, 3);
 });
 
 function ipcSetup(t) {

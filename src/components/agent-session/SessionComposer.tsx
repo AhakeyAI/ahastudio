@@ -5,6 +5,8 @@ import {
 import { composerDrafts, type ComposerDraftAttachment } from '../../lib/composer-drafts';
 import { prepareImageForAttachment } from '../../lib/image-compression';
 import { formatTokenCount } from '../../lib/worker-timeline-model';
+import type { UsageSummary } from '../../lib/usage-limits';
+import { UsageLimitChip } from './UsageLimitChip';
 import { POLICY_LABELS, codexCatalogClient } from '../../lib/agent-session-client';
 import {
   applyCompletion, detectTrigger, fileMention, filterSkills, resolveModelChoice, skillMention, skillsInText,
@@ -204,6 +206,8 @@ export interface SessionComposerProps {
   /** Direct sessions take one turn at a time, so sending waits for the running turn. */
   direct?: boolean;
   usage: { input: number; output: number; total: number } | null;
+  /** The person's Codex usage limits; direct sessions only. */
+  usageLimits?: UsageSummary | null;
   /** Direct sessions: model and effort, `$` skills, `@` files, attachments, and the plugin panel. */
   toolbar?: ComposerToolbar;
   /** Keeps the unsent draft across tab switches (and its text across restarts) under this key. */
@@ -662,6 +666,7 @@ export function SessionComposer(props: SessionComposerProps) {
           </button>
         )}
         <span className="asv-strip-spacer" />
+        {props.usageLimits && <UsageLimitChip summary={props.usageLimits} />}
         {props.usage && (
           <span className="asv-chip" title={`输入 ${props.usage.input} · 输出 ${props.usage.output}`}>
             {formatTokenCount(props.usage.total)} tokens

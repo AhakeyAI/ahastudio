@@ -260,6 +260,7 @@ const api = {
     setOrchestration: (opts) => ipcRenderer.invoke('agent-sessions:set-orchestration', opts),
     rename: (opts) => ipcRenderer.invoke('agent-sessions:rename', opts),
     models: () => ipcRenderer.invoke('agent-sessions:models', {}),
+    rateLimits: () => ipcRenderer.invoke('agent-sessions:rate-limits', {}),
     skills: (opts) => ipcRenderer.invoke('agent-sessions:skills', opts),
     setSkillEnabled: (opts) => ipcRenderer.invoke('agent-sessions:set-skill-enabled', opts),
     plugins: (opts) => ipcRenderer.invoke('agent-sessions:plugins', opts),

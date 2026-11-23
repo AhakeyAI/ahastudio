@@ -47,6 +47,24 @@ export interface CodexFileMatch {
   fileName: string;
 }
 
+export interface CodexRateLimitWindow {
+  usedPercent: number;
+  /** Length of the window, e.g. 300 for five hours; null when Codex does not say. */
+  windowMinutes: number | null;
+  /** When the window resets, in epoch milliseconds. */
+  resetsAt: number | null;
+}
+
+/** The account's Codex usage limits, as of when they were read. */
+export interface CodexRateLimits {
+  name: string | null;
+  primary: CodexRateLimitWindow | null;
+  secondary: CodexRateLimitWindow | null;
+  planType: string | null;
+  /** Codex reports the limit as reached (or the workspace out of credits). */
+  reached: boolean;
+}
+
 const MODEL_TTL_MS = 10 * 60_000;
 const LIST_TTL_MS = 60_000;
 const MAX_MODEL_PAGES = 5;
@@ -57,6 +75,18 @@ const object = (value: unknown): Obj => (value && typeof value === 'object' ? va
 const array = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 const text = (value: unknown): string => (typeof value === 'string' ? value : '');
 const textOrNull = (value: unknown): string | null => (typeof value === 'string' && value ? value : null);
+const finite = (value: unknown): number | null => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+const limitWindow = (value: unknown): CodexRateLimitWindow | null => {
+  const entry = object(value);
+  const usedPercent = finite(entry.usedPercent);
+  if (usedPercent === null) return null;
+  const resetsAt = finite(entry.resetsAt);
+  return {
+    usedPercent: Math.min(Math.max(usedPercent, 0), 100),
+    windowMinutes: finite(entry.windowDurationMins),
+    resetsAt: resetsAt === null ? null : resetsAt * 1000,
+  };
+};
 const samePath = (a: string, b: string) => {
   const clean = (value: string) => normalize(value).replace(/[\\/]+$/, '');
   return process.platform === 'win32' ? clean(a).toLowerCase() === clean(b).toLowerCase() : clean(a) === clean(b);
@@ -181,6 +211,23 @@ export class CodexCatalog {
       .filter((file) => text(file.path))
       .slice(0, MAX_FILE_MATCHES)
       .map((file) => ({ path: text(file.path).replace(/\\/g, '/'), fileName: text(file.file_name) }));
+  }
+
+  /**
+   * Usage limits of the signed-in account. Not cached here: the renderer decides how fresh it
+   * needs them. Throws when Codex has no account to ask about (e.g. an API key login).
+   */
+  async readRateLimits(): Promise<CodexRateLimits> {
+    const result = object(await this.query('account/rateLimits/read', { excludeResetCreditDetails: true }));
+    // The per-limit view has the Codex bucket by name; the single snapshot mirrors older servers.
+    const snapshot = object(object(result.rateLimitsByLimitId).codex ?? result.rateLimits);
+    return {
+      name: textOrNull(snapshot.limitName),
+      primary: limitWindow(snapshot.primary),
+      secondary: limitWindow(snapshot.secondary),
+      planType: textOrNull(snapshot.planType),
+      reached: Boolean(textOrNull(snapshot.rateLimitReachedType)) || result.ordinaryUsageAllowed === false,
+    };
   }
 
   async dispose(): Promise<void> {

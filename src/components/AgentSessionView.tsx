@@ -6,7 +6,8 @@ import {
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
 import { countDiffStats, parseUnifiedDiff } from '../lib/git-panel-model';
-import { agentSessionClient, codexCatalogClient, isStandaloneSession } from '../lib/agent-session-client';
+import { agentSessionClient, codexCatalogClient, isStandaloneSession, usageLimitsClient } from '../lib/agent-session-client';
+import { summarizeUsage, type UsageSummary } from '../lib/usage-limits';
 import { effortLabel } from '../lib/composer-tokens';
 import { folderName } from '../lib/session-title';
 import { orchestrationClient } from '../lib/orchestration-client';
@@ -450,6 +451,32 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     ? `${modelName ?? headerModelId}${direct && info?.effort ? ` · ${effortLabel(info.effort)}` : ''}`
     : null;
 
+  // Account usage is the person's own Codex quota, so only direct sessions show it.
+  const [usageLimits, setUsageLimits] = useState<UsageSummary | null>(null);
+  const loadUsage = useRef<(force: boolean) => void>(() => {});
+  useEffect(() => {
+    if (!direct) return;
+    let live = true;
+    loadUsage.current = (force) => {
+      void usageLimitsClient.read(force).then((limits) => {
+        if (live) setUsageLimits(summarizeUsage(limits, Date.now()));
+      });
+    };
+    loadUsage.current(false);
+    // Also keeps the "resets in" text current.
+    const timer = setInterval(() => loadUsage.current(false), 60_000);
+    return () => {
+      live = false;
+      clearInterval(timer);
+      loadUsage.current = () => {};
+    };
+  }, [direct]);
+  const wasRunning = useRef(running);
+  useEffect(() => {
+    if (wasRunning.current && !running) loadUsage.current(true);
+    wasRunning.current = running;
+  }, [running]);
+
   const stage = dispatch?.stage;
   const stageLabel = direct
     ? (info ? SESSION_STATUS_LABELS[info.status] : '已结束')
@@ -554,6 +581,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               },
             } : {})}
             usage={usage}
+            usageLimits={direct ? usageLimits : null}
             draftKey={win.workerId ?? win.id}
             onSend={send}
             onInterrupt={interrupt}
