@@ -449,3 +449,39 @@ test('SessionComposer shows non-switchable read-only and writable labels for Wor
   });
   assert.match(directHtml, /<select\b/);
 });
+
+test('header, empty-state, and usage pieces render their static parts', async () => {
+  const outfile = join(dir, 'session-pieces.cjs');
+  await build({
+    stdin: {
+      contents: `
+        import { createElement } from 'react';
+        import { renderToStaticMarkup } from 'react-dom/server';
+        import { SessionEmptyState } from './src/components/agent-session/SessionEmptyState.tsx';
+        import { SessionTitle } from './src/components/agent-session/SessionTitle.tsx';
+        import { UsageLimitChip } from './src/components/agent-session/UsageLimitChip.tsx';
+        export const empty = (props) => renderToStaticMarkup(createElement(SessionEmptyState, props));
+        export const title = (props) => renderToStaticMarkup(createElement(SessionTitle, props));
+        export const usage = (summary) => renderToStaticMarkup(createElement(UsageLimitChip, { summary }));`,
+      resolveDir: fileURLToPath(new URL('..', import.meta.url)),
+      loader: 'js',
+    },
+    outfile, bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', logLevel: 'silent',
+  });
+  const mod = await import(pathToFileURL(outfile).href);
+  const { empty, title, usage } = mod.default ?? mod;
+
+  const start = empty({ folder: 'repo', policy: 'read-only', onPick: () => {} });
+  assert.match(start, /要在 <span class="asv-start-folder">repo<\/span> 里做点什么？/);
+  assert.match(start, /当前为只读/);
+  assert.equal(start.match(/class="asv-start-example"/g).length, 3);
+  assert.match(start, /title="填入输入框，不会自动发送"/);
+
+  assert.equal(title({ title: 'Worker 任务' }), '<span class="asv-title">Worker 任务</span>', 'no rename without a handler');
+  assert.match(title({ title: '会话', onRename: async () => true }), /class="asv-title is-editable" role="button" tabindex="0" title="双击改名"/);
+
+  const chip = usage({ text: '每周额度 92%', level: 'bad', planType: 'plus', windows: [] });
+  assert.match(chip, /class="asv-chip asv-usage is-bad"/);
+  assert.match(chip, /aria-label="Codex 额度：每周额度 92%"/);
+  assert.doesNotMatch(chip, /asv-usage-pop/, 'the window list opens on hover or focus only');
+});

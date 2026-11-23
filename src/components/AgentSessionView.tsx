@@ -40,6 +40,7 @@ import { CopyButton, DiffBlock } from './agent-session/SessionCode';
 import { SessionComposer, type ComposerHandle } from './agent-session/SessionComposer';
 import { SessionMarkdown } from './agent-session/SessionMarkdown';
 import { SessionTitle } from './agent-session/SessionTitle';
+import { SessionEmptyState } from './agent-session/SessionEmptyState';
 import { FileChangeRows, LiveTimer, WorkGroup, WorkItemRow } from './agent-session/SessionWorkLog';
 import { AgentSessionContext, useAgentSession } from './agent-session/session-context';
 import { TurnChangesCard } from './agent-session/TurnChangesCard';
@@ -537,7 +538,15 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
                 <button type="button" className="asv-btn" onClick={() => setReloadKey((k) => k + 1)}>重试</button>
               </div>
             )}
-            {!loading && !error && !timeline?.turns.length && (!timeline || direct) && <div className="asv-empty">{emptyText}</div>}
+            {!loading && !error && !timeline?.turns.length && (
+              direct && info && canEdit && info.status !== 'starting'
+                ? <SessionEmptyState folder={cwd ? folderName(cwd) : null} policy={policy} onPick={editMessage} />
+                : (!timeline || direct) && (
+                  <div className="asv-empty">
+                    {info?.status === 'starting' ? <span className="asv-shimmer">{emptyText}</span> : emptyText}
+                  </div>
+                )
+            )}
             {timeline?.turns.map((turn) => (
               <TurnView key={turn.key} turn={turn} minHeight={turn.key === scroll.anchoredTurnKey ? scroll.anchoredMinHeight : undefined} />
             ))}
