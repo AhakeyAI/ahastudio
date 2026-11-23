@@ -1,12 +1,14 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
-  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, FileText, Hourglass, Image as ImageIcon, PencilLine, Sparkles, Square,
-  Workflow,
+  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Cpu, FileText, Folder, Hourglass, Image as ImageIcon, PencilLine, Sparkles,
+  Square, Workflow,
 } from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
 import { countDiffStats, parseUnifiedDiff } from '../lib/git-panel-model';
-import { agentSessionClient, isStandaloneSession } from '../lib/agent-session-client';
+import { agentSessionClient, codexCatalogClient, isStandaloneSession } from '../lib/agent-session-client';
+import { effortLabel } from '../lib/composer-tokens';
+import { folderName } from '../lib/session-title';
 import { orchestrationClient } from '../lib/orchestration-client';
 import { stageWindowStore, type StageWindow } from '../lib/stage-window-store';
 import { terminalSessionStore } from '../lib/terminal-session-store';
@@ -36,6 +38,7 @@ import type {
 import { CopyButton, DiffBlock } from './agent-session/SessionCode';
 import { SessionComposer, type ComposerHandle } from './agent-session/SessionComposer';
 import { SessionMarkdown } from './agent-session/SessionMarkdown';
+import { SessionTitle } from './agent-session/SessionTitle';
 import { FileChangeRows, LiveTimer, WorkGroup, WorkItemRow } from './agent-session/SessionWorkLog';
 import { AgentSessionContext, useAgentSession } from './agent-session/session-context';
 import { TurnChangesCard } from './agent-session/TurnChangesCard';
@@ -419,6 +422,34 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       });
   };
 
+  const rename = useCallback(async (next: string) => {
+    if (!sessionId) return false;
+    const res = await window.vibeMeet?.agentSessions?.rename?.({ id: sessionId, title: next });
+    if (!res?.ok) {
+      onNotify?.(res?.error ?? '改名失败');
+      return false;
+    }
+    stageWindowStore.renameWindow(win.id, next);
+    return true;
+  }, [sessionId, onNotify, win.id]);
+
+  // The header names the model the way the composer's picker does, once the catalog is loaded.
+  const headerModelId = direct ? info?.model ?? null : timeline?.model ?? dispatch?.model ?? null;
+  const [modelName, setModelName] = useState<string | null>(null);
+  useEffect(() => {
+    setModelName(null);
+    if (!direct || !headerModelId) return;
+    let live = true;
+    codexCatalogClient.models().then((models) => {
+      const match = models.find((entry) => entry.id === headerModelId || entry.model === headerModelId);
+      if (live && match) setModelName(match.displayName);
+    }, () => {});
+    return () => { live = false; };
+  }, [direct, headerModelId]);
+  const modelText = headerModelId
+    ? `${modelName ?? headerModelId}${direct && info?.effort ? ` · ${effortLabel(info.effort)}` : ''}`
+    : null;
+
   const stage = dispatch?.stage;
   const stageLabel = direct
     ? (info ? SESSION_STATUS_LABELS[info.status] : '已结束')
@@ -433,8 +464,14 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       <div className="agent-session-view" data-running={running || undefined}>
         <header className="asv-header">
           <TerminalProfileIcon id={timeline?.cliId ?? win.localCliId ?? 'codex'} size={16} />
-          <span className="asv-title">{title}</span>
+          <SessionTitle title={title} {...(direct && info && info.status !== 'closed' ? { onRename: rename } : {})} />
           {task?.taskTitle && role && <span className="asv-subtitle">{task.taskTitle}</span>}
+          {(cwd || modelText) && (
+            <span className="asv-head-meta">
+              {cwd && <span className="asv-head-chip" title={cwd}><Folder size={12} /><span>{folderName(cwd)}</span></span>}
+              {modelText && <span className="asv-head-chip is-model" title="模型 · 推理强度"><Cpu size={12} /><span>{modelText}</span></span>}
+            </span>
+          )}
           <span className="asv-spacer" />
           {stageLabel && (
             <span className={`asv-stage${stage ? ` is-${stage}` : info?.status === 'running' ? ' is-working' : info?.status === 'failed' ? ' is-failed' : ''}`}>
@@ -445,7 +482,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
           {direct && info && info.status !== 'closed' && (
             <button
               type="button"
-              className={`asv-btn asv-orchestration${info.orchestration ? ' is-on' : ''}`}
+              className={`asv-btn is-ghost asv-orchestration${info.orchestration ? ' is-on' : ''}`}
               aria-pressed={info.orchestration}
               disabled={!canToggleOrchestration || busy === 'orchestration'}
               title={canToggleOrchestration
@@ -453,12 +490,13 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
                 : '本轮结束后才能切换编排模式'}
               onClick={toggleOrchestration}
             >
-              <Workflow size={12} /> {busy === 'orchestration' ? '切换中…' : info.orchestration ? '编排模式 · 开' : '编排模式'}
+              <Workflow size={13} /> {busy === 'orchestration' ? '切换中…' : info.orchestration ? '编排模式 · 开' : '编排模式'}
             </button>
           )}
           {alive && !(direct && resumable) && (
-            <button type="button" className="asv-btn is-quiet-danger" disabled={busy === 'stop'} onClick={stop}>
-              <Square size={10} fill="currentColor" /> 停止
+            <button type="button" className="asv-btn is-ghost is-quiet-danger" disabled={busy === 'stop'} onClick={stop}
+              title={direct ? '结束这个会话' : '停止这个 Worker'}>
+              <Square size={11} fill="currentColor" /> 停止
             </button>
           )}
         </header>
@@ -493,9 +531,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             interrupting={busy === 'interrupt'}
             approvals={approvals}
             questions={questions}
-            cwd={cwd}
             branch={dispatch?.branch ?? null}
-            model={timeline?.model ?? dispatch?.model ?? null}
             readOnly={timeline?.readOnly}
             direct={direct}
             {...(direct && policy ? { policy, onPolicyChange: setNextPolicy } : {})}

@@ -190,6 +190,8 @@ export interface AgentSessionsApi {
   close: (opts: { id: string }) => AgentSessionResult;
   timeline: (opts: { id: string }) => AgentSessionResult<{ timeline: WorkerTimelineSnapshot | null }>;
   setOrchestration: (opts: { id: string; enabled: boolean }) => AgentSessionResult;
+  /** `synced` is false when Codex was not running; it is renamed there once the session resumes. */
+  rename: (opts: { id: string; title: string }) => AgentSessionResult<{ synced: boolean }>;
   onChanged: (cb: (sessions: AgentSessionInfo[]) => void) => () => void;
 }
 

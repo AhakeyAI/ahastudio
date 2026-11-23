@@ -182,6 +182,22 @@ test('a session opens without Aha MCP and runs turns one at a time with the chos
   assert.equal(manager.getTimeline(session.id).readOnly, false);
 });
 
+test('a rename keeps the title here and names the Codex thread, now or once it resumes', async (t) => {
+  const dir = mkdtempSync(join(cwd, '.agent-session-test-'));
+  const { manager, sent, status } = setup(t, 'normal', { dir, persist: true });
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  assert.deepEqual(await manager.rename(session.id, '  拆分\n登录   重构 '), { ok: true, synced: true });
+  assert.equal(manager.list()[0].title, '拆分 登录 重构');
+  assert.deepEqual(sent('thread/name/set'), [{ threadId: 'mock-thread-id', name: '拆分 登录 重构' }]);
+
+  assert.equal((await manager.send(session.id, { text: 'first message' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+  assert.equal(manager.list()[0].title, '拆分 登录 重构', 'the first message does not replace a chosen title');
+  assert.deepEqual(await manager.rename(session.id, '   '), { ok: false, error: '标题不能为空' });
+  assert.deepEqual(await manager.rename('agent-session-00000000-0000-0000-0000-000000000000', 'x'), { ok: false, error: '会话不存在' });
+  assert.match(readFileSync(join(dir, 'agent-sessions.json'), 'utf8'), /拆分 登录 重构/);
+});
+
 test('an approval waits in the timeline for the person and is delivered once', async (t) => {
   const { manager, turns, status } = setup(t);
   const session = await manager.create({ cwd, policy: 'workspace-write' });
@@ -268,9 +284,14 @@ test('sessions survive a restart with their history and resume the same thread o
   assert.equal(history.alive, false);
   assert.equal(history.turns[0].items.find((item) => item.kind === 'message').text, '模拟输出 1');
 
+  assert.deepEqual(await after.manager.rename(session.id, '改过的标题'), { ok: true, synced: false }, 'no process is up to rename');
+  assert.equal(after.status(session.id), 'suspended', 'renaming does not resume the session');
+
   assert.equal((await after.manager.send(session.id, { text: 'second question' })).status, 'accepted');
   await until(() => after.status(session.id) === 'idle');
   assert.deepEqual(after.sent('thread/resume').map((params) => params.threadId), ['mock-thread-id']);
+  await until(() => after.sent('thread/name/set').length);
+  assert.deepEqual(after.sent('thread/name/set'), [{ threadId: 'mock-thread-id', name: '改过的标题' }], 'named once it resumed');
   assert.equal(after.sent('thread/start').length, 0);
   assert.equal(after.sent('turn/start')[0].sandboxPolicy.networkAccess, true);
   const turns = after.turns(session.id);

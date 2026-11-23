@@ -94,7 +94,8 @@ for await (const line of history) {
       { name: 'mock-skill', description: 'Long description', interface: { shortDescription: 'Does mock things' },
         path: join(root, '.agents', 'skills', 'mock-skill', 'SKILL.md'), scope: 'repo', enabled: true, pluginId: null },
     ] }] } });
-  } else if (method === 'skills/config/write' || method === 'plugin/installed' || method === 'fuzzyFileSearch') {
+  } else if (method === 'skills/config/write' || method === 'plugin/installed' || method === 'fuzzyFileSearch'
+    || method === 'thread/name/set') {
     send({ id, result: method === 'plugin/installed'
       ? { marketplaceLoadErrors: [], marketplaces: [{ name: 'mock-market', path: null, interface: null, plugins: [
         { id: 'docs@mock-market', name: 'docs', installed: true, enabled: true,

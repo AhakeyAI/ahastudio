@@ -1,6 +1,6 @@
 import { useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref } from 'react';
 import {
-  ArrowUp, Cpu, FileText, Folder, GitBranch, Globe, Loader2, Lock, MessageCircleQuestion, Paperclip, ShieldAlert, Sparkles, Square, X,
+  ArrowUp, FileText, GitBranch, Globe, Loader2, Lock, MessageCircleQuestion, Paperclip, ShieldAlert, Sparkles, Square, X,
 } from 'lucide-react';
 import { composerDrafts, type ComposerDraftAttachment } from '../../lib/composer-drafts';
 import { prepareImageForAttachment } from '../../lib/image-compression';
@@ -182,7 +182,6 @@ function Chip({ icon, children, title }: { icon: ReactNode; children: ReactNode;
   );
 }
 
-const baseName = (path: string) => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path;
 
 export interface SessionComposerProps {
   alive: boolean;
@@ -191,9 +190,7 @@ export interface SessionComposerProps {
   interrupting: boolean;
   approvals: readonly ApprovalItem[];
   questions: readonly OrchestrationQuestionRecord[];
-  cwd: string | null;
   branch: string | null;
-  model: string | null;
   readOnly?: boolean;
   /** Direct sessions only: the permission level, switchable between turns. */
   policy?: AgentSessionPolicy;
@@ -641,9 +638,7 @@ export function SessionComposer(props: SessionComposerProps) {
         <div className="asv-composer is-ended">会话已结束，当前为只读回放</div>
       )}
       <div className="asv-context-strip">
-        {props.cwd && <Chip icon={<Folder size={12} />} title={props.cwd}>{baseName(props.cwd)}</Chip>}
         {props.branch && <Chip icon={<GitBranch size={12} />} title={props.branch}>{props.branch}</Chip>}
-        {props.model && !toolbar && <Chip icon={<Cpu size={12} />}>{props.model}</Chip>}
         {props.policy && props.onPolicyChange ? (
           <label className="asv-chip asv-policy" title="权限：下一条消息起生效">
             <Lock size={12} />

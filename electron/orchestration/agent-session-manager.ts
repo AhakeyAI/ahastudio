@@ -52,6 +52,8 @@ interface Session {
   hasTurns: boolean;
   /** Policy the live process was launched with; Aha MCP approvals are baked in at that point. */
   launchedPolicy: AgentSessionPolicy | null;
+  /** A title the person chose that the provider has not stored yet; sent when a process is next up. */
+  unsyncedName: string | null;
 }
 
 export interface AgentSessionManagerDependencies {
@@ -182,6 +184,8 @@ export class AgentSessionManager {
     }
     const delivery = await this.startTurn(session, text, input);
     if (delivery.status === 'accepted' && session.info.orchestration) this.deps.onUserTurn?.(id);
+    // Codex may refuse to name a thread before its first turn; try again once it has one.
+    if (delivery.status === 'accepted' && session.unsyncedName) void this.syncName(session);
     return delivery;
   }
 
@@ -298,6 +302,30 @@ export class AgentSessionManager {
     return (await this.sessions.get(id)?.driver?.interrupt()) ?? false;
   }
 
+  /**
+   * Retitles the session. The title is kept here at once; the provider thread is renamed too, now
+   * if its process is up, otherwise the next time it starts. `synced` says whether that happened.
+   */
+  async rename(id: string, title: string): Promise<{ ok: true; synced: boolean } | { ok: false; error: string }> {
+    const session = this.sessions.get(id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    const name = title.replace(/\s+/gu, ' ').trim();
+    if (!name) return { ok: false, error: '标题不能为空' };
+    session.info.title = name;
+    session.unsyncedName = name;
+    this.sessionsChanged();
+    return { ok: true, synced: await this.syncName(session) };
+  }
+
+  private async syncName(session: Session): Promise<boolean> {
+    const { driver, unsyncedName: name } = session;
+    if (!name || !driver?.alive || !driver.sessionId || !driver.setName) return false;
+    const synced = await driver.setName(name);
+    // A newer rename while this one was in flight keeps its own pending name.
+    if (synced && session.unsyncedName === name) session.unsyncedName = null;
+    return synced;
+  }
+
   /** Answers an approval the agent is waiting on. Returns false if it is no longer pending. */
   respond(id: string, requestId: string, allow: boolean, reason?: string): boolean {
     const session = this.sessions.get(id);
@@ -344,7 +372,7 @@ export class AgentSessionManager {
 
   private track(info: AgentSessionInfo, initial?: WorkerTimelineSnapshot): Session {
     const session: Session = {
-      info, driver: null, requests: new Map(), generation: 0, launchedPolicy: null,
+      info, driver: null, requests: new Map(), generation: 0, launchedPolicy: null, unsyncedName: null,
       turns: initial?.turns.length ?? 0,
       // A turn that never reached the provider ends failed with no turn id and no output.
       hasTurns: initial?.turns.some((turn) => turn.status !== 'failed' || turn.turnId !== null || turn.items.length > 0) ?? false,
@@ -399,6 +427,7 @@ export class AgentSessionManager {
       info.effort = session.driver.effectiveEffort ?? info.effort;
       info.status = 'idle';
       timeline.setMeta({ alive: true, providerSessionId: info.providerSessionId });
+      void this.syncName(session);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       info.status = 'failed';

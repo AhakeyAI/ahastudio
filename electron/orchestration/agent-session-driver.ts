@@ -109,6 +109,8 @@ export interface AgentSessionDriver {
   }): Promise<TurnDelivery>;
   /** Asks the provider to stop the running turn; the turn then completes as interrupted. */
   interrupt(): Promise<boolean>;
+  /** Names the provider's conversation, so its own history shows the same title. False if it could not. */
+  setName?(name: string): Promise<boolean>;
   waitForIdle(timeoutMs: number): Promise<boolean>;
   read(turnKey: string, cursor?: number, limit?: number, screen?: boolean): AgentOutputSlice | null;
   redactText(text: string): string;

@@ -258,6 +258,7 @@ const api = {
     close: (opts) => ipcRenderer.invoke('agent-sessions:close', opts),
     timeline: (opts) => ipcRenderer.invoke('agent-sessions:timeline', opts),
     setOrchestration: (opts) => ipcRenderer.invoke('agent-sessions:set-orchestration', opts),
+    rename: (opts) => ipcRenderer.invoke('agent-sessions:rename', opts),
     models: () => ipcRenderer.invoke('agent-sessions:models', {}),
     skills: (opts) => ipcRenderer.invoke('agent-sessions:skills', opts),
     setSkillEnabled: (opts) => ipcRenderer.invoke('agent-sessions:set-skill-enabled', opts),

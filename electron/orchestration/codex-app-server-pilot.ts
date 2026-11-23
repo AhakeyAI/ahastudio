@@ -547,6 +547,16 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     }
   }
 
+  async setName(name: string): Promise<boolean> {
+    if (!this.alive || !this.threadId) return false;
+    try {
+      await this.request('thread/name/set', { threadId: this.threadId, name }, 5_000);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   close(interrupt = false): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
