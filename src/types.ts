@@ -110,7 +110,23 @@ export interface AgentSessionInfo {
   status: 'starting' | 'idle' | 'running' | 'suspended' | 'closed' | 'failed';
   error: string | null;
   pendingQuestions: { requestId: string; questions: AgentSessionQuestion[] }[];
+  /** Messages written while a turn ran; each goes out once the turn before it completes. */
+  queued?: AgentQueuedMessage[];
+  /** A turn did not complete, so the queue waits until the person resumes it. */
+  queuePaused?: boolean;
   createdAt: number;
+}
+
+// Mirrors QueuedMessage in electron/orchestration/agent-session-manager.ts.
+export interface AgentQueuedMessage {
+  id: string;
+  text: string;
+  attachments: AgentTurnAttachment[];
+  model?: string | null;
+  effort?: string | null;
+  policy?: AgentSessionPolicy;
+  network?: boolean;
+  queuedAt: number;
 }
 
 export interface AgentSessionQuestion {
@@ -204,6 +220,13 @@ export interface AgentSessionsApi {
     id: string; text: string; policy?: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
     attachments?: AgentTurnAttachment[];
   }) => AgentSessionResult;
+  /** Sends now if nothing is running, otherwise queues the message; `queued` says which happened. */
+  enqueue?: (opts: {
+    id: string; text: string; policy?: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
+    attachments?: AgentTurnAttachment[];
+  }) => AgentSessionResult<{ queued: boolean }>;
+  unqueue?: (opts: { id: string; messageId: string }) => AgentSessionResult<{ message: AgentQueuedMessage }>;
+  resumeQueue?: (opts: { id: string }) => AgentSessionResult;
   models: () => AgentSessionResult<{ models: CodexModelOption[] }>;
   rateLimits?: () => AgentSessionResult<{ limits: CodexRateLimits }>;
   skills: (opts: { id: string; reload?: boolean }) => AgentSessionResult<{ skills: CodexSkillOption[] }>;

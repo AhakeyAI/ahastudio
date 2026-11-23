@@ -29,10 +29,31 @@ export interface AgentSessionInfo {
   error: string | null;
   /** Questions the agent is blocked on until the person answers or skips them. */
   pendingQuestions: { requestId: string; questions: AgentQuestion[] }[];
+  /** Messages written while a turn ran; each goes out once the turn before it completes. */
+  queued: QueuedMessage[];
+  /** A turn ended without completing (or a queued message was refused), so the queue waits for the person. */
+  queuePaused: boolean;
   createdAt: number;
 }
 
-type SavedSession = Omit<AgentSessionInfo, 'status' | 'error' | 'pendingQuestions'> & { timeline: WorkerTimelineSnapshot };
+export interface QueuedMessage {
+  id: string;
+  text: string;
+  attachments: AgentTurnAttachment[];
+  model?: string | null;
+  effort?: string | null;
+  policy?: AgentSessionPolicy;
+  network?: boolean;
+  queuedAt: number;
+}
+
+type MessageInput = {
+  text: string; model?: string | null; effort?: string | null; policy?: AgentSessionPolicy; network?: boolean;
+  attachments?: readonly AgentTurnAttachment[];
+};
+
+// The queue lives only as long as the process: after a restart nothing is sent on its own.
+type SavedSession = Omit<AgentSessionInfo, 'status' | 'error' | 'pendingQuestions' | 'queued' | 'queuePaused'> & { timeline: WorkerTimelineSnapshot };
 
 interface PendingRequest {
   turnKey: string;
@@ -79,6 +100,7 @@ export interface AgentSessionManagerDependencies {
 
 const DECLINE: AgentRuntimeResponse = { decision: 'decline' };
 const MAX_SAVED_SESSIONS = 20;
+export const MAX_QUEUED_MESSAGES = 10;
 
 /**
  * Conversations a person drives directly, outside orchestration: no dispatch, no report_done. The
@@ -123,7 +145,8 @@ export class AgentSessionManager {
     const info: AgentSessionInfo = {
       id: `agent-session-${randomUUID()}`, provider: 'codex', title: input.title?.trim() || '', cwd: input.cwd,
       model: input.model ?? null, effort: input.effort ?? null, policy: input.policy, network: input.network ?? false,
-      orchestration: false, providerSessionId: null, status: 'starting', error: null, pendingQuestions: [], createdAt: this.now(),
+      orchestration: false, providerSessionId: null, status: 'starting', error: null, pendingQuestions: [],
+      queued: [], queuePaused: false, createdAt: this.now(),
     };
     const session = this.track(info);
     this.sessionsChanged();
@@ -148,7 +171,7 @@ export class AgentSessionManager {
       id, provider: 'codex', title: input.title.trim(), cwd: input.cwd,
       model: input.model ?? null, effort: input.effort ?? null, policy: input.policy, network: false,
       orchestration: false, providerSessionId: input.providerSessionId, status: 'suspended', error: null,
-      pendingQuestions: [], createdAt: this.now(),
+      pendingQuestions: [], queued: [], queuePaused: false, createdAt: this.now(),
     };
     const session = this.track(info, input.timeline(id));
     // The stored thread exists at the provider, so it is rejoined even if no turn replayed.
@@ -162,10 +185,7 @@ export class AgentSessionManager {
    * Starts a turn with the person's message, resuming the provider conversation first if the
    * session was suspended or its process died. A session takes one turn at a time.
    */
-  async send(id: string, input: {
-    text: string; model?: string | null; effort?: string | null; policy?: AgentSessionPolicy; network?: boolean;
-    attachments?: readonly AgentTurnAttachment[];
-  }): Promise<TurnDelivery> {
+  async send(id: string, input: MessageInput): Promise<TurnDelivery> {
     const session = this.sessions.get(id);
     const text = input.text.trim();
     if (!session) return { status: 'not_accepted', reason: 'Session not found' };
@@ -217,6 +237,74 @@ export class AgentSessionManager {
   }
 
   /**
+   * Keeps a message for after the running turn. A session with nothing running takes it at once
+   * instead, so a turn that just ended does not strand it; a paused queue stays where it is.
+   */
+  async enqueue(id: string, input: MessageInput): Promise<{ ok: true; queued: boolean } | { ok: false; error: string }> {
+    const session = this.sessions.get(id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    const text = input.text.trim();
+    if (!text && !input.attachments?.length) return { ok: false, error: '消息是空的' };
+    const { info } = session;
+    const busy = info.status === 'running' || info.status === 'starting' || Boolean(session.driver?.busy);
+    if (!busy && (!info.queued.length || info.queuePaused)) {
+      const delivery = await this.send(id, input);
+      return delivery.status === 'accepted' ? { ok: true, queued: false } : { ok: false, error: delivery.reason };
+    }
+    if (info.status === 'closed') return { ok: false, error: '会话已结束' };
+    if (info.queued.length >= MAX_QUEUED_MESSAGES) return { ok: false, error: `最多排队 ${MAX_QUEUED_MESSAGES} 条消息` };
+    info.queued.push({
+      id: `q_${randomUUID().replace(/-/g, '').slice(0, 12)}`, text, attachments: [...(input.attachments ?? [])],
+      ...(input.model !== undefined ? { model: input.model } : {}),
+      ...(input.effort !== undefined ? { effort: input.effort } : {}),
+      ...(input.policy ? { policy: input.policy } : {}),
+      ...(input.network !== undefined ? { network: input.network } : {}),
+      queuedAt: this.now(),
+    });
+    this.sessionsChanged();
+    return { ok: true, queued: true };
+  }
+
+  /** Takes a message out of the queue (to edit or drop it) and returns it. */
+  unqueue(id: string, messageId: string): QueuedMessage | null {
+    const session = this.sessions.get(id);
+    const index = session?.info.queued.findIndex((message) => message.id === messageId) ?? -1;
+    if (!session || index < 0) return null;
+    const [message] = session.info.queued.splice(index, 1);
+    if (!session.info.queued.length) session.info.queuePaused = false;
+    this.sessionsChanged();
+    return message!;
+  }
+
+  /** Lets a paused queue go on; the next message is sent now if nothing is running. */
+  resumeQueue(id: string): boolean {
+    const session = this.sessions.get(id);
+    if (!session) return false;
+    session.info.queuePaused = false;
+    this.sessionsChanged();
+    this.drainQueue(session);
+    return true;
+  }
+
+  /** Sends the next queued message if the session can take a turn; true when one went out. */
+  private drainQueue(session: Session): boolean {
+    const { info } = session;
+    if (info.queuePaused || !info.queued.length || this.disposing) return false;
+    const idle = info.status === 'idle' && Boolean(session.driver?.alive) && !session.driver?.busy && session.requests.size === 0;
+    if (!idle && !this.resumable(session)) return false;
+    const next = info.queued.shift()!;
+    this.sessionsChanged();
+    const { id: _id, queuedAt: _at, ...message } = next;
+    // send() moves the status off idle before its first await, so nothing else takes this turn.
+    void this.send(info.id, message).then((delivery) => {
+      if (delivery.status === 'accepted' || !this.sessions.has(info.id)) return;
+      info.queuePaused = true;
+      this.sessionsChanged();
+    });
+    return true;
+  }
+
+  /**
    * Starts a system turn in an idle orchestrating session, for Worker news and stall reminders. It
    * never resumes a stopped conversation and never counts as the person's message.
    */
@@ -225,6 +313,7 @@ export class AgentSessionManager {
     const text = prompt.trim();
     if (!session || !text) return { status: 'not_accepted', reason: 'Nothing to deliver' };
     if (!this.coordinatorState(id)?.idle) return { status: 'not_accepted', reason: 'Session is not an idle Coordinator' };
+    if (session.info.queued.length && !session.info.queuePaused) return { status: 'not_accepted', reason: 'The person has messages queued' };
     return this.startTurn(session, text, {}, 'system');
   }
 
@@ -487,8 +576,9 @@ export class AgentSessionManager {
             : result.stopReason === 'interrupted' ? 'interrupted' : 'failed',
         });
         if (info.status === 'running') info.status = 'idle';
+        if (result.stopReason !== 'completed' && info.queued.length) info.queuePaused = true;
         this.sessionsChanged();
-        this.coordinatorSettled(session);
+        if (!this.drainQueue(session)) this.coordinatorSettled(session);
       },
       onRequest: (turnKey, request) => {
         if (!current() || request.signal.aborted) return Promise.resolve(DECLINE);
@@ -517,6 +607,7 @@ export class AgentSessionManager {
           info.status = this.disposing && info.providerSessionId ? 'suspended' : expected ? 'closed' : 'failed';
           if (info.status === 'failed') info.error ??= reason;
         }
+        if (info.queued.length) info.queuePaused = true;
         if (this.sessions.has(info.id)) this.sessionsChanged();
       },
     };
@@ -558,7 +649,7 @@ export class AgentSessionManager {
     for (const entry of saved) {
       if (!entry?.id || !AGENT_SESSION_ID.test(entry.id) || !entry.providerSessionId || !entry.timeline) continue;
       const { timeline, ...rest } = entry;
-      const session = this.track({ ...rest, network: rest.network === true, orchestration: rest.orchestration === true, status: 'suspended', error: null, pendingQuestions: [] }, timeline);
+      const session = this.track({ ...rest, network: rest.network === true, orchestration: rest.orchestration === true, status: 'suspended', error: null, pendingQuestions: [], queued: [], queuePaused: false }, timeline);
       session.timeline.setMeta({ alive: false });
     }
   }
@@ -569,7 +660,7 @@ export class AgentSessionManager {
       .sort((a, b) => b.info.createdAt - a.info.createdAt)
       .slice(0, MAX_SAVED_SESSIONS)
       .map(({ info, timeline }) => {
-        const { status: _status, error: _error, pendingQuestions: _questions, ...rest } = info;
+        const { status: _status, error: _error, pendingQuestions: _questions, queued: _queued, queuePaused: _paused, ...rest } = info;
         return { ...rest, timeline: timeline.archive() };
       });
     return JSON.stringify({ version: 1, sessions });

@@ -357,7 +357,9 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     if (sessionId) {
       const sessions = window.vibeMeet?.agentSessions;
       if (!sessions) return false;
-      const ok = await run('send', () => sessions.send({
+      // Through the queue, a message written during a turn goes out after it, in order.
+      const deliver = sessions.enqueue ?? sessions.send;
+      const ok = await run('send', () => deliver({
         id: sessionId, text,
         ...(attachments.length ? { attachments } : {}),
         ...(nextPolicy && nextPolicy !== info?.policy ? { policy: nextPolicy } : {}),
@@ -435,6 +437,26 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     stageWindowStore.renameWindow(win.id, next);
     return true;
   }, [sessionId, onNotify, win.id]);
+
+  const queue = useMemo(() => {
+    const api = window.vibeMeet?.agentSessions;
+    if (!sessionId || !info || !api?.enqueue || !api.unqueue || !api.resumeQueue) return undefined;
+    const { unqueue, resumeQueue } = api;
+    return {
+      items: info.queued ?? [],
+      paused: Boolean(info.queuePaused),
+      take: async (messageId: string) => {
+        const res = await unqueue({ id: sessionId, messageId });
+        if (!res.ok) onNotify?.(res.error);
+        return res.ok ? res.message : null;
+      },
+      resume: () => {
+        void resumeQueue({ id: sessionId }).then((res) => {
+          if (!res.ok) onNotify?.(res.error);
+        });
+      },
+    };
+  }, [sessionId, info, onNotify]);
 
   const [historyOpen, setHistoryOpen] = useState(false);
   const closeHistory = useCallback(() => setHistoryOpen(false), []);
@@ -585,6 +607,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             branch={dispatch?.branch ?? null}
             readOnly={timeline?.readOnly}
             direct={direct}
+            {...(queue ? { queue } : {})}
             {...(direct && policy ? { policy, onPolicyChange: setNextPolicy } : {})}
             {...(direct ? {
               network, onNetworkChange: setNextNetwork, resumable,

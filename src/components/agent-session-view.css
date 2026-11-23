@@ -511,6 +511,25 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-banner-input { flex: 1; min-width: 0; height: 26px; padding: 0 9px; border: 1px solid var(--asv-line); border-radius: 7px; background: var(--workspace-bg); color: var(--asv-ink); font-size: 12.5px; box-sizing: border-box; }
 .asv-banner-input:focus { border-color: color-mix(in srgb, var(--workspace-accent) 60%, var(--asv-line)); outline: none; }
 
+/* Queued messages sit just above the input, tucked under its rounded top edge. */
+.asv-queue { margin: 0 14px -12px; padding: 6px 8px 16px; border: 1px solid var(--asv-line); border-bottom: 0; border-radius: 12px 12px 0 0; background: var(--asv-tint); font-size: 12.5px; }
+.asv-queue-head { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0 4px 4px; color: var(--asv-ink-2); font-size: 12px; }
+.asv-queue-head > svg { flex: none; }
+.asv-queue-head > span:not(.asv-spacer) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.asv-queue.is-paused { border-color: color-mix(in srgb, var(--asv-warn) 40%, var(--asv-line)); background: color-mix(in srgb, var(--asv-warn) 7%, var(--asv-tint)); }
+.asv-queue.is-paused .asv-queue-head { color: var(--asv-warn); }
+.asv-queue-head .asv-text-btn { display: inline-flex; flex: none; align-items: center; gap: 4px; }
+.asv-queue-hint { display: inline-flex; flex: none; align-items: center; gap: 4px; opacity: 0.8; }
+@media (max-width: 720px) { .asv-queue-hint { display: none; } }
+.asv-queue-list { display: flex; flex-direction: column; gap: 1px; max-height: 132px; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
+.asv-queue-row { display: flex; align-items: center; gap: 8px; min-width: 0; height: 28px; padding: 0 2px 0 6px; border-radius: 7px; }
+.asv-queue-row:hover { background: var(--asv-hover); }
+.asv-queue-index { flex: none; width: 16px; color: var(--asv-ink-2); font-size: 11px; font-variant-numeric: tabular-nums; text-align: center; }
+.asv-queue-text { flex: 1; min-width: 0; overflow: hidden; color: var(--asv-ink); text-overflow: ellipsis; white-space: nowrap; }
+.asv-queue-files { display: inline-flex; flex: none; align-items: center; gap: 2px; color: var(--asv-ink-2); font-size: 11.5px; }
+.asv-queue-row .asv-act { flex: none; opacity: 0.55; }
+.asv-queue-row:hover .asv-act, .asv-queue-row .asv-act:focus-visible { opacity: 1; }
+
 .asv-composer { display: flex; flex-direction: column; border: 1px solid color-mix(in srgb, var(--asv-ink) 12%, transparent); border-radius: 18px; background: var(--asv-surface); box-shadow: var(--asv-shadow); transition: border-color 120ms ease; }
 .asv-composer:focus-within { border-color: color-mix(in srgb, var(--asv-ink) 28%, transparent); }
 .asv-composer.is-ended { padding: 12px 16px; color: var(--asv-ink-2); font-size: 13px; text-align: center; }

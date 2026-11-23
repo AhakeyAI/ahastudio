@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { AGENT_SESSION_ID, AgentSessionManager } from '../dist-electron/orchestration/agent-session-manager.js';
+import { AGENT_SESSION_ID, AgentSessionManager, MAX_QUEUED_MESSAGES } from '../dist-electron/orchestration/agent-session-manager.js';
 import { CodexAppServerPilot, coordinatorApprovedMcpTools } from '../dist-electron/orchestration/codex-app-server-pilot.js';
 
 const cwd = process.cwd();
@@ -332,4 +332,105 @@ test('a question waits for an answer to every part, is recorded, and can be skip
   assert.equal(manager.answer(session.id, second.requestId, null), true);
   await until(() => status(session.id) === 'idle');
   assert.equal(turns(session.id)[1].items.find((item) => item.kind === 'message').text, 'request refused');
+});
+
+test('enqueue sends immediately when the session is idle and rejects an empty message', async (t) => {
+  const { manager, sent, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  assert.deepEqual(await manager.enqueue(session.id, { text: '  send now  ' }), { ok: true, queued: false });
+  await until(() => status(session.id) === 'idle');
+  assert.deepEqual(manager.list()[0].queued, []);
+  assert.equal(sent('turn/start')[0].input.find((item) => item.type === 'text').text, 'send now');
+  assert.deepEqual(await manager.enqueue(session.id, { text: '   ' }), { ok: false, error: '消息是空的' });
+  assert.deepEqual(
+    await manager.enqueue('agent-session-00000000-0000-0000-0000-000000000000', { text: 'missing' }),
+    { ok: false, error: '会话不存在' },
+  );
+});
+
+test('messages queued during a turn go out in order after it completes', async (t) => {
+  const { manager, sent, turns, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  await manager.send(session.id, { text: 'ASK_FOR_APPROVAL' });
+  const approval = await until(() => turns(session.id)[0].items.find((item) => item.kind === 'approval'));
+
+  assert.deepEqual(await manager.enqueue(session.id, { text: 'second message' }), { ok: true, queued: true });
+  assert.deepEqual(await manager.enqueue(session.id, { text: 'third message' }), { ok: true, queued: true });
+  assert.equal(sent('turn/start').length, 1, 'neither message overtakes the running turn');
+  assert.deepEqual(manager.list()[0].queued.map((message) => message.text), ['second message', 'third message']);
+
+  assert.equal(manager.respond(session.id, approval.approvalId, true), true);
+  await until(() => sent('turn/start').length === 3 && status(session.id) === 'idle' && manager.list()[0].queued.length === 0);
+  assert.deepEqual(
+    sent('turn/start').map((params) => params.input.find((item) => item.type === 'text').text),
+    ['ASK_FOR_APPROVAL', 'second message', 'third message'],
+  );
+  assert.deepEqual(turns(session.id).map((turn) => turn.status), ['completed', 'completed', 'completed']);
+  assert.equal(manager.list()[0].queuePaused, false);
+});
+
+test('an interrupted turn pauses the queue until the person resumes it', async (t) => {
+  const { manager, sent, turns, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  await manager.send(session.id, { text: 'WAIT_FOR_INTERRUPT' });
+  await manager.enqueue(session.id, { text: 'after interruption' });
+  await manager.enqueue(session.id, { text: 'last message' });
+
+  assert.equal(await manager.interrupt(session.id), true);
+  await until(() => status(session.id) === 'idle' && manager.list()[0].queuePaused);
+  assert.equal(turns(session.id)[0].status, 'interrupted');
+  assert.deepEqual(manager.list()[0].queued.map((message) => message.text), ['after interruption', 'last message']);
+  await delay(60);
+  assert.equal(sent('turn/start').length, 1, 'an interruption never sends the next message on its own');
+
+  assert.equal(manager.resumeQueue(session.id), true);
+  await until(() => sent('turn/start').length === 3 && status(session.id) === 'idle' && manager.list()[0].queued.length === 0);
+  assert.deepEqual(turns(session.id).map((turn) => turn.prompt), ['WAIT_FOR_INTERRUPT', 'after interruption', 'last message']);
+  assert.equal(manager.list()[0].queuePaused, false);
+  assert.equal(manager.resumeQueue('agent-session-00000000-0000-0000-0000-000000000000'), false);
+});
+
+test('queued messages can be removed, are capped, and never send after the session closes', async (t) => {
+  const { manager, sent } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  await manager.send(session.id, { text: 'WAIT_FOR_INTERRUPT' });
+  for (let index = 0; index < MAX_QUEUED_MESSAGES; index++) {
+    assert.deepEqual(await manager.enqueue(session.id, { text: `queued ${index}` }), { ok: true, queued: true });
+  }
+  assert.deepEqual(
+    await manager.enqueue(session.id, { text: 'one too many' }),
+    { ok: false, error: `最多排队 ${MAX_QUEUED_MESSAGES} 条消息` },
+  );
+
+  const first = manager.list()[0].queued[0];
+  assert.equal(manager.unqueue(session.id, first.id).text, 'queued 0');
+  assert.equal(manager.unqueue(session.id, 'missing'), null);
+  assert.equal(manager.list()[0].queued.length, MAX_QUEUED_MESSAGES - 1);
+  assert.deepEqual(await manager.enqueue(session.id, { text: 'replacement' }), { ok: true, queued: true });
+
+  await manager.close(session.id);
+  assert.deepEqual(manager.list(), []);
+  assert.equal(sent('turn/start').length, 1, 'closing forgets every message that was still queued');
+  assert.equal(manager.resumeQueue(session.id), false);
+});
+
+test('queued messages are process-local and are empty after a restart', async (t) => {
+  const dir = mkdtempSync(join(cwd, '.agent-session-test-'));
+  const before = setup(t, 'normal', { dir, persist: true });
+  const session = await before.manager.create({ cwd, policy: 'workspace-write' });
+  await before.manager.send(session.id, { text: 'WAIT_FOR_INTERRUPT' });
+  await before.manager.enqueue(session.id, { text: 'do not restore me' });
+  await before.manager.dispose();
+
+  const saved = JSON.parse(readFileSync(join(dir, 'agent-sessions.json'), 'utf8'));
+  assert.equal(saved.sessions.length, 1);
+  assert.equal('queued' in saved.sessions[0], false);
+  assert.equal('queuePaused' in saved.sessions[0], false);
+  assert.doesNotMatch(JSON.stringify(saved), /do not restore me/);
+
+  const after = setup(t, 'normal', { dir, persist: true });
+  const [restored] = after.manager.list();
+  assert.equal(restored.status, 'suspended');
+  assert.deepEqual(restored.queued, []);
+  assert.equal(restored.queuePaused, false);
 });

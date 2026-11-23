@@ -41,6 +41,7 @@ const sendSchema = z.object({
   id, text: z.string().max(512_000), policy: policy.optional(), model: optionalName, effort: optionalName,
   network: z.boolean().optional(), attachments: z.array(attachmentSchema).max(MAX_ATTACHMENTS).optional(),
 }).strict().refine((input) => input.text.trim() || input.attachments?.length, 'Message is empty');
+const unqueueSchema = z.object({ id, messageId: z.string().min(1).max(64) }).strict();
 const catalogSchema = z.object({ id, reload: z.boolean().optional() }).strict();
 const searchSchema = z.object({ id, query: z.string().max(200) }).strict();
 const skillSwitchSchema = z.object({ id, path: absolutePath, enabled: z.boolean() }).strict();
@@ -158,6 +159,21 @@ export function registerAgentSessionsIpc(
     if (message.attachments?.length) await checkAttachments(sessionId, message.attachments);
     const delivery = await manager.send(sessionId, message);
     if (delivery.status !== 'accepted') throw new Error(delivery.reason);
+    return {};
+  });
+  secure('enqueue', sendSchema, async ({ id: sessionId, ...message }) => {
+    if (message.attachments?.length) await checkAttachments(sessionId, message.attachments);
+    const result = await manager.enqueue(sessionId, message);
+    if (!result.ok) throw new Error(result.error);
+    return { queued: result.queued };
+  });
+  secure('unqueue', unqueueSchema, (input) => {
+    const message = manager.unqueue(input.id, input.messageId);
+    if (!message) throw new Error('这条消息已经发出或已移除');
+    return { message };
+  });
+  secure('resume-queue', targetSchema, (input) => {
+    if (!manager.resumeQueue(input.id)) throw new Error('会话不存在');
     return {};
   });
   secure('models', z.object({}).strict(), async () => ({ models: await requireCatalog().listModels() }));

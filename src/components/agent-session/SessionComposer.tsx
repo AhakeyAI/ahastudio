@@ -1,4 +1,4 @@
-import { useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref } from 'react';
+import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref } from 'react';
 import {
   ArrowUp, FileText, GitBranch, Globe, Loader2, Lock, MessageCircleQuestion, Paperclip, ShieldAlert, Sparkles, Square, X,
 } from 'lucide-react';
@@ -13,11 +13,12 @@ import {
   type ComposerTrigger,
 } from '../../lib/composer-tokens';
 import type {
-  AgentSessionInfo, AgentSessionPolicy, AgentTurnAttachment, CodexFileMatch, CodexModelOption, CodexSkillOption,
+  AgentQueuedMessage, AgentSessionInfo, AgentSessionPolicy, AgentTurnAttachment, CodexFileMatch, CodexModelOption, CodexSkillOption,
   OrchestrationQuestionRecord, WorkerTimelineItem,
 } from '../../types';
 import { ComposerCatalogPanel } from './ComposerCatalogPanel';
 import { ComposerModelPicker } from './ComposerModelPicker';
+import { SessionQueue } from './SessionQueue';
 import { useAgentSession } from './session-context';
 
 type ApprovalItem = Extract<WorkerTimelineItem, { kind: 'approval' }>;
@@ -205,6 +206,8 @@ export interface SessionComposerProps {
   resumable?: boolean;
   /** Direct sessions take one turn at a time, so sending waits for the running turn. */
   direct?: boolean;
+  /** Direct sessions: a message sent while a turn runs is queued for after it, listed above the input. */
+  queue?: ComposerQueue;
   usage: { input: number; output: number; total: number } | null;
   /** The person's Codex usage limits; direct sessions only. */
   usageLimits?: UsageSummary | null;
@@ -221,6 +224,14 @@ export interface SessionComposerProps {
 export interface ComposerHandle {
   /** Replaces the draft text and focuses the input with the caret at the end; nothing is sent. */
   fill: (text: string) => void;
+}
+
+export interface ComposerQueue {
+  items: readonly AgentQueuedMessage[];
+  paused: boolean;
+  /** Takes a message out of the queue; resolves null when it already went out. */
+  take: (id: string) => Promise<AgentQueuedMessage | null>;
+  resume: () => void;
 }
 
 export interface ComposerToolbar {
@@ -343,9 +354,11 @@ export function SessionComposer(props: SessionComposerProps) {
   }, [trigger, catalog.skills, files]);
   const menuOpen = Boolean(trigger) && (suggestions.length > 0 || (trigger?.kind === 'skill' && !catalog.skills));
 
-  const blocked = Boolean(props.direct && props.running);
+  const { queue } = props;
+  const queueing = Boolean(queue && props.running);
+  const blocked = Boolean(props.direct && props.running && !queue);
   const placeholder = props.direct
-    ? (props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : toolbar ? '给 Codex 发消息，$ 选技能，@ 引用文件' : '给 Codex 发消息')
+    ? (queueing ? '正在工作，现在发送会排队，本轮结束后自动发出' : props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : toolbar ? '给 Codex 发消息，$ 选技能，@ 引用文件' : '给 Codex 发消息')
     : (props.running ? '补充指令，本轮结束后送达' : '给 Worker 发送追加指令');
 
   const updateTrigger = (text: string, caret: number) => {
@@ -450,6 +463,32 @@ export function SessionComposer(props: SessionComposerProps) {
     }
   };
 
+  const [queueBusy, setQueueBusy] = useState(false);
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  const takeQueued = useCallback(async (id: string, edit: boolean) => {
+    if (!queue) return;
+    if (edit && (draftRef.current.trim() || attachedRef.current.length)) {
+      toolbar?.onNotify?.('输入框里还有内容，先发送或清空后再取回');
+      return;
+    }
+    setQueueBusy(true);
+    const message = await queue.take(id).finally(() => setQueueBusy(false));
+    if (!message || !edit) return;
+    setDraft(message.text);
+    setAttached(message.attachments.flatMap((attachment): ComposerDraftAttachment[] => attachment.type === 'skill' ? [] : [{
+      key: attachment.path, kind: attachment.type === 'localImage' ? 'image' : 'file',
+      name: attachment.name ?? attachment.path.split(/[\\/]/u).pop() ?? '附件', previewUrl: null, attachment,
+    }]));
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      el?.focus();
+      el?.setSelectionRange(message.text.length, message.text.length);
+    });
+  }, [queue, toolbar]);
+  const editQueued = useCallback((id: string) => void takeQueued(id, true), [takeQueued]);
+  const removeQueued = useCallback((id: string) => void takeQueued(id, false), [takeQueued]);
+
   // A `$` typed before the skills loaded still finds them once they arrive.
   const { skills: loadedSkills, loadSkills } = catalog;
   const hasToolbar = Boolean(toolbar);
@@ -467,6 +506,16 @@ export function SessionComposer(props: SessionComposerProps) {
             <DirectQuestionBanner key={entry.requestId} entry={entry} onAnswer={props.onAnswer!} />
           ))}
         </div>
+      )}
+      {queue && (
+        <SessionQueue
+          queued={queue.items}
+          paused={queue.paused}
+          busy={queueBusy}
+          onEdit={editQueued}
+          onRemove={removeQueued}
+          onResume={queue.resume}
+        />
       )}
       {props.alive ? (
         <div
@@ -631,8 +680,8 @@ export function SessionComposer(props: SessionComposerProps) {
               className="asv-round-btn is-primary"
               disabled={(!draft.trim() && attached.length === 0) || props.sending || blocked || preparing > 0}
               onClick={() => void send()}
-              aria-label="发送"
-              title="发送（Enter）· Shift+Enter 换行"
+              aria-label={queueing ? '加入队列' : '发送'}
+              title={queueing ? '加入队列，本轮结束后发送（Enter）' : '发送（Enter）· Shift+Enter 换行'}
             >
               <ArrowUp size={15} strokeWidth={2.25} />
             </button>

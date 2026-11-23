@@ -450,6 +450,35 @@ test('SessionComposer shows non-switchable read-only and writable labels for Wor
   assert.match(directHtml, /<select\b/);
 });
 
+test('SessionComposer renders the direct-session queue and its paused state, but none for Workers', async () => {
+  const render = await loadComposerRenderer();
+  const baseProps = {
+    alive: true, running: true, sending: false, interrupting: false,
+    approvals: [], questions: [], branch: null, usage: null,
+    onSend: async () => true, onInterrupt: () => {},
+  };
+  const items = [
+    { id: 'q1', text: '下一条消息\n第二行', attachments: [], queuedAt: 1 },
+    { id: 'q2', text: '', attachments: [{ type: 'file', path: 'C:/repo/note.txt', name: 'note.txt' }], queuedAt: 2 },
+  ];
+  const queue = { items, paused: false, take: async () => null, resume: () => {} };
+  const html = render({ ...baseProps, direct: true, queue });
+  assert.match(html, /<section class="asv-queue" aria-label="排队的消息">/);
+  assert.match(html, /排队中 2 条 · 本轮结束后依次发送/);
+  assert.match(html, /下一条消息/);
+  assert.match(html, /（仅附件）/);
+  assert.match(html, /aria-label="取回编辑"/);
+  assert.match(html, /aria-label="移出队列"/);
+  assert.match(html, /aria-label="加入队列"/);
+
+  const paused = render({ ...baseProps, direct: true, queue: { ...queue, paused: true } });
+  assert.match(paused, /class="asv-queue is-paused"/);
+  assert.match(paused, /已暂停 · 上一轮没有正常结束，2 条消息等你确认后再发/);
+  assert.match(paused, /> 继续发送<\/button>/);
+
+  const worker = render({ ...baseProps, direct: false, readOnly: true });
+  assert.doesNotMatch(worker, /asv-queue|加入队列|继续发送/);
+});
 test('header, empty-state, and usage pieces render their static parts', async () => {
   const outfile = join(dir, 'session-pieces.cjs');
   await build({
