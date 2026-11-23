@@ -10,12 +10,14 @@ import { agentSessionClient, codexCatalogClient, isStandaloneSession, usageLimit
 import { summarizeUsage, type UsageSummary } from '../lib/usage-limits';
 import type { GoalCommandAction } from '../lib/composer-slash-commands';
 import { effortLabel } from '../lib/composer-tokens';
+import { composerDrafts } from '../lib/composer-drafts';
 import { folderName } from '../lib/session-title';
 import { orchestrationClient } from '../lib/orchestration-client';
 import { stageWindowStore, type StageWindow } from '../lib/stage-window-store';
 import { terminalSessionStore } from '../lib/terminal-session-store';
 import {
   activeTimelineTurn,
+  currentThreadHasTurns,
   formatDuration,
   groupTimelineItems,
   pendingApprovals,
@@ -482,19 +484,26 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     return true;
   }, [sessionId, onNotify, win.id]);
 
-  const [freshSessionArmed, setFreshSessionArmed] = useState(false);
+  // A waiting `/clear` lives in the draft store, so switching tabs and back keeps it.
+  const draftKey = win.workerId ?? win.id;
+  const [freshSessionArmed, setFreshSessionArmedState] = useState(() => Boolean(composerDrafts.get(draftKey).freshContext));
+  const setFreshSessionArmed = useCallback((armed: boolean) => {
+    composerDrafts.set(draftKey, { freshContext: armed });
+    setFreshSessionArmedState(armed);
+  }, [draftKey]);
   const [usageLimitsOpen, setUsageLimitsOpen] = useState(false);
   const [usageLimitsRefreshing, setUsageLimitsRefreshing] = useState(false);
   const [feedbackState, setFeedbackState] = useState<FeedbackBannerState | null>(null);
   const [goalBusy, setGoalBusy] = useState(false);
   useEffect(() => {
-    setFreshSessionArmed(false);
+    // Another session's own waiting `/clear` (if any) comes back from the draft store.
+    setFreshSessionArmedState(Boolean(composerDrafts.get(draftKey).freshContext));
     setUsageLimitsOpen(false);
     setFeedbackState(null);
-  }, [sessionId]);
+  }, [sessionId, draftKey]);
 
-  const armFreshSession = useCallback(() => setFreshSessionArmed(true), []);
-  const disarmFreshSession = useCallback(() => setFreshSessionArmed(false), []);
+  const armFreshSession = useCallback(() => setFreshSessionArmed(true), [setFreshSessionArmed]);
+  const disarmFreshSession = useCallback(() => setFreshSessionArmed(false), [setFreshSessionArmed]);
   const closeUsageLimits = useCallback(() => setUsageLimitsOpen(false), []);
   const dismissFeedback = useCallback(() => setFeedbackState(null), []);
 
@@ -632,7 +641,8 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     if (!direct || !sessionId || !info || info.status === 'closed') return undefined;
     return {
       currentTitle: title,
-      hasTurns: Boolean(timeline?.turns.length),
+      // A waiting `/clear` means the next message starts a new thread, so there is nothing to compact.
+      hasTurns: !freshSessionArmed && currentThreadHasTurns(timeline?.turns ?? []),
       hasUsageLimits: Boolean(window.vibeMeet?.agentSessions?.rateLimits),
       canHistory: Boolean(cwd && window.vibeMeet?.agentSessions?.history),
       canRename: Boolean(window.vibeMeet?.agentSessions?.rename),
@@ -657,7 +667,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       onDismissFeedback: dismissFeedback,
     };
   }, [
-    direct, sessionId, info, title, timeline?.turns.length, cwd, freshSessionArmed, goalBusy,
+    direct, sessionId, info, title, timeline?.turns, cwd, freshSessionArmed, goalBusy,
     usageLimitsOpen, usageLimitsRefreshing, feedbackState, armFreshSession, disarmFreshSession,
     openUsageLimits, refreshUsageLimits, closeUsageLimits, openHistory, rename, setOrchestrationMode,
     runGoalCommand, runFeedbackCommand, dismissFeedback,
@@ -789,7 +799,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             {...(slashControl ? { slash: slashControl } : {})}
             usage={usage}
             usageLimits={direct ? usageLimits : null}
-            draftKey={win.workerId ?? win.id}
+            draftKey={draftKey}
             onSend={send}
             onInterrupt={interrupt}
             handleRef={composerRef}

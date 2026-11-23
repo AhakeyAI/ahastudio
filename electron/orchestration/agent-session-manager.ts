@@ -74,6 +74,8 @@ interface Session {
   generation: number;
   /** The provider accepted a turn; Codex saves a thread only then, so before it there is nothing to resume. */
   hasTurns: boolean;
+  /** The person interrupted while a `/goal` turn was being started; its goal must not stay active. */
+  goalTurnInterrupted?: boolean;
   /** Policy the live process was launched with; Aha MCP approvals are baked in at that point. */
   launchedPolicy: AgentSessionPolicy | null;
   /** A title the person chose that the provider has not stored yet; sent when a process is next up. */
@@ -441,6 +443,21 @@ export class AgentSessionManager {
     return delivery;
   }
 
+  /**
+   * Starts the turn that works on a paused goal, then activates the goal (T3 Code's order). If the
+   * person interrupted the turn before the activation landed, the goal is paused again.
+   */
+  private async startGoalTurn(session: Session, prompt: string, shown: string): Promise<TurnDelivery> {
+    const driver = session.driver!;
+    session.goalTurnInterrupted = false;
+    const delivery = await this.startTurn(session, prompt, {}, undefined, { prompt: shown, commandKind: 'goal' });
+    if (delivery.status !== 'accepted' || !driver.setGoal) return delivery;
+    session.info.goal = await driver.setGoal({ status: 'active' });
+    if (session.goalTurnInterrupted) session.info.goal = await driver.setGoal({ status: 'paused' });
+    this.sessionsChanged();
+    return delivery;
+  }
+
   /** Reads, sets, pauses, resumes, or clears the session's Codex goal (`/goal`). */
   async runGoal(id: string, action: AgentGoalAction): Promise<
     { ok: true; goal: AgentSessionGoal | null; message: string } | { ok: false; error: string }
@@ -506,15 +523,9 @@ export class AgentSessionManager {
         if (info.status === 'running' || driver.busy) {
           return { ok: false, error: '当前有进行中的轮次，请等本轮结束后再继续目标' };
         }
-        const goal = await driver.setGoal({ status: 'active' });
-        info.goal = goal;
-        this.sessionsChanged();
-        const delivery = await this.startTurn(
-          session,
-          `Continue working toward the active thread goal: ${current.objective}`,
-          {},
-          undefined,
-          { prompt: '/goal resume', commandKind: 'goal' },
+        // The goal stays paused until our own turn is running, so Codex cannot start one first.
+        const delivery = await this.startGoalTurn(
+          session, `Continue working toward the active thread goal: ${current.objective}`, '/goal resume',
         );
         if (delivery.status !== 'accepted') return { ok: false, error: delivery.reason };
         return { ok: true, goal: info.goal, message: '已继续推进目标' };
@@ -526,17 +537,13 @@ export class AgentSessionManager {
       const current = await driver.getGoal();
       if (current) await driver.clearGoal();
       // Keep paused until our turn starts so Codex does not race an extra turn.
-      await driver.setGoal({ objective, status: 'paused' });
-      const goal = await driver.setGoal({ status: 'active' });
-      info.goal = goal;
+      info.goal = await driver.setGoal({ objective, status: 'paused' });
       if (!info.title) info.title = objective.split('\n')[0]!.slice(0, 60);
       this.sessionsChanged();
-      const delivery = await this.startTurn(
+      const delivery = await this.startGoalTurn(
         session,
         `This thread's goal is already set. Do not call create_goal. Start working on it now: ${objective}`,
-        {},
-        undefined,
-        { prompt: `/goal ${objective}`, commandKind: 'goal' },
+        `/goal ${objective}`,
       );
       if (delivery.status !== 'accepted') return { ok: false, error: delivery.reason };
       if (session.info.orchestration) this.deps.onUserTurn?.(id);
@@ -622,7 +629,9 @@ export class AgentSessionManager {
   }
 
   async interrupt(id: string): Promise<boolean> {
-    return (await this.sessions.get(id)?.driver?.interrupt()) ?? false;
+    const session = this.sessions.get(id);
+    if (session) session.goalTurnInterrupted = true;
+    return (await session?.driver?.interrupt()) ?? false;
   }
 
   /**

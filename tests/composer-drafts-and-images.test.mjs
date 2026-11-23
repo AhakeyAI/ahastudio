@@ -48,6 +48,34 @@ test('a draft survives leaving the view, and its text survives a restart', async
   assert.equal(storage.map.has('aha.composer-draft:session-1'), false, 'a sent or cleared draft leaves nothing behind');
 });
 
+test('a waiting /clear survives the composer saving its text, and only for this run', async (t) => {
+  const storage = fakeStorage();
+  globalThis.localStorage = storage;
+  t.after(() => delete globalThis.localStorage);
+  const { composerDrafts } = await load('composer-drafts');
+
+  composerDrafts.set('s', { freshContext: true });
+  composerDrafts.set('s', { text: 'next message', attachments: [] });
+  assert.equal(composerDrafts.get('s').freshContext, true, 'saving the text keeps the waiting /clear');
+  assert.equal(composerDrafts.get('s').text, 'next message');
+  composerDrafts.set('s', { freshContext: false });
+  assert.equal(composerDrafts.get('s').text, 'next message', 'turning /clear off keeps the text');
+  assert.equal(storage.map.get('aha.composer-draft:s'), 'next message', 'only the text is written to storage');
+});
+
+test('the current thread has turns only after the last /clear and only once Codex took one', async () => {
+  const { currentThreadHasTurns } = await load('worker-timeline-model');
+  const turn = (extra = {}) => ({ turnId: 't', status: 'completed', ...extra });
+  assert.equal(currentThreadHasTurns([]), false);
+  assert.equal(currentThreadHasTurns([turn()]), true);
+  assert.equal(currentThreadHasTurns([turn({ turnId: null, status: 'failed' })]), false,
+    'a message that never reached Codex leaves the thread empty');
+  assert.equal(currentThreadHasTurns([turn(), turn({ freshContext: true, turnId: null, status: 'failed' })]), false,
+    'after /clear, the old thread\'s turns do not count');
+  assert.equal(currentThreadHasTurns([turn(), turn({ freshContext: true, turnId: null, status: 'running' })]), true,
+    'the new thread\'s first turn counts once it is running');
+});
+
 test('only images longer than the max edge are scaled, keeping their aspect ratio', async () => {
   const { fitToMaxEdge, IMAGE_MAX_EDGE } = await load('image-compression');
   assert.equal(IMAGE_MAX_EDGE, 2000);

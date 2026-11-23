@@ -39,7 +39,11 @@ function setup(t, scenario = 'normal', { dir = mkdtempSync(join(cwd, '.agent-ses
     .filter((message) => message.method === method).map((message) => message.params);
   const turns = (id) => manager.getTimeline(id).turns;
   const status = (id) => manager.list().find((session) => session.id === id)?.status;
-  return { manager, sent, turns, status };
+  /** Every request the client sent, in order, as `method` or `method:status` for goal writes. */
+  const order = () => readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse)
+    .filter((message) => message.method)
+    .map((message) => (message.method === 'thread/goal/set' ? `${message.method}:${message.params.status}` : message.method));
+  return { manager, sent, turns, status, order };
 }
 
 function orchSetup(t, { dir = mkdtempSync(join(cwd, '.agent-session-test-')), failPolicy } = {}) {
@@ -476,8 +480,13 @@ test('/compact runs Codex thread/compact/start and rejects before any conversati
 });
 
 test('/goal sets, pauses, resumes, shows, and clears a Codex thread goal', async (t) => {
-  const { manager, sent, turns, status } = setup(t);
+  const { manager, sent, turns, status, order } = setup(t);
   const session = await manager.create({ cwd, policy: 'workspace-write' });
+  // From the first goal write on: what /goal sent, leaving out turn traffic Codex does not see as goal-related.
+  const goalOrder = () => {
+    const all = order().filter((method) => method.startsWith('thread/goal/') || method === 'turn/start');
+    return all.slice(all.findIndex((method) => method.startsWith('thread/goal/set')));
+  };
 
   const empty = await manager.runGoal(session.id, { type: 'show' });
   assert.equal(empty.ok, true);
@@ -493,6 +502,8 @@ test('/goal sets, pauses, resumes, shows, and clears a Codex thread goal', async
   assert.equal(manager.list()[0].goal?.status, 'active');
   assert.equal(turns(session.id)[0].commandKind, 'goal');
   assert.equal(turns(session.id)[0].prompt, '/goal 补齐所有斜杠命令测试');
+  // The goal stays paused until our own turn has started, so Codex cannot start an extra one first.
+  assert.deepEqual(goalOrder(), ['thread/goal/set:paused', 'turn/start', 'thread/goal/set:active']);
 
   const paused = await manager.runGoal(session.id, { type: 'pause' });
   assert.equal(paused.ok, true);
@@ -503,6 +514,8 @@ test('/goal sets, pauses, resumes, shows, and clears a Codex thread goal', async
   await until(() => status(session.id) === 'idle' && turns(session.id).length === 2);
   assert.equal(manager.list()[0].goal?.status, 'active');
   assert.equal(turns(session.id)[1].prompt, '/goal resume');
+  assert.deepEqual(goalOrder().slice(-3), ['thread/goal/get', 'turn/start', 'thread/goal/set:active'],
+    'a resumed goal is activated only after its turn started');
 
   const cleared = await manager.runGoal(session.id, { type: 'clear' });
   assert.equal(cleared.ok, true);

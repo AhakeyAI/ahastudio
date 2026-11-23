@@ -13,6 +13,8 @@ export interface ComposerDraftAttachment {
 export interface ComposerDraft {
   text: string;
   attachments: ComposerDraftAttachment[];
+  /** `/clear` is waiting: the next message opens a new Codex thread. */
+  freshContext?: boolean;
 }
 
 const STORAGE_PREFIX = 'aha.composer-draft:';
@@ -28,7 +30,8 @@ const storage = () => {
 
 /**
  * Drafts per session, kept outside the view so switching tabs does not lose them. The text is
- * also saved locally and comes back after a restart; attachments live for this run of the app.
+ * also saved locally and comes back after a restart; attachments and a waiting `/clear` live for
+ * this run of the app.
  */
 export const composerDrafts = {
   get(key: string): ComposerDraft {
@@ -38,8 +41,11 @@ export const composerDrafts = {
     drafts.set(key, draft);
     return draft;
   },
-  set(key: string, draft: ComposerDraft): void {
+  /** Updates only the given fields, so the view and the composer can each keep their own part. */
+  set(key: string, patch: Partial<ComposerDraft>): void {
+    const draft = { ...composerDrafts.get(key), ...patch };
     drafts.set(key, draft);
+    if (patch.text === undefined) return;
     const store = storage();
     if (!store) return;
     try {

@@ -218,6 +218,18 @@ export function formatTokenCount(count: number): string {
 }
 
 /** Sums per-turn token usage across the session. */
+/**
+ * Whether the current Codex thread holds a turn: turns before the last `/clear` belong to a thread
+ * that is no longer used, and a turn that never reached Codex (failed with no turn id) does not count.
+ */
+export function currentThreadHasTurns(turns: readonly WorkerTimelineTurn[]): boolean {
+  let start = 0;
+  turns.forEach((turn, index) => {
+    if (turn.freshContext) start = index;
+  });
+  return turns.slice(start).some((turn) => turn.turnId !== null || turn.status !== 'failed');
+}
+
 export function totalTokenUsage(snapshot: WorkerTimelineSnapshot | null): { input: number; output: number; total: number } | null {
   if (!snapshot) return null;
   let input = 0;
