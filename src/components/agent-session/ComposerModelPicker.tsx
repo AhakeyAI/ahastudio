@@ -6,7 +6,7 @@ import { ComposerPopover } from './ComposerPopover';
 
 /** Model list with the chosen model's reasoning levels below it; changes apply from the next message. */
 export function ComposerModelPicker({
-  models, model, fallbackLabel, effort, disabled, onModelChange, onEffortChange,
+  models, model, fallbackLabel, effort, disabled, open: controlledOpen, onOpenChange, onModelChange, onEffortChange,
 }: {
   models: readonly CodexModelOption[];
   model: CodexModelOption | null;
@@ -14,11 +14,20 @@ export function ComposerModelPicker({
   fallbackLabel: string | null;
   effort: string | null;
   disabled: boolean;
+  /** Controlled open state so `/model` can open the picker directly. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   onModelChange: (model: CodexModelOption) => void;
   onEffortChange: (effort: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const close = useCallback(() => setOpen(false), []);
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+  const open = controlledOpen ?? uncontrolledOpen;
+  const setOpen = useCallback((next: boolean | ((value: boolean) => boolean)) => {
+    const resolved = typeof next === 'function' ? next(open) : next;
+    if (onOpenChange) onOpenChange(resolved);
+    else setUncontrolledOpen(resolved);
+  }, [open, onOpenChange]);
+  const close = useCallback(() => setOpen(false), [setOpen]);
   const label = model?.displayName ?? fallbackLabel ?? '默认模型';
   return (
     <ComposerPopover

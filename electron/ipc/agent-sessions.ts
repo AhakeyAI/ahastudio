@@ -39,8 +39,18 @@ const createSchema = z.object({
 }).strict();
 const sendSchema = z.object({
   id, text: z.string().max(512_000), policy: policy.optional(), model: optionalName, effort: optionalName,
-  network: z.boolean().optional(), attachments: z.array(attachmentSchema).max(MAX_ATTACHMENTS).optional(),
+  network: z.boolean().optional(), freshContext: z.boolean().optional(),
+  attachments: z.array(attachmentSchema).max(MAX_ATTACHMENTS).optional(),
 }).strict().refine((input) => input.text.trim() || input.attachments?.length, 'Message is empty');
+const goalActionSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('show') }).strict(),
+  z.object({ type: z.literal('clear') }).strict(),
+  z.object({ type: z.literal('pause') }).strict(),
+  z.object({ type: z.literal('resume') }).strict(),
+  z.object({ type: z.literal('set'), objective: z.string().max(8_000) }).strict(),
+]);
+const goalSchema = z.object({ id, action: goalActionSchema }).strict();
+const feedbackSchema = z.object({ id, reason: z.string().max(4_000).optional() }).strict();
 const unqueueSchema = z.object({ id, messageId: z.string().min(1).max(64) }).strict();
 const catalogSchema = z.object({ id, reload: z.boolean().optional() }).strict();
 const searchSchema = z.object({ id, query: z.string().max(200) }).strict();
@@ -235,6 +245,20 @@ export function registerAgentSessionsIpc(
     const result = await manager.rename(input.id, input.title);
     if (!result.ok) throw new Error(result.error);
     return { synced: result.synced };
+  });
+  secure('goal', goalSchema, async (input) => {
+    const result = await manager.runGoal(input.id, input.action);
+    if (!result.ok) throw new Error(result.error);
+    return { goal: result.goal, message: result.message };
+  });
+  secure('upload-feedback', feedbackSchema, async (input) => {
+    const result = await manager.uploadFeedback(
+      input.id,
+      input.reason,
+      catalog ? (tid, reason) => catalog.uploadFeedback(tid, reason) : undefined,
+    );
+    if (!result.ok) throw new Error(result.error);
+    return { feedbackId: result.feedbackId };
   });
   secure('history', historySchema, async (input) => requireCatalog().listThreads(input));
   secure('open-history', openHistorySchema, async (input) => {

@@ -1,22 +1,45 @@
 import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref } from 'react';
 import {
-  ArrowUp, FileText, GitBranch, Globe, Loader2, Lock, MessageCircleQuestion, Paperclip, ShieldAlert, Sparkles, Square, X,
+  ArrowUp, FileText, GitBranch, Globe, Loader2, Lock, MessageCircleQuestion, Paperclip, ShieldAlert, Square, X,
 } from 'lucide-react';
 import { composerDrafts, type ComposerDraftAttachment } from '../../lib/composer-drafts';
 import { prepareImageForAttachment } from '../../lib/image-compression';
 import { formatTokenCount } from '../../lib/worker-timeline-model';
 import type { UsageSummary } from '../../lib/usage-limits';
+import { resolveTitleEdit } from '../../lib/session-title';
 import { UsageLimitChip } from './UsageLimitChip';
 import { POLICY_LABELS, codexCatalogClient } from '../../lib/agent-session-client';
 import {
-  applyCompletion, detectTrigger, fileMention, filterSkills, resolveModelChoice, skillMention, skillsInText,
-  type ComposerTrigger,
+  buildSlashCommandItems,
+  isClearCommand,
+  isCompactCommand,
+  isHistoryCommand,
+  isModelCommand,
+  isUsageLimitsCommand,
+  parseFeedbackCommand,
+  parseGoalCommand,
+  parseOrchestrationCommand,
+  parseRenameCommand,
+  resolveMenuActiveItemId,
+  resolveSkillSourceKind,
+  runsSlashCommandLocally,
+  searchSkills,
+  searchSlashCommandItems,
+  type GoalCommandAction,
+} from '../../lib/composer-slash-commands';
+import {
+  applyCompletion, detectTrigger, fileMention, isSameTrigger, removeTriggerRange, resolveModelChoice, skillMention,
+  skillsInText, type ComposerTrigger,
 } from '../../lib/composer-tokens';
 import type {
-  AgentQueuedMessage, AgentSessionInfo, AgentSessionPolicy, AgentTurnAttachment, CodexFileMatch, CodexModelOption, CodexSkillOption,
-  OrchestrationQuestionRecord, WorkerTimelineItem,
+  AgentQueuedMessage, AgentSessionGoal, AgentSessionInfo, AgentSessionPolicy, AgentTurnAttachment, CodexFileMatch,
+  CodexModelOption, CodexSkillOption, OrchestrationQuestionRecord, WorkerTimelineItem,
 } from '../../types';
+import {
+  FeedbackBanner, FreshSessionBanner, GoalBanner, UsageLimitsBanner, type FeedbackBannerState,
+} from './ComposerBanners';
 import { ComposerCatalogPanel } from './ComposerCatalogPanel';
+import { ComposerCommandMenu, type ComposerSuggestion } from './ComposerCommandMenu';
 import { ComposerModelPicker } from './ComposerModelPicker';
 import { SessionQueue } from './SessionQueue';
 import { useAgentSession } from './session-context';
@@ -211,14 +234,43 @@ export interface SessionComposerProps {
   usage: { input: number; output: number; total: number } | null;
   /** The person's Codex usage limits; direct sessions only. */
   usageLimits?: UsageSummary | null;
-  /** Direct sessions: model and effort, `$` skills, `@` files, attachments, and the plugin panel. */
+  /** Direct sessions: model and effort, `/` slash commands, `$` skills, `@` files, attachments, and the plugin panel. */
   toolbar?: ComposerToolbar;
+  /** Direct sessions only: slash command actions and inline command banners. */
+  slash?: ComposerSlashControl;
   /** Keeps the unsent draft across tab switches (and its text across restarts) under this key. */
   draftKey?: string;
   /** Resolves true once the message was accepted, which clears the draft. */
-  onSend: (text: string, attachments: AgentTurnAttachment[]) => Promise<boolean>;
+  onSend: (text: string, attachments: AgentTurnAttachment[], options?: { freshContext?: boolean }) => Promise<boolean>;
   onInterrupt: () => void;
   handleRef?: Ref<ComposerHandle>;
+}
+
+export interface ComposerSlashControl {
+  currentTitle: string;
+  hasTurns: boolean;
+  hasUsageLimits: boolean;
+  canHistory: boolean;
+  canRename: boolean;
+  canOrchestration: boolean;
+  orchestrationOn: boolean;
+  freshSessionArmed: boolean;
+  goal: AgentSessionGoal | null;
+  goalBusy: boolean;
+  usageLimitsOpen: boolean;
+  usageLimitsRefreshing: boolean;
+  feedback: FeedbackBannerState | null;
+  onArmFreshSession: () => void;
+  onDisarmFreshSession: () => void;
+  onOpenUsageLimits: () => void;
+  onRefreshUsageLimits: () => void;
+  onCloseUsageLimits: () => void;
+  onOpenHistory: () => void;
+  onRename: (title: string) => Promise<boolean>;
+  onSetOrchestration: (mode: 'toggle' | 'on' | 'off') => void;
+  onGoalCommand: (action: GoalCommandAction) => Promise<boolean>;
+  onFeedbackCommand: (reason?: string) => void;
+  onDismissFeedback: () => void;
 }
 
 export interface ComposerHandle {
@@ -243,10 +295,6 @@ export interface ComposerToolbar {
   onEffortChange: (effort: string) => void;
   onNotify?: (message: string) => void;
 }
-
-type Suggestion =
-  | { kind: 'skill'; key: string; skill: CodexSkillOption }
-  | { kind: 'file'; key: string; file: CodexFileMatch };
 
 const IMAGE_MIME = /^image\/(png|jpeg|gif|webp)$/u;
 const MAX_ATTACHMENTS = 12;
@@ -285,13 +333,19 @@ function useComposerCatalog(sessionId: string | undefined) {
 
 /** Floating input card with the approvals and questions that block the Worker stacked above it. */
 export function SessionComposer(props: SessionComposerProps) {
-  const { toolbar, draftKey } = props;
+  const { toolbar, slash, draftKey } = props;
   const [draft, setDraft] = useState(() => (draftKey ? composerDrafts.get(draftKey).text : ''));
   const [attached, setAttached] = useState<ComposerDraftAttachment[]>(() => (draftKey ? composerDrafts.get(draftKey).attachments : []));
   const [preparing, setPreparing] = useState(0);
-  const [trigger, setTrigger] = useState<ComposerTrigger | null>(null);
+  // Trigger state adapted from T3 Code `useComposerTriggerState.ts` (MIT): edits open suggestions
+  // unless Escape dismissed the same trigger; caret moves only follow or close an open menu.
+  const [trigger, setTriggerState] = useState<ComposerTrigger | null>(null);
+  const activeTriggerRef = useRef<ComposerTrigger | null>(null);
+  const dismissedTriggerRef = useRef<ComposerTrigger | null>(null);
   const [files, setFiles] = useState<CodexFileMatch[]>([]);
-  const [active, setActive] = useState(0);
+  const [fileSearching, setFileSearching] = useState(false);
+  const [highlight, setHighlight] = useState<{ itemId: string | null; searchKey: string | null }>({ itemId: null, searchKey: null });
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -303,10 +357,20 @@ export function SessionComposer(props: SessionComposerProps) {
   );
   const imagesAllowed = Boolean(toolbar) && (choice.model?.images ?? true);
 
+  const activateTrigger = useCallback((next: ComposerTrigger | null) => {
+    activeTriggerRef.current = next;
+    setTriggerState(next);
+  }, []);
+
+  const resetTrigger = useCallback((next: ComposerTrigger | null) => {
+    dismissedTriggerRef.current = null;
+    activateTrigger(next);
+  }, [activateTrigger]);
+
   useImperativeHandle(props.handleRef, () => ({
     fill: (text: string) => {
       setDraft(text);
-      setTrigger(null);
+      resetTrigger(null);
       requestAnimationFrame(() => {
         const el = inputRef.current;
         if (!el) return;
@@ -314,7 +378,7 @@ export function SessionComposer(props: SessionComposerProps) {
         el.setSelectionRange(text.length, text.length);
       });
     },
-  }), []);
+  }), [resetTrigger]);
 
   useLayoutEffect(() => {
     const el = inputRef.current;
@@ -333,53 +397,215 @@ export function SessionComposer(props: SessionComposerProps) {
   useEffect(() => {
     if (!toolbar || trigger?.kind !== 'file' || !trigger.query) {
       setFiles([]);
+      setFileSearching(false);
       return;
     }
     const seq = ++searchSeq.current;
+    setFileSearching(true);
     const timer = setTimeout(() => {
       void window.vibeMeet?.agentSessions?.searchFiles({ id: toolbar.sessionId, query: trigger.query }).then((res) => {
-        if (seq === searchSeq.current) setFiles(res?.ok ? res.files : []);
+        if (seq === searchSeq.current) {
+          setFiles(res?.ok ? res.files : []);
+          setFileSearching(false);
+        }
+      }, () => {
+        if (seq === searchSeq.current) {
+          setFiles([]);
+          setFileSearching(false);
+        }
       });
     }, FILE_SEARCH_DELAY_MS);
     return () => clearTimeout(timer);
   }, [toolbar?.sessionId, trigger?.kind, trigger?.query]);
 
-  const suggestions = useMemo<Suggestion[]>(() => {
+  const suggestions = useMemo<ComposerSuggestion[]>(() => {
     if (!trigger) return [];
-    if (trigger.kind === 'skill') {
-      return filterSkills(catalog.skills ?? [], trigger.query, 12)
-        .map((skill) => ({ kind: 'skill' as const, key: skill.path, skill }));
+    if (trigger.kind === 'slash') {
+      if (!slash) return [];
+      const isAtPromptStart = draft.slice(0, trigger.start).trim() === '';
+      const hasTrailingText = draft.slice(trigger.end).trim() !== '';
+      const canCompact =
+        isAtPromptStart &&
+        !hasTrailingText &&
+        attached.length === 0 &&
+        slash.hasTurns &&
+        !props.running &&
+        props.approvals.length === 0 &&
+        !(props.directQuestions?.length);
+      const items = buildSlashCommandItems({
+        isAtPromptStart,
+        hasTurns: slash.hasTurns,
+        canCompact,
+        hasUsageLimits: slash.hasUsageLimits,
+        canHistory: slash.canHistory,
+        canRename: slash.canRename,
+        canOrchestration: slash.canOrchestration,
+        orchestrationOn: slash.orchestrationOn,
+        skills: catalog.skills ?? [],
+      });
+      return searchSlashCommandItems(items, trigger.query).map((item) => ({
+        kind: 'slash' as const,
+        id: item.id,
+        item,
+      }));
     }
-    return files.map((file) => ({ kind: 'file' as const, key: file.path, file }));
-  }, [trigger, catalog.skills, files]);
-  const menuOpen = Boolean(trigger) && (suggestions.length > 0 || (trigger?.kind === 'skill' && !catalog.skills));
+    if (trigger.kind === 'skill') {
+      return searchSkills(catalog.skills ?? [], trigger.query, 16).map((skill) => ({
+        kind: 'skill' as const,
+        id: `skill:${skill.path}`,
+        skill,
+        sourceKind: resolveSkillSourceKind(skill),
+      }));
+    }
+    return files.map((file) => ({ kind: 'file' as const, id: `file:${file.path}`, file }));
+  }, [trigger, slash, draft, attached.length, props.running, props.approvals.length, props.directQuestions?.length, catalog.skills, files]);
+
+  const menuOpen = Boolean(trigger) && (
+    (trigger!.kind === 'slash' && Boolean(slash)) ||
+    trigger!.kind === 'skill' ||
+    (trigger!.kind === 'file' && Boolean(trigger!.query))
+  );
+  const menuLoading =
+    ((trigger?.kind === 'skill' || trigger?.kind === 'slash') && !catalog.skills) ||
+    (trigger?.kind === 'file' && fileSearching);
+  const searchKey = trigger ? `${trigger.kind}:${trigger.query.trim().toLowerCase()}` : null;
+  const activeItemId = resolveMenuActiveItemId({
+    items: suggestions,
+    highlightedItemId: highlight.itemId,
+    currentSearchKey: searchKey,
+    highlightedSearchKey: highlight.searchKey,
+  });
+  const activeSuggestion = suggestions.find((item) => item.id === activeItemId) ?? suggestions[0] ?? null;
+  const onHighlightItem = useCallback((itemId: string) => {
+    setHighlight({ itemId, searchKey });
+  }, [searchKey]);
+
+  const localSlashCommand = Boolean(slash) && runsSlashCommandLocally({
+    text: draft,
+    holdsOnlyText: attached.length === 0,
+    hasTurns: Boolean(slash?.hasTurns),
+    hasUsageLimits: Boolean(slash?.hasUsageLimits),
+    canHistory: Boolean(slash?.canHistory),
+    canRename: Boolean(slash?.canRename),
+    canOrchestration: Boolean(slash?.canOrchestration),
+  });
 
   const { queue } = props;
-  const queueing = Boolean(queue && props.running);
-  const blocked = Boolean(props.direct && props.running && !queue);
+  const queueing = Boolean(queue && props.running && !localSlashCommand);
+  const blocked = Boolean(props.direct && props.running && !queue && !localSlashCommand);
   const placeholder = props.direct
-    ? (queueing ? '正在工作，现在发送会排队，本轮结束后自动发出' : props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : toolbar ? '给 Codex 发消息，$ 选技能，@ 引用文件' : '给 Codex 发消息')
+    ? (queueing ? '正在工作，现在发送会排队，本轮结束后自动发出' : props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : toolbar ? '给 Codex 发消息，/ 斜杠命令，$ 选技能，@ 引用文件' : '给 Codex 发消息')
     : (props.running ? '补充指令，本轮结束后送达' : '给 Worker 发送追加指令');
 
-  const updateTrigger = (text: string, caret: number) => {
+  const handleEditTrigger = (text: string, caret: number) => {
     if (!toolbar) return;
-    const next = detectTrigger(text, caret);
-    setTrigger(next);
-    setActive(0);
-    if (next?.kind === 'skill' && !catalog.skills) catalog.loadSkills();
+    const candidate = detectTrigger(text, caret);
+    const allowed = candidate?.kind === 'slash' && !slash ? null : candidate;
+    if (isSameTrigger(dismissedTriggerRef.current, allowed)) {
+      activateTrigger(null);
+      return;
+    }
+    dismissedTriggerRef.current = null;
+    activateTrigger(allowed);
+    if ((allowed?.kind === 'skill' || allowed?.kind === 'slash') && !catalog.skills) catalog.loadSkills();
   };
 
-  const insert = (insertion: string) => {
+  const handleSelectTrigger = (text: string, caret: number) => {
+    if (!toolbar) return;
+    const candidate = detectTrigger(text, caret);
+    const allowed = candidate?.kind === 'slash' && !slash ? null : candidate;
+    if (!isSameTrigger(dismissedTriggerRef.current, allowed)) {
+      dismissedTriggerRef.current = null;
+    }
+    activateTrigger(isSameTrigger(activeTriggerRef.current, allowed) ? allowed : null);
+  };
+
+  const openModelPicker = useCallback(() => {
+    if (props.running) {
+      toolbar?.onNotify?.('本轮结束后可以切换模型');
+      return;
+    }
+    if (catalog.models.length === 0) {
+      toolbar?.onNotify?.('正在读取模型列表，请稍后再试');
+      return;
+    }
+    setModelPickerOpen(true);
+  }, [props.running, catalog.models.length, toolbar]);
+
+  const replaceTrigger = (insertion: string) => {
     if (!trigger) return;
     const next = applyCompletion(draft, trigger, insertion);
     setDraft(next.text);
-    setTrigger(null);
+    resetTrigger(null);
+    setHighlight({ itemId: null, searchKey: null });
     requestAnimationFrame(() => {
       inputRef.current?.focus();
       inputRef.current?.setSelectionRange(next.caret, next.caret);
     });
   };
-  const choose = (item: Suggestion) => insert(item.kind === 'skill' ? skillMention(item.skill.name) : fileMention(item.file.path));
+
+  const stripTrigger = (focusAfter = true) => {
+    if (!trigger) return;
+    const next = removeTriggerRange(draft, trigger);
+    setDraft(next.text);
+    resetTrigger(null);
+    setHighlight({ itemId: null, searchKey: null });
+    if (focusAfter) {
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+        inputRef.current?.setSelectionRange(next.caret, next.caret);
+      });
+    }
+  };
+
+  const choose = useCallback((item: ComposerSuggestion) => {
+    if (item.kind === 'file') {
+      replaceTrigger(fileMention(item.file.path));
+      return;
+    }
+    if (item.kind === 'skill') {
+      replaceTrigger(skillMention(item.skill.name));
+      return;
+    }
+    const cmd = item.item;
+    if (cmd.type === 'skill') {
+      replaceTrigger(skillMention(cmd.skill.name));
+      return;
+    }
+    if (cmd.type === 'builtin') {
+      if (cmd.command === 'model') {
+        stripTrigger(false);
+        openModelPicker();
+        return;
+      }
+      if (cmd.command === 'clear') {
+        stripTrigger(true);
+        slash?.onArmFreshSession();
+        return;
+      }
+      if (cmd.command === 'history') {
+        stripTrigger(false);
+        slash?.onOpenHistory();
+        return;
+      }
+      if (cmd.command === 'rename') {
+        replaceTrigger('/rename');
+        return;
+      }
+      if (cmd.command === 'orchestration') {
+        stripTrigger(true);
+        slash?.onSetOrchestration('toggle');
+        return;
+      }
+      return;
+    }
+    if (cmd.command === 'usage-limits') {
+      stripTrigger(false);
+      slash?.onOpenUsageLimits();
+      return;
+    }
+    replaceTrigger(`/${cmd.command}`);
+  }, [draft, trigger, slash, openModelPicker]);
 
   const useSkill = (skill: CodexSkillOption) => {
     const el = inputRef.current;
@@ -447,19 +673,104 @@ export function SessionComposer(props: SessionComposerProps) {
     return item.key !== key;
   }));
 
+  const clearDraft = () => {
+    setDraft('');
+    resetTrigger(null);
+    setHighlight({ itemId: null, searchKey: null });
+    attached.forEach((item) => item.previewUrl && URL.revokeObjectURL(item.previewUrl));
+    setAttached([]);
+  };
+
   const send = async () => {
     const text = draft.trim();
     if ((!text && attached.length === 0) || props.sending || blocked || preparing > 0) return;
+    if (slash && attached.length === 0 && text) {
+      if (isModelCommand(text)) {
+        clearDraft();
+        openModelPicker();
+        return;
+      }
+      if (isClearCommand(text)) {
+        if (!slash.hasTurns) {
+          toolbar?.onNotify?.('当前还没有历史对话，无需开启新上下文');
+          return;
+        }
+        clearDraft();
+        slash.onArmFreshSession();
+        return;
+      }
+      if (isUsageLimitsCommand(text)) {
+        clearDraft();
+        slash.onOpenUsageLimits();
+        return;
+      }
+      if (isHistoryCommand(text)) {
+        if (!slash.canHistory) {
+          toolbar?.onNotify?.('当前会话不支持历史记录');
+          return;
+        }
+        clearDraft();
+        slash.onOpenHistory();
+        return;
+      }
+      const renameCmd = parseRenameCommand(text);
+      if (renameCmd) {
+        if (!slash.canRename) return;
+        if (!renameCmd.title) {
+          toolbar?.onNotify?.('请输入新标题，例如 /rename 登录重构');
+          return;
+        }
+        const edit = resolveTitleEdit(renameCmd.title, slash.currentTitle);
+        if (edit.action === 'reject') {
+          toolbar?.onNotify?.(edit.error);
+          return;
+        }
+        if (edit.action === 'noop') {
+          clearDraft();
+          toolbar?.onNotify?.('标题没有变化');
+          return;
+        }
+        if (await slash.onRename(edit.title)) {
+          clearDraft();
+          toolbar?.onNotify?.(`已改名为「${edit.title}」`);
+        }
+        return;
+      }
+      const orchCmd = parseOrchestrationCommand(text);
+      if (orchCmd && slash.canOrchestration) {
+        clearDraft();
+        slash.onSetOrchestration(orchCmd.mode);
+        return;
+      }
+      const feedbackCmd = parseFeedbackCommand(text);
+      if (feedbackCmd) {
+        if (!slash.hasTurns) {
+          toolbar?.onNotify?.('请先发送至少一条消息后再提交反馈');
+          return;
+        }
+        clearDraft();
+        slash.onFeedbackCommand(feedbackCmd.reason);
+        return;
+      }
+      const goalCmd = parseGoalCommand(text, attached.length);
+      if (goalCmd) {
+        if (await slash.onGoalCommand(goalCmd)) clearDraft();
+        return;
+      }
+      if (isCompactCommand(text) && !slash.hasTurns) {
+        toolbar?.onNotify?.('还没有可压缩的对话记录');
+        return;
+      }
+    }
     const skills = skillsInText(text, catalog.skills ?? []);
     const attachments: AgentTurnAttachment[] = [
       ...skills.map((skill) => ({ type: 'skill' as const, name: skill.name, path: skill.path })),
       ...attached.map((item) => item.attachment),
     ];
-    if (await props.onSend(text, attachments)) {
-      setDraft('');
-      setTrigger(null);
-      attached.forEach((item) => item.previewUrl && URL.revokeObjectURL(item.previewUrl));
-      setAttached([]);
+    const freshContext = Boolean(slash?.freshSessionArmed);
+    if (await props.onSend(text, attachments, freshContext ? { freshContext: true } : undefined)) {
+      clearDraft();
+      if (freshContext) slash?.onDisarmFreshSession();
     }
   };
 
@@ -476,6 +787,7 @@ export function SessionComposer(props: SessionComposerProps) {
     const message = await queue.take(id).finally(() => setQueueBusy(false));
     if (!message || !edit) return;
     setDraft(message.text);
+    if (message.freshContext) slash?.onArmFreshSession();
     setAttached(message.attachments.flatMap((attachment): ComposerDraftAttachment[] => attachment.type === 'skill' ? [] : [{
       key: attachment.path, kind: attachment.type === 'localImage' ? 'image' : 'file',
       name: attachment.name ?? attachment.path.split(/[\\/]/u).pop() ?? '附件', previewUrl: null, attachment,
@@ -485,26 +797,56 @@ export function SessionComposer(props: SessionComposerProps) {
       el?.focus();
       el?.setSelectionRange(message.text.length, message.text.length);
     });
-  }, [queue, toolbar]);
+  }, [queue, toolbar, slash]);
   const editQueued = useCallback((id: string) => void takeQueued(id, true), [takeQueued]);
   const removeQueued = useCallback((id: string) => void takeQueued(id, false), [takeQueued]);
 
-  // A `$` typed before the skills loaded still finds them once they arrive.
+  // A `$` or `/` typed before the skills loaded still finds them once they arrive.
   const { skills: loadedSkills, loadSkills } = catalog;
   const hasToolbar = Boolean(toolbar);
   useEffect(() => {
-    if (hasToolbar && /(^|\s)\$/u.test(draft) && !loadedSkills) loadSkills();
+    if (hasToolbar && /(^|\s)[$/]/u.test(draft) && !loadedSkills) loadSkills();
   }, [hasToolbar, draft, loadedSkills, loadSkills]);
+
+  const hasSlashBanners = Boolean(
+    slash && (slash.freshSessionArmed || slash.usageLimitsOpen || slash.goal || slash.feedback),
+  );
+  const hasBannerLane =
+    props.approvals.length > 0 || props.questions.length > 0 || Boolean(props.directQuestions?.length) || hasSlashBanners;
 
   return (
     <div className="asv-dock-inner">
-      {(props.approvals.length > 0 || props.questions.length > 0 || Boolean(props.directQuestions?.length)) && (
+      {hasBannerLane && (
         <div className="asv-banner-lane">
           {props.approvals.map((item) => <ApprovalBanner key={item.id} item={item} />)}
           {props.questions.map((question) => <QuestionBanner key={question.messageId} question={question} />)}
           {props.onAnswer && props.directQuestions?.map((entry) => (
             <DirectQuestionBanner key={entry.requestId} entry={entry} onAnswer={props.onAnswer!} />
           ))}
+          {slash?.goal && (
+            <GoalBanner
+              goal={slash.goal}
+              running={props.running}
+              busy={slash.goalBusy}
+              onPause={() => void slash.onGoalCommand({ type: 'pause' })}
+              onResume={() => void slash.onGoalCommand({ type: 'resume' })}
+              onClear={() => void slash.onGoalCommand({ type: 'clear' })}
+            />
+          )}
+          {slash?.usageLimitsOpen && (
+            <UsageLimitsBanner
+              summary={props.usageLimits ?? null}
+              refreshing={slash.usageLimitsRefreshing}
+              onRefresh={slash.onRefreshUsageLimits}
+              onClose={slash.onCloseUsageLimits}
+            />
+          )}
+          {slash?.feedback && (
+            <FeedbackBanner state={slash.feedback} onDismiss={slash.onDismissFeedback} />
+          )}
+          {slash?.freshSessionArmed && (
+            <FreshSessionBanner onDismiss={slash.onDisarmFreshSession} />
+          )}
         </div>
       )}
       {queue && (
@@ -534,27 +876,15 @@ export function SessionComposer(props: SessionComposerProps) {
             void addFiles(dropped);
           }}
         >
-          {menuOpen && (
-            <div className="asv-suggest" role="listbox" aria-label={trigger?.kind === 'skill' ? '技能' : '文件'}>
-              <div className="asv-suggest-head">{trigger?.kind === 'skill' ? '技能' : '文件'}</div>
-              {trigger?.kind === 'skill' && !catalog.skills && <div className="asv-pop-note">正在读取技能…</div>}
-              {suggestions.map((item, index) => (
-                <button
-                  key={item.key}
-                  type="button"
-                  role="option"
-                  aria-selected={index === active}
-                  className={`asv-suggest-row${index === active ? ' is-active' : ''}`}
-                  onMouseEnter={() => setActive(index)}
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => choose(item)}
-                >
-                  {item.kind === 'skill' ? <Sparkles size={13} aria-hidden="true" /> : <FileText size={13} aria-hidden="true" />}
-                  <span className="asv-suggest-title">{item.kind === 'skill' ? item.skill.name : item.file.fileName}</span>
-                  <span className="asv-suggest-desc">{item.kind === 'skill' ? item.skill.description : item.file.path}</span>
-                </button>
-              ))}
-            </div>
+          {menuOpen && trigger && (
+            <ComposerCommandMenu
+              triggerKind={trigger.kind}
+              items={suggestions}
+              activeItemId={activeItemId}
+              loading={menuLoading}
+              onHighlight={onHighlightItem}
+              onSelect={choose}
+            />
           )}
           {(attached.length > 0 || preparing > 0) && (
             <div className="asv-attach-strip">
@@ -589,10 +919,10 @@ export function SessionComposer(props: SessionComposerProps) {
             rows={1}
             onChange={(event) => {
               setDraft(event.target.value);
-              updateTrigger(event.target.value, event.target.selectionStart ?? event.target.value.length);
+              handleEditTrigger(event.target.value, event.target.selectionStart ?? event.target.value.length);
             }}
-            onSelect={(event) => updateTrigger(event.currentTarget.value, event.currentTarget.selectionStart ?? 0)}
-            onBlur={() => setTrigger(null)}
+            onSelect={(event) => handleSelectTrigger(event.currentTarget.value, event.currentTarget.selectionStart ?? 0)}
+            onBlur={() => activateTrigger(null)}
             onPaste={(event) => {
               if (!toolbar) return;
               const pasted = [...event.clipboardData.files];
@@ -609,23 +939,26 @@ export function SessionComposer(props: SessionComposerProps) {
               }
             }}
             onKeyDown={(event) => {
-              if (menuOpen && suggestions.length > 0) {
+              if (menuOpen && event.key === 'Escape' && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                dismissedTriggerRef.current = trigger;
+                activateTrigger(null);
+                return;
+              }
+              if (menuOpen && suggestions.length > 0 && !event.shiftKey) {
                 if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
                   event.preventDefault();
                   const step = event.key === 'ArrowDown' ? 1 : -1;
-                  setActive((index) => (index + step + suggestions.length) % suggestions.length);
+                  const currentIndex = Math.max(0, suggestions.findIndex((item) => item.id === activeItemId));
+                  const next = suggestions[(currentIndex + step + suggestions.length) % suggestions.length]!;
+                  setHighlight({ itemId: next.id, searchKey });
                   return;
                 }
-                if ((event.key === 'Enter' || event.key === 'Tab') && !event.nativeEvent.isComposing) {
+                if ((event.key === 'Enter' || event.key === 'Tab') && !event.nativeEvent.isComposing && activeSuggestion) {
                   event.preventDefault();
-                  choose(suggestions[active] ?? suggestions[0]!);
+                  choose(activeSuggestion);
                   return;
                 }
-              }
-              if (menuOpen && event.key === 'Escape') {
-                event.preventDefault();
-                setTrigger(null);
-                return;
               }
               if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
@@ -663,6 +996,8 @@ export function SessionComposer(props: SessionComposerProps) {
                   fallbackLabel={toolbar.modelId}
                   effort={choice.effort}
                   disabled={props.running}
+                  open={modelPickerOpen}
+                  onOpenChange={setModelPickerOpen}
                   onModelChange={toolbar.onModelChange}
                   onEffortChange={toolbar.onEffortChange}
                 />
@@ -680,8 +1015,8 @@ export function SessionComposer(props: SessionComposerProps) {
               className="asv-round-btn is-primary"
               disabled={(!draft.trim() && attached.length === 0) || props.sending || blocked || preparing > 0}
               onClick={() => void send()}
-              aria-label={queueing ? '加入队列' : '发送'}
-              title={queueing ? '加入队列，本轮结束后发送（Enter）' : '发送（Enter）· Shift+Enter 换行'}
+              aria-label={localSlashCommand ? '执行命令' : queueing ? '加入队列' : '发送'}
+              title={localSlashCommand ? '执行斜杠命令（Enter）' : queueing ? '加入队列，本轮结束后发送（Enter）' : '发送（Enter）· Shift+Enter 换行'}
             >
               <ArrowUp size={15} strokeWidth={2.25} />
             </button>

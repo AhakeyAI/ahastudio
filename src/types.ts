@@ -94,6 +94,23 @@ export interface BrowserApi {
 
 export type AgentSessionPolicy = 'read-only' | 'workspace-write' | 'full-auto';
 
+export type AgentGoalStatus = 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete';
+
+export interface AgentSessionGoal {
+  objective: string;
+  status: AgentGoalStatus;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  updatedAt: number;
+}
+
+export type AgentGoalAction =
+  | { type: 'show' }
+  | { type: 'clear' }
+  | { type: 'pause' }
+  | { type: 'resume' }
+  | { type: 'set'; objective: string };
+
 // Mirrors electron/orchestration/agent-session-manager.ts.
 export interface AgentSessionInfo {
   id: string;
@@ -114,6 +131,8 @@ export interface AgentSessionInfo {
   queued?: AgentQueuedMessage[];
   /** A turn did not complete, so the queue waits until the person resumes it. */
   queuePaused?: boolean;
+  /** Active or paused goal set via `/goal` on the provider thread, if any. */
+  goal?: AgentSessionGoal | null;
   createdAt: number;
 }
 
@@ -126,6 +145,7 @@ export interface AgentQueuedMessage {
   effort?: string | null;
   policy?: AgentSessionPolicy;
   network?: boolean;
+  freshContext?: boolean;
   queuedAt: number;
 }
 
@@ -218,12 +238,12 @@ export interface AgentSessionsApi {
     AgentSessionResult<{ session: AgentSessionInfo }>;
   send: (opts: {
     id: string; text: string; policy?: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
-    attachments?: AgentTurnAttachment[];
+    freshContext?: boolean; attachments?: AgentTurnAttachment[];
   }) => AgentSessionResult;
   /** Sends now if nothing is running, otherwise queues the message; `queued` says which happened. */
   enqueue?: (opts: {
     id: string; text: string; policy?: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
-    attachments?: AgentTurnAttachment[];
+    freshContext?: boolean; attachments?: AgentTurnAttachment[];
   }) => AgentSessionResult<{ queued: boolean }>;
   unqueue?: (opts: { id: string; messageId: string }) => AgentSessionResult<{ message: AgentQueuedMessage }>;
   resumeQueue?: (opts: { id: string }) => AgentSessionResult;
@@ -245,6 +265,10 @@ export interface AgentSessionsApi {
   setOrchestration: (opts: { id: string; enabled: boolean }) => AgentSessionResult;
   /** `synced` is false when Codex was not running; it is renamed there once the session resumes. */
   rename: (opts: { id: string; title: string }) => AgentSessionResult<{ synced: boolean }>;
+  /** Reads, sets, pauses, resumes, or clears the thread's `/goal`. */
+  goal?: (opts: { id: string; action: AgentGoalAction }) => AgentSessionResult<{ goal: AgentSessionGoal | null; message: string }>;
+  /** Uploads the current thread and Codex logs to OpenAI (`/feedback`). */
+  uploadFeedback?: (opts: { id: string; reason?: string }) => AgentSessionResult<{ feedbackId: string }>;
   /** Past Codex conversations in a folder, newest first, without Worker threads. */
   history?: (opts: { cwd: string; search?: string; archived?: boolean; cursor?: string | null }) =>
     AgentSessionResult<{ threads: CodexThreadSummary[]; nextCursor: string | null }>;
@@ -1251,6 +1275,10 @@ export interface WorkerTimelineTurn {
   prompt: string;
   /** `system`: AhaStation started the turn (a wake-up), not the person or a dispatch brief. */
   origin?: 'system';
+  /** True when `/clear` started a fresh provider thread before this turn. */
+  freshContext?: boolean;
+  /** Marks control turns initiated by slash commands (`/compact`, `/goal`). */
+  commandKind?: 'compact' | 'goal';
   /** Skills and images sent with the prompt, by name. */
   attachments?: { kind: 'skill' | 'image' | 'file'; name: string }[];
   startedAt: number;

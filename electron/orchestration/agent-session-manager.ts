@@ -3,8 +3,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { AtomicSnapshotWriter } from '../persistence/atomic-snapshot-writer.js';
 import type {
-  AgentProvider, AgentQuestion, AgentRuntimeRequest, AgentRuntimeResponse, AgentSessionDriver, AgentSessionEvents,
-  AgentSessionPolicy, AgentTurnAttachment, TurnDelivery,
+  AgentGoalAction, AgentProvider, AgentQuestion, AgentRuntimeRequest, AgentRuntimeResponse, AgentSessionDriver,
+  AgentSessionEvents, AgentSessionGoal, AgentSessionPolicy, AgentTurnAttachment, TurnDelivery,
 } from './agent-session-driver.js';
 import { WorkerTimeline, type WorkerTimelineChange, type WorkerTimelineSnapshot } from './worker-timeline.js';
 
@@ -33,6 +33,8 @@ export interface AgentSessionInfo {
   queued: QueuedMessage[];
   /** A turn ended without completing (or a queued message was refused), so the queue waits for the person. */
   queuePaused: boolean;
+  /** Active or paused goal set via `/goal` on the provider thread, if any. */
+  goal: AgentSessionGoal | null;
   createdAt: number;
 }
 
@@ -44,16 +46,17 @@ export interface QueuedMessage {
   effort?: string | null;
   policy?: AgentSessionPolicy;
   network?: boolean;
+  freshContext?: boolean;
   queuedAt: number;
 }
 
 type MessageInput = {
   text: string; model?: string | null; effort?: string | null; policy?: AgentSessionPolicy; network?: boolean;
-  attachments?: readonly AgentTurnAttachment[];
+  freshContext?: boolean; attachments?: readonly AgentTurnAttachment[];
 };
 
 // The queue lives only as long as the process: after a restart nothing is sent on its own.
-type SavedSession = Omit<AgentSessionInfo, 'status' | 'error' | 'pendingQuestions' | 'queued' | 'queuePaused'> & { timeline: WorkerTimelineSnapshot };
+type SavedSession = Omit<AgentSessionInfo, 'status' | 'error' | 'pendingQuestions' | 'queued' | 'queuePaused' | 'goal'> & { timeline: WorkerTimelineSnapshot };
 
 interface PendingRequest {
   turnKey: string;
@@ -101,6 +104,18 @@ export interface AgentSessionManagerDependencies {
 const DECLINE: AgentRuntimeResponse = { decision: 'decline' };
 const MAX_SAVED_SESSIONS = 20;
 export const MAX_QUEUED_MESSAGES = 10;
+const MAX_GOAL_OBJECTIVE_CHARS = 2_000;
+
+const GOAL_STATUS_LABELS: Record<AgentSessionGoal['status'], string> = {
+  active: '进行中',
+  paused: '已暂停',
+  blocked: '已阻塞',
+  usageLimited: '额度受限',
+  budgetLimited: '预算受限',
+  complete: '已完成',
+};
+
+const describeGoal = (goal: AgentSessionGoal) => `当前目标（${GOAL_STATUS_LABELS[goal.status]}）：${goal.objective}`;
 
 /**
  * Conversations a person drives directly, outside orchestration: no dispatch, no report_done. The
@@ -146,7 +161,7 @@ export class AgentSessionManager {
       id: `agent-session-${randomUUID()}`, provider: 'codex', title: input.title?.trim() || '', cwd: input.cwd,
       model: input.model ?? null, effort: input.effort ?? null, policy: input.policy, network: input.network ?? false,
       orchestration: false, providerSessionId: null, status: 'starting', error: null, pendingQuestions: [],
-      queued: [], queuePaused: false, createdAt: this.now(),
+      queued: [], queuePaused: false, goal: null, createdAt: this.now(),
     };
     const session = this.track(info);
     this.sessionsChanged();
@@ -171,7 +186,7 @@ export class AgentSessionManager {
       id, provider: 'codex', title: input.title.trim(), cwd: input.cwd,
       model: input.model ?? null, effort: input.effort ?? null, policy: input.policy, network: false,
       orchestration: false, providerSessionId: input.providerSessionId, status: 'suspended', error: null,
-      pendingQuestions: [], queued: [], queuePaused: false, createdAt: this.now(),
+      pendingQuestions: [], queued: [], queuePaused: false, goal: null, createdAt: this.now(),
     };
     const session = this.track(info, input.timeline(id));
     // The stored thread exists at the provider, so it is rejoined even if no turn replayed.
@@ -191,8 +206,36 @@ export class AgentSessionManager {
     if (!session) return { status: 'not_accepted', reason: 'Session not found' };
     if (!text && !input.attachments?.length) return { status: 'not_accepted', reason: 'Message is empty' };
     const { info } = session;
+    const compact = !input.attachments?.length && /^\/compact\s*$/iu.test(text);
+    if (compact && (input.freshContext || !session.hasTurns)) {
+      return { status: 'not_accepted', reason: '还没有可压缩的对话记录' };
+    }
     const wanted = input.policy ?? info.policy;
-    if (this.resumable(session)) {
+    if (input.freshContext) {
+      if (info.status === 'running' || info.status === 'starting' || session.driver?.busy) {
+        return { status: 'not_accepted', reason: `Session is ${info.status}` };
+      }
+      if (info.status === 'closed') return { status: 'not_accepted', reason: 'Session is closed' };
+      const previous = info.policy;
+      if (info.orchestration) info.policy = wanted;
+      info.goal = null;
+      session.hasTurns = false;
+      if (info.title) session.unsyncedName = info.title;
+      if (session.driver?.alive) {
+        const driver = session.driver;
+        session.generation++;
+        session.driver = null;
+        info.status = 'starting';
+        this.sessionsChanged();
+        await driver.close();
+      }
+      await this.connect(session, false);
+      if ((info.status as AgentSessionStatus) !== 'idle') {
+        info.policy = previous;
+        this.sessionsChanged();
+        return { status: 'not_accepted', reason: info.error ?? '无法开启新上下文' };
+      }
+    } else if (this.resumable(session)) {
       const previous = info.policy;
       if (info.orchestration) info.policy = wanted;
       await this.connect(session, true);
@@ -224,6 +267,12 @@ export class AgentSessionManager {
         this.sessionsChanged();
         return { status: 'not_accepted', reason: info.error ?? 'Session did not restart' };
       }
+    }
+    if (compact) {
+      if (!session.driver?.compactThread) {
+        return { status: 'not_accepted', reason: '当前会话不支持压缩上下文' };
+      }
+      return this.startCompactTurn(session);
     }
     if (!session.info.title) {
       const firstSkill = input.attachments?.find((item) => item.type === 'skill');
@@ -259,6 +308,7 @@ export class AgentSessionManager {
       ...(input.effort !== undefined ? { effort: input.effort } : {}),
       ...(input.policy ? { policy: input.policy } : {}),
       ...(input.network !== undefined ? { network: input.network } : {}),
+      ...(input.freshContext ? { freshContext: true } : {}),
       queuedAt: this.now(),
     });
     this.sessionsChanged();
@@ -321,9 +371,10 @@ export class AgentSessionManager {
     session: Session, text: string,
     input: {
       model?: string | null; effort?: string | null; policy?: AgentSessionPolicy; network?: boolean;
-      attachments?: readonly AgentTurnAttachment[];
+      freshContext?: boolean; attachments?: readonly AgentTurnAttachment[];
     },
     origin?: 'system',
+    display?: { prompt?: string; commandKind?: 'compact' | 'goal' },
   ): Promise<TurnDelivery> {
     const { info, timeline } = session;
     const driver = session.driver!;
@@ -331,7 +382,9 @@ export class AgentSessionManager {
     const attachments = input.attachments ?? [];
     info.status = 'running';
     timeline.beginTurn({
-      dispatchId: turnKey, prompt: text, ...(origin ? { origin } : {}),
+      dispatchId: turnKey, prompt: display?.prompt ?? text, ...(origin ? { origin } : {}),
+      ...(input.freshContext ? { freshContext: true } : {}),
+      ...(display?.commandKind ? { commandKind: display.commandKind } : {}),
       attachments: attachments.map((item) => item.type === 'skill'
         ? { kind: 'skill' as const, name: item.name }
         : { kind: item.type === 'localImage' ? 'image' as const : 'file' as const, name: item.name || basename(item.path) }),
@@ -364,6 +417,160 @@ export class AgentSessionManager {
     this.sessionsChanged();
     if (delivery.status !== 'accepted') this.coordinatorSettled(session);
     return delivery;
+  }
+
+  private async startCompactTurn(session: Session): Promise<TurnDelivery> {
+    const { info, timeline } = session;
+    const driver = session.driver!;
+    const turnKey = `${info.id}:${++session.turns}`;
+    info.status = 'running';
+    timeline.beginTurn({ dispatchId: turnKey, prompt: '/compact', commandKind: 'compact' });
+    this.sessionsChanged();
+    const delivery = await driver.compactThread!(turnKey);
+    if (delivery.status !== 'accepted') {
+      timeline.endActiveTurn('failed', delivery.reason);
+      if (delivery.status === 'unknown_acceptance') {
+        info.error = delivery.reason;
+        await driver.close();
+      } else if (info.status === 'running') {
+        info.status = 'idle';
+      }
+    }
+    this.sessionsChanged();
+    if (delivery.status !== 'accepted') this.coordinatorSettled(session);
+    return delivery;
+  }
+
+  /** Reads, sets, pauses, resumes, or clears the session's Codex goal (`/goal`). */
+  async runGoal(id: string, action: AgentGoalAction): Promise<
+    { ok: true; goal: AgentSessionGoal | null; message: string } | { ok: false; error: string }
+  > {
+    const session = this.sessions.get(id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    const { info } = session;
+    if (info.status === 'closed') return { ok: false, error: '会话已结束' };
+    if (action.type === 'set') {
+      const objective = action.objective.trim();
+      if (!objective) return { ok: false, error: '请输入目标内容' };
+      if ([...objective].length > MAX_GOAL_OBJECTIVE_CHARS) {
+        return { ok: false, error: `目标内容最多 ${MAX_GOAL_OBJECTIVE_CHARS} 个字符` };
+      }
+    }
+    if (action.type === 'show' && !session.driver?.alive && !session.hasTurns) {
+      return { ok: true, goal: null, message: '当前没有设定目标' };
+    }
+    if (!session.driver?.alive) {
+      if (this.resumable(session)) {
+        await this.connect(session, true);
+      }
+      if (!session.driver?.alive) {
+        return { ok: false, error: info.error ?? '会话未连接' };
+      }
+    }
+    const driver = session.driver;
+    if (!driver.getGoal || !driver.setGoal || !driver.clearGoal) {
+      return { ok: false, error: '当前会话不支持 /goal 命令' };
+    }
+    try {
+      if (action.type === 'show') {
+        const goal = await driver.getGoal();
+        info.goal = goal;
+        this.sessionsChanged();
+        return { ok: true, goal, message: goal ? describeGoal(goal) : '当前没有设定目标' };
+      }
+      if (action.type === 'clear') {
+        const cleared = await driver.clearGoal();
+        info.goal = null;
+        this.sessionsChanged();
+        return { ok: true, goal: null, message: cleared ? '已清除会话目标' : '当前没有设定目标' };
+      }
+      if (action.type === 'pause') {
+        const current = await driver.getGoal();
+        if (!current) {
+          info.goal = null;
+          this.sessionsChanged();
+          return { ok: true, goal: null, message: '当前没有设定目标' };
+        }
+        const goal = await driver.setGoal({ status: 'paused' });
+        info.goal = goal;
+        this.sessionsChanged();
+        return { ok: true, goal, message: '已暂停目标推进' };
+      }
+      if (action.type === 'resume') {
+        const current = await driver.getGoal();
+        if (!current) {
+          info.goal = null;
+          this.sessionsChanged();
+          return { ok: false, error: '当前没有设定目标' };
+        }
+        if (info.status === 'running' || driver.busy) {
+          return { ok: false, error: '当前有进行中的轮次，请等本轮结束后再继续目标' };
+        }
+        const goal = await driver.setGoal({ status: 'active' });
+        info.goal = goal;
+        this.sessionsChanged();
+        const delivery = await this.startTurn(
+          session,
+          `Continue working toward the active thread goal: ${current.objective}`,
+          {},
+          undefined,
+          { prompt: '/goal resume', commandKind: 'goal' },
+        );
+        if (delivery.status !== 'accepted') return { ok: false, error: delivery.reason };
+        return { ok: true, goal: info.goal, message: '已继续推进目标' };
+      }
+      if (info.status === 'running' || driver.busy) {
+        return { ok: false, error: '请等本轮结束后再设定新目标' };
+      }
+      const objective = action.objective.trim();
+      const current = await driver.getGoal();
+      if (current) await driver.clearGoal();
+      // Keep paused until our turn starts so Codex does not race an extra turn.
+      await driver.setGoal({ objective, status: 'paused' });
+      const goal = await driver.setGoal({ status: 'active' });
+      info.goal = goal;
+      if (!info.title) info.title = objective.split('\n')[0]!.slice(0, 60);
+      this.sessionsChanged();
+      const delivery = await this.startTurn(
+        session,
+        `This thread's goal is already set. Do not call create_goal. Start working on it now: ${objective}`,
+        {},
+        undefined,
+        { prompt: `/goal ${objective}`, commandKind: 'goal' },
+      );
+      if (delivery.status !== 'accepted') return { ok: false, error: delivery.reason };
+      if (session.info.orchestration) this.deps.onUserTurn?.(id);
+      if (session.unsyncedName) void this.syncName(session);
+      return { ok: true, goal: info.goal, message: '已设定并开始推进目标' };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /** Uploads this thread and Codex logs to OpenAI (`/feedback [reason]`). */
+  async uploadFeedback(
+    id: string,
+    reason?: string,
+    fallback?: (threadId: string, reason?: string) => Promise<{ feedbackId: string }>,
+  ): Promise<{ ok: true; feedbackId: string } | { ok: false; error: string }> {
+    const session = this.sessions.get(id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    if (!session.info.providerSessionId || !session.hasTurns) {
+      return { ok: false, error: '请先发送至少一条消息后再提交反馈' };
+    }
+    try {
+      if (session.driver?.alive && session.driver.uploadFeedback) {
+        const res = await session.driver.uploadFeedback(reason);
+        return { ok: true, feedbackId: res.feedbackId };
+      }
+      if (fallback) {
+        const res = await fallback(session.info.providerSessionId, reason);
+        return { ok: true, feedbackId: res.feedbackId };
+      }
+      return { ok: false, error: '当前会话未连接，无法上传反馈' };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   /** Coordinator state the orchestration service checks before trusting the session's MCP calls. */
@@ -567,6 +774,11 @@ export class AgentSessionManager {
       onTimeline: (turnKey, event) => {
         if (current() && timeline.activeTurn?.dispatchId === turnKey) timeline.apply(event);
       },
+      onGoalChanged: (goal) => {
+        if (!current()) return;
+        info.goal = goal;
+        this.sessionsChanged();
+      },
       onTurnCompleted: (_turnKey, result) => {
         if (!current()) return;
         this.cancelRequests(session, 'Turn ended');
@@ -649,7 +861,7 @@ export class AgentSessionManager {
     for (const entry of saved) {
       if (!entry?.id || !AGENT_SESSION_ID.test(entry.id) || !entry.providerSessionId || !entry.timeline) continue;
       const { timeline, ...rest } = entry;
-      const session = this.track({ ...rest, network: rest.network === true, orchestration: rest.orchestration === true, status: 'suspended', error: null, pendingQuestions: [], queued: [], queuePaused: false }, timeline);
+      const session = this.track({ ...rest, network: rest.network === true, orchestration: rest.orchestration === true, status: 'suspended', error: null, pendingQuestions: [], queued: [], queuePaused: false, goal: null }, timeline);
       session.timeline.setMeta({ alive: false });
     }
   }
@@ -660,7 +872,7 @@ export class AgentSessionManager {
       .sort((a, b) => b.info.createdAt - a.info.createdAt)
       .slice(0, MAX_SAVED_SESSIONS)
       .map(({ info, timeline }) => {
-        const { status: _status, error: _error, pendingQuestions: _questions, queued: _queued, queuePaused: _paused, ...rest } = info;
+        const { status: _status, error: _error, pendingQuestions: _questions, queued: _queued, queuePaused: _paused, goal: _goal, ...rest } = info;
         return { ...rest, timeline: timeline.archive() };
       });
     return JSON.stringify({ version: 1, sessions });

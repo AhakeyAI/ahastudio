@@ -57,6 +57,23 @@ export type AgentRuntimeResponse =
   | { decision: 'accept' | 'decline' }
   | { answers: Record<string, string[]> };
 
+export type AgentGoalStatus = 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete';
+
+export interface AgentSessionGoal {
+  objective: string;
+  status: AgentGoalStatus;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  updatedAt: number;
+}
+
+export type AgentGoalAction =
+  | { type: 'show' }
+  | { type: 'clear' }
+  | { type: 'pause' }
+  | { type: 'resume' }
+  | { type: 'set'; objective: string };
+
 /**
  * Callbacks are keyed by the `turnKey` the caller passed to `startTurn`. A completed turn only says
  * the provider stopped; whether the work is accepted is the caller's decision.
@@ -67,6 +84,8 @@ export interface AgentSessionEvents {
   onRequest: (turnKey: string, request: AgentRuntimeRequest) => Promise<AgentRuntimeResponse>;
   /** Normalized process events for the active turn; text is already redacted by the driver. */
   onTimeline?: (turnKey: string, event: WorkerTimelineEvent) => void;
+  /** Emitted when the provider updates or clears the thread's goal. */
+  onGoalChanged?: (goal: AgentSessionGoal | null) => void;
   onExit: (reason: string, exitCode: number | null) => void;
 }
 
@@ -111,6 +130,14 @@ export interface AgentSessionDriver {
   interrupt(): Promise<boolean>;
   /** Names the provider's conversation, so its own history shows the same title. False if it could not. */
   setName?(name: string): Promise<boolean>;
+  /** Compacts the provider conversation's context window (Codex `thread/compact/start`). */
+  compactThread?(turnKey: string): Promise<TurnDelivery>;
+  /** Uploads thread logs and an optional reason to the provider (Codex `feedback/upload`). */
+  uploadFeedback?(reason?: string): Promise<{ feedbackId: string }>;
+  /** Reads, updates, or clears the thread's goal (Codex `thread/goal/*`). */
+  getGoal?(): Promise<AgentSessionGoal | null>;
+  setGoal?(input: { objective?: string; status?: 'active' | 'paused' }): Promise<AgentSessionGoal | null>;
+  clearGoal?(): Promise<boolean>;
   waitForIdle(timeoutMs: number): Promise<boolean>;
   read(turnKey: string, cursor?: number, limit?: number, screen?: boolean): AgentOutputSlice | null;
   redactText(text: string): string;

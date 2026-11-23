@@ -260,6 +260,17 @@ export class CodexCatalog {
     await this.query(archived ? 'thread/archive' : 'thread/unarchive', { threadId });
   }
 
+  /** Uploads thread logs and an optional reason to OpenAI even when the session process is suspended. */
+  async uploadFeedback(threadId: string, reason?: string): Promise<{ feedbackId: string }> {
+    const result = object(await this.query('feedback/upload', {
+      classification: 'bug',
+      includeLogs: true,
+      threadId,
+      ...(reason ? { reason } : {}),
+    }));
+    return { feedbackId: text(result.threadId) || threadId };
+  }
+
   async dispose(): Promise<void> {
     this.disposed = true;
     this.clearIdle();

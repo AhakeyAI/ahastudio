@@ -434,3 +434,99 @@ test('queued messages are process-local and are empty after a restart', async (t
   assert.deepEqual(restored.queued, []);
   assert.equal(restored.queuePaused, false);
 });
+
+test('/clear freshContext starts a brand new thread while preserving prior timeline turns', async (t) => {
+  const { manager, sent, turns, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write', title: '保留标题' });
+  assert.equal((await manager.send(session.id, { text: 'first turn' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+  assert.equal(sent('thread/start').length, 1);
+  assert.equal(sent('thread/resume').length, 0);
+
+  assert.equal((await manager.send(session.id, { text: 'after clear', freshContext: true })).status, 'accepted');
+  await until(() => status(session.id) === 'idle' && turns(session.id).length === 2);
+  assert.equal(sent('thread/start').length, 2, 'freshContext opens a new thread instead of resuming');
+  assert.equal(sent('thread/resume').length, 0);
+  assert.equal(turns(session.id)[0].prompt, 'first turn');
+  assert.equal(turns(session.id)[1].prompt, 'after clear');
+  assert.equal(turns(session.id)[1].freshContext, true);
+  assert.equal(manager.list()[0].title, '保留标题');
+  assert.equal(sent('thread/name/set').at(-1).name, '保留标题');
+});
+
+test('/compact runs Codex thread/compact/start and rejects before any conversation turn', async (t) => {
+  const { manager, sent, turns, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+
+  const early = await manager.send(session.id, { text: '/compact' });
+  assert.equal(early.status, 'not_accepted');
+  assert.match(early.reason, /还没有可压缩的对话记录/);
+
+  assert.equal((await manager.send(session.id, { text: 'seed turn' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+
+  assert.equal((await manager.send(session.id, { text: '/compact' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle' && turns(session.id).length === 2);
+  assert.equal(sent('thread/compact/start').length, 1);
+  assert.equal(sent('turn/start').length, 1, '/compact does not go through turn/start');
+  const compactTurn = turns(session.id)[1];
+  assert.equal(compactTurn.commandKind, 'compact');
+  assert.equal(compactTurn.status, 'completed');
+  assert.ok(compactTurn.items.some((item) => item.kind === 'notice' && item.text === '上下文已压缩'));
+});
+
+test('/goal sets, pauses, resumes, shows, and clears a Codex thread goal', async (t) => {
+  const { manager, sent, turns, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+
+  const empty = await manager.runGoal(session.id, { type: 'show' });
+  assert.equal(empty.ok, true);
+  assert.equal(empty.goal, null);
+
+  const tooLong = await manager.runGoal(session.id, { type: 'set', objective: 'x'.repeat(2_001) });
+  assert.equal(tooLong.ok, false);
+
+  const setRes = await manager.runGoal(session.id, { type: 'set', objective: '补齐所有斜杠命令测试' });
+  assert.equal(setRes.ok, true);
+  await until(() => status(session.id) === 'idle' && turns(session.id).length === 1);
+  assert.equal(manager.list()[0].goal?.objective, '补齐所有斜杠命令测试');
+  assert.equal(manager.list()[0].goal?.status, 'active');
+  assert.equal(turns(session.id)[0].commandKind, 'goal');
+  assert.equal(turns(session.id)[0].prompt, '/goal 补齐所有斜杠命令测试');
+
+  const paused = await manager.runGoal(session.id, { type: 'pause' });
+  assert.equal(paused.ok, true);
+  assert.equal(manager.list()[0].goal?.status, 'paused');
+
+  const resumed = await manager.runGoal(session.id, { type: 'resume' });
+  assert.equal(resumed.ok, true);
+  await until(() => status(session.id) === 'idle' && turns(session.id).length === 2);
+  assert.equal(manager.list()[0].goal?.status, 'active');
+  assert.equal(turns(session.id)[1].prompt, '/goal resume');
+
+  const cleared = await manager.runGoal(session.id, { type: 'clear' });
+  assert.equal(cleared.ok, true);
+  assert.equal(manager.list()[0].goal, null);
+  assert.equal(sent('thread/goal/clear').length, 1);
+});
+
+test('/feedback requires a turn and uploads thread logs with an optional reason', async (t) => {
+  const { manager, sent, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+
+  const early = await manager.uploadFeedback(session.id, 'too early');
+  assert.equal(early.ok, false);
+  assert.match(early.error, /请先发送至少一条消息/);
+
+  assert.equal((await manager.send(session.id, { text: 'hello' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+
+  const res = await manager.uploadFeedback(session.id, 'slash menu check');
+  assert.equal(res.ok, true);
+  assert.equal(res.feedbackId, 'fb_mock-thread-id');
+  const [req] = sent('feedback/upload');
+  assert.equal(req.classification, 'bug');
+  assert.equal(req.includeLogs, true);
+  assert.equal(req.reason, 'slash menu check');
+  assert.equal(req.threadId, 'mock-thread-id');
+});

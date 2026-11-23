@@ -1,13 +1,14 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
-  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Cpu, FileText, Folder, History, Hourglass, Image as ImageIcon, PencilLine, Sparkles,
-  Square, Workflow,
+  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Cpu, Eraser, FileText, Folder, History, Hourglass,
+  Image as ImageIcon, Minimize2, PencilLine, Sparkles, Square, Workflow,
 } from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
 import { countDiffStats, parseUnifiedDiff } from '../lib/git-panel-model';
 import { agentSessionClient, codexCatalogClient, isStandaloneSession, usageLimitsClient } from '../lib/agent-session-client';
 import { summarizeUsage, type UsageSummary } from '../lib/usage-limits';
+import type { GoalCommandAction } from '../lib/composer-slash-commands';
 import { effortLabel } from '../lib/composer-tokens';
 import { folderName } from '../lib/session-title';
 import { orchestrationClient } from '../lib/orchestration-client';
@@ -37,7 +38,8 @@ import type {
   WorkerTimelineTurn,
 } from '../types';
 import { CopyButton, DiffBlock } from './agent-session/SessionCode';
-import { SessionComposer, type ComposerHandle } from './agent-session/SessionComposer';
+import type { FeedbackBannerState } from './agent-session/ComposerBanners';
+import { SessionComposer, type ComposerHandle, type ComposerSlashControl } from './agent-session/SessionComposer';
 import { SessionMarkdown } from './agent-session/SessionMarkdown';
 import { SessionTitle } from './agent-session/SessionTitle';
 import { SessionEmptyState } from './agent-session/SessionEmptyState';
@@ -228,6 +230,20 @@ function turnFootText(turn: WorkerTimelineTurn): string {
   return [label, elapsed && `用时 ${elapsed}`, turn.error].filter(Boolean).join(' · ');
 }
 
+/** Marks where `/clear` started a fresh provider thread while keeping earlier turns visible (adapted from T3 Code `FreshSessionRow`, MIT). */
+const FreshSessionDivider = memo(function FreshSessionDivider() {
+  return (
+    <div className="asv-fresh-divider" role="separator" aria-label="新上下文">
+      <span className="asv-fresh-divider-line" aria-hidden="true" />
+      <span className="asv-fresh-divider-label">
+        <Eraser size={11} aria-hidden="true" />
+        <span>新上下文</span>
+      </span>
+      <span className="asv-fresh-divider-line" aria-hidden="true" />
+    </div>
+  );
+});
+
 const TurnView = memo(function TurnView({ turn, minHeight }: { turn: WorkerTimelineTurn; minHeight?: number }) {
   const { cwd } = useAgentSession();
   const blocks = useMemo(() => groupTimelineItems(turn.items), [turn.items]);
@@ -235,22 +251,32 @@ const TurnView = memo(function TurnView({ turn, minHeight }: { turn: WorkerTimel
   const foot = running ? '' : turnFootText(turn);
   const changes = useMemo(() => (running ? null : summarizeTurnChanges(turn.items, cwd)), [running, turn.items, cwd]);
   const hasCard = Boolean(changes?.files.length);
+  const isCompactTurn = turn.commandKind === 'compact';
   const renderBlock = (block: (typeof blocks)[number]) =>
     block.type === 'group' ? <WorkGroup key={block.id} block={block} />
       : <TimelineItem key={block.item.id} item={block.item} inlineDiff={!hasCard} />;
   const isSettlement = (block: (typeof blocks)[number]) => block.type === 'item' && block.item.kind === 'settlement';
   return (
     <section className={`asv-turn is-${turn.status}`} aria-label={`第 ${turn.generation} 轮`} style={minHeight ? { minHeight } : undefined}>
-      {turn.origin === 'system'
-        ? <SystemWakeRow text={turn.prompt} generation={turn.generation} />
-        : <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} attachments={turn.attachments} editable />}
+      {turn.freshContext && <FreshSessionDivider />}
+      {turn.origin === 'system' ? (
+        <SystemWakeRow text={turn.prompt} generation={turn.generation} />
+      ) : isCompactTurn ? (
+        <div className="asv-turn-cmd" data-asv-row>
+          <Minimize2 size={12} aria-hidden="true" />
+          <span>压缩上下文</span>
+          <span className="asv-turn-cmd-meta">第 {turn.generation} 轮 · /compact</span>
+        </div>
+      ) : (
+        <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} attachments={turn.attachments} editable={turn.commandKind !== 'goal'} />
+      )}
       {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}
       {blocks.filter((block) => !isSettlement(block)).map(renderBlock)}
       {hasCard && <TurnChangesCard changes={changes!} />}
       {blocks.filter(isSettlement).map(renderBlock)}
       {running && !turnHasLiveItem(turn) && (
         <div className="asv-working">
-          <span className="asv-shimmer">工作中</span>
+          <span className="asv-shimmer">{isCompactTurn ? '正在压缩上下文' : '工作中'}</span>
           <LiveTimer startedAt={turn.startedAt} />
         </div>
       )}
@@ -353,7 +379,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     }
   };
 
-  const send = async (text: string, attachments: AgentTurnAttachment[] = []) => {
+  const send = async (text: string, attachments: AgentTurnAttachment[] = [], options?: { freshContext?: boolean }) => {
     if (sessionId) {
       const sessions = window.vibeMeet?.agentSessions;
       if (!sessions) return false;
@@ -362,6 +388,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       const ok = await run('send', () => deliver({
         id: sessionId, text,
         ...(attachments.length ? { attachments } : {}),
+        ...(options?.freshContext ? { freshContext: true } : {}),
         ...(nextPolicy && nextPolicy !== info?.policy ? { policy: nextPolicy } : {}),
         ...(nextNetwork !== null && nextNetwork !== info?.network ? { network: nextNetwork } : {}),
         ...(nextModel && nextModel !== info?.model ? { model: nextModel } : {}),
@@ -427,6 +454,23 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       });
   };
 
+  const setOrchestrationMode = useCallback((mode: 'toggle' | 'on' | 'off') => {
+    if (!sessionId || !info) return;
+    const enabled = mode === 'toggle' ? !info.orchestration : mode === 'on';
+    if (enabled === info.orchestration) {
+      onNotify?.(enabled ? '编排模式已经是开启状态' : '编排模式已经是关闭状态');
+      return;
+    }
+    if (!canToggleOrchestration || busy === 'orchestration') {
+      onNotify?.('本轮结束后才能切换编排模式');
+      return;
+    }
+    void run('orchestration', async () => window.vibeMeet?.agentSessions?.setOrchestration({ id: sessionId, enabled }))
+      .then((ok) => {
+        if (ok) onNotify?.(enabled ? '已开启编排模式：这个会话可以派发和管理 Worker' : '已关闭编排模式');
+      });
+  }, [sessionId, info, canToggleOrchestration, busy, onNotify]);
+
   const rename = useCallback(async (next: string) => {
     if (!sessionId) return false;
     const res = await window.vibeMeet?.agentSessions?.rename?.({ id: sessionId, title: next });
@@ -437,6 +481,22 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     stageWindowStore.renameWindow(win.id, next);
     return true;
   }, [sessionId, onNotify, win.id]);
+
+  const [freshSessionArmed, setFreshSessionArmed] = useState(false);
+  const [usageLimitsOpen, setUsageLimitsOpen] = useState(false);
+  const [usageLimitsRefreshing, setUsageLimitsRefreshing] = useState(false);
+  const [feedbackState, setFeedbackState] = useState<FeedbackBannerState | null>(null);
+  const [goalBusy, setGoalBusy] = useState(false);
+  useEffect(() => {
+    setFreshSessionArmed(false);
+    setUsageLimitsOpen(false);
+    setFeedbackState(null);
+  }, [sessionId]);
+
+  const armFreshSession = useCallback(() => setFreshSessionArmed(true), []);
+  const disarmFreshSession = useCallback(() => setFreshSessionArmed(false), []);
+  const closeUsageLimits = useCallback(() => setUsageLimitsOpen(false), []);
+  const dismissFeedback = useCallback(() => setFeedbackState(null), []);
 
   const queue = useMemo(() => {
     const api = window.vibeMeet?.agentSessions;
@@ -480,29 +540,128 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
 
   // Account usage is the person's own Codex quota, so only direct sessions show it.
   const [usageLimits, setUsageLimits] = useState<UsageSummary | null>(null);
-  const loadUsage = useRef<(force: boolean) => void>(() => {});
+  const loadUsage = useRef<(force: boolean) => Promise<UsageSummary | null>>(async () => null);
   useEffect(() => {
     if (!direct) return;
     let live = true;
-    loadUsage.current = (force) => {
-      void usageLimitsClient.read(force).then((limits) => {
-        if (live) setUsageLimits(summarizeUsage(limits, Date.now()));
-      });
+    loadUsage.current = async (force) => {
+      const limits = await usageLimitsClient.read(force);
+      const summary = summarizeUsage(limits, Date.now());
+      if (live) setUsageLimits(summary);
+      return summary;
     };
-    loadUsage.current(false);
+    void loadUsage.current(false);
     // Also keeps the "resets in" text current.
-    const timer = setInterval(() => loadUsage.current(false), 60_000);
+    const timer = setInterval(() => void loadUsage.current(false), 60_000);
     return () => {
       live = false;
       clearInterval(timer);
-      loadUsage.current = () => {};
+      loadUsage.current = async () => null;
     };
   }, [direct]);
   const wasRunning = useRef(running);
   useEffect(() => {
-    if (wasRunning.current && !running) loadUsage.current(true);
+    if (wasRunning.current && !running) void loadUsage.current(true);
     wasRunning.current = running;
   }, [running]);
+
+  const openUsageLimits = useCallback(() => {
+    if (usageLimits) setUsageLimitsOpen(true);
+    setUsageLimitsRefreshing(true);
+    void loadUsage.current(true).then((summary) => {
+      if (summary) {
+        setUsageLimitsOpen(true);
+      } else {
+        setUsageLimitsOpen(false);
+        onNotify?.('当前账号没有可用的 Codex 额度信息');
+      }
+    }).finally(() => setUsageLimitsRefreshing(false));
+  }, [usageLimits, onNotify]);
+
+  const refreshUsageLimits = useCallback(() => {
+    setUsageLimitsRefreshing(true);
+    void loadUsage.current(true).finally(() => setUsageLimitsRefreshing(false));
+  }, []);
+
+  const openHistory = useCallback(() => {
+    if (direct && cwd && window.vibeMeet?.agentSessions?.history) setHistoryOpen(true);
+  }, [direct, cwd]);
+
+  const runGoalCommand = useCallback(async (action: GoalCommandAction): Promise<boolean> => {
+    if (!sessionId) return false;
+    const goalApi = window.vibeMeet?.agentSessions?.goal;
+    if (!goalApi) {
+      onNotify?.('当前环境不支持 /goal 命令');
+      return false;
+    }
+    setGoalBusy(true);
+    try {
+      const res = await goalApi({ id: sessionId, action });
+      if (!res.ok) {
+        onNotify?.(res.error);
+        return false;
+      }
+      if (res.message) onNotify?.(res.message);
+      if (action.type === 'set' || action.type === 'resume') scroll.scrollToEnd();
+      return true;
+    } finally {
+      setGoalBusy(false);
+    }
+  }, [sessionId, onNotify, scroll]);
+
+  const runFeedbackCommand = useCallback((reason?: string) => {
+    if (!sessionId) return;
+    const uploadApi = window.vibeMeet?.agentSessions?.uploadFeedback;
+    if (!uploadApi) {
+      onNotify?.('当前环境不支持 /feedback 命令');
+      return;
+    }
+    setFeedbackState({ status: 'uploading' });
+    void uploadApi({ id: sessionId, ...(reason ? { reason } : {}) }).then(
+      (res) => {
+        if (res.ok) setFeedbackState({ status: 'sent', feedbackId: res.feedbackId });
+        else setFeedbackState({ status: 'failed', error: res.error });
+      },
+      (err: unknown) => {
+        setFeedbackState({ status: 'failed', error: err instanceof Error ? err.message : String(err) });
+      },
+    );
+  }, [sessionId, onNotify]);
+
+  const slashControl = useMemo<ComposerSlashControl | undefined>(() => {
+    if (!direct || !sessionId || !info || info.status === 'closed') return undefined;
+    return {
+      currentTitle: title,
+      hasTurns: Boolean(timeline?.turns.length),
+      hasUsageLimits: Boolean(window.vibeMeet?.agentSessions?.rateLimits),
+      canHistory: Boolean(cwd && window.vibeMeet?.agentSessions?.history),
+      canRename: Boolean(window.vibeMeet?.agentSessions?.rename),
+      canOrchestration: Boolean(window.vibeMeet?.agentSessions?.setOrchestration),
+      orchestrationOn: info.orchestration,
+      freshSessionArmed,
+      goal: info.goal ?? null,
+      goalBusy,
+      usageLimitsOpen,
+      usageLimitsRefreshing,
+      feedback: feedbackState,
+      onArmFreshSession: armFreshSession,
+      onDisarmFreshSession: disarmFreshSession,
+      onOpenUsageLimits: openUsageLimits,
+      onRefreshUsageLimits: refreshUsageLimits,
+      onCloseUsageLimits: closeUsageLimits,
+      onOpenHistory: openHistory,
+      onRename: rename,
+      onSetOrchestration: setOrchestrationMode,
+      onGoalCommand: runGoalCommand,
+      onFeedbackCommand: runFeedbackCommand,
+      onDismissFeedback: dismissFeedback,
+    };
+  }, [
+    direct, sessionId, info, title, timeline?.turns.length, cwd, freshSessionArmed, goalBusy,
+    usageLimitsOpen, usageLimitsRefreshing, feedbackState, armFreshSession, disarmFreshSession,
+    openUsageLimits, refreshUsageLimits, closeUsageLimits, openHistory, rename, setOrchestrationMode,
+    runGoalCommand, runFeedbackCommand, dismissFeedback,
+  ]);
 
   const stage = dispatch?.stage;
   const stageLabel = direct
@@ -627,6 +786,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
                 onNotify,
               },
             } : {})}
+            {...(slashControl ? { slash: slashControl } : {})}
             usage={usage}
             usageLimits={direct ? usageLimits : null}
             draftKey={win.workerId ?? win.id}

@@ -4,7 +4,8 @@ import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { augmentedPath, resolveBinaryFromPath } from '../bin-resolve.js';
 import type {
-  AgentOutputSlice, AgentSessionDriver, AgentSessionEvents, AgentSessionPolicy, AgentTurnAttachment, TurnDelivery,
+  AgentGoalStatus, AgentOutputSlice, AgentSessionDriver, AgentSessionEvents, AgentSessionGoal, AgentSessionPolicy,
+  AgentTurnAttachment, TurnDelivery,
 } from './agent-session-driver.js';
 import { spawnWindowsCodexJob } from './windows-codex-job.js';
 import type {
@@ -25,7 +26,7 @@ const POLICIES: Record<AgentSessionPolicy, { sandbox: string; sandboxType: strin
  */
 export const CODEX_QUERY_METHODS = new Set([
   'model/list', 'skills/list', 'skills/config/write', 'plugin/installed', 'fuzzyFileSearch', 'account/rateLimits/read',
-  'thread/list', 'thread/read', 'thread/archive', 'thread/unarchive',
+  'thread/list', 'thread/read', 'thread/archive', 'thread/unarchive', 'feedback/upload',
 ]);
 const OUTPUT_LIMIT = 512 * 1024;
 const STDERR_LIMIT = 4 * 1024;
@@ -59,6 +60,23 @@ function string(value: unknown): string | undefined {
 function numericFields(value: unknown): Record<string, number> {
   return Object.fromEntries(Object.entries(object(value))
     .filter((entry): entry is [string, number] => typeof entry[1] === 'number'));
+}
+
+const GOAL_STATUSES = new Set<AgentGoalStatus>(['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete']);
+
+function parseCodexGoal(raw: unknown): AgentSessionGoal | null {
+  const entry = object(raw);
+  const objective = string(entry.objective)?.trim();
+  const status = string(entry.status) as AgentGoalStatus | undefined;
+  if (!objective || !status || !GOAL_STATUSES.has(status)) return null;
+  const rawUpdated = typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt) ? entry.updatedAt : Date.now();
+  return {
+    objective,
+    status,
+    tokensUsed: typeof entry.tokensUsed === 'number' && Number.isFinite(entry.tokensUsed) ? entry.tokensUsed : 0,
+    timeUsedSeconds: typeof entry.timeUsedSeconds === 'number' && Number.isFinite(entry.timeUsedSeconds) ? entry.timeUsedSeconds : 0,
+    updatedAt: rawUpdated < 1e12 ? rawUpdated * 1000 : rawUpdated,
+  };
 }
 
 function codexStatus(value: unknown): WorkerTimelineItemStatus {
@@ -154,7 +172,9 @@ export function codexItemUpdate(raw: unknown, completedAt?: number): WorkerTimel
         status: completedAt !== undefined ? 'completed' : 'running', ...done,
       };
     case 'contextCompaction':
-      return completedAt !== undefined ? { id, kind: 'notice', level: 'info', text: 'Context compacted', ...done } : null;
+      return completedAt !== undefined
+        ? { id, kind: 'notice', level: 'info', text: '上下文已压缩', ...done }
+        : { id, kind: 'notice', level: 'info', text: '正在压缩上下文…' };
     case 'userMessage':
       return null;
     default: {
@@ -559,6 +579,71 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     }
   }
 
+  /**
+   * Starts Codex's native context compaction (`thread/compact/start`). Unlike `turn/start`, the
+   * RPC result is empty and `turn/started` arrives asynchronously as a notification.
+   */
+  async compactThread(turnKey: string): Promise<TurnDelivery> {
+    if (!this.alive || !this.threadId || this.active) {
+      return { status: 'not_accepted', reason: 'Codex thread is closed or busy' };
+    }
+    let finish!: () => void;
+    const idle = new Promise<void>((resolve) => { finish = resolve; });
+    const turn: ActiveTurn = {
+      turnKey, id: null, messages: new Map(), diff: null, usage: null, usageBaseline: this.tokenTotal, idle, finish,
+    };
+    this.active = turn;
+    if (this.outputTurnKey !== turnKey) {
+      this.outputTurnKey = turnKey;
+      this.output = '';
+      this.offset = 0;
+    }
+    try {
+      await this.request('thread/compact/start', { threadId: this.threadId });
+      return { status: 'accepted' };
+    } catch (error) {
+      const rejected = error instanceof RpcRejection && !turn.id && this.alive;
+      this.finishTurn(turn);
+      return {
+        status: rejected ? 'not_accepted' : 'unknown_acceptance',
+        reason: error instanceof Error ? this.redact(error.message) : 'Codex compaction failed',
+      };
+    }
+  }
+
+  async uploadFeedback(reason?: string): Promise<{ feedbackId: string }> {
+    if (!this.alive || !this.threadId) throw new Error('Codex 会话尚未连接');
+    const result = object(await this.request('feedback/upload', {
+      classification: 'bug',
+      includeLogs: true,
+      threadId: this.threadId,
+      ...(reason ? { reason } : {}),
+    }, 30_000));
+    return { feedbackId: string(result.threadId) || this.threadId };
+  }
+
+  async getGoal(): Promise<AgentSessionGoal | null> {
+    if (!this.alive || !this.threadId) throw new Error('Codex 会话尚未连接');
+    const result = object(await this.request('thread/goal/get', { threadId: this.threadId }, 10_000));
+    return parseCodexGoal(result.goal);
+  }
+
+  async setGoal(input: { objective?: string; status?: 'active' | 'paused' }): Promise<AgentSessionGoal | null> {
+    if (!this.alive || !this.threadId) throw new Error('Codex 会话尚未连接');
+    const result = object(await this.request('thread/goal/set', {
+      threadId: this.threadId,
+      ...(input.objective !== undefined ? { objective: input.objective } : {}),
+      ...(input.status !== undefined ? { status: input.status } : {}),
+    }, 10_000));
+    return parseCodexGoal(result.goal);
+  }
+
+  async clearGoal(): Promise<boolean> {
+    if (!this.alive || !this.threadId) throw new Error('Codex 会话尚未连接');
+    const result = object(await this.request('thread/goal/clear', { threadId: this.threadId }, 10_000));
+    return result.cleared === true;
+  }
+
   close(interrupt = false): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
@@ -653,6 +738,16 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     if (typeof id === 'string' || typeof id === 'number') {
       void this.replyToServer(id, method, params).catch(() => this.transportLost('Codex approval response could not be sent'));
       return;
+    }
+    if (this.threadId && params.threadId === this.threadId) {
+      if (method === 'thread/goal/updated') {
+        this.events.onGoalChanged?.(parseCodexGoal(params.goal));
+        return;
+      }
+      if (method === 'thread/goal/cleared') {
+        this.events.onGoalChanged?.(null);
+        return;
+      }
     }
     const turn = this.active;
     if (!turn || params.threadId !== this.threadId) return;

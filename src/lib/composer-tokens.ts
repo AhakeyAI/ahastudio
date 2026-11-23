@@ -1,8 +1,8 @@
 import type { CodexModelOption, CodexSkillOption } from '../types';
 
-/** A `$skill` or `@file` token the caret is in, with the text range it covers. */
+/** A `/command`, `$skill`, or `@file` token the caret is in, with the text range it covers. */
 export interface ComposerTrigger {
-  kind: 'skill' | 'file';
+  kind: 'slash' | 'skill' | 'file';
   query: string;
   start: number;
   end: number;
@@ -16,15 +16,34 @@ const SKILL_QUERY = /^[\w:.\-]*$/u;
  */
 export const isCurrencyAmount = (query: string) => /^\.?[0-9][0-9,._]*(?:[kKmMbBtT]|[eE][0-9]+)?[.,;:!?)]*$/u.test(query);
 
+/**
+ * A second slash or backslash makes the whole word a path (e.g. `/src/a.ts`), even when the caret precedes it.
+ * Ported from T3 Code `isPathWord` (packages/shared/src/composerTrigger.ts, MIT, Copyright (c) 2026 T3 Tools Inc.).
+ */
+export function isPathWord(text: string, wordStart: number, caret: number): boolean {
+  let wordEnd = caret;
+  while (wordEnd < text.length && !/\s/u.test(text[wordEnd]!)) wordEnd++;
+  return /[/\\]/u.test(text.slice(wordStart + 1, wordEnd));
+}
+
+/** True when two triggers point to the same token in the draft (adapted from T3 Code `useComposerTriggerState.ts`, MIT). */
+export const isSameTrigger = (a: ComposerTrigger | null, b: ComposerTrigger | null): boolean =>
+  a !== null && b !== null && a.kind === b.kind && a.start === b.start;
+
 /** The trigger token around `caret`; it must start the text or follow whitespace. */
-export function detectTrigger(text: string, caret: number): ComposerTrigger | null {
+export function detectTrigger(text: string, caretInput: number): ComposerTrigger | null {
+  const caret = Number.isFinite(caretInput) ? Math.max(0, Math.min(text.length, Math.floor(caretInput))) : text.length;
   let start = caret;
   while (start > 0 && !/\s/u.test(text[start - 1]!)) start--;
   const sigil = text[start];
-  if (sigil !== '$' && sigil !== '@') return null;
+  if (sigil !== '/' && sigil !== '$' && sigil !== '@') return null;
   let end = caret;
   while (end < text.length && !/\s/u.test(text[end]!)) end++;
   const query = text.slice(start + 1, caret);
+  if (sigil === '/') {
+    if (isPathWord(text, start, caret)) return null;
+    return { kind: 'slash', query, start, end };
+  }
   if (sigil === '$' && (!SKILL_QUERY.test(query) || isCurrencyAmount(query))) return null;
   return { kind: sigil === '$' ? 'skill' : 'file', query, start, end };
 }
@@ -34,6 +53,19 @@ export function applyCompletion(text: string, trigger: ComposerTrigger, insertio
   const after = text.slice(trigger.end);
   const spaced = after.startsWith(' ') ? insertion : `${insertion} `;
   return { text: text.slice(0, trigger.start) + spaced + after, caret: trigger.start + spaced.length + (after.startsWith(' ') ? 1 : 0) };
+}
+
+/** Removes the trigger token without leaving double spaces behind. */
+export function removeTriggerRange(text: string, trigger: ComposerTrigger): { text: string; caret: number } {
+  const before = text.slice(0, trigger.start);
+  const after = text.slice(trigger.end);
+  if (before.endsWith(' ') && after.startsWith(' ')) {
+    return { text: before + after.slice(1), caret: before.length };
+  }
+  if (!before && after.startsWith(' ')) {
+    return { text: after.slice(1), caret: 0 };
+  }
+  return { text: before + after, caret: before.length };
 }
 
 export const fileMention = (path: string) => (/\s/u.test(path) ? `@"${path}"` : `@${path}`);

@@ -514,3 +514,141 @@ test('header, empty-state, and usage pieces render their static parts', async ()
   assert.match(chip, /aria-label="Codex 额度：每周额度 92%"/);
   assert.doesNotMatch(chip, /asv-usage-pop/, 'the window list opens on hover or focus only');
 });
+
+test('slash trigger detection ignores paths, supports mid-prompt /model and /skill, and ranks matches', async () => {
+  const tokensUrl = emit('composer-tokens');
+  const rankingUrl = emit('search-ranking');
+  const slashUrl = emit('composer-slash-commands', (s) => s.replace("'./search-ranking'", JSON.stringify(rankingUrl)));
+  const tokens = await import(tokensUrl);
+  const slash = await import(slashUrl);
+
+  assert.deepEqual(tokens.detectTrigger('/mo', 3), { kind: 'slash', query: 'mo', start: 0, end: 3 });
+  assert.deepEqual(tokens.detectTrigger('请帮我 /sk', 7), { kind: 'slash', query: 'sk', start: 4, end: 7 });
+  assert.equal(tokens.detectTrigger('/src/auth/session.ts', 4), null, 'paths with a second slash never trigger commands');
+  assert.equal(tokens.detectTrigger('/foo\\bar', 3), null, 'backslash paths never trigger commands');
+  assert.equal(tokens.detectTrigger('a/b', 3), null, 'slashes inside a word never trigger commands');
+  assert.deepEqual(tokens.removeTriggerRange('请 /model 看看', { kind: 'slash', query: 'model', start: 2, end: 8 }), { text: '请 看看', caret: 2 });
+
+  const skills = [
+    { name: 'pdf', description: '读取、创建和校验 PDF', path: 'C:/s/pdf/SKILL.md', scope: 'system', enabled: true, pluginId: null },
+    { name: 'code-reviewer', description: '审查补丁的正确性与安全问题', path: 'C:/s/.codex/plugins/cr/SKILL.md', scope: 'user', enabled: true, pluginId: 'cr@openai' },
+    { name: 'disabled-skill', description: 'hidden', path: 'C:/s/off/SKILL.md', scope: 'user', enabled: false, pluginId: null },
+  ];
+  assert.equal(slash.resolveSkillSourceKind(skills[0]), 'system');
+  assert.equal(slash.resolveSkillSourceKind(skills[1]), 'app');
+
+  const atStart = slash.buildSlashCommandItems({
+    isAtPromptStart: true, hasTurns: true, canCompact: true, hasUsageLimits: true,
+    canHistory: true, canRename: true, canOrchestration: true, orchestrationOn: false, skills,
+  });
+  const names = atStart.map((item) => item.label);
+  for (const expected of ['/model', '/clear', '/history', '/rename', '/orchestration', '/compact', '/usage-limits', '/goal', '/feedback', '/skill:pdf', '/skill:code-reviewer']) {
+    assert.ok(names.includes(expected), `expected ${expected} in slash menu`);
+  }
+  assert.ok(!names.includes('/skill:disabled-skill'), 'disabled skills stay hidden');
+
+  const midPrompt = slash.buildSlashCommandItems({
+    isAtPromptStart: false, hasTurns: true, canCompact: false, hasUsageLimits: true,
+    canHistory: true, canRename: true, canOrchestration: true, orchestrationOn: false, skills,
+  });
+  assert.deepEqual(midPrompt.map((item) => item.label), ['/model', '/skill:pdf', '/skill:code-reviewer']);
+
+  assert.equal(slash.searchSlashCommandItems(atStart, 'comp')[0].label, '/compact');
+  assert.equal(slash.searchSlashCommandItems(atStart, '额度')[0].label, '/usage-limits');
+  assert.equal(slash.searchSlashCommandItems(atStart, 'skill:pdf')[0].label, '/skill:pdf');
+  assert.equal(slash.searchSlashCommandItems(atStart, 'rev')[0].label, '/skill:code-reviewer');
+  assert.equal(slash.searchSlashCommandItems(atStart, 'skill:cr')[0].label, '/skill:code-reviewer');
+
+  assert.equal(slash.resolveMenuActiveItemId({
+    items: [{ id: 'a' }, { id: 'b' }], highlightedItemId: 'b', currentSearchKey: 'slash:m', highlightedSearchKey: 'slash:m',
+  }), 'b');
+  assert.equal(slash.resolveMenuActiveItemId({
+    items: [{ id: 'a' }, { id: 'b' }], highlightedItemId: 'b', currentSearchKey: 'slash:mo', highlightedSearchKey: 'slash:m',
+  }), 'a');
+
+  assert.equal(slash.isClearCommand('/clear'), true);
+  assert.equal(slash.isCompactCommand(' /compact '), true);
+  assert.equal(slash.isUsageLimitsCommand('/usage'), true);
+  assert.equal(slash.isUsageLimitsCommand('/usage-limits'), true);
+  assert.deepEqual(slash.parseRenameCommand('/rename 新标题'), { title: '新标题' });
+  assert.deepEqual(slash.parseOrchestrationCommand('/orchestration'), { mode: 'toggle' });
+  assert.deepEqual(slash.parseOrchestrationCommand('/orchestration on'), { mode: 'on' });
+  assert.deepEqual(slash.parseOrchestrationCommand('/orchestration 关闭'), { mode: 'off' });
+  assert.deepEqual(slash.parseFeedbackCommand('/feedback 按钮错位'), { reason: '按钮错位' });
+  assert.deepEqual(slash.parseGoalCommand('/goal'), { type: 'show' });
+  assert.deepEqual(slash.parseGoalCommand('/goal pause'), { type: 'pause' });
+  assert.deepEqual(slash.parseGoalCommand('/goal resume'), { type: 'resume' });
+  assert.deepEqual(slash.parseGoalCommand('/goal clear'), { type: 'clear' });
+  assert.deepEqual(slash.parseGoalCommand('/goal 修完所有测试'), { type: 'set', objective: '修完所有测试' });
+  assert.equal(slash.parseGoalCommand('/goal 修完所有测试', 1), null, 'messages with attachments are ordinary prompts');
+  assert.equal(slash.runsSlashCommandLocally({
+    text: '/clear', holdsOnlyText: true, hasTurns: true, hasUsageLimits: true, canHistory: true, canRename: true, canOrchestration: true,
+  }), true);
+  assert.equal(slash.runsSlashCommandLocally({
+    text: '/compact', holdsOnlyText: true, hasTurns: true, hasUsageLimits: true, canHistory: true, canRename: true, canOrchestration: true,
+  }), false, '/compact runs as a Codex turn, not locally');
+});
+
+test('ComposerCommandMenu and ComposerBanners render slash items/banners and never leak to Workers', async () => {
+  const outfile = join(dir, 'session-slash-ui.cjs');
+  await build({
+    stdin: {
+      contents: `
+        import { createElement } from 'react';
+        import { renderToStaticMarkup } from 'react-dom/server';
+        import { ComposerCommandMenu } from './src/components/agent-session/ComposerCommandMenu.tsx';
+        import { FeedbackBanner, FreshSessionBanner, GoalBanner, UsageLimitsBanner } from './src/components/agent-session/ComposerBanners.tsx';
+        import { SessionComposer } from './src/components/agent-session/SessionComposer.tsx';
+        export const menu = (props) => renderToStaticMarkup(createElement(ComposerCommandMenu, props));
+        export const fresh = () => renderToStaticMarkup(createElement(FreshSessionBanner, { onDismiss: () => {} }));
+        export const usageBanner = (props) => renderToStaticMarkup(createElement(UsageLimitsBanner, props));
+        export const goalBanner = (props) => renderToStaticMarkup(createElement(GoalBanner, props));
+        export const feedbackBanner = (props) => renderToStaticMarkup(createElement(FeedbackBanner, props));
+        export const composer = (props) => renderToStaticMarkup(createElement(SessionComposer, props));`,
+      resolveDir: fileURLToPath(new URL('..', import.meta.url)),
+      loader: 'js',
+    },
+    outfile, bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', logLevel: 'silent',
+  });
+  const ui = (await import(pathToFileURL(outfile).href)).default ?? await import(pathToFileURL(outfile).href);
+
+  const menuHtml = ui.menu({
+    triggerKind: 'slash',
+    activeItemId: 'slash:model',
+    loading: false,
+    onHighlight: () => {},
+    onSelect: () => {},
+    items: [
+      { kind: 'slash', id: 'slash:model', item: { type: 'builtin', id: 'slash:model', command: 'model', label: '/model', description: '切换模型', promptStartOnly: false } },
+      { kind: 'slash', id: 'provider:goal', item: { type: 'provider', id: 'provider:goal', command: 'goal', label: '/goal', description: '设定目标', hint: '目标', promptStartOnly: true } },
+      { kind: 'slash', id: 'skill:pdf', item: { type: 'skill', id: 'skill:pdf', skill: { name: 'pdf', description: '处理 PDF', path: 'C:/s/pdf/SKILL.md', scope: 'system', enabled: true, pluginId: null }, label: '/skill:pdf', description: '处理 PDF', sourceKind: 'system', promptStartOnly: false } },
+    ],
+  });
+  assert.match(menuHtml, /aria-label="斜杠命令"/);
+  assert.match(menuHtml, /\/model/);
+  assert.match(menuHtml, /asv-suggest-hint">目标<\/span>/);
+  assert.match(menuHtml, /asv-suggest-prefix">\/skill:<\/span>pdf/);
+  assert.match(menuHtml, /asv-suggest-badge[\s\S]*内置/);
+
+  const emptyMenu = ui.menu({ triggerKind: 'slash', items: [], activeItemId: null, loading: false, onHighlight: () => {}, onSelect: () => {} });
+  assert.match(emptyMenu, /没有匹配的命令/);
+
+  assert.match(ui.fresh(), /下一条消息将开启全新上下文/);
+  assert.match(ui.fresh(), /保留当前上下文/);
+  assert.match(ui.usageBanner({
+    summary: { text: '额度 37%', level: 'ok', planType: 'pro', windows: [{ label: '5 小时', percent: 37, level: 'ok', used: '已用 37%', reset: '2 小时后重置' }] },
+    refreshing: false, onRefresh: () => {}, onClose: () => {},
+  }), /Codex 额度 · pro[\s\S]*5 小时[\s\S]*已用 37%/);
+  assert.match(ui.goalBanner({
+    goal: { objective: '修完所有测试', status: 'active', tokensUsed: 0, timeUsedSeconds: 0, updatedAt: 1 },
+    running: false, busy: false, onPause: () => {}, onResume: () => {}, onClear: () => {},
+  }), /会话目标[\s\S]*进行中[\s\S]*修完所有测试[\s\S]*暂停/);
+  assert.match(ui.feedbackBanner({ state: { status: 'sent', feedbackId: 'fb_123' }, onDismiss: () => {} }), /反馈已发送至 OpenAI[\s\S]*fb_123/);
+
+  const workerHtml = ui.composer({
+    alive: true, running: false, sending: false, interrupting: false,
+    approvals: [], questions: [], branch: null, readOnly: true, direct: false, usage: null,
+    onSend: async () => true, onInterrupt: () => {},
+  });
+  assert.doesNotMatch(workerHtml, /斜杠命令|asv-slash-banner|新上下文|会话目标/);
+});

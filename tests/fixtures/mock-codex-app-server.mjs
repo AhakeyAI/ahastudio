@@ -11,6 +11,7 @@ let threadCwd = process.cwd();
 let turnNumber = 0;
 let turnId;
 let approvalId;
+let activeGoal = null;
 const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
 const notify = (method, params) => send({ method, params: { threadId, ...params } });
 const completed = (status, text) => {
@@ -134,6 +135,40 @@ for await (const line of history) {
     } } });
   } else if (method === 'thread/archive' || method === 'thread/unarchive') {
     send({ id, result: {} });
+  } else if (method === 'thread/compact/start') {
+    assert.equal(params.threadId, threadId);
+    turnId = 'mock-compact-' + ++turnNumber;
+    send({ id, result: {} });
+    notify('turn/started', { turn: { id: turnId, status: 'inProgress' } });
+    notify('item/started', { turnId, item: { id: 'compact-1', type: 'contextCompaction' } });
+    notify('item/completed', { turnId, item: { id: 'compact-1', type: 'contextCompaction' } });
+    notify('turn/completed', { turn: { id: turnId, status: 'completed', error: null, items: [] } });
+  } else if (method === 'feedback/upload') {
+    send({ id, result: { threadId: `fb_${params.threadId || threadId}`, promptHash: null } });
+  } else if (method === 'thread/goal/get') {
+    assert.equal(params.threadId, threadId);
+    send({ id, result: { goal: activeGoal } });
+  } else if (method === 'thread/goal/set') {
+    assert.equal(params.threadId, threadId);
+    const nowSec = Math.floor(Date.now() / 1000);
+    activeGoal = {
+      threadId,
+      objective: params.objective ?? activeGoal?.objective ?? '',
+      status: params.status ?? activeGoal?.status ?? 'active',
+      tokenBudget: null,
+      tokensUsed: activeGoal?.tokensUsed ?? 0,
+      timeUsedSeconds: activeGoal?.timeUsedSeconds ?? 0,
+      createdAt: activeGoal?.createdAt ?? nowSec,
+      updatedAt: nowSec,
+    };
+    send({ id, result: { goal: activeGoal } });
+    notify('thread/goal/updated', { goal: activeGoal });
+  } else if (method === 'thread/goal/clear') {
+    assert.equal(params.threadId, threadId);
+    const cleared = activeGoal !== null;
+    activeGoal = null;
+    send({ id, result: { cleared } });
+    if (cleared) notify('thread/goal/cleared', {});
   } else if (method === 'turn/start') {
     assert.equal(params.threadId, threadId);
     const prompt = params.input.find((item) => item.type === 'text')?.text ?? '';
