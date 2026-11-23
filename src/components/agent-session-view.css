@@ -269,6 +269,33 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-diffstat .is-del { color: var(--asv-del); }
 .asv-file-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
 
+/* ---- Turn changes card ---- */
+
+.asv-changes { min-width: 0; border: 1px solid var(--asv-line); border-radius: 12px; background: var(--asv-tint); overflow: hidden; }
+.asv-changes-head { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 6px 0 12px; color: var(--asv-ink-2); font-size: 12.5px; }
+.asv-changes-head > svg { flex: none; }
+.asv-changes-title { color: var(--asv-ink-strong); font-weight: 600; }
+.asv-changes-count { font-variant-numeric: tabular-nums; }
+.asv-changes-body { display: flex; flex-direction: column; padding: 0 4px 6px; }
+.asv-changes-row {
+  display: flex; align-items: center; gap: 7px; width: 100%; min-width: 0; height: 28px; padding-right: 8px;
+  border: 0; border-radius: 7px; background: none; color: var(--asv-ink-2); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer;
+}
+.asv-changes-row:hover { background: var(--asv-hover); color: var(--asv-ink); }
+.asv-changes-row > svg { flex: none; opacity: 0.75; }
+.asv-changes-chevron { transition: transform 120ms ease; }
+.asv-changes-row[aria-expanded="true"] > .asv-changes-chevron { transform: rotate(90deg); }
+.asv-changes-row.is-file > .asv-changes-chevron { opacity: 0; }
+.asv-changes-row.is-file:hover > .asv-changes-chevron, .asv-changes-row.is-file[aria-expanded="true"] > .asv-changes-chevron { opacity: 0.6; }
+.asv-changes-name { min-width: 0; overflow: hidden; font-family: var(--asv-mono); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.asv-changes-name.is-file { color: var(--asv-ink); }
+.asv-changes-row > .asv-diffstat { margin-left: auto; flex: none; }
+.asv-changes-kind { flex: none; padding: 0 6px; border-radius: 999px; font-size: 11px; line-height: 17px; }
+.asv-changes-kind.is-add { background: color-mix(in srgb, var(--asv-add) 14%, transparent); color: var(--asv-add); }
+.asv-changes-kind.is-delete { background: color-mix(in srgb, var(--asv-del) 14%, transparent); color: var(--asv-del); }
+.asv-changes-detail { display: flex; flex-direction: column; gap: 8px; min-width: 0; margin: 2px 4px 8px 20px; }
+.asv-changes-detail .asv-diff { background: var(--workspace-bg); }
+
 .asv-plan-body { display: flex; flex-direction: column; gap: 6px; margin: 2px 0 6px 26px; }
 .asv-plan-steps { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
 .asv-plan-steps li { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; }

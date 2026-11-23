@@ -21,6 +21,7 @@ import {
   totalTokenUsage,
   turnHasLiveItem,
 } from '../lib/worker-timeline-model';
+import { summarizeTurnChanges } from '../lib/turn-changes';
 import type {
   AgentSessionInfo,
   AgentSessionPolicy,
@@ -37,6 +38,7 @@ import { SessionComposer, type ComposerHandle } from './agent-session/SessionCom
 import { SessionMarkdown } from './agent-session/SessionMarkdown';
 import { FileChangeRows, LiveTimer, WorkGroup, WorkItemRow } from './agent-session/SessionWorkLog';
 import { AgentSessionContext, useAgentSession } from './agent-session/session-context';
+import { TurnChangesCard } from './agent-session/TurnChangesCard';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
 import './agent-session-view.css';
 
@@ -186,9 +188,9 @@ function SettlementBlock({ item }: { item: Item<'settlement'> }) {
   );
 }
 
-const TimelineItem = memo(function TimelineItem({ item }: { item: WorkerTimelineItem }) {
+const TimelineItem = memo(function TimelineItem({ item, inlineDiff }: { item: WorkerTimelineItem; inlineDiff: boolean }) {
   if (item.kind === 'settlement') return <SettlementBlock item={item} />;
-  if (item.kind !== 'message') return <WorkItemRow item={item} />;
+  if (item.kind !== 'message') return <WorkItemRow item={item} inlineDiff={inlineDiff} />;
   if (item.role === 'user') return <UserBubble text={item.text} caption="追加指令" />;
   const streaming = item.status === 'running';
   return (
@@ -221,18 +223,25 @@ function turnFootText(turn: WorkerTimelineTurn): string {
 }
 
 const TurnView = memo(function TurnView({ turn, minHeight }: { turn: WorkerTimelineTurn; minHeight?: number }) {
+  const { cwd } = useAgentSession();
   const blocks = useMemo(() => groupTimelineItems(turn.items), [turn.items]);
   const running = turn.status === 'running';
   const foot = running ? '' : turnFootText(turn);
+  const changes = useMemo(() => (running ? null : summarizeTurnChanges(turn.items, cwd)), [running, turn.items, cwd]);
+  const hasCard = Boolean(changes?.files.length);
+  const renderBlock = (block: (typeof blocks)[number]) =>
+    block.type === 'group' ? <WorkGroup key={block.id} block={block} />
+      : <TimelineItem key={block.item.id} item={block.item} inlineDiff={!hasCard} />;
+  const isSettlement = (block: (typeof blocks)[number]) => block.type === 'item' && block.item.kind === 'settlement';
   return (
     <section className={`asv-turn is-${turn.status}`} aria-label={`第 ${turn.generation} 轮`} style={minHeight ? { minHeight } : undefined}>
       {turn.origin === 'system'
         ? <SystemWakeRow text={turn.prompt} generation={turn.generation} />
         : <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} attachments={turn.attachments} editable />}
       {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}
-      {blocks.map((block) =>
-        block.type === 'group' ? <WorkGroup key={block.id} block={block} /> : <TimelineItem key={block.item.id} item={block.item} />,
-      )}
+      {blocks.filter((block) => !isSettlement(block)).map(renderBlock)}
+      {hasCard && <TurnChangesCard changes={changes!} />}
+      {blocks.filter(isSettlement).map(renderBlock)}
       {running && !turnHasLiveItem(turn) && (
         <div className="asv-working">
           <span className="asv-shimmer">工作中</span>

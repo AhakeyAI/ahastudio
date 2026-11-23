@@ -52,6 +52,8 @@ Certain ported, adapted, or bundled components retain their original upstream co
   - `src/lib/image-compression.ts` (attached-image downscaling and re-encoding, adapted from `apps/web/src/lib/imageCompression.ts`)
   - `src/lib/composer-tokens.ts` (`isCurrencyAmount`, adapted from `packages/shared/src/composerTrigger.ts`)
   - `electron/ipc/agent-sessions.ts` (attachment paths stated in the message text, adapted from `packages/provider-core/src/server/attachmentPrompt.ts`)
+  - `src/lib/turn-changes.ts` (changed-file tree and compact diff counts, adapted from `apps/web/src/lib/turnDiffTree.ts` and `apps/web/src/components/chat/DiffStatLabel.tsx`)
+  - `src/components/agent-session/TurnChangesCard.tsx` (per-turn changed-files card, adapted from `apps/web/src/components/chat/ChangedFilesTree.tsx`)
 
 ---
 
