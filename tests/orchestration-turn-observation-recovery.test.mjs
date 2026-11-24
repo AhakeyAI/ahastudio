@@ -3,12 +3,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { atNextDelivery, createTrackedTestService } from './fixtures/tracked-orchestration-service.mjs';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
 
 import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
 import { Coordinator } from '../dist-electron/orchestration/coordinator.js';
-import { OrchestrationService } from '../dist-electron/orchestration/orchestration-service.js';
 import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
 import {
   AGENT_PROMPT_STALLED_ERROR,
@@ -26,7 +26,7 @@ function createClockedHarness(opts = {}) {
   const writes = [];
   const events = [];
 
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore,
     writePty: async (ptyId, data) => {
@@ -281,7 +281,7 @@ test('2. queued and permission start observations keep dispatches alive and exem
     h.agentStatusStore.registerPane('w_perm_later', { agentId: 'claude' });
 
     // Pre-mark w_queued as already 'working'.
-    h.agentStatusStore.ingestHookEvent({ ptyId: 'w_queued', state: 'working' });
+    atNextDelivery(h.service, () => h.agentStatusStore.ingestHookEvent({ ptyId: 'w_queued', state: 'working' }));
 
     const { run } = h.service.runCreate({
       id: 'run_qp',
@@ -654,7 +654,7 @@ test('4. heartbeat timeout parks observed dispatches without retry, queued/unsup
     });
     h.service.taskCreate({ id: 't_q_hb', runId: runQueued.id, spec: 'Queued behind earlier work' });
     h.agentStatusStore.registerPane('w_q', { agentId: 'claude' });
-    h.agentStatusStore.ingestHookEvent({ ptyId: 'w_q', state: 'working' });
+    atNextDelivery(h.service, () => h.agentStatusStore.ingestHookEvent({ ptyId: 'w_q', state: 'working' }));
     const qDisp = await h.service.dispatchTask({ taskId: 't_q_hb', to: 'w_q', from: 'coord' });
     assert.equal(qDisp.dispatch?.startObservation, 'queued');
     assert.equal(qDisp.dispatch?.queuedWorkingBaseline != null, true);
@@ -681,6 +681,8 @@ test('4. heartbeat timeout parks observed dispatches without retry, queued/unsup
         paneId: 'coord',
       });
       rawHarness.service.taskCreate({ id: 't_raw', runId: runRaw.id, spec: 'Unregistered pane' });
+      rawHarness.agentStatusStore.registerPane('w_raw', { agentId: 'codex' });
+      atNextDelivery(rawHarness.service, () => rawHarness.agentStatusStore.removePane('w_raw'));
       const rawDisp = await rawHarness.service.dispatchTask({
         taskId: 't_raw',
         to: 'w_raw',
@@ -1208,9 +1210,8 @@ test('7. Defect 1 regression: raw PTY stdout mid-delivery or post-settle never f
     h.service.taskCreate({ id: 't_q_coord', runId: run.id, spec: 'Coordinator queued stdout check' });
 
     // 7a. Manual dispatchTask to an already-'working' pane.
-    h.agentStatusStore.ingestHookEvent({ ptyId: 'w_manual_q', state: 'working' });
-    const seqManualBefore = h.agentStatusStore.getActivitySnapshot('w_manual_q')?.workingSequence;
-    assert.equal(seqManualBefore, 1);
+    const seqManualBefore = 1;
+    atNextDelivery(h.service, () => h.agentStatusStore.ingestHookEvent({ ptyId: 'w_manual_q', state: 'working' }));
 
     const manualRes = await h.service.dispatchTask({
       taskId: 't_q_manual',
@@ -1249,17 +1250,9 @@ test('7. Defect 1 regression: raw PTY stdout mid-delivery or post-settle never f
     });
 
     // 7b. coordinatorTick (sendTurn) when pane enters 'working' right before dispatch creation / delivery.
-    const origCreateDispatch = h.store.createDispatchContext.bind(h.store);
-    const createMock = t.mock.method(h.store, 'createDispatchContext', (input) => {
-      if (input.taskId === 't_q_coord') {
-        h.agentStatusStore.ingestHookEvent({ ptyId: 'w_coord_q', state: 'working' });
-      }
-      return origCreateDispatch(input);
-    });
+    atNextDelivery(h.service, () => h.agentStatusStore.ingestHookEvent({ ptyId: 'w_coord_q', state: 'working' }));
 
     await h.service.coordinatorTick(run.id, { workerPaneIds: ['w_coord_q'] });
-    createMock.mock.restore();
-
     const dCoordQ = h.store.getLatestDispatchForTask('t_q_coord');
     assert.ok(dCoordQ);
     assert.equal(dCoordQ.startObservation, 'queued');
@@ -1296,7 +1289,7 @@ test('8. Defect 2 regression: single-side synthetic-epoch clock injection aligns
     let nowMs = INITIAL_EPOCH;
     const store = new OrchestrationStore();
     const agentStatusStore = new AgentStatusStore({ now: () => nowMs });
-    const service = new OrchestrationService({
+    const service = createTrackedTestService({
       store,
       agentStatusStore,
       writePty: async () => ({ ok: true }),
@@ -1439,7 +1432,7 @@ test('8. Defect 2 regression: single-side synthetic-epoch clock injection aligns
     assert.equal(store.hasCustomClock(), true);
     assert.equal(store.getClockMs(), INITIAL_EPOCH);
 
-    const service = new OrchestrationService({
+    const service = createTrackedTestService({
       store,
       agentStatusStore,
       writePty: async () => ({ ok: true }),
@@ -1695,7 +1688,7 @@ test('10. sweep reaps exited workers without a coordinator, and stale warnings a
 
     // Warn-only path: a queued turn behind earlier work gets one advisory, no state change.
     h.agentStatusStore.registerPane('w_q', { agentId: 'claude' });
-    h.agentStatusStore.ingestHookEvent({ ptyId: 'w_q', state: 'working' });
+    atNextDelivery(h.service, () => h.agentStatusStore.ingestHookEvent({ ptyId: 'w_q', state: 'working' }));
     const { run: runQueued } = h.service.runCreate({
       id: 'run_advisory',
       objective: 'Advisory stale warning',
@@ -1749,6 +1742,8 @@ test('10. sweep reaps exited workers without a coordinator, and stale warnings a
         paneId: 'coord',
       });
       rawHarness.service.taskCreate({ id: 't_raw', runId: runRaw.id, spec: 'Unregistered pane' });
+      rawHarness.agentStatusStore.registerPane('w_raw', { agentId: 'codex' });
+      atNextDelivery(rawHarness.service, () => rawHarness.agentStatusStore.removePane('w_raw'));
       const rawDisp = await rawHarness.service.dispatchTask({
         taskId: 't_raw',
         to: 'w_raw',

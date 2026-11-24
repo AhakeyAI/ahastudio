@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -47,7 +48,7 @@ async function mcpRequest(env, method, params, spawnCwd = cwd) {
 async function setup(t, {
   confirmMode = 'auto', stallThresholdMs, pilotEnabled = true, scenario = 'normal', allowPtySpawn = false,
 } = {}) {
-  const dir = mkdtempSync(join(cwd, '.session-coordinator-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'aha-session-coordinator-test-'));
   const workerTrace = join(dir, 'worker-rpc.jsonl');
   const agentStatusStore = new AgentStatusStore();
   const store = new OrchestrationStore({ resolveFile: () => join(dir, 'state.json') });
@@ -379,7 +380,7 @@ test('Aha MCP server exposes Coordinator tools to a session and delegates throug
 });
 
 function sessionSetup(t, {
-  dir = mkdtempSync(join(cwd, '.session-coordinator-test-')), failOrchestration = false, owner = true, onUserTurn,
+  dir = mkdtempSync(join(tmpdir(), 'aha-session-coordinator-test-')), failOrchestration = false, owner = true, onUserTurn,
   onCoordinatorIdle,
 } = {}) {
   const trace = join(dir, 'rpc.jsonl');
@@ -466,7 +467,7 @@ test('orchestration mode switches only between turns and resumes the same thread
 });
 
 test('orchestration mode survives a restart and applies when the conversation resumes', async (t) => {
-  const dir = mkdtempSync(join(cwd, '.session-coordinator-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'aha-session-coordinator-test-'));
   const first = sessionSetup(t, { dir, owner: false });
   const session = await first.manager.create({ cwd, policy: 'read-only' });
   assert.equal((await first.manager.send(session.id, { text: 'Plan the work' })).status, 'accepted');

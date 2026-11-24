@@ -1,11 +1,11 @@
 import test from 'node:test';
+import { createTrackedTestService } from './fixtures/tracked-orchestration-service.mjs';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
-import { OrchestrationService } from '../dist-electron/orchestration/orchestration-service.js';
 import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
 import { dispatchOrchestrationHttpAction } from '../dist-electron/orchestration/orchestration-http-router.js';
 import { OrchestrationError } from '../dist-electron/orchestration/orchestration-types.js';
@@ -17,7 +17,7 @@ function makeHarness() {
   const agentStatusStore = new AgentStatusStore();
   agentStatusStore.registerPane('coord', { agentId: 'claude' });
   const writes = [];
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore,
     writePty: async (ptyId, data) => {

@@ -146,6 +146,37 @@ async function createRepoHarness(t, opts = {}) {
   };
 }
 
+test('an approved dependent waits through squash and starts exactly once on the published tree', async t => {
+  const { store, service, run, setCoordAlive } = await createRepoHarness(t, { confirmMode: 'auto' });
+  const common = { from: 'local-coord', callerPaneId: 'local-coord', runId: run.id, agent: 'codex', worktree: true, userInitiated: true };
+  const a = await service.delegateTask({ ...common, role: 'author', task: 'Write handoff document' });
+  const b = await service.delegateTask({ ...common, role: 'consumer', task: 'Read handoff document', codeDeps: [a.task.id] });
+  assert.equal(b.status, 'queued');
+  writeFileSync(join(a.worktreePath, 'handoff.md'), 'handoff evidence\n');
+  await service.workerDoneByPane(a.ptyId, { outcome: 'completed', summary: 'Document ready' });
+  assert.equal(store.getTask(b.task.id).status, 'pending');
+  setCoordAlive(false);
+  const integrated = await service.workerIntegrate({ dispatchId: a.dispatch.id, targetBranch: 'integration', releaseAfter: false, force: true });
+  const promoted = await service.runFinalizeIntegration({ runId: run.id, mode: 'squash', force: true });
+  assert.equal(promoted.integrated, true);
+  assert.equal(store.requireRun(run.id).finalizedBatches.at(-1).members[a.dispatch.id], integrated.integratedCommit);
+  assert.equal(store.getLatestDispatchForTask(b.task.id), undefined);
+  setCoordAlive(true);
+  service.sessionCoordinatorIdle('local-coord');
+  service.sessionCoordinatorIdle('local-coord');
+  let consumer;
+  for (let n = 0; n < 200 && !consumer; n++) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    consumer = store.getLatestDispatchForTask(b.task.id);
+  }
+  assert.ok(consumer);
+  assert.equal(consumer.baseCommit, promoted.integratedCommit);
+  assert.equal(readFileSync(join(consumer.worktreePath, 'handoff.md'), 'utf8'), 'handoff evidence\n');
+  assert.equal(store.listDispatches({ taskId: b.task.id }).length, 1);
+  for (let n = 0; n < 200 && store.getTask(b.task.id).queuedLaunch; n++) await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(store.getTask(b.task.id).queuedLaunch, undefined);
+});
+
 test('selectAgentForTask strictly avoids authorCliId before coordinatorCliId for adversarial review', () => {
   const roster = makeRoster();
   const picked = selectAgentForTask({
@@ -532,6 +563,8 @@ test('full autonomous close-out: server review gate, chat-and-guard non-bypass, 
   assert.equal(integrated.status, 200);
   const intRes = integrated.body.result;
   assert.equal(intRes.integrated, true);
+  assert.equal(store.codeDependency(impl.task.id).id, reworkDispatch.id);
+  assert.equal(store.codeDependency(impl.task.id).integratedCommit, intRes.integratedCommit);
   assert.equal(intRes.released, true, 'verified squash integration must cleanly release worker worktree and branch');
   assert.equal(intRes.releasedReviews, 3);
   assert.equal(readFileSync(join(repo, 'feature.ts'), 'utf8'), 'export function greet() { return "hello"; }\n');

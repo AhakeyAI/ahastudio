@@ -172,7 +172,7 @@ for await (const line of history) {
   } else if (method === 'turn/start') {
     assert.equal(params.threadId, threadId);
     const prompt = params.input.find((item) => item.type === 'text')?.text ?? '';
-    if (scenario === 'timeout') continue;
+    if (scenario === 'timeout' || (scenario === 'second-timeout' && turnNumber > 0)) continue;
     if (scenario === 'rejected') {
       send({ id, error: { code: -32602, message: 'mock rejected turn before start' } });
       continue;

@@ -4,11 +4,11 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { atNextDelivery, createTrackedTestService } from './fixtures/tracked-orchestration-service.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
 import { dispatchOrchestrationHttpAction } from '../dist-electron/orchestration/orchestration-http-router.js';
-import { OrchestrationService } from '../dist-electron/orchestration/orchestration-service.js';
 import { syncBundledOrchestrationSkills } from '../dist-electron/orchestration/orchestration-skill-sync.js';
 import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
 import { prepareWorkerWorktreePlacement } from '../dist-electron/orchestration/worker-worktree-placement.js';
@@ -23,7 +23,7 @@ function createService(t, { store = new OrchestrationStore(), ...options } = {})
   const agents = new AgentStatusStore();
   agents.registerPane('coordinator', { agentId: 'claude' });
   agents.registerPane('worker', { agentId: 'claude' });
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore: agents,
     settleDelayMs: 0,
@@ -104,7 +104,7 @@ test('a deferred dispatch survives store reload and is delivered when the worker
   const { run } = initial.service.runCreate({ objective: 'fixture', from: 'coordinator' });
   const { task } = initial.service.taskCreate({ runId: run.id, spec: 'recover this prompt' });
   const trustPrompt = 'Do you trust the files in this folder?\nYes, proceed';
-  initial.agents.ingestPtyData('worker', trustPrompt);
+  atNextDelivery(initial.service, () => initial.agents.ingestPtyData('worker', trustPrompt));
   const { dispatch } = await initial.service.dispatchTask({ taskId: task.id, to: 'worker', from: 'coordinator' });
   assert.equal(dispatch.promptSentAt, null);
   await initial.service.waitForPendingWrites();
