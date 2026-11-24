@@ -490,7 +490,7 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-dock {
   position: absolute;
   inset: auto 0 0;
-  padding: 0 var(--asv-gutter) 10px;
+  padding: 0 var(--asv-gutter) 6px;
   background: linear-gradient(to bottom, transparent, var(--workspace-bg) 28px);
   pointer-events: none;
 }
@@ -522,7 +522,7 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-queue-hint { display: inline-flex; flex: none; align-items: center; gap: 4px; opacity: 0.8; }
 @media (max-width: 720px) { .asv-queue-hint { display: none; } }
 .asv-queue-list { display: flex; flex-direction: column; gap: 1px; max-height: 132px; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
-.asv-queue-row { display: flex; align-items: center; gap: 8px; min-width: 0; height: 28px; padding: 0 2px 0 6px; border-radius: 7px; }
+.asv-queue-row { display: flex; flex: none; align-items: center; gap: 8px; min-width: 0; height: 28px; padding: 0 2px 0 6px; border-radius: 7px; }
 .asv-queue-row:hover { background: var(--asv-hover); }
 .asv-queue-index { flex: none; width: 16px; color: var(--asv-ink-2); font-size: 11px; font-variant-numeric: tabular-nums; text-align: center; }
 .asv-queue-text { flex: 1; min-width: 0; overflow: hidden; color: var(--asv-ink); text-overflow: ellipsis; white-space: nowrap; }
@@ -530,18 +530,101 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-queue-row .asv-act { flex: none; opacity: 0.55; }
 .asv-queue-row:hover .asv-act, .asv-queue-row .asv-act:focus-visible { opacity: 1; }
 
-.asv-composer { display: flex; flex-direction: column; border: 1px solid color-mix(in srgb, var(--asv-ink) 12%, transparent); border-radius: 18px; background: var(--asv-surface); box-shadow: var(--asv-shadow); transition: border-color 120ms ease; }
+.asv-composer { display: flex; flex-direction: column; border: 1px solid color-mix(in srgb, var(--asv-ink) 12%, transparent); border-radius: 20px; background: var(--asv-surface); box-shadow: var(--asv-shadow); transition: border-color 120ms ease; }
 .asv-composer:focus-within { border-color: color-mix(in srgb, var(--asv-ink) 28%, transparent); }
 .asv-composer.is-ended { padding: 12px 16px; color: var(--asv-ink-2); font-size: 13px; text-align: center; }
-.asv-composer-input { display: block; width: 100%; min-height: 24px; padding: 12px 16px 4px; border: 0; background: none; color: var(--asv-ink-strong); font: inherit; line-height: 1.5; resize: none; outline: none; box-sizing: border-box; }
+.asv-composer-input { display: block; width: 100%; min-height: 24px; padding: 12px 16px 6px; border: 0; background: none; color: var(--asv-ink-strong); font: inherit; line-height: 1.5; resize: none; outline: none; box-sizing: border-box; }
 .asv-composer-input::placeholder { color: var(--asv-ink-2); opacity: 0.8; }
-.asv-composer-bar { display: flex; align-items: center; gap: 6px; padding: 4px 8px 8px 16px; }
-.asv-composer-hint { flex: 1; color: var(--asv-ink-2); font-size: 11.5px; opacity: 0.75; }
-.asv-round-btn { display: inline-flex; flex: none; align-items: center; justify-content: center; width: 28px; height: 28px; border: 1px solid var(--asv-line); border-radius: 50%; background: var(--asv-surface); color: var(--asv-ink); cursor: pointer; }
-.asv-round-btn:hover:not(:disabled) { background: var(--workspace-hover-subtle); }
-.asv-round-btn.is-primary { border-color: var(--asv-ink-strong); background: var(--asv-ink-strong); color: var(--workspace-bg); }
-.asv-round-btn.is-primary:hover:not(:disabled) { background: var(--asv-ink); }
-.asv-round-btn:disabled { opacity: 0.35; cursor: default; }
+.asv-composer-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 4px 10px 8px 12px; }
+.asv-composer-hint { flex: 1 1 auto; min-width: 0; color: var(--asv-ink-2); font-size: 11.5px; opacity: 0.75; }
+.asv-composer-actions {
+  display: inline-flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-left: auto;
+  min-width: 0;
+  color: var(--asv-ink-2);
+  font-size: 12px;
+}
+.asv-composer-submit { display: inline-flex; flex: none; align-items: center; gap: 6px; margin-left: 4px; }
+/* Scoped under .agent-session-view so handheld global button min-height never stretches circles into ovals. */
+.agent-session-view .asv-round-btn {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+  border: 1px solid var(--asv-line);
+  border-radius: 999px;
+  background: var(--asv-surface);
+  color: var(--asv-ink);
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease, transform 120ms ease, opacity 140ms ease;
+}
+.agent-session-view .asv-round-btn:hover:not(:disabled) {
+  background: var(--workspace-hover-subtle);
+  border-color: color-mix(in srgb, var(--asv-ink) 20%, transparent);
+}
+.agent-session-view .asv-round-btn:active:not(:disabled) { transform: scale(0.94); }
+.agent-session-view .asv-round-btn.is-primary {
+  border-color: transparent;
+  background: var(--asv-ink-strong);
+  color: var(--workspace-bg);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 12%), 0 4px 10px -4px rgb(0 0 0 / 28%);
+}
+.agent-session-view .asv-round-btn.is-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--asv-ink-strong) 86%, var(--workspace-bg));
+  box-shadow: 0 2px 4px rgb(0 0 0 / 14%), 0 6px 14px -4px rgb(0 0 0 / 32%);
+}
+.agent-session-view .asv-round-btn:disabled { opacity: 0.4; cursor: default; }
+.agent-session-view .asv-round-btn.is-primary:disabled {
+  background: color-mix(in srgb, var(--asv-ink) 12%, transparent);
+  color: var(--asv-ink-2);
+  opacity: 0.72;
+  box-shadow: none;
+}
+
+.agent-session-view .asv-composer-ctrl,
+.agent-session-view .asv-composer-actions .asv-usage {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--asv-ink-2);
+  font-size: 12px;
+  line-height: 1;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.agent-session-view .asv-composer-ctrl:hover:not(:disabled):not(:has(select:disabled)),
+.agent-session-view .asv-composer-actions .asv-usage:hover {
+  background: var(--asv-hover);
+  color: var(--asv-ink-strong);
+}
+.agent-session-view .asv-composer-actions .asv-chip-toggle.is-on {
+  background: color-mix(in srgb, var(--workspace-accent) 11%, transparent);
+  color: var(--workspace-accent);
+}
+.agent-session-view .asv-composer-actions .asv-chip-toggle.is-on:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--workspace-accent) 16%, transparent);
+  color: var(--workspace-accent);
+}
+.agent-session-view .asv-composer-actions > .asv-chip:not(.asv-composer-ctrl):not(.asv-usage) {
+  max-width: 160px;
+  padding: 0 4px;
+}
+.agent-session-view .asv-composer-usage { font-variant-numeric: tabular-nums; }
 
 .asv-context-strip { display: flex; align-items: center; gap: 12px; min-width: 0; min-height: 18px; padding: 0 8px; color: var(--asv-ink-2); font-size: 11.5px; }
 .asv-chip { display: inline-flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; }
@@ -556,8 +639,8 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-usage.is-bad { color: var(--asv-bad); }
 .asv-usage-pop {
   position: absolute;
-  right: -8px;
-  bottom: calc(100% + 8px);
+  right: 0;
+  bottom: calc(100% + 10px);
   z-index: 20;
   display: flex;
   flex-direction: column;
@@ -588,15 +671,15 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 
 .asv-composer { position: relative; }
 .asv-composer.is-dragging { border-color: var(--workspace-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--workspace-accent) 18%, transparent), var(--asv-shadow); }
-.asv-composer-tools { display: flex; flex: 1; align-items: center; gap: 2px; min-width: 0; margin-left: -8px; }
-.asv-tool-btn {
-  display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 260px; height: 28px; padding: 0 9px;
+.asv-composer-tools { display: flex; flex: 1 1 auto; align-items: center; gap: 2px; min-width: 0; margin-left: -4px; }
+.agent-session-view .asv-tool-btn {
+  display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 260px; height: 28px; min-height: 28px; padding: 0 9px;
   border: 0; border-radius: 999px; background: none; color: var(--asv-ink-2); font: inherit; font-size: 12.5px; cursor: pointer;
 }
-.asv-tool-btn.is-icon { justify-content: center; width: 28px; padding: 0; }
-.asv-tool-btn:hover:not(:disabled), .asv-tool-btn.is-open { background: var(--asv-hover); color: var(--asv-ink-strong); }
-.asv-tool-btn:disabled { opacity: 0.45; cursor: default; }
-.asv-tool-btn > svg { flex: none; }
+.agent-session-view .asv-tool-btn.is-icon { justify-content: center; width: 28px; padding: 0; }
+.agent-session-view .asv-tool-btn:hover:not(:disabled), .agent-session-view .asv-tool-btn.is-open { background: var(--asv-hover); color: var(--asv-ink-strong); }
+.agent-session-view .asv-tool-btn:disabled { opacity: 0.45; cursor: default; }
+.agent-session-view .asv-tool-btn > svg { flex: none; }
 .asv-tool-label { overflow: hidden; color: var(--asv-ink); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .asv-tool-sub { flex: none; color: var(--asv-ink-2); }
 
@@ -611,19 +694,21 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-pop.is-start { left: 0; }
 .asv-pop.is-end { right: 0; }
 @keyframes asv-pop-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
-.asv-pop-section { display: flex; flex-direction: column; gap: 2px; min-height: 0; }
+.asv-pop-section { display: flex; flex: none; flex-direction: column; gap: 2px; min-height: 0; }
+.asv-pop-section:has(.asv-pop-list) { flex: 0 1 auto; }
 .asv-pop-section + .asv-pop-section { padding-top: 6px; border-top: 1px solid var(--asv-line); }
 .asv-pop-heading { padding: 4px 8px 2px; color: var(--asv-ink-2); font-size: 11.5px; font-weight: 500; }
-.asv-pop-list { display: flex; flex-direction: column; min-height: 0; max-height: 260px; overflow-y: auto; }
-.asv-pop-row {
-  display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 8px; border: 0; border-radius: 9px;
+.asv-pop-list { display: flex; flex-direction: column; gap: 2px; min-height: 0; max-height: 260px; overflow-y: auto; }
+/* flex: none prevents scrollable column flex items from shrinking below content height (especially when handheld min-height overrides min-height: auto). */
+.agent-session-view .asv-pop-row {
+  display: flex; flex: none; align-items: center; gap: 8px; width: 100%; min-height: 0; height: auto; padding: 8px 10px; border: 0; border-radius: 10px;
   background: none; color: var(--asv-ink); font: inherit; text-align: left; cursor: pointer;
 }
-.asv-pop-row:hover { background: var(--asv-hover); }
-.asv-pop-row.is-selected { color: var(--asv-ink-strong); }
-.asv-pop-row > svg { flex: none; color: var(--workspace-accent); }
-.asv-pop-row-main { display: flex; flex: 1; flex-direction: column; gap: 1px; min-width: 0; }
-.asv-pop-row-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--asv-ink-strong); font-size: 13px; font-weight: 500; }
+.agent-session-view .asv-pop-row:hover { background: var(--asv-hover); }
+.agent-session-view .asv-pop-row.is-selected { background: var(--asv-tint); color: var(--asv-ink-strong); }
+.agent-session-view .asv-pop-row > svg { flex: none; color: var(--workspace-accent); }
+.asv-pop-row-main { display: flex; flex: 1; flex-direction: column; gap: 3px; min-width: 0; }
+.asv-pop-row-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--asv-ink-strong); font-size: 13px; font-weight: 500; line-height: 1.35; }
 .asv-pop-row-desc { overflow: hidden; color: var(--asv-ink-2); font-size: 12px; line-height: 1.45; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .asv-pop-badge { flex: none; padding: 1px 6px; border-radius: 999px; background: var(--asv-tint); color: var(--asv-ink-2); font-size: 10.5px; font-weight: 500; }
 .asv-pop-badge.is-ok { background: color-mix(in srgb, var(--asv-ok) 14%, transparent); color: var(--asv-ok); }
@@ -632,12 +717,13 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-pop-foot { padding: 6px 8px 2px; border-top: 1px solid var(--asv-line); color: var(--asv-ink-2); font-size: 11.5px; }
 
 .asv-effort-row { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px 6px 4px; }
-.asv-effort {
-  height: 26px; padding: 0 10px; border: 1px solid var(--asv-line); border-radius: 999px; background: none;
+.agent-session-view .asv-effort {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 28px; min-height: 28px; padding: 0 11px; border: 1px solid var(--asv-line); border-radius: 999px; background: none;
   color: var(--asv-ink); font: inherit; font-size: 12px; cursor: pointer;
 }
-.asv-effort:hover { background: var(--asv-hover); }
-.asv-effort.is-selected { border-color: var(--asv-ink-strong); background: var(--asv-ink-strong); color: var(--workspace-bg); }
+.agent-session-view .asv-effort:hover { background: var(--asv-hover); }
+.agent-session-view .asv-effort.is-selected { border-color: var(--asv-ink-strong); background: var(--asv-ink-strong); color: var(--workspace-bg); }
 
 .asv-catalog-pop { width: 380px; }
 .asv-catalog-head { display: flex; align-items: center; gap: 6px; padding: 2px 2px 0; }
@@ -654,7 +740,7 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-catalog-search:focus-within { border-color: color-mix(in srgb, var(--workspace-accent) 55%, var(--asv-line)); }
 .asv-catalog-search input { flex: 1; min-width: 0; border: 0; background: none; color: var(--asv-ink); font: inherit; font-size: 12.5px; outline: none; }
 .asv-catalog-list { display: flex; flex-direction: column; gap: 2px; min-height: 0; overflow-y: auto; }
-.asv-catalog-item { display: flex; flex-direction: column; gap: 3px; padding: 8px; border-radius: 10px; }
+.asv-catalog-item { display: flex; flex: none; flex-direction: column; gap: 3px; padding: 8px; border-radius: 10px; }
 .asv-catalog-item:hover { background: var(--asv-hover); }
 .asv-catalog-item.is-off { opacity: 0.6; }
 .asv-catalog-item-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
@@ -682,8 +768,8 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 }
 .asv-suggest-head-status { font-weight: 400; opacity: 0.85; }
 .asv-suggest-list { display: flex; flex-direction: column; gap: 1px; min-height: 0; max-height: 236px; overflow-y: auto; }
-.asv-suggest-row {
-  display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding: 6px 8px; border: 0; border-radius: 8px;
+.agent-session-view .asv-suggest-row {
+  display: flex; flex: none; align-items: center; gap: 8px; width: 100%; min-width: 0; min-height: 0; padding: 6px 8px; border: 0; border-radius: 8px;
   background: none; color: var(--asv-ink-2); font: inherit; text-align: left; cursor: pointer;
 }
 .asv-suggest-row:hover, .asv-suggest-row.is-active { background: var(--asv-hover); color: var(--asv-ink); }
@@ -794,10 +880,45 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-attach-pill { display: inline-flex; align-items: center; gap: 4px; max-width: 260px; padding: 2px 8px; overflow: hidden; border: 1px solid var(--asv-line); border-radius: 999px; color: var(--asv-ink-2); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .asv-attach-pill.is-skill { font-family: var(--asv-mono); }
 
-.asv-policy select { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; outline: none; padding: 0; }
-.asv-policy select:focus-visible { text-decoration: underline; }
-.asv-policy select:disabled { cursor: default; }
+.agent-session-view .asv-policy { position: relative; cursor: pointer; }
+.agent-session-view .asv-policy:has(select:disabled) { opacity: 0.55; cursor: default; }
+.agent-session-view .asv-policy select {
+  appearance: none;
+  field-sizing: content;
+  min-width: 0;
+  min-height: 0;
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  line-height: 1.2;
+  cursor: inherit;
+  outline: none;
+}
+.agent-session-view .asv-policy select option { background: var(--asv-surface); color: var(--asv-ink); }
+.agent-session-view .asv-policy select:focus-visible { text-decoration: underline; }
+.agent-session-view .asv-policy select:disabled { cursor: default; }
+.agent-session-view .asv-policy-caret { margin-left: -1px; opacity: 0.7; pointer-events: none; }
 .asv-strip-spacer { flex: 1; }
+
+/* Preserve pill/circle corners when keyboard focus rings appear. */
+.agent-session-view :is(.asv-round-btn, .asv-tool-btn, .asv-composer-ctrl, .asv-effort, .asv-composer-actions .asv-usage):focus-visible {
+  border-radius: 999px;
+}
+
+/* Keep composer pills proportioned and circular buttons 1:1 under handheld mode's global 44px button floor. */
+html.handheld .agent-session-view .asv-tool-btn,
+html.handheld .agent-session-view .asv-composer-ctrl,
+html.handheld .agent-session-view .asv-composer-actions .asv-usage {
+  height: 34px;
+  min-height: 34px;
+}
+html.handheld .agent-session-view .asv-tool-btn.is-icon { width: 34px; }
+html.handheld .agent-session-view .asv-round-btn { width: 36px; height: 36px; min-width: 36px; min-height: 36px; }
+html.handheld .agent-session-view .asv-effort { height: 32px; min-height: 32px; }
+html.handheld .agent-session-view .asv-pop-row { min-height: 44px; }
 
 .asv-to-bottom {
   position: absolute;

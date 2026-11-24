@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref } from 'react';
 import {
-  ArrowUp, FileText, GitBranch, Globe, Loader2, Lock, MessageCircleQuestion, Paperclip, ShieldAlert, Square, X,
+  ArrowUp, ChevronDown, FileText, GitBranch, Globe, Loader2, Lock, MessageCircleQuestion, Paperclip, ShieldAlert, Square, X,
 } from 'lucide-react';
 import { composerDrafts, type ComposerDraftAttachment } from '../../lib/composer-drafts';
 import { prepareImageForAttachment } from '../../lib/image-compression';
@@ -813,6 +813,9 @@ export function SessionComposer(props: SessionComposerProps) {
   );
   const hasBannerLane =
     props.approvals.length > 0 || props.questions.length > 0 || Boolean(props.directQuestions?.length) || hasSlashBanners;
+  const hasEndedStrip = !props.alive && Boolean(
+    props.branch || (!props.direct && props.readOnly !== undefined) || props.readOnly || props.usageLimits || props.usage,
+  );
 
   return (
     <div className="asv-dock-inner">
@@ -1005,58 +1008,83 @@ export function SessionComposer(props: SessionComposerProps) {
             ) : (
               <span className="asv-composer-hint">Enter 发送 · Shift+Enter 换行</span>
             )}
-            {props.running && (
-              <button type="button" className="asv-round-btn" disabled={props.interrupting} onClick={props.onInterrupt} aria-label="中断本轮" title="中断本轮">
-                <Square size={12} fill="currentColor" />
-              </button>
-            )}
-            <button
-              type="button"
-              className="asv-round-btn is-primary"
-              disabled={(!draft.trim() && attached.length === 0) || props.sending || blocked || preparing > 0}
-              onClick={() => void send()}
-              aria-label={localSlashCommand ? '执行命令' : queueing ? '加入队列' : '发送'}
-              title={localSlashCommand ? '执行斜杠命令（Enter）' : queueing ? '加入队列，本轮结束后发送（Enter）' : '发送（Enter）· Shift+Enter 换行'}
-            >
-              <ArrowUp size={15} strokeWidth={2.25} />
-            </button>
+            <div className="asv-composer-actions">
+              {props.branch && <Chip icon={<GitBranch size={12} />} title={props.branch}>{props.branch}</Chip>}
+              {props.policy && props.onPolicyChange ? (
+                <label className="asv-chip asv-policy asv-composer-ctrl" title="权限：下一条消息起生效">
+                  <Lock size={12} aria-hidden="true" />
+                  <select
+                    value={props.policy}
+                    disabled={props.running}
+                    aria-label="权限"
+                    onChange={(event) => props.onPolicyChange!(event.target.value as AgentSessionPolicy)}
+                  >
+                    {(Object.keys(POLICY_LABELS) as AgentSessionPolicy[]).map((value) => (
+                      <option key={value} value={value}>{POLICY_LABELS[value]}</option>
+                    ))}
+                  </select>
+                  <ChevronDown size={11} className="asv-policy-caret" aria-hidden="true" />
+                </label>
+              ) : !props.direct && props.readOnly !== undefined ? (
+                <Chip icon={<Lock size={12} />}>{props.readOnly ? POLICY_LABELS['read-only'] : POLICY_LABELS['workspace-write']}</Chip>
+              ) : props.readOnly && <Chip icon={<Lock size={12} />}>{POLICY_LABELS['read-only']}</Chip>}
+              {props.onNetworkChange && (
+                <button
+                  type="button"
+                  className={`asv-chip asv-chip-toggle asv-composer-ctrl${props.network ? ' is-on' : ''}`}
+                  disabled={props.running}
+                  aria-pressed={Boolean(props.network)}
+                  title={props.network ? '命令可以联网：下一条消息起生效' : '命令不能联网（npm install 等会失败）：下一条消息起生效'}
+                  onClick={() => props.onNetworkChange!(!props.network)}
+                >
+                  <Globe size={12} aria-hidden="true" />
+                  <span>{props.network ? '联网' : '不联网'}</span>
+                </button>
+              )}
+              {props.usageLimits && <UsageLimitChip summary={props.usageLimits} />}
+              {props.usage && (
+                <span className="asv-chip asv-composer-usage" title={`输入 ${props.usage.input} · 输出 ${props.usage.output}`}>
+                  {formatTokenCount(props.usage.total)} tokens
+                </span>
+              )}
+              <div className="asv-composer-submit">
+                {props.running && (
+                  <button type="button" className="asv-round-btn" disabled={props.interrupting} onClick={props.onInterrupt} aria-label="中断本轮" title="中断本轮">
+                    <Square size={12} fill="currentColor" />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="asv-round-btn is-primary"
+                  disabled={(!draft.trim() && attached.length === 0) || props.sending || blocked || preparing > 0}
+                  onClick={() => void send()}
+                  aria-label={localSlashCommand ? '执行命令' : queueing ? '加入队列' : '发送'}
+                  title={localSlashCommand ? '执行斜杠命令（Enter）' : queueing ? '加入队列，本轮结束后发送（Enter）' : '发送（Enter）· Shift+Enter 换行'}
+                >
+                  <ArrowUp size={16} strokeWidth={2.25} />
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       ) : (
         <div className="asv-composer is-ended">会话已结束，当前为只读回放</div>
       )}
-      <div className="asv-context-strip">
-        {props.branch && <Chip icon={<GitBranch size={12} />} title={props.branch}>{props.branch}</Chip>}
-        {props.policy && props.onPolicyChange ? (
-          <label className="asv-chip asv-policy" title="权限：下一条消息起生效">
-            <Lock size={12} />
-            <select value={props.policy} disabled={props.running} aria-label="权限"
-              onChange={(event) => props.onPolicyChange!(event.target.value as AgentSessionPolicy)}>
-              {(Object.keys(POLICY_LABELS) as AgentSessionPolicy[]).map((value) => (
-                <option key={value} value={value}>{POLICY_LABELS[value]}</option>
-              ))}
-            </select>
-          </label>
-        ) : !props.direct && props.readOnly !== undefined ? (
-          <Chip icon={<Lock size={12} />}>{props.readOnly ? POLICY_LABELS['read-only'] : POLICY_LABELS['workspace-write']}</Chip>
-        ) : props.readOnly && <Chip icon={<Lock size={12} />}>{POLICY_LABELS['read-only']}</Chip>}
-        {props.onNetworkChange && (
-          <button type="button" className={`asv-chip asv-chip-toggle${props.network ? ' is-on' : ''}`}
-            disabled={props.running} aria-pressed={Boolean(props.network)}
-            title={props.network ? '命令可以联网：下一条消息起生效' : '命令不能联网（npm install 等会失败）：下一条消息起生效'}
-            onClick={() => props.onNetworkChange!(!props.network)}>
-            <Globe size={12} />
-            <span>{props.network ? '联网' : '不联网'}</span>
-          </button>
-        )}
-        <span className="asv-strip-spacer" />
-        {props.usageLimits && <UsageLimitChip summary={props.usageLimits} />}
-        {props.usage && (
-          <span className="asv-chip" title={`输入 ${props.usage.input} · 输出 ${props.usage.output}`}>
-            {formatTokenCount(props.usage.total)} tokens
-          </span>
-        )}
-      </div>
+      {hasEndedStrip && (
+        <div className="asv-context-strip">
+          {props.branch && <Chip icon={<GitBranch size={12} />} title={props.branch}>{props.branch}</Chip>}
+          {!props.direct && props.readOnly !== undefined ? (
+            <Chip icon={<Lock size={12} />}>{props.readOnly ? POLICY_LABELS['read-only'] : POLICY_LABELS['workspace-write']}</Chip>
+          ) : props.readOnly && <Chip icon={<Lock size={12} />}>{POLICY_LABELS['read-only']}</Chip>}
+          <span className="asv-strip-spacer" />
+          {props.usageLimits && <UsageLimitChip summary={props.usageLimits} />}
+          {props.usage && (
+            <span className="asv-chip" title={`输入 ${props.usage.input} · 输出 ${props.usage.output}`}>
+              {formatTokenCount(props.usage.total)} tokens
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
