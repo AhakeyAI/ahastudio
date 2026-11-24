@@ -552,7 +552,17 @@ app.whenReady().then(async () => {
     get: (id) => agentSessions.coordinatorState(id),
     wake: (id, prompt) => agentSessions.wake(id, prompt),
   });
-  const agentSessionsIpc = registerAgentSessionsIpc(ipcCtx, agentSessions);
+  const { CodexCatalog } = await import('./orchestration/codex-catalog.js');
+  const noSessionEvents = {
+    onTurnStarted: () => {}, onTurnCompleted: () => {}, onExit: () => {},
+    onRequest: async () => ({ decision: 'decline' as const }),
+  };
+  // A separate app-server without a conversation, so catalogs never touch a session's thread.
+  const codexCatalog = new CodexCatalog(() => launchCodexPilot({ cwd: app.getPath('home'), events: noSessionEvents }));
+  const agentSessionsIpc = registerAgentSessionsIpc(ipcCtx, agentSessions, {
+    catalog: codexCatalog,
+    attachmentsDir: () => join(app.getPath('userData'), 'agent-session-attachments'),
+  });
   const offPtyExit = shellPtyCtrl.onPtyExit((ptyId) => {
     orchestrationService.markPtyExited(ptyId);
   });
@@ -562,7 +572,7 @@ app.whenReady().then(async () => {
     const workers = orchestrationService.hasCodexWorkers()
       ? orchestrationService.stopCodexWorkers().then(() => orchestrationService.waitForPendingWrites())
       : null;
-    return Promise.all([sessions, workers]).then(() => undefined);
+    return Promise.all([sessions, workers, codexCatalog.dispose()]).then(() => undefined);
   };
   disposeOrchestration = () => {
     offPtyExit();

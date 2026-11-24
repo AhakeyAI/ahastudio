@@ -94,6 +94,23 @@ export interface BrowserApi {
 
 export type AgentSessionPolicy = 'read-only' | 'workspace-write' | 'full-auto';
 
+export type AgentGoalStatus = 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete';
+
+export interface AgentSessionGoal {
+  objective: string;
+  status: AgentGoalStatus;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  updatedAt: number;
+}
+
+export type AgentGoalAction =
+  | { type: 'show' }
+  | { type: 'clear' }
+  | { type: 'pause' }
+  | { type: 'resume' }
+  | { type: 'set'; objective: string };
+
 // Mirrors electron/orchestration/agent-session-manager.ts.
 export interface AgentSessionInfo {
   id: string;
@@ -110,7 +127,26 @@ export interface AgentSessionInfo {
   status: 'starting' | 'idle' | 'running' | 'suspended' | 'closed' | 'failed';
   error: string | null;
   pendingQuestions: { requestId: string; questions: AgentSessionQuestion[] }[];
+  /** Messages written while a turn ran; each goes out once the turn before it completes. */
+  queued?: AgentQueuedMessage[];
+  /** A turn did not complete, so the queue waits until the person resumes it. */
+  queuePaused?: boolean;
+  /** Active or paused goal set via `/goal` on the provider thread, if any. */
+  goal?: AgentSessionGoal | null;
   createdAt: number;
+}
+
+// Mirrors QueuedMessage in electron/orchestration/agent-session-manager.ts.
+export interface AgentQueuedMessage {
+  id: string;
+  text: string;
+  attachments: AgentTurnAttachment[];
+  model?: string | null;
+  effort?: string | null;
+  policy?: AgentSessionPolicy;
+  network?: boolean;
+  freshContext?: boolean;
+  queuedAt: number;
 }
 
 export interface AgentSessionQuestion {
@@ -123,19 +159,122 @@ export interface AgentSessionQuestion {
 
 type AgentSessionResult<T = object> = Promise<({ ok: true } & T) | { ok: false; error: string }>;
 
+// Mirrors electron/orchestration/codex-catalog.ts.
+export interface CodexModelOption {
+  id: string;
+  model: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
+  efforts: { value: string; description: string }[];
+  defaultEffort: string | null;
+  images: boolean;
+}
+
+export interface CodexSkillOption {
+  name: string;
+  description: string;
+  path: string;
+  scope: string;
+  enabled: boolean;
+  pluginId: string | null;
+}
+
+export interface CodexPluginOption {
+  id: string;
+  name: string;
+  displayName: string;
+  description: string;
+  developer: string | null;
+  category: string | null;
+  marketplace: string;
+  enabled: boolean;
+  capabilities: string[];
+  defaultPrompts: string[];
+}
+
+// Mirrors CodexRateLimits in electron/orchestration/codex-catalog.ts.
+export interface CodexRateLimitWindow {
+  usedPercent: number;
+  windowMinutes: number | null;
+  /** Epoch milliseconds. */
+  resetsAt: number | null;
+}
+
+export interface CodexRateLimits {
+  name: string | null;
+  primary: CodexRateLimitWindow | null;
+  secondary: CodexRateLimitWindow | null;
+  planType: string | null;
+  reached: boolean;
+}
+
+// Mirrors CodexThreadSummary in electron/orchestration/codex-thread-history.ts.
+export interface CodexThreadSummary {
+  id: string;
+  title: string;
+  preview: string;
+  cwd: string;
+  /** Epoch milliseconds. */
+  createdAt: number;
+  updatedAt: number;
+  model: string | null;
+  effort: string | null;
+}
+
+export interface CodexFileMatch {
+  path: string;
+  fileName: string;
+}
+
+export type AgentTurnAttachment =
+  | { type: 'skill'; name: string; path: string }
+  | { type: 'localImage'; path: string; name?: string }
+  | { type: 'file'; path: string; name?: string };
+
 export interface AgentSessionsApi {
   list: () => AgentSessionResult<{ sessions: AgentSessionInfo[] }>;
   create: (opts: { cwd?: string; policy: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean }) =>
     AgentSessionResult<{ session: AgentSessionInfo }>;
   send: (opts: {
     id: string; text: string; policy?: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
+    freshContext?: boolean; attachments?: AgentTurnAttachment[];
   }) => AgentSessionResult;
+  /** Sends now if nothing is running, otherwise queues the message; `queued` says which happened. */
+  enqueue?: (opts: {
+    id: string; text: string; policy?: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
+    freshContext?: boolean; attachments?: AgentTurnAttachment[];
+  }) => AgentSessionResult<{ queued: boolean }>;
+  unqueue?: (opts: { id: string; messageId: string }) => AgentSessionResult<{ message: AgentQueuedMessage }>;
+  resumeQueue?: (opts: { id: string }) => AgentSessionResult;
+  models: () => AgentSessionResult<{ models: CodexModelOption[] }>;
+  rateLimits?: () => AgentSessionResult<{ limits: CodexRateLimits }>;
+  skills: (opts: { id: string; reload?: boolean }) => AgentSessionResult<{ skills: CodexSkillOption[] }>;
+  setSkillEnabled: (opts: { id: string; path: string; enabled: boolean }) => AgentSessionResult;
+  plugins: (opts: { id: string; reload?: boolean }) => AgentSessionResult<{ plugins: CodexPluginOption[] }>;
+  searchFiles: (opts: { id: string; query: string }) => AgentSessionResult<{ files: CodexFileMatch[] }>;
+  attachImage: (opts: { id: string; name: string; mime: string; data: string }) =>
+    AgentSessionResult<{ attachment: Extract<AgentTurnAttachment, { type: 'localImage' }> }>;
+  attachFile: (opts: { id: string; name: string; data: string }) =>
+    AgentSessionResult<{ attachment: Extract<AgentTurnAttachment, { type: 'file' }> }>;
   answer: (opts: { id: string; requestId: string; answers: Record<string, string[]> | null }) => AgentSessionResult;
   interrupt: (opts: { id: string }) => AgentSessionResult<{ interrupted: boolean }>;
   respond: (opts: { id: string; requestId: string; allow: boolean; reason?: string }) => AgentSessionResult;
   close: (opts: { id: string }) => AgentSessionResult;
   timeline: (opts: { id: string }) => AgentSessionResult<{ timeline: WorkerTimelineSnapshot | null }>;
   setOrchestration: (opts: { id: string; enabled: boolean }) => AgentSessionResult;
+  /** `synced` is false when Codex was not running; it is renamed there once the session resumes. */
+  rename: (opts: { id: string; title: string }) => AgentSessionResult<{ synced: boolean }>;
+  /** Reads, sets, pauses, resumes, or clears the thread's `/goal`. */
+  goal?: (opts: { id: string; action: AgentGoalAction }) => AgentSessionResult<{ goal: AgentSessionGoal | null; message: string }>;
+  /** Uploads the current thread and Codex logs to OpenAI (`/feedback`). */
+  uploadFeedback?: (opts: { id: string; reason?: string }) => AgentSessionResult<{ feedbackId: string }>;
+  /** Past Codex conversations in a folder, newest first, without Worker threads. */
+  history?: (opts: { cwd: string; search?: string; archived?: boolean; cursor?: string | null }) =>
+    AgentSessionResult<{ threads: CodexThreadSummary[]; nextCursor: string | null }>;
+  /** Opens a past conversation as a suspended session; one already open is returned as it is. */
+  openHistory?: (opts: { threadId: string; policy: AgentSessionPolicy }) => AgentSessionResult<{ session: AgentSessionInfo }>;
+  archiveHistory?: (opts: { threadId: string; archived: boolean }) => AgentSessionResult;
   onChanged: (cb: (sessions: AgentSessionInfo[]) => void) => () => void;
 }
 
@@ -1136,6 +1275,12 @@ export interface WorkerTimelineTurn {
   prompt: string;
   /** `system`: AhaStation started the turn (a wake-up), not the person or a dispatch brief. */
   origin?: 'system';
+  /** True when `/clear` started a fresh provider thread before this turn. */
+  freshContext?: boolean;
+  /** Marks control turns initiated by slash commands (`/compact`, `/goal`). */
+  commandKind?: 'compact' | 'goal';
+  /** Skills and images sent with the prompt, by name. */
+  attachments?: { kind: 'skill' | 'image' | 'file'; name: string }[];
   startedAt: number;
   completedAt: number | null;
   status: WorkerTimelineTurnStatus;

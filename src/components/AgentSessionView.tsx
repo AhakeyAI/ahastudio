@@ -1,14 +1,23 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Hourglass, Square, Workflow } from 'lucide-react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import {
+  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Cpu, Eraser, FileText, Folder, History, Hourglass,
+  Image as ImageIcon, Minimize2, PencilLine, Sparkles, Square, Workflow,
+} from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
 import { countDiffStats, parseUnifiedDiff } from '../lib/git-panel-model';
-import { agentSessionClient, isStandaloneSession } from '../lib/agent-session-client';
+import { agentSessionClient, codexCatalogClient, isStandaloneSession, usageLimitsClient } from '../lib/agent-session-client';
+import { summarizeUsage, type UsageSummary } from '../lib/usage-limits';
+import type { GoalCommandAction } from '../lib/composer-slash-commands';
+import { effortLabel } from '../lib/composer-tokens';
+import { composerDrafts } from '../lib/composer-drafts';
+import { folderName } from '../lib/session-title';
 import { orchestrationClient } from '../lib/orchestration-client';
 import { stageWindowStore, type StageWindow } from '../lib/stage-window-store';
 import { terminalSessionStore } from '../lib/terminal-session-store';
 import {
   activeTimelineTurn,
+  currentThreadHasTurns,
   formatDuration,
   groupTimelineItems,
   pendingApprovals,
@@ -18,20 +27,28 @@ import {
   totalTokenUsage,
   turnHasLiveItem,
 } from '../lib/worker-timeline-model';
+import { summarizeTurnChanges } from '../lib/turn-changes';
 import type {
   AgentSessionInfo,
   AgentSessionPolicy,
+  AgentTurnAttachment,
+  CodexModelOption,
   OrchestrationDispatchRecord,
   OrchestrationDispatchStage,
   WorkerTimelineFileChange,
   WorkerTimelineItem,
   WorkerTimelineTurn,
 } from '../types';
-import { DiffBlock } from './agent-session/SessionCode';
-import { SessionComposer } from './agent-session/SessionComposer';
+import { CopyButton, DiffBlock } from './agent-session/SessionCode';
+import type { FeedbackBannerState } from './agent-session/ComposerBanners';
+import { SessionComposer, type ComposerHandle, type ComposerSlashControl } from './agent-session/SessionComposer';
 import { SessionMarkdown } from './agent-session/SessionMarkdown';
+import { SessionTitle } from './agent-session/SessionTitle';
+import { SessionEmptyState } from './agent-session/SessionEmptyState';
+import { SessionHistoryPanel } from './agent-session/SessionHistoryPanel';
 import { FileChangeRows, LiveTimer, WorkGroup, WorkItemRow } from './agent-session/SessionWorkLog';
-import { AgentSessionContext } from './agent-session/session-context';
+import { AgentSessionContext, useAgentSession } from './agent-session/session-context';
+import { TurnChangesCard } from './agent-session/TurnChangesCard';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
 import './agent-session-view.css';
 
@@ -54,7 +71,25 @@ const LONG_PROMPT_LINES = 16;
 
 type Item<K extends WorkerTimelineItem['kind']> = Extract<WorkerTimelineItem, { kind: K }>;
 
-function UserBubble({ text, caption }: { text: string; caption?: string }) {
+/** Hover actions under a message; shown by CSS so rows hold no hover state. */
+function MessageActions({ text, onEdit }: { text: string; onEdit?: () => void }) {
+  if (!text.trim()) return null;
+  return (
+    <span className="asv-msg-actions">
+      <CopyButton text={text} label="复制" className="asv-act" />
+      {onEdit && (
+        <button type="button" className="asv-act" aria-label="编辑后重发" title="编辑后重发（填回输入框，不会自动发送）" onClick={onEdit}>
+          <PencilLine size={13} />
+        </button>
+      )}
+    </span>
+  );
+}
+
+function UserBubble({ text, caption, attachments, editable = false }: {
+  text: string; caption?: string; attachments?: WorkerTimelineTurn['attachments']; editable?: boolean;
+}) {
+  const { editMessage } = useAgentSession();
   const parts = useMemo(() => splitDispatchPrompt(text), [text]);
   const long = parts.body.length > LONG_PROMPT_CHARS || parts.body.split('\n').length > LONG_PROMPT_LINES;
   const [expanded, setExpanded] = useState(false);
@@ -62,11 +97,28 @@ function UserBubble({ text, caption }: { text: string; caption?: string }) {
   const origin = parts.system ? (parts.followUp ? '追加派发' : '编排派发') : null;
   return (
     <div className="asv-user" data-asv-row>
-      <div className={`asv-bubble${long && !expanded ? ' is-clamped' : ''}`}>
-        <SessionMarkdown text={parts.body} variant="bubble" />
-      </div>
-      {(long || parts.system || caption) && (
+      {parts.body && (
+        <div className={`asv-bubble${long && !expanded ? ' is-clamped' : ''}`}>
+          <SessionMarkdown text={parts.body} variant="bubble" />
+        </div>
+      )}
+      {attachments && attachments.length > 0 && (
+        <div className="asv-user-attachments">
+          {attachments.map((item, index) => (
+            <span key={`${item.kind}:${item.name}:${index}`} className={`asv-attach-pill is-${item.kind}`}>
+              {item.kind === 'skill' ? <Sparkles size={11} aria-hidden="true" />
+                : item.kind === 'image' ? <ImageIcon size={11} aria-hidden="true" /> : <FileText size={11} aria-hidden="true" />}
+              {item.kind === 'skill' ? `$${item.name}` : item.name}
+            </span>
+          ))}
+        </div>
+      )}
+      {(parts.body || long || parts.system || caption) && (
         <div className="asv-user-meta">
+          <MessageActions
+            text={parts.body}
+            {...(editable && editMessage && !parts.system ? { onEdit: () => editMessage(parts.body) } : {})}
+          />
           {long && (
             <button type="button" className="asv-text-btn" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
               {expanded ? '收起' : '展开全部'}
@@ -146,13 +198,15 @@ function SettlementBlock({ item }: { item: Item<'settlement'> }) {
   );
 }
 
-const TimelineItem = memo(function TimelineItem({ item }: { item: WorkerTimelineItem }) {
+const TimelineItem = memo(function TimelineItem({ item, inlineDiff }: { item: WorkerTimelineItem; inlineDiff: boolean }) {
   if (item.kind === 'settlement') return <SettlementBlock item={item} />;
-  if (item.kind !== 'message') return <WorkItemRow item={item} />;
+  if (item.kind !== 'message') return <WorkItemRow item={item} inlineDiff={inlineDiff} />;
   if (item.role === 'user') return <UserBubble text={item.text} caption="追加指令" />;
+  const streaming = item.status === 'running';
   return (
     <div className="asv-assistant" data-asv-row>
-      <SessionMarkdown text={item.text} streaming={item.status === 'running'} />
+      <SessionMarkdown text={item.text} streaming={streaming} />
+      {!streaming && <div className="asv-assistant-foot"><MessageActions text={item.text} /></div>}
     </div>
   );
 });
@@ -178,22 +232,53 @@ function turnFootText(turn: WorkerTimelineTurn): string {
   return [label, elapsed && `用时 ${elapsed}`, turn.error].filter(Boolean).join(' · ');
 }
 
+/** Marks where `/clear` started a fresh provider thread while keeping earlier turns visible (adapted from T3 Code `FreshSessionRow`, MIT). */
+const FreshSessionDivider = memo(function FreshSessionDivider() {
+  return (
+    <div className="asv-fresh-divider" role="separator" aria-label="新上下文">
+      <span className="asv-fresh-divider-line" aria-hidden="true" />
+      <span className="asv-fresh-divider-label">
+        <Eraser size={11} aria-hidden="true" />
+        <span>新上下文</span>
+      </span>
+      <span className="asv-fresh-divider-line" aria-hidden="true" />
+    </div>
+  );
+});
+
 const TurnView = memo(function TurnView({ turn, minHeight }: { turn: WorkerTimelineTurn; minHeight?: number }) {
+  const { cwd } = useAgentSession();
   const blocks = useMemo(() => groupTimelineItems(turn.items), [turn.items]);
   const running = turn.status === 'running';
   const foot = running ? '' : turnFootText(turn);
+  const changes = useMemo(() => (running ? null : summarizeTurnChanges(turn.items, cwd)), [running, turn.items, cwd]);
+  const hasCard = Boolean(changes?.files.length);
+  const isCompactTurn = turn.commandKind === 'compact';
+  const renderBlock = (block: (typeof blocks)[number]) =>
+    block.type === 'group' ? <WorkGroup key={block.id} block={block} />
+      : <TimelineItem key={block.item.id} item={block.item} inlineDiff={!hasCard} />;
+  const isSettlement = (block: (typeof blocks)[number]) => block.type === 'item' && block.item.kind === 'settlement';
   return (
     <section className={`asv-turn is-${turn.status}`} aria-label={`第 ${turn.generation} 轮`} style={minHeight ? { minHeight } : undefined}>
-      {turn.origin === 'system'
-        ? <SystemWakeRow text={turn.prompt} generation={turn.generation} />
-        : <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} />}
-      {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}
-      {blocks.map((block) =>
-        block.type === 'group' ? <WorkGroup key={block.id} block={block} /> : <TimelineItem key={block.item.id} item={block.item} />,
+      {turn.freshContext && <FreshSessionDivider />}
+      {turn.origin === 'system' ? (
+        <SystemWakeRow text={turn.prompt} generation={turn.generation} />
+      ) : isCompactTurn ? (
+        <div className="asv-turn-cmd" data-asv-row>
+          <Minimize2 size={12} aria-hidden="true" />
+          <span>压缩上下文</span>
+          <span className="asv-turn-cmd-meta">第 {turn.generation} 轮 · /compact</span>
+        </div>
+      ) : (
+        <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} attachments={turn.attachments} editable={turn.commandKind !== 'goal'} />
       )}
+      {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}
+      {blocks.filter((block) => !isSettlement(block)).map(renderBlock)}
+      {hasCard && <TurnChangesCard changes={changes!} />}
+      {blocks.filter(isSettlement).map(renderBlock)}
       {running && !turnHasLiveItem(turn) && (
         <div className="asv-working">
-          <span className="asv-shimmer">工作中</span>
+          <span className="asv-shimmer">{isCompactTurn ? '正在压缩上下文' : '工作中'}</span>
           <LiveTimer startedAt={turn.startedAt} />
         </div>
       )}
@@ -226,6 +311,8 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const info = direct ? directSessions.find((entry) => entry.id === win.workerId) : undefined;
   const [nextPolicy, setNextPolicy] = useState<AgentSessionPolicy | null>(null);
   const [nextNetwork, setNextNetwork] = useState<boolean | null>(null);
+  const [nextModel, setNextModel] = useState<string | null>(null);
+  const [nextEffort, setNextEffort] = useState<string | null>(null);
   const policy = nextPolicy ?? info?.policy;
   const network = nextNetwork ?? info?.network ?? false;
   const resumable = Boolean(info?.providerSessionId) && (info?.status === 'suspended' || info?.status === 'failed');
@@ -245,6 +332,9 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   );
   const appearance = useSyncExternalStore(terminalSessionStore.subscribe, terminalSessionStore.getAppearance);
   const sessionId = direct ? win.workerId : undefined;
+  const composerRef = useRef<ComposerHandle>(null);
+  const editMessage = useCallback((text: string) => composerRef.current?.fill(text), []);
+  const canEdit = Boolean(sessionId) && alive;
   const session = useMemo(() => ({
     cwd, appearance, onNotify,
     ...(sessionId ? {
@@ -252,7 +342,8 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
         (await window.vibeMeet?.agentSessions?.respond({ id: sessionId, requestId, allow, ...(reason ? { reason } : {}) }))
           ?? { ok: false, error: '会话接口不可用' },
     } : {}),
-  }), [cwd, appearance, onNotify, sessionId]);
+    ...(canEdit ? { editMessage } : {}),
+  }), [cwd, appearance, onNotify, sessionId, canEdit, editMessage]);
 
   const dockRef = useRef<HTMLDivElement>(null);
   const [dockHeight, setDockHeight] = useState(0);
@@ -290,22 +381,31 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     }
   };
 
-  const send = async (text: string) => {
+  const send = async (text: string, attachments: AgentTurnAttachment[] = [], options?: { freshContext?: boolean }) => {
     if (sessionId) {
       const sessions = window.vibeMeet?.agentSessions;
       if (!sessions) return false;
-      const ok = await run('send', () => sessions.send({
+      // Through the queue, a message written during a turn goes out after it, in order.
+      const deliver = sessions.enqueue ?? sessions.send;
+      const ok = await run('send', () => deliver({
         id: sessionId, text,
+        ...(attachments.length ? { attachments } : {}),
+        ...(options?.freshContext ? { freshContext: true } : {}),
         ...(nextPolicy && nextPolicy !== info?.policy ? { policy: nextPolicy } : {}),
         ...(nextNetwork !== null && nextNetwork !== info?.network ? { network: nextNetwork } : {}),
+        ...(nextModel && nextModel !== info?.model ? { model: nextModel } : {}),
+        ...(nextEffort && nextEffort !== info?.effort ? { effort: nextEffort } : {}),
       }));
       if (ok) {
         setNextPolicy(null);
         setNextNetwork(null);
+        setNextModel(null);
+        setNextEffort(null);
         scroll.scrollToEnd();
       }
       return ok;
     }
+    if (!text) return false;
     if (!targetDispatchId || !api) return false;
     const [first = '', ...rest] = text.split('\n');
     const long = first.length > 200;
@@ -356,6 +456,223 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       });
   };
 
+  const setOrchestrationMode = useCallback((mode: 'toggle' | 'on' | 'off') => {
+    if (!sessionId || !info) return;
+    const enabled = mode === 'toggle' ? !info.orchestration : mode === 'on';
+    if (enabled === info.orchestration) {
+      onNotify?.(enabled ? '编排模式已经是开启状态' : '编排模式已经是关闭状态');
+      return;
+    }
+    if (!canToggleOrchestration || busy === 'orchestration') {
+      onNotify?.('本轮结束后才能切换编排模式');
+      return;
+    }
+    void run('orchestration', async () => window.vibeMeet?.agentSessions?.setOrchestration({ id: sessionId, enabled }))
+      .then((ok) => {
+        if (ok) onNotify?.(enabled ? '已开启编排模式：这个会话可以派发和管理 Worker' : '已关闭编排模式');
+      });
+  }, [sessionId, info, canToggleOrchestration, busy, onNotify]);
+
+  const rename = useCallback(async (next: string) => {
+    if (!sessionId) return false;
+    const res = await window.vibeMeet?.agentSessions?.rename?.({ id: sessionId, title: next });
+    if (!res?.ok) {
+      onNotify?.(res?.error ?? '改名失败');
+      return false;
+    }
+    stageWindowStore.renameWindow(win.id, next);
+    return true;
+  }, [sessionId, onNotify, win.id]);
+
+  // A waiting `/clear` lives in the draft store, so switching tabs and back keeps it.
+  const draftKey = win.workerId ?? win.id;
+  const [freshSessionArmed, setFreshSessionArmedState] = useState(() => Boolean(composerDrafts.get(draftKey).freshContext));
+  const setFreshSessionArmed = useCallback((armed: boolean) => {
+    composerDrafts.set(draftKey, { freshContext: armed });
+    setFreshSessionArmedState(armed);
+  }, [draftKey]);
+  const [usageLimitsOpen, setUsageLimitsOpen] = useState(false);
+  const [usageLimitsRefreshing, setUsageLimitsRefreshing] = useState(false);
+  const [feedbackState, setFeedbackState] = useState<FeedbackBannerState | null>(null);
+  const [goalBusy, setGoalBusy] = useState(false);
+  useEffect(() => {
+    // Another session's own waiting `/clear` (if any) comes back from the draft store.
+    setFreshSessionArmedState(Boolean(composerDrafts.get(draftKey).freshContext));
+    setUsageLimitsOpen(false);
+    setFeedbackState(null);
+  }, [sessionId, draftKey]);
+
+  const armFreshSession = useCallback(() => setFreshSessionArmed(true), [setFreshSessionArmed]);
+  const disarmFreshSession = useCallback(() => setFreshSessionArmed(false), [setFreshSessionArmed]);
+  const closeUsageLimits = useCallback(() => setUsageLimitsOpen(false), []);
+  const dismissFeedback = useCallback(() => setFeedbackState(null), []);
+
+  const queue = useMemo(() => {
+    const api = window.vibeMeet?.agentSessions;
+    if (!sessionId || !info || !api?.enqueue || !api.unqueue || !api.resumeQueue) return undefined;
+    const { unqueue, resumeQueue } = api;
+    return {
+      items: info.queued ?? [],
+      paused: Boolean(info.queuePaused),
+      take: async (messageId: string) => {
+        const res = await unqueue({ id: sessionId, messageId });
+        if (!res.ok) onNotify?.(res.error);
+        return res.ok ? res.message : null;
+      },
+      resume: () => {
+        void resumeQueue({ id: sessionId }).then((res) => {
+          if (!res.ok) onNotify?.(res.error);
+        });
+      },
+    };
+  }, [sessionId, info, onNotify]);
+
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const closeHistory = useCallback(() => setHistoryOpen(false), []);
+
+  // The header names the model the way the composer's picker does, once the catalog is loaded.
+  const headerModelId = direct ? info?.model ?? null : timeline?.model ?? dispatch?.model ?? null;
+  const [modelName, setModelName] = useState<string | null>(null);
+  useEffect(() => {
+    setModelName(null);
+    if (!direct || !headerModelId) return;
+    let live = true;
+    codexCatalogClient.models().then((models) => {
+      const match = models.find((entry) => entry.id === headerModelId || entry.model === headerModelId);
+      if (live && match) setModelName(match.displayName);
+    }, () => {});
+    return () => { live = false; };
+  }, [direct, headerModelId]);
+  const modelText = headerModelId
+    ? `${modelName ?? headerModelId}${direct && info?.effort ? ` · ${effortLabel(info.effort)}` : ''}`
+    : null;
+
+  // Account usage is the person's own Codex quota, so only direct sessions show it.
+  const [usageLimits, setUsageLimits] = useState<UsageSummary | null>(null);
+  const loadUsage = useRef<(force: boolean) => Promise<UsageSummary | null>>(async () => null);
+  useEffect(() => {
+    if (!direct) return;
+    let live = true;
+    loadUsage.current = async (force) => {
+      const limits = await usageLimitsClient.read(force);
+      const summary = summarizeUsage(limits, Date.now());
+      if (live) setUsageLimits(summary);
+      return summary;
+    };
+    void loadUsage.current(false);
+    // Also keeps the "resets in" text current.
+    const timer = setInterval(() => void loadUsage.current(false), 60_000);
+    return () => {
+      live = false;
+      clearInterval(timer);
+      loadUsage.current = async () => null;
+    };
+  }, [direct]);
+  const wasRunning = useRef(running);
+  useEffect(() => {
+    if (wasRunning.current && !running) void loadUsage.current(true);
+    wasRunning.current = running;
+  }, [running]);
+
+  const openUsageLimits = useCallback(() => {
+    if (usageLimits) setUsageLimitsOpen(true);
+    setUsageLimitsRefreshing(true);
+    void loadUsage.current(true).then((summary) => {
+      if (summary) {
+        setUsageLimitsOpen(true);
+      } else {
+        setUsageLimitsOpen(false);
+        onNotify?.('当前账号没有可用的 Codex 额度信息');
+      }
+    }).finally(() => setUsageLimitsRefreshing(false));
+  }, [usageLimits, onNotify]);
+
+  const refreshUsageLimits = useCallback(() => {
+    setUsageLimitsRefreshing(true);
+    void loadUsage.current(true).finally(() => setUsageLimitsRefreshing(false));
+  }, []);
+
+  const openHistory = useCallback(() => {
+    if (direct && cwd && window.vibeMeet?.agentSessions?.history) setHistoryOpen(true);
+  }, [direct, cwd]);
+
+  const runGoalCommand = useCallback(async (action: GoalCommandAction): Promise<boolean> => {
+    if (!sessionId) return false;
+    const goalApi = window.vibeMeet?.agentSessions?.goal;
+    if (!goalApi) {
+      onNotify?.('当前环境不支持 /goal 命令');
+      return false;
+    }
+    setGoalBusy(true);
+    try {
+      const res = await goalApi({ id: sessionId, action });
+      if (!res.ok) {
+        onNotify?.(res.error);
+        return false;
+      }
+      if (res.message) onNotify?.(res.message);
+      if (action.type === 'set' || action.type === 'resume') scroll.scrollToEnd();
+      return true;
+    } finally {
+      setGoalBusy(false);
+    }
+  }, [sessionId, onNotify, scroll]);
+
+  const runFeedbackCommand = useCallback((reason?: string) => {
+    if (!sessionId) return;
+    const uploadApi = window.vibeMeet?.agentSessions?.uploadFeedback;
+    if (!uploadApi) {
+      onNotify?.('当前环境不支持 /feedback 命令');
+      return;
+    }
+    setFeedbackState({ status: 'uploading' });
+    void uploadApi({ id: sessionId, ...(reason ? { reason } : {}) }).then(
+      (res) => {
+        if (res.ok) setFeedbackState({ status: 'sent', feedbackId: res.feedbackId });
+        else setFeedbackState({ status: 'failed', error: res.error });
+      },
+      (err: unknown) => {
+        setFeedbackState({ status: 'failed', error: err instanceof Error ? err.message : String(err) });
+      },
+    );
+  }, [sessionId, onNotify]);
+
+  const slashControl = useMemo<ComposerSlashControl | undefined>(() => {
+    if (!direct || !sessionId || !info || info.status === 'closed') return undefined;
+    return {
+      currentTitle: title,
+      // A waiting `/clear` means the next message starts a new thread, so there is nothing to compact.
+      hasTurns: !freshSessionArmed && currentThreadHasTurns(timeline?.turns ?? []),
+      hasUsageLimits: Boolean(window.vibeMeet?.agentSessions?.rateLimits),
+      canHistory: Boolean(cwd && window.vibeMeet?.agentSessions?.history),
+      canRename: Boolean(window.vibeMeet?.agentSessions?.rename),
+      canOrchestration: Boolean(window.vibeMeet?.agentSessions?.setOrchestration),
+      orchestrationOn: info.orchestration,
+      freshSessionArmed,
+      goal: info.goal ?? null,
+      goalBusy,
+      usageLimitsOpen,
+      usageLimitsRefreshing,
+      feedback: feedbackState,
+      onArmFreshSession: armFreshSession,
+      onDisarmFreshSession: disarmFreshSession,
+      onOpenUsageLimits: openUsageLimits,
+      onRefreshUsageLimits: refreshUsageLimits,
+      onCloseUsageLimits: closeUsageLimits,
+      onOpenHistory: openHistory,
+      onRename: rename,
+      onSetOrchestration: setOrchestrationMode,
+      onGoalCommand: runGoalCommand,
+      onFeedbackCommand: runFeedbackCommand,
+      onDismissFeedback: dismissFeedback,
+    };
+  }, [
+    direct, sessionId, info, title, timeline?.turns, cwd, freshSessionArmed, goalBusy,
+    usageLimitsOpen, usageLimitsRefreshing, feedbackState, armFreshSession, disarmFreshSession,
+    openUsageLimits, refreshUsageLimits, closeUsageLimits, openHistory, rename, setOrchestrationMode,
+    runGoalCommand, runFeedbackCommand, dismissFeedback,
+  ]);
+
   const stage = dispatch?.stage;
   const stageLabel = direct
     ? (info ? SESSION_STATUS_LABELS[info.status] : '已结束')
@@ -370,8 +687,14 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       <div className="agent-session-view" data-running={running || undefined}>
         <header className="asv-header">
           <TerminalProfileIcon id={timeline?.cliId ?? win.localCliId ?? 'codex'} size={16} />
-          <span className="asv-title">{title}</span>
+          <SessionTitle title={title} {...(direct && info && info.status !== 'closed' ? { onRename: rename } : {})} />
           {task?.taskTitle && role && <span className="asv-subtitle">{task.taskTitle}</span>}
+          {(cwd || modelText) && (
+            <span className="asv-head-meta">
+              {cwd && <span className="asv-head-chip" title={cwd}><Folder size={12} /><span>{folderName(cwd)}</span></span>}
+              {modelText && <span className="asv-head-chip is-model" title="模型 · 推理强度"><Cpu size={12} /><span>{modelText}</span></span>}
+            </span>
+          )}
           <span className="asv-spacer" />
           {stageLabel && (
             <span className={`asv-stage${stage ? ` is-${stage}` : info?.status === 'running' ? ' is-working' : info?.status === 'failed' ? ' is-failed' : ''}`}>
@@ -379,10 +702,21 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               {stageLabel}
             </span>
           )}
+          {direct && cwd && window.vibeMeet?.agentSessions?.history && (
+            <button
+              type="button"
+              className={`asv-btn is-ghost${historyOpen ? ' is-pressed' : ''}`}
+              aria-pressed={historyOpen}
+              title="这个文件夹里以前的 Codex 会话"
+              onClick={() => setHistoryOpen((value) => !value)}
+            >
+              <History size={13} /> 历史
+            </button>
+          )}
           {direct && info && info.status !== 'closed' && (
             <button
               type="button"
-              className={`asv-btn asv-orchestration${info.orchestration ? ' is-on' : ''}`}
+              className={`asv-btn is-ghost asv-orchestration${info.orchestration ? ' is-on' : ''}`}
               aria-pressed={info.orchestration}
               disabled={!canToggleOrchestration || busy === 'orchestration'}
               title={canToggleOrchestration
@@ -390,12 +724,13 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
                 : '本轮结束后才能切换编排模式'}
               onClick={toggleOrchestration}
             >
-              <Workflow size={12} /> {busy === 'orchestration' ? '切换中…' : info.orchestration ? '编排模式 · 开' : '编排模式'}
+              <Workflow size={13} /> {busy === 'orchestration' ? '切换中…' : info.orchestration ? '编排模式 · 开' : '编排模式'}
             </button>
           )}
           {alive && !(direct && resumable) && (
-            <button type="button" className="asv-btn is-quiet-danger" disabled={busy === 'stop'} onClick={stop}>
-              <Square size={10} fill="currentColor" /> 停止
+            <button type="button" className="asv-btn is-ghost is-quiet-danger" disabled={busy === 'stop'} onClick={stop}
+              title={direct ? '结束这个会话' : '停止这个 Worker'}>
+              <Square size={11} fill="currentColor" /> 停止
             </button>
           )}
         </header>
@@ -409,7 +744,15 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
                 <button type="button" className="asv-btn" onClick={() => setReloadKey((k) => k + 1)}>重试</button>
               </div>
             )}
-            {!loading && !error && !timeline?.turns.length && (!timeline || direct) && <div className="asv-empty">{emptyText}</div>}
+            {!loading && !error && !timeline?.turns.length && (
+              direct && info && canEdit && info.status !== 'starting'
+                ? <SessionEmptyState folder={cwd ? folderName(cwd) : null} policy={policy} onPick={editMessage} />
+                : (!timeline || direct) && (
+                  <div className="asv-empty">
+                    {info?.status === 'starting' ? <span className="asv-shimmer">{emptyText}</span> : emptyText}
+                  </div>
+                )
+            )}
             {timeline?.turns.map((turn) => (
               <TurnView key={turn.key} turn={turn} minHeight={turn.key === scroll.anchoredTurnKey ? scroll.anchoredMinHeight : undefined} />
             ))}
@@ -430,21 +773,41 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             interrupting={busy === 'interrupt'}
             approvals={approvals}
             questions={questions}
-            cwd={cwd}
             branch={dispatch?.branch ?? null}
-            model={timeline?.model ?? dispatch?.model ?? null}
             readOnly={timeline?.readOnly}
             direct={direct}
+            {...(queue ? { queue } : {})}
             {...(direct && policy ? { policy, onPolicyChange: setNextPolicy } : {})}
             {...(direct ? {
               network, onNetworkChange: setNextNetwork, resumable,
               directQuestions: info?.pendingQuestions ?? [], onAnswer: answer,
             } : {})}
+            {...(direct && sessionId && info && info.status !== 'closed' ? {
+              toolbar: {
+                sessionId,
+                modelId: nextModel ?? info.model,
+                effort: nextEffort ?? info.effort,
+                onModelChange: (model: CodexModelOption) => {
+                  setNextModel(model.id);
+                  const effort = nextEffort ?? info.effort;
+                  if (!model.efforts.some((option) => option.value === effort)) setNextEffort(model.defaultEffort);
+                },
+                onEffortChange: setNextEffort,
+                onNotify,
+              },
+            } : {})}
+            {...(slashControl ? { slash: slashControl } : {})}
             usage={usage}
+            usageLimits={direct ? usageLimits : null}
+            draftKey={draftKey}
             onSend={send}
             onInterrupt={interrupt}
+            handleRef={composerRef}
           />
         </div>
+        {historyOpen && direct && cwd && (
+          <SessionHistoryPanel cwd={cwd} onClose={closeHistory} onOpened={closeHistory} {...(onNotify ? { onNotify } : {})} />
+        )}
       </div>
     </AgentSessionContext.Provider>
   );

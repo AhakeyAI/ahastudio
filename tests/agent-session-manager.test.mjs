@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { AGENT_SESSION_ID, AgentSessionManager } from '../dist-electron/orchestration/agent-session-manager.js';
+import { AGENT_SESSION_ID, AgentSessionManager, MAX_QUEUED_MESSAGES } from '../dist-electron/orchestration/agent-session-manager.js';
 import { CodexAppServerPilot, coordinatorApprovedMcpTools } from '../dist-electron/orchestration/codex-app-server-pilot.js';
 
 const cwd = process.cwd();
@@ -39,7 +39,11 @@ function setup(t, scenario = 'normal', { dir = mkdtempSync(join(cwd, '.agent-ses
     .filter((message) => message.method === method).map((message) => message.params);
   const turns = (id) => manager.getTimeline(id).turns;
   const status = (id) => manager.list().find((session) => session.id === id)?.status;
-  return { manager, sent, turns, status };
+  /** Every request the client sent, in order, as `method` or `method:status` for goal writes. */
+  const order = () => readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse)
+    .filter((message) => message.method)
+    .map((message) => (message.method === 'thread/goal/set' ? `${message.method}:${message.params.status}` : message.method));
+  return { manager, sent, turns, status, order };
 }
 
 function orchSetup(t, { dir = mkdtempSync(join(cwd, '.agent-session-test-')), failPolicy } = {}) {
@@ -182,6 +186,22 @@ test('a session opens without Aha MCP and runs turns one at a time with the chos
   assert.equal(manager.getTimeline(session.id).readOnly, false);
 });
 
+test('a rename keeps the title here and names the Codex thread, now or once it resumes', async (t) => {
+  const dir = mkdtempSync(join(cwd, '.agent-session-test-'));
+  const { manager, sent, status } = setup(t, 'normal', { dir, persist: true });
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  assert.deepEqual(await manager.rename(session.id, '  拆分\n登录   重构 '), { ok: true, synced: true });
+  assert.equal(manager.list()[0].title, '拆分 登录 重构');
+  assert.deepEqual(sent('thread/name/set'), [{ threadId: 'mock-thread-id', name: '拆分 登录 重构' }]);
+
+  assert.equal((await manager.send(session.id, { text: 'first message' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+  assert.equal(manager.list()[0].title, '拆分 登录 重构', 'the first message does not replace a chosen title');
+  assert.deepEqual(await manager.rename(session.id, '   '), { ok: false, error: '标题不能为空' });
+  assert.deepEqual(await manager.rename('agent-session-00000000-0000-0000-0000-000000000000', 'x'), { ok: false, error: '会话不存在' });
+  assert.match(readFileSync(join(dir, 'agent-sessions.json'), 'utf8'), /拆分 登录 重构/);
+});
+
 test('an approval waits in the timeline for the person and is delivered once', async (t) => {
   const { manager, turns, status } = setup(t);
   const session = await manager.create({ cwd, policy: 'workspace-write' });
@@ -268,9 +288,14 @@ test('sessions survive a restart with their history and resume the same thread o
   assert.equal(history.alive, false);
   assert.equal(history.turns[0].items.find((item) => item.kind === 'message').text, '模拟输出 1');
 
+  assert.deepEqual(await after.manager.rename(session.id, '改过的标题'), { ok: true, synced: false }, 'no process is up to rename');
+  assert.equal(after.status(session.id), 'suspended', 'renaming does not resume the session');
+
   assert.equal((await after.manager.send(session.id, { text: 'second question' })).status, 'accepted');
   await until(() => after.status(session.id) === 'idle');
   assert.deepEqual(after.sent('thread/resume').map((params) => params.threadId), ['mock-thread-id']);
+  await until(() => after.sent('thread/name/set').length);
+  assert.deepEqual(after.sent('thread/name/set'), [{ threadId: 'mock-thread-id', name: '改过的标题' }], 'named once it resumed');
   assert.equal(after.sent('thread/start').length, 0);
   assert.equal(after.sent('turn/start')[0].sandboxPolicy.networkAccess, true);
   const turns = after.turns(session.id);
@@ -311,4 +336,210 @@ test('a question waits for an answer to every part, is recorded, and can be skip
   assert.equal(manager.answer(session.id, second.requestId, null), true);
   await until(() => status(session.id) === 'idle');
   assert.equal(turns(session.id)[1].items.find((item) => item.kind === 'message').text, 'request refused');
+});
+
+test('enqueue sends immediately when the session is idle and rejects an empty message', async (t) => {
+  const { manager, sent, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  assert.deepEqual(await manager.enqueue(session.id, { text: '  send now  ' }), { ok: true, queued: false });
+  await until(() => status(session.id) === 'idle');
+  assert.deepEqual(manager.list()[0].queued, []);
+  assert.equal(sent('turn/start')[0].input.find((item) => item.type === 'text').text, 'send now');
+  assert.deepEqual(await manager.enqueue(session.id, { text: '   ' }), { ok: false, error: '消息是空的' });
+  assert.deepEqual(
+    await manager.enqueue('agent-session-00000000-0000-0000-0000-000000000000', { text: 'missing' }),
+    { ok: false, error: '会话不存在' },
+  );
+});
+
+test('messages queued during a turn go out in order after it completes', async (t) => {
+  const { manager, sent, turns, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  await manager.send(session.id, { text: 'ASK_FOR_APPROVAL' });
+  const approval = await until(() => turns(session.id)[0].items.find((item) => item.kind === 'approval'));
+
+  assert.deepEqual(await manager.enqueue(session.id, { text: 'second message' }), { ok: true, queued: true });
+  assert.deepEqual(await manager.enqueue(session.id, { text: 'third message' }), { ok: true, queued: true });
+  assert.equal(sent('turn/start').length, 1, 'neither message overtakes the running turn');
+  assert.deepEqual(manager.list()[0].queued.map((message) => message.text), ['second message', 'third message']);
+
+  assert.equal(manager.respond(session.id, approval.approvalId, true), true);
+  await until(() => sent('turn/start').length === 3 && status(session.id) === 'idle' && manager.list()[0].queued.length === 0);
+  assert.deepEqual(
+    sent('turn/start').map((params) => params.input.find((item) => item.type === 'text').text),
+    ['ASK_FOR_APPROVAL', 'second message', 'third message'],
+  );
+  assert.deepEqual(turns(session.id).map((turn) => turn.status), ['completed', 'completed', 'completed']);
+  assert.equal(manager.list()[0].queuePaused, false);
+});
+
+test('an interrupted turn pauses the queue until the person resumes it', async (t) => {
+  const { manager, sent, turns, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  await manager.send(session.id, { text: 'WAIT_FOR_INTERRUPT' });
+  await manager.enqueue(session.id, { text: 'after interruption' });
+  await manager.enqueue(session.id, { text: 'last message' });
+
+  assert.equal(await manager.interrupt(session.id), true);
+  await until(() => status(session.id) === 'idle' && manager.list()[0].queuePaused);
+  assert.equal(turns(session.id)[0].status, 'interrupted');
+  assert.deepEqual(manager.list()[0].queued.map((message) => message.text), ['after interruption', 'last message']);
+  await delay(60);
+  assert.equal(sent('turn/start').length, 1, 'an interruption never sends the next message on its own');
+
+  assert.equal(manager.resumeQueue(session.id), true);
+  await until(() => sent('turn/start').length === 3 && status(session.id) === 'idle' && manager.list()[0].queued.length === 0);
+  assert.deepEqual(turns(session.id).map((turn) => turn.prompt), ['WAIT_FOR_INTERRUPT', 'after interruption', 'last message']);
+  assert.equal(manager.list()[0].queuePaused, false);
+  assert.equal(manager.resumeQueue('agent-session-00000000-0000-0000-0000-000000000000'), false);
+});
+
+test('queued messages can be removed, are capped, and never send after the session closes', async (t) => {
+  const { manager, sent } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  await manager.send(session.id, { text: 'WAIT_FOR_INTERRUPT' });
+  for (let index = 0; index < MAX_QUEUED_MESSAGES; index++) {
+    assert.deepEqual(await manager.enqueue(session.id, { text: `queued ${index}` }), { ok: true, queued: true });
+  }
+  assert.deepEqual(
+    await manager.enqueue(session.id, { text: 'one too many' }),
+    { ok: false, error: `最多排队 ${MAX_QUEUED_MESSAGES} 条消息` },
+  );
+
+  const first = manager.list()[0].queued[0];
+  assert.equal(manager.unqueue(session.id, first.id).text, 'queued 0');
+  assert.equal(manager.unqueue(session.id, 'missing'), null);
+  assert.equal(manager.list()[0].queued.length, MAX_QUEUED_MESSAGES - 1);
+  assert.deepEqual(await manager.enqueue(session.id, { text: 'replacement' }), { ok: true, queued: true });
+
+  await manager.close(session.id);
+  assert.deepEqual(manager.list(), []);
+  assert.equal(sent('turn/start').length, 1, 'closing forgets every message that was still queued');
+  assert.equal(manager.resumeQueue(session.id), false);
+});
+
+test('queued messages are process-local and are empty after a restart', async (t) => {
+  const dir = mkdtempSync(join(cwd, '.agent-session-test-'));
+  const before = setup(t, 'normal', { dir, persist: true });
+  const session = await before.manager.create({ cwd, policy: 'workspace-write' });
+  await before.manager.send(session.id, { text: 'WAIT_FOR_INTERRUPT' });
+  await before.manager.enqueue(session.id, { text: 'do not restore me' });
+  await before.manager.dispose();
+
+  const saved = JSON.parse(readFileSync(join(dir, 'agent-sessions.json'), 'utf8'));
+  assert.equal(saved.sessions.length, 1);
+  assert.equal('queued' in saved.sessions[0], false);
+  assert.equal('queuePaused' in saved.sessions[0], false);
+  assert.doesNotMatch(JSON.stringify(saved), /do not restore me/);
+
+  const after = setup(t, 'normal', { dir, persist: true });
+  const [restored] = after.manager.list();
+  assert.equal(restored.status, 'suspended');
+  assert.deepEqual(restored.queued, []);
+  assert.equal(restored.queuePaused, false);
+});
+
+test('/clear freshContext starts a brand new thread while preserving prior timeline turns', async (t) => {
+  const { manager, sent, turns, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write', title: '保留标题' });
+  assert.equal((await manager.send(session.id, { text: 'first turn' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+  assert.equal(sent('thread/start').length, 1);
+  assert.equal(sent('thread/resume').length, 0);
+
+  assert.equal((await manager.send(session.id, { text: 'after clear', freshContext: true })).status, 'accepted');
+  await until(() => status(session.id) === 'idle' && turns(session.id).length === 2);
+  assert.equal(sent('thread/start').length, 2, 'freshContext opens a new thread instead of resuming');
+  assert.equal(sent('thread/resume').length, 0);
+  assert.equal(turns(session.id)[0].prompt, 'first turn');
+  assert.equal(turns(session.id)[1].prompt, 'after clear');
+  assert.equal(turns(session.id)[1].freshContext, true);
+  assert.equal(manager.list()[0].title, '保留标题');
+  assert.equal(sent('thread/name/set').at(-1).name, '保留标题');
+});
+
+test('/compact runs Codex thread/compact/start and rejects before any conversation turn', async (t) => {
+  const { manager, sent, turns, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+
+  const early = await manager.send(session.id, { text: '/compact' });
+  assert.equal(early.status, 'not_accepted');
+  assert.match(early.reason, /还没有可压缩的对话记录/);
+
+  assert.equal((await manager.send(session.id, { text: 'seed turn' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+
+  assert.equal((await manager.send(session.id, { text: '/compact' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle' && turns(session.id).length === 2);
+  assert.equal(sent('thread/compact/start').length, 1);
+  assert.equal(sent('turn/start').length, 1, '/compact does not go through turn/start');
+  const compactTurn = turns(session.id)[1];
+  assert.equal(compactTurn.commandKind, 'compact');
+  assert.equal(compactTurn.status, 'completed');
+  assert.ok(compactTurn.items.some((item) => item.kind === 'notice' && item.text === '上下文已压缩'));
+});
+
+test('/goal sets, pauses, resumes, shows, and clears a Codex thread goal', async (t) => {
+  const { manager, sent, turns, status, order } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+  // From the first goal write on: what /goal sent, leaving out turn traffic Codex does not see as goal-related.
+  const goalOrder = () => {
+    const all = order().filter((method) => method.startsWith('thread/goal/') || method === 'turn/start');
+    return all.slice(all.findIndex((method) => method.startsWith('thread/goal/set')));
+  };
+
+  const empty = await manager.runGoal(session.id, { type: 'show' });
+  assert.equal(empty.ok, true);
+  assert.equal(empty.goal, null);
+
+  const tooLong = await manager.runGoal(session.id, { type: 'set', objective: 'x'.repeat(2_001) });
+  assert.equal(tooLong.ok, false);
+
+  const setRes = await manager.runGoal(session.id, { type: 'set', objective: '补齐所有斜杠命令测试' });
+  assert.equal(setRes.ok, true);
+  await until(() => status(session.id) === 'idle' && turns(session.id).length === 1);
+  assert.equal(manager.list()[0].goal?.objective, '补齐所有斜杠命令测试');
+  assert.equal(manager.list()[0].goal?.status, 'active');
+  assert.equal(turns(session.id)[0].commandKind, 'goal');
+  assert.equal(turns(session.id)[0].prompt, '/goal 补齐所有斜杠命令测试');
+  // The goal stays paused until our own turn has started, so Codex cannot start an extra one first.
+  assert.deepEqual(goalOrder(), ['thread/goal/set:paused', 'turn/start', 'thread/goal/set:active']);
+
+  const paused = await manager.runGoal(session.id, { type: 'pause' });
+  assert.equal(paused.ok, true);
+  assert.equal(manager.list()[0].goal?.status, 'paused');
+
+  const resumed = await manager.runGoal(session.id, { type: 'resume' });
+  assert.equal(resumed.ok, true);
+  await until(() => status(session.id) === 'idle' && turns(session.id).length === 2);
+  assert.equal(manager.list()[0].goal?.status, 'active');
+  assert.equal(turns(session.id)[1].prompt, '/goal resume');
+  assert.deepEqual(goalOrder().slice(-3), ['thread/goal/get', 'turn/start', 'thread/goal/set:active'],
+    'a resumed goal is activated only after its turn started');
+
+  const cleared = await manager.runGoal(session.id, { type: 'clear' });
+  assert.equal(cleared.ok, true);
+  assert.equal(manager.list()[0].goal, null);
+  assert.equal(sent('thread/goal/clear').length, 1);
+});
+
+test('/feedback requires a turn and uploads thread logs with an optional reason', async (t) => {
+  const { manager, sent, status } = setup(t);
+  const session = await manager.create({ cwd, policy: 'workspace-write' });
+
+  const early = await manager.uploadFeedback(session.id, 'too early');
+  assert.equal(early.ok, false);
+  assert.match(early.error, /请先发送至少一条消息/);
+
+  assert.equal((await manager.send(session.id, { text: 'hello' })).status, 'accepted');
+  await until(() => status(session.id) === 'idle');
+
+  const res = await manager.uploadFeedback(session.id, 'slash menu check');
+  assert.equal(res.ok, true);
+  assert.equal(res.feedbackId, 'fb_mock-thread-id');
+  const [req] = sent('feedback/upload');
+  assert.equal(req.classification, 'bug');
+  assert.equal(req.includeLogs, true);
+  assert.equal(req.reason, 'slash menu check');
+  assert.equal(req.threadId, 'mock-thread-id');
 });

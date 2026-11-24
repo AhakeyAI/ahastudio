@@ -4,7 +4,8 @@ import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { augmentedPath, resolveBinaryFromPath } from '../bin-resolve.js';
 import type {
-  AgentOutputSlice, AgentSessionDriver, AgentSessionEvents, AgentSessionPolicy, TurnDelivery,
+  AgentGoalStatus, AgentOutputSlice, AgentSessionDriver, AgentSessionEvents, AgentSessionGoal, AgentSessionPolicy,
+  AgentTurnAttachment, TurnDelivery,
 } from './agent-session-driver.js';
 import { spawnWindowsCodexJob } from './windows-codex-job.js';
 import type {
@@ -18,6 +19,15 @@ const POLICIES: Record<AgentSessionPolicy, { sandbox: string; sandboxType: strin
   // Still sandboxed to the workspace; it only stops asking.
   'full-auto': { sandbox: 'workspace-write', sandboxType: 'workspaceWrite', approvalPolicy: 'never' },
 };
+/**
+ * Requests a client may make outside a conversation: catalogs, file search, usage limits, the skill
+ * switch, and the conversation history (listing, reading, archiving stored threads). Anything that
+ * runs a thread (start, resume, turns) or writes config goes through the methods of this class.
+ */
+export const CODEX_QUERY_METHODS = new Set([
+  'model/list', 'skills/list', 'skills/config/write', 'plugin/installed', 'fuzzyFileSearch', 'account/rateLimits/read',
+  'thread/list', 'thread/read', 'thread/archive', 'thread/unarchive', 'feedback/upload',
+]);
 const OUTPUT_LIMIT = 512 * 1024;
 const STDERR_LIMIT = 4 * 1024;
 const CHILD_CLOSE_TIMEOUT_MS = 3_000;
@@ -50,6 +60,23 @@ function string(value: unknown): string | undefined {
 function numericFields(value: unknown): Record<string, number> {
   return Object.fromEntries(Object.entries(object(value))
     .filter((entry): entry is [string, number] => typeof entry[1] === 'number'));
+}
+
+const GOAL_STATUSES = new Set<AgentGoalStatus>(['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete']);
+
+function parseCodexGoal(raw: unknown): AgentSessionGoal | null {
+  const entry = object(raw);
+  const objective = string(entry.objective)?.trim();
+  const status = string(entry.status) as AgentGoalStatus | undefined;
+  if (!objective || !status || !GOAL_STATUSES.has(status)) return null;
+  const rawUpdated = typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt) ? entry.updatedAt : Date.now();
+  return {
+    objective,
+    status,
+    tokensUsed: typeof entry.tokensUsed === 'number' && Number.isFinite(entry.tokensUsed) ? entry.tokensUsed : 0,
+    timeUsedSeconds: typeof entry.timeUsedSeconds === 'number' && Number.isFinite(entry.timeUsedSeconds) ? entry.timeUsedSeconds : 0,
+    updatedAt: rawUpdated < 1e12 ? rawUpdated * 1000 : rawUpdated,
+  };
 }
 
 function codexStatus(value: unknown): WorkerTimelineItemStatus {
@@ -145,7 +172,9 @@ export function codexItemUpdate(raw: unknown, completedAt?: number): WorkerTimel
         status: completedAt !== undefined ? 'completed' : 'running', ...done,
       };
     case 'contextCompaction':
-      return completedAt !== undefined ? { id, kind: 'notice', level: 'info', text: 'Context compacted', ...done } : null;
+      return completedAt !== undefined
+        ? { id, kind: 'notice', level: 'info', text: '上下文已压缩', ...done }
+        : { id, kind: 'notice', level: 'info', text: '正在压缩上下文…' };
     case 'userMessage':
       return null;
     default: {
@@ -241,6 +270,26 @@ export function coordinatorApprovedMcpTools(policy: AgentSessionPolicy): readonl
     : COORDINATOR_APPROVED_MCP_TOOLS;
 }
 
+/**
+ * `turn/start` input for a message. Images go as image items; every saved file, images included,
+ * is also named with its path in the text so the agent can open it with its own tools.
+ */
+export function codexTurnInput(prompt: string, attachments: readonly AgentTurnAttachment[]): Obj[] {
+  const saved = attachments.filter((item) => item.type !== 'skill');
+  const notes = saved.map((item) => {
+    const kind = item.type === 'localImage' ? 'image' : 'file';
+    const name = (item.name || item.path.split(/[\\/]/).pop() || kind).replace(/"/g, "'");
+    return `[Attached ${kind} "${name}" is saved at: ${item.path}]`;
+  });
+  const text = [prompt, ...notes].filter(Boolean).join('\n\n');
+  return [
+    ...(text ? [{ type: 'text', text, text_elements: [] }] : []),
+    ...attachments.flatMap((item) => item.type === 'skill'
+      ? [{ type: 'skill', name: item.name, path: item.path }]
+      : item.type === 'localImage' ? [{ type: 'localImage', path: item.path }] : []),
+  ];
+}
+
 export function codexMcpConfigArgs(
   node: string, mcp: { serverPath: string; env: Record<string, string>; approvedTools?: readonly string[] },
 ): string[] {
@@ -309,7 +358,10 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   private disconnected = false;
   private stopping = false;
   private stopPromise: Promise<void> | null = null;
+  private initialized: Promise<void> | null = null;
   private readonly childClosed: Promise<void>;
+  effectiveModel: string | null = null;
+  effectiveEffort: string | null = null;
 
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
@@ -368,10 +420,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   }): Promise<string> {
     const wanted = POLICIES[policy];
     try {
-      await this.request('initialize', {
-        clientInfo: { name: 'ahastation', title: 'AhaStation', version: '0.1.0' },
-      });
-      this.write({ method: 'initialized' });
+      await this.initialize();
       const settings = {
         cwd, ...(model ? { model } : {}), sandbox: wanted.sandbox,
         approvalPolicy: wanted.approvalPolicy, approvalsReviewer: 'user',
@@ -388,6 +437,8 @@ export class CodexAppServerPilot implements AgentSessionDriver {
       }
       this.policy = policy;
       this.network = network;
+      this.effectiveModel = string(result.model) ?? model;
+      this.effectiveEffort = string(result.reasoningEffort) ?? null;
       // The resumed thread's running token total is unknown until Codex reports it.
       if (resumeSessionId) this.tokenTotal = null;
       this.threadId = id;
@@ -410,6 +461,31 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     }
   }
 
+  /** One handshake per process, shared by `open` and `query`; a failed one may be retried. */
+  private initialize(): Promise<void> {
+    this.initialized ??= this.request('initialize', {
+      clientInfo: { name: 'ahastation', title: 'AhaStation', version: '0.1.0' },
+    }).then(
+      () => this.write({ method: 'initialized' }),
+      (error: unknown) => {
+        this.initialized = null;
+        throw error;
+      },
+    );
+    return this.initialized;
+  }
+
+  /** A catalog or search request from `CODEX_QUERY_METHODS`; it needs no open conversation. */
+  async query(method: string, params: Obj): Promise<unknown> {
+    if (!CODEX_QUERY_METHODS.has(method)) throw new Error(`Codex request ${method} is not allowed here`);
+    try {
+      await this.initialize();
+      return await this.request(method, params);
+    } catch (error) {
+      throw new Error(this.withStderr(error instanceof Error ? error.message : String(error)));
+    }
+  }
+
   async waitForIdle(timeoutMs: number): Promise<boolean> {
     const active = this.active;
     if (!active) return true;
@@ -422,9 +498,9 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     });
   }
 
-  async startTurn({ turnKey, prompt, effort, model, policy, network }: {
+  async startTurn({ turnKey, prompt, effort, model, policy, network, attachments = [] }: {
     turnKey: string; prompt: string; effort?: string | null; model?: string | null; policy?: AgentSessionPolicy;
-    network?: boolean;
+    network?: boolean; attachments?: readonly AgentTurnAttachment[];
   }): Promise<TurnDelivery> {
     if (!this.alive || !this.threadId || this.active) {
       return { status: 'not_accepted', reason: 'Codex thread is closed or busy' };
@@ -445,7 +521,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     try {
       const result = object(await this.request('turn/start', {
         threadId: this.threadId,
-        input: [{ type: 'text', text: prompt, text_elements: [] }],
+        input: codexTurnInput(prompt, attachments),
         ...(effort ? { effort } : {}),
         ...(model ? { model } : {}),
         sandboxPolicy: wanted.sandboxType === 'readOnly'
@@ -491,6 +567,81 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     } catch {
       return false;
     }
+  }
+
+  async setName(name: string): Promise<boolean> {
+    if (!this.alive || !this.threadId) return false;
+    try {
+      await this.request('thread/name/set', { threadId: this.threadId, name }, 5_000);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Starts Codex's native context compaction (`thread/compact/start`). Unlike `turn/start`, the
+   * RPC result is empty and `turn/started` arrives asynchronously as a notification.
+   */
+  async compactThread(turnKey: string): Promise<TurnDelivery> {
+    if (!this.alive || !this.threadId || this.active) {
+      return { status: 'not_accepted', reason: 'Codex thread is closed or busy' };
+    }
+    let finish!: () => void;
+    const idle = new Promise<void>((resolve) => { finish = resolve; });
+    const turn: ActiveTurn = {
+      turnKey, id: null, messages: new Map(), diff: null, usage: null, usageBaseline: this.tokenTotal, idle, finish,
+    };
+    this.active = turn;
+    if (this.outputTurnKey !== turnKey) {
+      this.outputTurnKey = turnKey;
+      this.output = '';
+      this.offset = 0;
+    }
+    try {
+      await this.request('thread/compact/start', { threadId: this.threadId });
+      return { status: 'accepted' };
+    } catch (error) {
+      const rejected = error instanceof RpcRejection && !turn.id && this.alive;
+      this.finishTurn(turn);
+      return {
+        status: rejected ? 'not_accepted' : 'unknown_acceptance',
+        reason: error instanceof Error ? this.redact(error.message) : 'Codex compaction failed',
+      };
+    }
+  }
+
+  async uploadFeedback(reason?: string): Promise<{ feedbackId: string }> {
+    if (!this.alive || !this.threadId) throw new Error('Codex 会话尚未连接');
+    const result = object(await this.request('feedback/upload', {
+      classification: 'bug',
+      includeLogs: true,
+      threadId: this.threadId,
+      ...(reason ? { reason } : {}),
+    }, 30_000));
+    return { feedbackId: string(result.threadId) || this.threadId };
+  }
+
+  async getGoal(): Promise<AgentSessionGoal | null> {
+    if (!this.alive || !this.threadId) throw new Error('Codex 会话尚未连接');
+    const result = object(await this.request('thread/goal/get', { threadId: this.threadId }, 10_000));
+    return parseCodexGoal(result.goal);
+  }
+
+  async setGoal(input: { objective?: string; status?: 'active' | 'paused' }): Promise<AgentSessionGoal | null> {
+    if (!this.alive || !this.threadId) throw new Error('Codex 会话尚未连接');
+    const result = object(await this.request('thread/goal/set', {
+      threadId: this.threadId,
+      ...(input.objective !== undefined ? { objective: input.objective } : {}),
+      ...(input.status !== undefined ? { status: input.status } : {}),
+    }, 10_000));
+    return parseCodexGoal(result.goal);
+  }
+
+  async clearGoal(): Promise<boolean> {
+    if (!this.alive || !this.threadId) throw new Error('Codex 会话尚未连接');
+    const result = object(await this.request('thread/goal/clear', { threadId: this.threadId }, 10_000));
+    return result.cleared === true;
   }
 
   close(interrupt = false): Promise<void> {
@@ -587,6 +738,16 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     if (typeof id === 'string' || typeof id === 'number') {
       void this.replyToServer(id, method, params).catch(() => this.transportLost('Codex approval response could not be sent'));
       return;
+    }
+    if (this.threadId && params.threadId === this.threadId) {
+      if (method === 'thread/goal/updated') {
+        this.events.onGoalChanged?.(parseCodexGoal(params.goal));
+        return;
+      }
+      if (method === 'thread/goal/cleared') {
+        this.events.onGoalChanged?.(null);
+        return;
+      }
     }
     const turn = this.active;
     if (!turn || params.threadId !== this.threadId) return;

@@ -1,6 +1,6 @@
 import { agentSessionClient } from '../lib/agent-session-client';
 import { useState, useRef, useEffect, useSyncExternalStore, type ReactNode } from 'react';
-import { Activity, Globe, Terminal, FileText, X, Plus, SquareArrowOutUpRight, MessagesSquare } from 'lucide-react';
+import { Activity, Globe, Terminal, FileText, X, Plus, SquareArrowOutUpRight, MessagesSquare, History } from 'lucide-react';
 import type { StageWindow, StageWindowType, StageWindowOptions } from '../lib/stage-window-store';
 import { requestHideBrowser } from '../lib/browser-store';
 import type { LocalCliInfo } from '../types';
@@ -17,6 +17,8 @@ interface StageTabBarProps {
   localOnly?: boolean;
   /** Extra status shown after a tab title (e.g. agent lifecycle). */
   renderTabBadge?: (win: StageWindow) => ReactNode;
+  /** Shows the folder's past Codex conversations; without it the menu does not offer them. */
+  onOpenHistory?: () => void;
 }
 
 const ACTIVITY_TAB_ID = 'activity-default';
@@ -39,6 +41,7 @@ export function StageTabBar({
   onPopOut,
   localOnly = false,
   renderTabBadge,
+  onOpenHistory,
 }: StageTabBarProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -209,7 +212,7 @@ export function StageTabBar({
                 <span>新建浏览器</span>
               </button>
             )}
-            {agentSessionClient.available() && clis.some((cli) => cli.id === 'codex') && 'codex 会话 session'.includes(query.trim().toLowerCase()) && (
+            {agentSessionClient.available() && clis.some((cli) => cli.id === 'codex') && 'codex 会话 session 历史 history'.includes(query.trim().toLowerCase()) && (
               <>
                 <div className="stage-tab-menu-section">桌面会话</div>
                 <button type="button" role="menuitem" className="stage-tab-menu-item"
@@ -217,6 +220,13 @@ export function StageTabBar({
                   onClick={() => handleCreate('agent-session', { localCliId: 'codex', title: 'Codex 会话' })}>
                   <TerminalProfileIcon id="codex" /><span>Codex 会话</span>
                 </button>
+                {onOpenHistory && (
+                  <button type="button" role="menuitem" className="stage-tab-menu-item"
+                    title="打开这个文件夹里以前的 Codex 会话"
+                    onClick={() => { setMenuOpen(false); onOpenHistory(); }}>
+                    <History size={14} /><span>从历史打开…</span>
+                  </button>
+                )}
               </>
             )}
             <div className="stage-tab-menu-section">本地 Shell</div>

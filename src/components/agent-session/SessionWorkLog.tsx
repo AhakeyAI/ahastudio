@@ -247,7 +247,8 @@ export function FileChangeRows({ files }: { files: readonly WorkerTimelineFileCh
   );
 }
 
-function FileChangeRow({ item }: { item: Item<'file_change'> }) {
+/** `inlineDiff` is off once the turn's change card lists the same diffs, so the row stays a one-line note. */
+function FileChangeRow({ item, inlineDiff }: { item: Item<'file_change'>; inlineDiff: boolean }) {
   const live = item.status === 'running';
   const totals = fileChangeTotals(item.files);
   const single = item.files.length === 1 ? item.files[0]! : null;
@@ -268,7 +269,7 @@ function FileChangeRow({ item }: { item: Item<'file_change'> }) {
         </>
       }
     >
-      {single ? <FileDiff file={single} /> : item.files.length > 0 ? <FileChangeRows files={item.files} /> : null}
+      {!inlineDiff ? null : single ? <FileDiff file={single} /> : item.files.length > 0 ? <FileChangeRows files={item.files} /> : null}
     </WorkLogRow>
   );
 }
@@ -342,12 +343,12 @@ function NoticeRow({ item }: { item: Item<'notice'> }) {
 }
 
 /** Rows for every item kind that reads as "work" rather than as a message. */
-export const WorkItemRow = memo(function WorkItemRow({ item }: { item: WorkerTimelineItem }) {
+export const WorkItemRow = memo(function WorkItemRow({ item, inlineDiff = true }: { item: WorkerTimelineItem; inlineDiff?: boolean }) {
   switch (item.kind) {
     case 'reasoning': return <ReasoningRow item={item} />;
     case 'command': return <CommandRow item={item} />;
     case 'tool_call': return <ToolRow item={item} />;
-    case 'file_change': return <FileChangeRow item={item} />;
+    case 'file_change': return <FileChangeRow item={item} inlineDiff={inlineDiff} />;
     case 'approval': return <ApprovalRow item={item} />;
     case 'plan': return <PlanBlock item={item} />;
     case 'notice': return <NoticeRow item={item} />;
