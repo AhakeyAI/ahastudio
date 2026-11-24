@@ -1,4 +1,4 @@
-import type { AgentSessionInfo, AgentSessionPolicy } from '../types';
+import type { AgentSessionInfo, AgentSessionPolicy, CodexModelOption, CodexRateLimits, CodexSkillOption } from '../types';
 
 const STANDALONE_ID = /^agent-session-[a-f0-9-]{36}$/;
 
@@ -51,5 +51,71 @@ export const agentSessionClient = {
     // The change event can arrive after this call resolves; the view needs the session right away.
     if (!sessions.some((session) => session.id === res.session.id)) publish([...sessions, res.session]);
     return res;
+  },
+  /**
+   * Opens a past Codex conversation as a session (the one already open, if any). No process
+   * starts until the first message.
+   */
+  async openHistory(threadId: string): Promise<{ ok: true; session: AgentSessionInfo } | { ok: false; error: string }> {
+    const api = window.vibeMeet?.agentSessions;
+    if (!api?.openHistory) return { ok: false, error: '当前环境不支持会话历史' };
+    start();
+    const res = await api.openHistory({ threadId, policy: 'workspace-write' })
+      .catch((error: unknown) => ({ ok: false as const, error: error instanceof Error ? error.message : String(error) }));
+    if (!res.ok) return res;
+    if (!sessions.some((session) => session.id === res.session.id)) publish([...sessions, res.session]);
+    return res;
+  },
+};
+
+const LIMITS_CACHE_MS = 60_000;
+let limitsRequest: { at: number; request: Promise<CodexRateLimits | null> } | null = null;
+
+/**
+ * The account's Codex usage limits, shared by every session view and read at most once a minute
+ * unless `force`d. Any failure (signed out, API key login, offline) resolves to null.
+ */
+export const usageLimitsClient = {
+  read(force = false): Promise<CodexRateLimits | null> {
+    const api = typeof window !== 'undefined' ? window.vibeMeet?.agentSessions : undefined;
+    if (!api?.rateLimits) return Promise.resolve(null);
+    if (!force && limitsRequest && Date.now() - limitsRequest.at < LIMITS_CACHE_MS) return limitsRequest.request;
+    const request = api.rateLimits().then((res) => (res.ok ? res.limits : null), () => null);
+    limitsRequest = { at: Date.now(), request };
+    return request;
+  },
+};
+
+let modelsRequest: Promise<CodexModelOption[]> | null = null;
+const skillRequests = new Map<string, { at: number; request: Promise<CodexSkillOption[]> }>();
+const SKILL_CACHE_MS = 60_000;
+
+/** Models and skills for the composer, shared by every open session view. */
+export const codexCatalogClient = {
+  models(): Promise<CodexModelOption[]> {
+    const api = window.vibeMeet?.agentSessions;
+    if (!api?.models) return Promise.resolve([]);
+    modelsRequest ??= api.models().then((res) => {
+      if (res.ok) return res.models;
+      modelsRequest = null;
+      throw new Error(res.error);
+    }, (error: unknown) => {
+      modelsRequest = null;
+      throw error;
+    });
+    return modelsRequest;
+  },
+  skills(sessionId: string): Promise<CodexSkillOption[]> {
+    const api = window.vibeMeet?.agentSessions;
+    if (!api?.skills) return Promise.resolve([]);
+    const cached = skillRequests.get(sessionId);
+    if (cached && Date.now() - cached.at < SKILL_CACHE_MS) return cached.request;
+    const request = api.skills({ id: sessionId }).then((res) => {
+      if (res.ok) return res.skills;
+      skillRequests.delete(sessionId);
+      throw new Error(res.error);
+    });
+    skillRequests.set(sessionId, { at: Date.now(), request });
+    return request;
   },
 };

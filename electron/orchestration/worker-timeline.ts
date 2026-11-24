@@ -121,6 +121,11 @@ export type WorkerTimelineItem =
 
 export type WorkerTimelineItemKind = WorkerTimelineItem['kind'];
 
+export interface WorkerTimelineAttachment {
+  kind: 'skill' | 'image' | 'file';
+  name: string;
+}
+
 export interface WorkerTimelineTurn {
   /** Unique per timeline; a dispatch can own several turns (mailbox wake-ups). */
   key: string;
@@ -130,6 +135,12 @@ export interface WorkerTimelineTurn {
   prompt: string;
   /** `system`: AhaStation started the turn (a wake-up), not the person or a dispatch brief. */
   origin?: 'system';
+  /** True when `/clear` started a fresh provider thread before this turn while keeping prior history visible. */
+  freshContext?: boolean;
+  /** Marks control turns initiated by slash commands (`/compact`, `/goal`). */
+  commandKind?: 'compact' | 'goal';
+  /** Skills and images sent with the prompt, by name. */
+  attachments?: WorkerTimelineAttachment[];
   startedAt: number;
   completedAt: number | null;
   status: WorkerTimelineTurnStatus;
@@ -437,7 +448,11 @@ export class WorkerTimeline {
     this.changed(null, null);
   }
 
-  beginTurn(input: { dispatchId: string; prompt: string; startedAt?: number; origin?: 'system' }): WorkerTimelineTurn {
+  beginTurn(input: {
+    dispatchId: string; prompt: string; startedAt?: number; origin?: 'system';
+    freshContext?: boolean; commandKind?: 'compact' | 'goal';
+    attachments?: readonly WorkerTimelineAttachment[];
+  }): WorkerTimelineTurn {
     const running = this.activeTurn;
     if (running) this.finishTurn(running, { status: 'interrupted', stopReason: 'superseded' });
     this.generation += 1;
@@ -448,6 +463,11 @@ export class WorkerTimeline {
       generation: this.generation,
       prompt: capHead(this.redact(input.prompt), TIMELINE_LIMITS.prompt),
       ...(input.origin ? { origin: input.origin } : {}),
+      ...(input.freshContext ? { freshContext: true } : {}),
+      ...(input.commandKind ? { commandKind: input.commandKind } : {}),
+      ...(input.attachments?.length
+        ? { attachments: input.attachments.map((item) => ({ kind: item.kind, name: capHead(this.redact(item.name), 200) })) }
+        : {}),
       startedAt: input.startedAt ?? this.now(),
       completedAt: null,
       status: 'running',

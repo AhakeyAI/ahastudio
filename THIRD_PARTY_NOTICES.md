@@ -49,6 +49,16 @@ Certain ported, adapted, or bundled components retain their original upstream co
 - **Ported / adapted files in this repository:**
   - `src/lib/timeline-scroll-anchoring.ts` (`resolveDisclosureRevealScrollDelta`, ported from `apps/web/src/components/chat/timelineScrollAnchoring.ts`)
   - `src/components/agent-session-view.css`, `src/components/agent-session/*` (chat surface layout, work-log row and composer presentation adapted from `apps/web/src/components/chat/WorkLog.tsx`, `ComposerSurface.tsx` and `apps/web/src/index.css`)
+  - `src/lib/image-compression.ts` (attached-image downscaling and re-encoding, adapted from `apps/web/src/lib/imageCompression.ts`)
+  - `src/lib/composer-tokens.ts` (`isCurrencyAmount`, `isPathWord`, and `isSameTrigger`, adapted from `packages/shared/src/composerTrigger.ts` and `apps/web/src/components/chat/useComposerTriggerState.ts`)
+  - `src/lib/search-ranking.ts` (ranked prefix/boundary/subsequence search, ported from `packages/shared/src/searchRanking.ts`)
+  - `src/lib/composer-slash-commands.ts` (slash command search, skill source resolution, highlight tracking, and `/clear`/`/compact`/`/usage-limits`/`/goal`/`/feedback` command parsers, adapted from `apps/web/src/components/chat/composerSlashCommandSearch.ts`, `composerMenuHighlight.ts`, `apps/web/src/providerSkillSearch.ts`, `packages/client-runtime/src/providerSkills.ts`, `packages/client-runtime/src/state/composerDispatch.ts`, `packages/client-runtime/src/state/threadFeedback.ts`, `packages/contracts/src/orchestrationV2.ts`, `packages/shared/src/composerTrigger.ts`, and `packages/shared/src/usageLimits.ts`)
+  - `src/components/agent-session/ComposerCommandMenu.tsx` (composer slash/skill/file menu and skill source badges, adapted from `apps/web/src/components/chat/ComposerCommandMenu.tsx`)
+  - `src/components/agent-session/ComposerBanners.tsx` (fresh-session, usage-limits, goal, and feedback inline banners, adapted from `apps/web/src/components/chat/ComposerFreshSession.tsx`, `ComposerUsageLimits.tsx`, and `packages/client-runtime/src/state/threadFeedback.ts`)
+  - `src/components/AgentSessionView.tsx` (`FreshSessionDivider`, adapted from `FreshSessionRow` in `apps/web/src/components/chat/V2LifecycleRow.tsx`)
+  - `electron/ipc/agent-sessions.ts` (attachment paths stated in the message text, adapted from `packages/provider-core/src/server/attachmentPrompt.ts`)
+  - `src/lib/turn-changes.ts` (changed-file tree and compact diff counts, adapted from `apps/web/src/lib/turnDiffTree.ts` and `apps/web/src/components/chat/DiffStatLabel.tsx`)
+  - `src/components/agent-session/TurnChangesCard.tsx` (per-turn changed-files card, adapted from `apps/web/src/components/chat/ChangedFilesTree.tsx`)
 
 ---
 

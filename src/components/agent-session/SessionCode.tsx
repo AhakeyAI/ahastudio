@@ -15,19 +15,25 @@ const HIGHLIGHT_DEBOUNCE_MS = 120;
 
 const useAppearance = (): CodeHighlightAppearance => useAgentSession().appearance;
 
-export function CopyButton({ text, label = '复制' }: { text: string; label?: string }) {
+export function CopyButton({ text, label = '复制', className = 'asv-copy' }: { text: string; label?: string; className?: string }) {
+  const { onNotify } = useAgentSession();
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout>>();
   useEffect(() => () => clearTimeout(timer.current), []);
   const copy = () => {
-    void navigator.clipboard?.writeText(text).then(() => {
+    const write = navigator.clipboard?.writeText(text);
+    if (!write) {
+      onNotify?.('当前环境无法复制');
+      return;
+    }
+    void write.then(() => {
       setCopied(true);
       clearTimeout(timer.current);
       timer.current = setTimeout(() => setCopied(false), 1400);
-    });
+    }, () => onNotify?.('复制失败'));
   };
   return (
-    <button type="button" className="asv-copy" onClick={copy} aria-label={copied ? '已复制' : label} title={copied ? '已复制' : label}>
+    <button type="button" className={className} data-copied={copied || undefined} onClick={copy} aria-label={copied ? '已复制' : label} title={copied ? '已复制' : label}>
       {copied ? <Check size={13} /> : <Copy size={13} />}
     </button>
   );
