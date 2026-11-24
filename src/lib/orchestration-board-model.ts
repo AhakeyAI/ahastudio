@@ -41,6 +41,7 @@ export interface BoardPostView {
   fromCliId: string | null;
   fromPtyId: string | null;
   mentions: string[];
+  receipts?: OrchestrationMessageRecord['receipts'];
   refs: number[];
   subject: string;
   body: string;
@@ -639,6 +640,7 @@ export function buildBoardViewModel(
       fromCliId: fromMeta?.cliId ?? null,
       fromPtyId: fromMeta?.ptyId ?? null,
       mentions: [...mentionSet],
+      receipts: msg.receipts,
       refs: [...refSet],
       subject: msg.subject?.trim() ?? '',
       body,
@@ -736,7 +738,7 @@ export function buildBoardViewModel(
       const needsAttention =
         stage === 'waiting_permission' ||
         stage === 'waiting_input' ||
-        stage === 'awaiting_review' ||
+        stage === 'needs_reconciliation' || stage === 'awaiting_review' ||
         stage === 'failed';
       const cliId = dispatch.cliId ?? agentStatus?.agentId ?? null;
       const latestPost = latestPostByRole.get(role.toLowerCase()) ?? null;

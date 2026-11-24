@@ -48,6 +48,8 @@ interface ProposalDraft {
   reason: string;
 }
 
+import { RunAttention } from './RunAttention';
+
 export function OrchestrationCrewPanel({
   leafId,
   cwd,
@@ -321,7 +323,11 @@ export function OrchestrationCrewPanel({
       } else {
         setQuickInput('');
         const target = res.role ? `@${res.role}` : res.agent ?? parsed.agent;
-        onNotify?.(res.message ?? `已派发给 ${target}`);
+        const d = res.dispatch;
+        const receipt = d?.startObservation === 'observed' ? '已启动'
+          : d?.startObservation === 'permission' ? (d.promptSentAt ? '已发送，等待授权' : '等待授权，尚未发送')
+          : d?.startObservation === 'queued' ? '已发送，等待执行' : '已发送，启动待确认';
+        onNotify?.(res.message ?? `${target} · ${receipt}${d?.worktreePath ? ' · ' + d.worktreePath : ''}`);
       }
     } finally {
       setQuickBusy(false);
@@ -542,6 +548,7 @@ export function OrchestrationCrewPanel({
           />
           <span>{crew.isOrchestrationMode && !showRightSummary ? '编排中' : '编排'}</span>
         </button>
+        {crew.isOrchestrationMode && <RunAttention snapshot={snapshot} runId={snapshot.currentRunByConsumer[ptyId]} />}
         <span className="aha-crew-pill-divider" aria-hidden="true" />
         <button
           type="button"

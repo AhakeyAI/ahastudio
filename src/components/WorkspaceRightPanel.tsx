@@ -72,6 +72,7 @@ function useGitStatus(cwd: string | undefined) {
 }
 
 export function WorkspaceRightPanel({
+  boardRequest,
   cwd,
   tab,
   onTabChange,
@@ -87,6 +88,7 @@ export function WorkspaceRightPanel({
   onFocusAgentSession,
   activePtyId,
 }: {
+  boardRequest?: { runId: string };
   cwd: string | undefined;
   tab: RightPanelTab;
   onTabChange: (tab: RightPanelTab) => void;
@@ -266,6 +268,7 @@ export function WorkspaceRightPanel({
   if (tab === 'board') {
     body = (
       <OrchestrationBoardPanel
+        boardRequest={boardRequest}
         activePtyId={activePtyId}
         agentTargets={agentTargets}
         sessionTargets={sessionTargets}

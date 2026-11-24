@@ -124,6 +124,7 @@ function renderAvatarContent(role: string, cliId: string | null) {
 }
 
 export function OrchestrationBoardPanel({
+  boardRequest,
   activePtyId,
   agentTargets = [],
   sessionTargets = [],
@@ -131,6 +132,7 @@ export function OrchestrationBoardPanel({
   onFocusAgentSession,
   onNotify,
 }: {
+  boardRequest?: { runId: string };
   activePtyId?: string;
   agentTargets?: AgentPromptTarget[];
   /** Orchestrating Agent sessions open in this workspace folder (no PTY, not prompt targets). */
@@ -149,7 +151,8 @@ export function OrchestrationBoardPanel({
   );
   const agents = useAgentStatuses();
 
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(boardRequest?.runId ?? null);
+  useEffect(() => { if (boardRequest) setSelectedRunId(boardRequest.runId); }, [boardRequest]);
   const [subTab, setSubTab] = useState<BoardSubTab>('board');
 
   // Board filter & interaction state
@@ -430,7 +433,8 @@ export function OrchestrationBoardPanel({
     }
   };
 
-  const handleClearHistory = async () => {
+  const [retainedHistory, setRetainedHistory] = useState<Array<{ id: string; reason: string }>>([]);
+  const handleClearHistory = async (discardRunId?: string) => {
     if (model.hasAnyActiveRun) {
       onNotify?.('仍有进行中的协作任务，无法清理历史');
       return;
@@ -439,12 +443,13 @@ export function OrchestrationBoardPanel({
     if (!api) return;
     setBusyId('reset-history');
     try {
-      const res = await api({ all: true });
+      const res = await api({ all: true, historyOnly: true, discardRunId });
       if (!res.ok) {
         onNotify?.(res.error);
       } else {
-        setSelectedRunId(null);
-        onNotify?.('已清理历史协作记录');
+        setRetainedHistory(res.retained ?? []);
+        if (!res.retained?.length) setSelectedRunId(null);
+        onNotify?.(`已清理 ${res.removed.runs} 个协作记录，保留 ${res.retained?.length ?? 0} 个。`);
       }
     } finally {
       setBusyId(null);
@@ -1258,6 +1263,45 @@ export function OrchestrationBoardPanel({
             <span className="obp-live-dot" aria-hidden="true" />
             {model.runStatusLabel}
           </span>
+          {model.run?.integrationIntent && <button type="button" onClick={async () => {
+            const run = model.run!;
+            const res = await window.vibeMeet.orchestration?.reconcilePublication?.({
+              runId: run.id, expectedCommit: run.integrationIntent!.commit,
+              acceptUnpublished: window.confirm('重新核对 Git。若目标仍在写入前的提交，允许关闭这次未发布的记录？'),
+            });
+            if (res) onNotify?.(res.ok ? res.message : res.error);
+          }}>核对 Git 交付位置 · {model.run.integrationIntent.target} · {model.run.integrationIntent.commit.slice(0, 8)}</button>}
+          {model.run?.integrationStatus === 'active' && <span>成果位于 {model.run.integrationBranch}，待合回 {model.run.integrationBaseBranch}</span>}
+          {model.run?.integrationStatus === 'finalized' && <span>已合回 {model.run.integrationBaseBranch} · {model.run.finalizedCommit?.slice(0, 8)}</span>}
+          {model.run && snapshot.tasks.filter(task => task.runId === model.run?.id && task.queuedLaunch).map(task => {
+            const q = task.queuedLaunch!;
+            const blocked = task.codeDeps?.map(id => snapshot.tasks.find(t => t.id === id)).find(t => t?.latestDispatch?.integrationStatus === 'skipped');
+            const owner = sessionTargets.find(target => target.isActive)?.sessionId ?? activePtyId;
+            return <div key={task.id} className="obp-inline-card">
+              <strong>{task.taskTitle}</strong> · {q.reason ?? (blocked ? `上游 ${blocked.taskTitle} 尚无交付提交，下游无法读取工作区改动` : task.blockedReason ?? (task.status === 'pending' ? '等待上游成果' : '已排队，等待原协调者'))}
+              {q.state !== 'claimed' && <button type="button" onClick={async () => {
+                const res = await window.vibeMeet.orchestration?.taskUpdate({ id: task.id, status: 'failed', queueDecision: 'cancel' });
+                if (res && !res.ok) onNotify?.(res.error);
+              }}>取消排队</button>}
+              {q.state === 'needs_reconciliation' && <button type="button" onClick={async () => {
+                if (!window.confirm('已核对现场且没有仍在执行的 Worker？将按原方案重新领取任务。')) return;
+                const res = await window.vibeMeet.orchestration?.taskUpdate({ id: task.id, status: task.status, queueDecision: 'resume' });
+                if (res && !res.ok) onNotify?.(res.error);
+              }}>已核对，恢复排队</button>}
+              {owner && q.state === 'waiting' && (owner !== q.from || q.coordinatorGeneration !== model.run?.consumerGeneration) &&
+                <button type="button" onClick={async () => {
+                  const result = await window.vibeMeet.orchestration?.runUse({ id: task.runId, from: owner, paneId: owner, takeOverQueue: true });
+                  if (result && !result.ok) onNotify?.(result.error);
+                }}>接管本轮已批准队列</button>}
+            </div>;
+          })}
+          {retainedHistory.map(item => (
+            <div key={item.id}>{item.id} · {item.reason}
+              <button type="button" onClick={() => {
+                if (window.confirm(`放弃 ${item.id} 的交接记录？分支和工作树保留在磁盘上，清除后面板将无法追踪它们。`)) void handleClearHistory(item.id);
+              }}>放弃该记录</button>
+            </div>
+          ))}
           {!model.hasAnyActiveRun && model.runs.length > 0 && (
             <button
               type="button"
@@ -1502,7 +1546,7 @@ export function OrchestrationBoardPanel({
                                   className="obp-target-btn"
                                   onClick={() => handleMentionClick(target)}
                                 >
-                                  @{target}
+                                  @{target}{target !== 'all' && target !== 'workers' && ` · ${{ notified: '已提醒查看', delivered: '已送达', replied: '已回复', published: '已发布' }[post.receipts?.[target.toLowerCase()] ?? 'published']}`}
                                 </button>
                               ))}
                             </span>
@@ -1886,6 +1930,12 @@ export function OrchestrationBoardPanel({
             ) : (
               filteredMembers.map((member) => {
                 const colorIdx = roleColorIndex(member.role);
+                const dispatch = snapshot.dispatches.find(d => d.id === member.dispatchId);
+                const destination = !dispatch || !member.isSettled ? null : dispatch.noChanges ? '已核验：无代码差异'
+                  : dispatch.reviewOfDispatchId || dispatch.reviewOfRunId || dispatch.taskKind === 'research' || dispatch.taskKind === 'review' ? '报告已提交'
+                  : dispatch.integrationStatus === 'merged' ? `已合入 ${dispatch.integratedTargetBranch ?? '共享分支'}`
+                  : dispatch.integrationStatus === 'skipped' ? '共享工作区未生成交付提交'
+                  : dispatch.worktreePath ? `改动位置：${dispatch.worktreePath}` : '交付位置待核对';
                 const modelMeta = [member.cliId, member.model].filter(Boolean).join('/');
                 return (
                   <div key={member.key} className="obp-member-card is-worker">
@@ -1915,6 +1965,7 @@ export function OrchestrationBoardPanel({
                           </div>
                           <div className="obp-member-sub-row">
                             <span className="obp-member-sub">{member.taskSummary}</span>
+                            {destination && <span className="obp-member-sub">{destination}</span>}
                             {member.verificationBadge && (
                               <span className={`obp-stage-pill tone-${member.verificationBadge.tone}`}>
                                 {member.verificationBadge.label}
@@ -1957,6 +2008,21 @@ export function OrchestrationBoardPanel({
                           {member.isSettled ? <Trash2 size={12} /> : <Square size={11} />}
                         </button>
                       </div>
+                    )}
+                    {dispatch?.codexDeliveryFailure === 'unknown_acceptance' && member.isSettled &&
+                      dispatch.lastFailureReason === 'worker_stopped' && !dispatch.releasedAt && (
+                      <button type="button" className="wrp-btn" disabled={busyId === dispatch.id} onClick={async () => {
+                        if (!window.confirm('确认已核对原执行现场？原工作树将保留，新 Worker 将从原基线开始。')) return;
+                        setBusyId(dispatch.id);
+                        try {
+                          const result = await window.vibeMeet.orchestration?.workerStart?.({
+                            runId: dispatch.runId, retryOfDispatchId: dispatch.id, agent: dispatch.cliId ?? undefined,
+                            model: dispatch.model ?? undefined, effort: dispatch.effort ?? undefined,
+                            readOnly: dispatch.taskKind === 'review' || dispatch.taskKind === 'research',
+                          });
+                          if (result && !result.ok) onNotify?.(result.error);
+                        } finally { setBusyId(null); }
+                      }}>保留原树，新树重派</button>
                     )}
                     {(member.canTriggerReview || member.canIntegrate) && (
                       <div className="obp-member-workflow-bar">
