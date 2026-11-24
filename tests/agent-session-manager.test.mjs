@@ -199,7 +199,10 @@ test('a rename keeps the title here and names the Codex thread, now or once it r
   assert.equal(manager.list()[0].title, '拆分 登录 重构', 'the first message does not replace a chosen title');
   assert.deepEqual(await manager.rename(session.id, '   '), { ok: false, error: '标题不能为空' });
   assert.deepEqual(await manager.rename('agent-session-00000000-0000-0000-0000-000000000000', 'x'), { ok: false, error: '会话不存在' });
-  assert.match(readFileSync(join(dir, 'agent-sessions.json'), 'utf8'), /拆分 登录 重构/);
+  await until(() => {
+    try { return /拆分 登录 重构/.test(readFileSync(join(dir, 'agent-sessions.json'), 'utf8')); }
+    catch { return false; }
+  });
 });
 
 test('an approval waits in the timeline for the person and is delivered once', async (t) => {
