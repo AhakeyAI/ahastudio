@@ -5860,15 +5860,17 @@ export class OrchestrationService {
   }
 
   /** Inlines one or two short messages, like PTY direct delivery; anything else points the Worker at read_board. */
-  private codexMailboxPrompt(workerId: string, pending: { messages: OrchestrationMessageRecord[]; opaque: boolean }): string {
+  private codexMailboxPrompt(pending: { messages: OrchestrationMessageRecord[]; opaque: boolean }) {
     const pointer = 'You have a new message from AhaStation. Use the Aha read_board tool to read unread messages for your role, then continue the current assignment.';
     const messages = pending.messages
       .map((message) => this.store.getMessageById(message.id) ?? message)
       .filter((message) => message.lifecycleRejectedReason === null && message.type !== 'heartbeat');
-    if (pending.opaque || messages.length === 0 || messages.length > 2) return pointer;
+    const notification = { prompt: pointer, messages, inlined: false };
+    if (pending.opaque || messages.length === 0 || messages.length > 2) return notification;
     const rendered = this.store.redactDispatchCredentials(messages.map((message) => formatBoardPostForAgent(message)).join('\n\n'));
-    if (rendered.length > 1_000) return pointer;
-    return `${rendered}\n\n(Full message above from AhaStation; no read_board call is needed for it. Continue the current assignment.)`;
+    if (rendered.length > 1_000) return notification;
+    const prompt = `${rendered}\n\n(Full message above from AhaStation; no read_board call is needed for it. Continue the current assignment.)`;
+    return { prompt, messages, inlined: true };
   }
 
   private acknowledgeCodexMail(workerId: string, messages: OrchestrationMessageRecord[]): void {
@@ -5890,13 +5892,14 @@ export class OrchestrationService {
       if (dispatch) this.codexMailbox.set(workerId, pending);
       return;
     }
-    const prompt = this.codexMailboxPrompt(workerId, pending);
-    const inlined = prompt.endsWith('(Full message above from AhaStation; no read_board call is needed for it. Continue the current assignment.)');
+    const { prompt, messages, inlined } = this.codexMailboxPrompt(pending);
     void this.submitCodexTurn(dispatch, session, prompt).then(async (outcome) => {
       if (outcome.status === 'accepted') {
         const member = this.resolveBoardMemberForPane(workerId);
-        if (member && this.store.recordBoardReceipt(pending.messages.map(m => m.id), member.memberKey, inlined ? 'delivered' : 'notified')) this.emitChanged('board:delivery', member.runId);
-        if (inlined) this.acknowledgeCodexMail(workerId, pending.messages.filter(m => !m.lifecycleRejectedReason && m.type !== 'heartbeat'));
+        this.acknowledgeCodexMail(workerId, messages);
+        if (member && this.store.recordBoardReceipt(messages.map(m => m.id), member.memberKey, inlined ? 'delivered' : 'notified')) {
+          this.emitChanged('board:delivery', member.runId);
+        }
       } else {
         this.failCodexDispatch(dispatch.id, outcome.status, outcome.reason);
         await session.close();
