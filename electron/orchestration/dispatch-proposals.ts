@@ -27,6 +27,9 @@ export interface CreateHeldProposalInput {
   runId: string | null;
   role: string;
   task: string;
+  deps?: string[];
+  codeDeps?: string[];
+  baseBranch?: string;
   taskContext?: OrchestrationTaskContext | null;
   planSummary: string;
   requestedAgent: string;
@@ -174,6 +177,9 @@ export class DispatchProposalManager {
       prior.model === input.model &&
       prior.effort === input.effort &&
       prior.terminal === input.terminal &&
+      prior.baseBranch === input.baseBranch &&
+      JSON.stringify(prior.deps ?? []) === JSON.stringify(input.deps ?? []) &&
+      JSON.stringify(prior.codeDeps ?? []) === JSON.stringify(input.codeDeps ?? []) &&
       Boolean(prior.authorizeReviews) === Boolean(input.authorizeReviews) &&
       JSON.stringify(cloneTaskContext(prior.taskContext)) === JSON.stringify(merged);
     if (confirmed && prior && samePlan && state.lastTurnAt >= match.createdAt) {
@@ -233,6 +239,9 @@ export class DispatchProposalManager {
       runId: input.runId,
       role: input.role,
       task: input.task,
+      deps: input.deps,
+      codeDeps: input.codeDeps,
+      baseBranch: input.baseBranch,
       ...(normalizedContext ? { taskContext: normalizedContext } : {}),
       planSummary: input.planSummary,
       requestedAgent: input.requestedAgent,

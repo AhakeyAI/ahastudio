@@ -13,6 +13,7 @@ import { ORCHESTRATION_DELIVERY_BATCH_LIMIT } from './orchestration-types.js';
 
 export interface MailboxPointerDeliveryDependencies {
   store: OrchestrationStore;
+  onReceipt?: (runId: string) => void;
   waiters: RuntimeMessageWaiters;
   agentStatusStore: AgentStatusStore;
   writePty: PtyWriteFn;
@@ -403,10 +404,12 @@ export class MailboxPointerDelivery {
 
     try {
       let promptText: string;
+      let inline = false;
       if (mcpEnabled) {
         const directText = this.deps.formatDirectDeliveryText?.(eligible, ptyId)?.trim() || '';
         if (directText) {
           promptText = directText;
+          inline = true;
         } else {
           const seqs = eligible
             .map((m) => m.boardSeq ?? m.seq)
@@ -431,8 +434,9 @@ export class MailboxPointerDelivery {
       const target = this.deps.turnTarget?.(ptyId);
       // After unknown acceptance the agent may already have the messages; sending them again
       // would repeat the wake-up, so only a turn that never started gives them back.
-      const res = target
-        ? { ok: (await target.startTurn(promptText.trim())).status !== 'not_accepted' }
+      const native = target ? await target.startTurn(promptText.trim()) : null;
+      const res = native
+        ? { ok: native.status !== 'not_accepted' }
         : await deliverPromptToPty(
           {
             ptyId,
@@ -449,6 +453,7 @@ export class MailboxPointerDelivery {
         state.deferredUntilIdle = true;
         return false;
       }
+      if (memberInfo && native?.status !== 'unknown_acceptance' && this.deps.store.recordBoardReceipt(ids, memberInfo.memberKey, inline ? 'delivered' : 'notified')) this.deps.onReceipt?.(memberInfo.runId);
       if (mcpEnabled && memberInfo) {
         let maxBoardSeq = 0;
         for (const msg of eligible) {

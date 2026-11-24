@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { resolve as resolveFsPath } from 'node:path';
 import { runGitCommand } from '../git/git-exec.js';
 import type {
@@ -217,6 +217,7 @@ export interface OrchestrationAgentSelectionResult {
 }
 
 export type OrchestrationDelegateTaskResult =
+  | { status: 'queued'; task: OrchestrationTaskRecord; message: string; proposal?: undefined }
   | {
       status: 'confirmation_required';
       proposal: OrchestrationDispatchProposal;
@@ -364,6 +365,8 @@ export class OrchestrationService {
   private readonly workerTimelines = new Map<string, WorkerTimeline>();
   private readonly timelineListeners = new Set<(change: WorkerTimelineChange) => void>();
   private disposed = false;
+  private queueSweepScheduled = false;
+  private readonly claimedLaunches = new Map<string, symbol>();
   private readonly closeWorkerPty?: OrchestrationServiceDependencies['closeWorkerPty'];
   private readonly externalIsPtyAlive?: (ptyId: string) => boolean;
   private readonly isAgentCliId?: (cliId: string) => boolean;
@@ -450,6 +453,7 @@ export class OrchestrationService {
 
     this.waiters = new RuntimeMessageWaiters();
     this.pointerDelivery = new MailboxPointerDelivery({
+      onReceipt: runId => this.emitChanged('board:delivery', runId),
       store: this.store,
       waiters: this.waiters,
       agentStatusStore: this.agentStatusStore,
@@ -578,6 +582,7 @@ export class OrchestrationService {
       }
     });
 
+    void this.recoverGitPublications().catch(error => console.warn('[orchestration] Git recovery:', error)).finally(() => this.scheduleQueuedLaunches());
     const staleSweepIntervalMs = deps.staleSweepIntervalMs ?? 0;
     if (staleSweepIntervalMs > 0) {
       this.staleSweepTimer = setInterval(() => {
@@ -631,6 +636,7 @@ export class OrchestrationService {
 
   setSessionCoordinators(registry: OrchestrationSessionCoordinators | null): void {
     this.sessionCoordinators = registry;
+    this.scheduleQueuedLaunches();
   }
 
   /** An Agent session left orchestration mode or closed: drop what was waiting on it as Coordinator. */
@@ -646,6 +652,7 @@ export class OrchestrationService {
 
   /** An orchestrating session finished a turn: deliver what arrived for it meanwhile. */
   sessionCoordinatorIdle(sessionId: string): void {
+    this.scheduleQueuedLaunches();
     if (this.isActiveSessionCoordinator(sessionId)) this.pointerDelivery.scheduleRedriveForPane(sessionId);
   }
 
@@ -674,7 +681,8 @@ export class OrchestrationService {
     return this.agentStatusStore.get(id) !== null || this.isActiveSessionCoordinator(id);
   }
 
-  isAuthenticatedCallerActive(id: string, discoverTools = false): boolean {
+  isAuthenticatedCallerActive(id: string, discoverTools = false, reporting = false): boolean {
+    if (reporting && CODEX_WORKER_ID.test(id) && this.store.getActiveDispatchForIdentity(id, null)?.stage === 'needs_reconciliation') return true;
     if (AGENT_SESSION_ID.test(id)) return this.isActiveSessionCoordinator(id);
     return !CODEX_WORKER_ID.test(id) ||
       (this.isPaneAlive(id) && (discoverTools || Boolean(this.store.getActiveDispatchForIdentity(id, null))));
@@ -786,7 +794,110 @@ export class OrchestrationService {
     return () => this.paneClosedListeners.delete(listener);
   }
 
+  private async recoverGitPublications(onlyRunId?: string): Promise<void> {
+    for (const run of this.store.listRuns()) {
+      if (onlyRunId && run.id !== onlyRunId) continue;
+      const intent = run.integrationIntent;
+      if (!intent) continue;
+      await this.withRunIntegrationLock(run.id, async () => {
+        const current = this.store.requireRun(run.id).integrationIntent;
+        if (current?.commit !== intent.commit) return;
+        const head = await resolveBranchRefOid(intent.repo, intent.target);
+        if (!head || !await isGitCommitAncestor(intent.repo, intent.commit, head)) return;
+        if (intent.dispatchId) {
+          this.store.updateDispatchIntegrationState(intent.dispatchId, { integrationStatus: 'merged',
+            integratedCommit: intent.commit, integratedTargetBranch: intent.target, noChanges: intent.commit === intent.before });
+          this.store.updateRunIntegrationState(run.id, {
+            ...(intent.baseBranch ? { integrationStatus: 'active', integrationBranch: intent.target,
+              integrationWorktreePath: intent.worktree, integrationBaseBranch: intent.baseBranch,
+              integrationBaseCommit: intent.baseCommit, integrationRepoRootPath: intent.repo } : {}),
+            integrationHeadCommit: intent.commit, integrationIntent: null,
+          });
+        } else if (intent.members) {
+          this.store.updateRunIntegrationState(run.id, { integrationStatus: 'finalized', finalizedCommit: intent.commit,
+            integrationHeadCommit: intent.commit, integrationIntent: null, finalizedBatch: {
+              branch: intent.target, sourceHead: intent.sourceHead, targetCommit: intent.commit, members: intent.members,
+            },
+            integrationBranch: await resolveBranchRefOid(intent.repo, run.integrationBranch) ? run.integrationBranch : null,
+            integrationWorktreePath: run.integrationWorktreePath && existsSync(run.integrationWorktreePath) ? run.integrationWorktreePath : null,
+          });
+        }
+        this.emitChanged('run:integration-recovered', run.id);
+      });
+    }
+  }
+
+  async reconcilePublication(input: { runId: string; expectedCommit: string; acceptUnpublished?: boolean }): Promise<{ message: string }> {
+    await this.recoverGitPublications(input.runId);
+    return this.withRunIntegrationLock(input.runId, async () => {
+      const run = this.store.requireRun(input.runId);
+      const intent = run.integrationIntent;
+      if (!intent) return { message: '已核对 Git 交付位置。' };
+      if (intent.commit !== input.expectedCommit) throw new OrchestrationError('operation_rejected', '交付记录已更新，请重新查看。');
+      const head = await resolveBranchRefOid(intent.repo, intent.target);
+      if (input.acceptUnpublished && head === intent.before) {
+        this.store.updateRunIntegrationState(run.id, { integrationIntent: null });
+        this.emitChanged('run:publication-unapplied', run.id);
+        return { message: '已确认目标分支仍在原提交；本次操作未标记为合入。' };
+      }
+      throw new OrchestrationError('operation_rejected', `需核对 ${intent.target}：当前 ${head ?? '无此分支'}，预期 ${intent.commit}，写入前 ${intent.before}。`);
+    });
+  }
+
+  private scheduleQueuedLaunches(): void {
+    if (this.disposed || this.queueSweepScheduled || !this.store.hasQueuedWork()) return;
+    this.queueSweepScheduled = true;
+    queueMicrotask(() => {
+      this.queueSweepScheduled = false;
+      if (this.disposed) return;
+      for (const task of this.store.listTasks()) {
+        if (!task.queuedLaunch || task.queuedLaunch.state !== 'waiting' || this.claimedLaunches.has(task.id)) continue;
+        this.store.promoteReadyTasks(task.runId);
+        if (this.store.getTask(task.id)?.status !== 'ready' || this.store.hasPendingGates(task.id) || task.codeDeps?.some(dep => !this.store.codeReady(dep))) continue;
+        this.claimedLaunches.set(task.id, Symbol(task.id));
+        void this.launchQueuedTask(task).catch(error => console.warn('[orchestration] queued launch:', error))
+          .finally(() => this.claimedLaunches.delete(task.id));
+      }
+    });
+  }
+
+  private async launchQueuedTask(task: OrchestrationTaskRecord): Promise<void> {
+    const q = task.queuedLaunch!;
+    const run = this.store.requireRun(task.runId);
+    if (run.integrationIntent || run.status !== 'active' || run.consumerGeneration !== q.coordinatorGeneration ||
+        !this.isCallerSurface(q.from) || !this.isPaneAlive(q.from) || (run.coordinatorPaneId ?? run.coordinatorHandle) !== q.from ||
+        this.store.getRemainingDispatchCapacity() < 1) return;
+    this.store.setQueuedLaunch(task.id, { ...q, state: 'claimed' });
+    try {
+      await this.store.waitForPendingWrite();
+      if (this.disposed || !this.isCallerSurface(q.from) || !this.isPaneAlive(q.from) ||
+          this.store.requireRun(run.id).consumerGeneration !== q.coordinatorGeneration) {
+        this.store.setQueuedLaunch(task.id, q);
+        return;
+      }
+      this.assertRunCoordinator(run.id, q.from);
+      if ((q.requiresPaneMode && !this.isPaneOrchestrationMode(q.from)) ||
+          (q.authorizedNetwork !== undefined && q.authorizedNetwork !== Boolean(this.sessionCoordinator(q.from)?.network))) {
+        throw new OrchestrationError('operation_rejected', '原协调者的编排或联网权限已改变，请恢复原设置再核对派发。');
+      }
+      await this.workerStart({ taskId: task.id, runId: run.id, from: q.from, callerPaneId: q.callerPaneId,
+        callerCwd: q.callerCwd, baseBranch: q.baseBranch, agent: q.agent, role: q.role, name: q.role,
+        terminal: q.terminal, model: q.model, effort: q.effort, noWorktree: !q.worktree,
+        taskKind: q.taskKind, mcpEnabled: this.isMcpEnabledForCliDep?.(q.agent), readOnly: q.taskKind === 'review' || q.taskKind === 'research',
+      }, this.claimedLaunches.get(task.id));
+      if (q.authorizeReviews) this.store.setRunAutoReviewAuthorized(run.id, true);
+      this.store.setQueuedLaunch(task.id);
+    } catch (error) {
+      if (this.store.getLatestDispatchForTask(task.id)) this.store.setQueuedLaunch(task.id);
+      else if (error instanceof OrchestrationError && error.code === 'worker_limit_reached') this.store.setQueuedLaunch(task.id, q);
+      else this.store.setQueuedLaunch(task.id, { ...q, state: 'needs_reconciliation',
+        reason: this.store.redactDispatchCredentials(error instanceof Error ? error.message : String(error)) });
+    }
+    this.emitChanged('task:queue-updated', run.id);
+  }
+
   private emitChanged(reason: string, runId?: string): void {
+    this.scheduleQueuedLaunches();
     if (this.eventListeners.size === 0) {
       return;
     }
@@ -898,12 +1009,17 @@ export class OrchestrationService {
   }
 
   runUse(input: {
+    takeOverQueue?: boolean;
     id: string;
     from?: string;
     paneId?: string;
   }): { run: OrchestrationRunRecord } {
     const handle = input.from?.trim() || 'coordinator';
     const paneId = input.paneId?.trim() || (this.isCallerSurface(handle) ? handle : null);
+    if (input.takeOverQueue) {
+      if (!paneId || !this.isCallerSurface(paneId) || !this.isPaneAlive(paneId)) throw new OrchestrationError('operation_rejected', '请选择活跃的协调者。');
+      this.assertCanBindRunCoordinator(input.id, paneId);
+    }
     const run = this.store.bindRun({
       runId: input.id,
       coordinatorHandle: handle,
@@ -920,6 +1036,15 @@ export class OrchestrationService {
     if (paneId && paneId !== handle) {
       this.waiters.cancel(paneId);
       this.waiters.cancelConsumer(paneId);
+    }
+    if (input.takeOverQueue && paneId) {
+      if (run.status === 'stopped') this.store.updateRunStatus(run.id, 'active');
+      for (const task of this.store.listTasks({ runId: run.id })) {
+        const q = task.queuedLaunch;
+        if (!q || q.state !== 'waiting') continue;
+        this.store.setQueuedLaunch(task.id, { ...q, from: paneId, callerPaneId: paneId,
+          coordinatorGeneration: run.consumerGeneration });
+      }
     }
     this.waiters.cancel(`run:${run.id}`);
     this.emitChanged('run:bound', run.id);
@@ -1938,6 +2063,7 @@ export class OrchestrationService {
     taskTitle?: string;
     displayName?: string;
     deps?: string[];
+    codeDeps?: string[];
     priority?: OrchestrationMessagePriority;
     worktreePath?: string;
   }): { task: OrchestrationTaskRecord } {
@@ -1951,6 +2077,7 @@ export class OrchestrationService {
       taskTitle: input.taskTitle,
       displayName: input.displayName,
       deps: input.deps,
+      codeDeps: input.codeDeps,
       priority: input.priority,
       worktreePath: input.worktreePath,
     });
@@ -1989,7 +2116,21 @@ export class OrchestrationService {
   taskUpdate(input: {
     id: string;
     status: OrchestrationTaskStatus;
+    queueDecision?: 'cancel' | 'resume';
   }): { task: OrchestrationTaskRecord } {
+    if (input.queueDecision) {
+      const task = this.store.requireTask(input.id);
+      if (!task.queuedLaunch || task.queuedLaunch.state === 'claimed' || this.claimedLaunches.has(task.id) ||
+          this.store.getActiveDispatchesForTask(task.id).length) throw new OrchestrationError('worker_busy', '派发已经领取，请处理当前 Worker。');
+      if (input.queueDecision === 'resume') {
+        if (this.store.getLatestDispatchForTask(task.id) || task.queuedLaunch.state !== 'needs_reconciliation') throw new OrchestrationError('task_not_ready', '请先处理已有派发。');
+        this.store.setQueuedLaunch(task.id, { ...task.queuedLaunch, reason: undefined, state: 'waiting' });
+        this.emitChanged('task:queue-resumed', task.runId);
+        return { task: this.store.requireTask(task.id) };
+      }
+      if (input.status !== 'failed') throw new OrchestrationError('invalid_argument', '取消排队须结束任务。');
+      this.store.setQueuedLaunch(task.id);
+    }
     const settledTargets =
       input.status === 'completed' || input.status === 'failed'
         ? this.store.getActiveDispatchesForTask(input.id)
@@ -2067,6 +2208,14 @@ export class OrchestrationService {
       );
     }
 
+    if (inject) {
+      const caller = this.terminalTracker?.getTerminal(from);
+      const expectedCwd = task.worktreePath ?? this.sessionCoordinator(from)?.cwd ??
+        (caller?.cwdKnown ? caller.cwd : this.getDefaultCwd?.());
+      await this.verifyCodeInputs(task, this.terminalTracker?.getTerminal(assignee)?.cwd);
+      const mismatch = this.paneMismatch(assignee, expectedCwd);
+      if (mismatch) throw new OrchestrationError('terminal_unavailable', mismatch);
+    }
     const paneStatus = this.agentStatusStore.get(assignee);
 
     const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
@@ -2237,6 +2386,53 @@ export class OrchestrationService {
 
   // ==================== Coordinator Lifecycle ====================
 
+  private async verifyCodeInputs(task: OrchestrationTaskRecord, cwd?: string | null): Promise<void> {
+    if (!task.codeDeps?.length) return;
+    if (!cwd) throw new OrchestrationError('task_not_ready', '无法核实下游工作目录。');
+    const result = await runGitCommand(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd, readOnly: true });
+    const head = result.exitCode === 0 ? result.stdout.trim() : '';
+    const run = this.store.requireRun(task.runId);
+    for (const id of task.codeDeps) {
+      const upstream = this.store.codeDependency(id);
+      const commit = upstream?.integratedCommit;
+      if (!upstream || upstream.status !== 'completed' || upstream.integrationStatus !== 'merged' || !commit) {
+        throw new OrchestrationError('task_not_ready', `等待 ${id} 合入共享分支；未提交的工作区改动无法交接。`);
+      }
+      const repo = upstream.repoRootPath ?? run.integrationRepoRootPath;
+      const commits = [commit, ...(run.finalizedBatches ?? [])
+        .filter(batch => batch.members[upstream.id] === commit).map(batch => batch.targetCommit)];
+      if (head && repo && await isSameGitRepo(repo, cwd)) {
+        let included = false;
+        for (const candidate of commits) {
+          if (await isGitCommitAncestor(cwd, candidate, head)) { included = true; break; }
+        }
+        if (included) continue;
+      }
+      throw new OrchestrationError('task_not_ready', `工作目录 ${cwd} 的 HEAD 尚未包含 ${id} 的交付提交 ${commit}。`);
+    }
+  }
+
+  private paneMismatch(id: string, cwd?: string | null, cliId?: string | null): string | null {
+    const pane = this.agentStatusStore.get(id);
+    if (!this.isPaneAlive(id) || !pane?.agentId) return 'Terminal has no live coding agent.';
+    if (pane.state === 'working' || pane.state === 'waiting') return 'Terminal is busy.';
+    if (cliId && pane.agentId !== cliId) return `Expected CLI ${cliId}, found ${pane.agentId}.`;
+    const terminal = this.terminalTracker?.getTerminal(id);
+    if (terminal?.alive === false) return 'Terminal has exited.';
+    if (!terminal?.cwdKnown) return 'Terminal working directory is unknown.';
+    if (cwd) {
+      try {
+        const canonical = (path: string) => {
+          const resolved = realpathSync.native(path);
+          return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+        };
+        if (canonical(cwd) === canonical(terminal.cwd)) return null;
+      } catch { /* An inaccessible directory cannot be verified. */ }
+      return `Expected working directory ${cwd}, found ${terminal.cwd}.`;
+    }
+    return null;
+  }
+
   private createCoordinatorRuntime(options: {
     coordinatorPaneId?: string | null;
     workerCliId?: string;
@@ -2251,7 +2447,12 @@ export class OrchestrationService {
     return {
       cliCommand: this.cliCommand,
       maxDepth: this.maxDepth,
-      listWorkerCandidates: (excludePaneIds) => {
+      launchDependent: async (task, cliId) => {
+        const run = this.store.requireRun(task.runId);
+        await this.workerStart({ runId: run.id, taskId: task.id, agent: cliId, from: run.coordinatorHandle, worktree: true });
+      },
+      verifyCodeInputs: (task, cwd) => this.verifyCodeInputs(task, cwd),
+      listWorkerCandidates: (excludePaneIds, cwd, cliId) => {
         const candidates: WorkerPaneCandidate[] = [];
         for (const pane of this.agentStatusStore.list()) {
           if (!this.isPaneAlive(pane.ptyId)) continue;
@@ -2265,7 +2466,9 @@ export class OrchestrationService {
           if (boundRun && (boundRun.coordinatorPaneId === pane.ptyId || boundRun.coordinatorHandle === pane.ptyId)) {
             continue;
           }
-          candidates.push({ ptyId: pane.ptyId, agentId: pane.agentId });
+          const caller = options.coordinatorPaneId ? this.terminalTracker?.getTerminal(options.coordinatorPaneId) : null;
+          if (this.paneMismatch(pane.ptyId, cwd ?? (caller?.cwdKnown ? caller.cwd : this.getDefaultCwd?.()), cliId)) continue;
+          candidates.push({ ptyId: pane.ptyId, agentId: pane.agentId, cwd: this.terminalTracker?.getTerminal(pane.ptyId)?.cwd });
         }
         return candidates;
       },
@@ -2309,6 +2512,15 @@ export class OrchestrationService {
               (d.assigneePaneId === turn.ptyId || d.assigneeHandle === turn.ptyId)
           );
         const dispatchId = matchingActive[matchingActive.length - 1]?.id ?? null;
+        if (dispatchId) {
+          const current = this.store.getDispatchContext(dispatchId)!;
+          const task = this.store.requireTask(current.taskId);
+          const caller = options.coordinatorPaneId ? this.terminalTracker?.getTerminal(options.coordinatorPaneId) : null;
+          const expected = task.worktreePath ?? options.cwd ?? (caller?.cwdKnown ? caller.cwd : this.getDefaultCwd?.());
+          const mismatch = turn.freshlySpawned ? null : this.paneMismatch(turn.ptyId, expected, options.workerCliId);
+          if (mismatch) return { ok: false, error: mismatch };
+          await this.verifyCodeInputs(task, this.terminalTracker?.getTerminal(turn.ptyId)?.cwd);
+        }
         return this.deliverAndObserveDispatchTurn(dispatchId, {
           ptyId: turn.ptyId,
           prompt: turn.body,
@@ -3337,6 +3549,7 @@ export class OrchestrationService {
       this.archiveWorkerTimeline(resolvedDispatch.assigneeHandle, resolvedDispatch.id);
     }
 
+    if (workerRole && resolvedDispatch.followUpMessageId && sent.lifecycle?.action === 'settled') this.store.recordBoardReceipt([resolvedDispatch.followUpMessageId], workerRole, 'replied');
     if (workerRole && typeof sent.message.boardSeq === 'number') {
       this.store.advanceMemberCursor(resolvedDispatch.runId, workerRole, {
         lastPostSeq: sent.message.boardSeq,
@@ -4342,6 +4555,7 @@ export class OrchestrationService {
     if (dispatch.status === 'failed' || dispatch.status === 'circuit_broken') {
       return dispatch.lastFailureReason === 'worker_stopped' ? 'stopped' : 'failed';
     }
+    if (dispatch.stage === 'needs_reconciliation') return dispatch.stage;
     if (this.approvals.hasOpenApprovalForDispatch(dispatch.id)) {
       return 'waiting_permission';
     }
@@ -4455,12 +4669,14 @@ export class OrchestrationService {
     taskTitle?: string;
     displayName?: string;
     deps?: string[];
+    codeDeps?: string[];
     priority?: OrchestrationMessagePriority;
     retryOfDispatchId?: string;
     reviewOf?: string;
     reviewRun?: boolean | string;
     reviewFocus?: string;
     readOnly?: boolean;
+    taskKind?: OrchestrationTaskKind;
     cliId?: string;
     agent?: string;
     model?: string;
@@ -4476,7 +4692,7 @@ export class OrchestrationService {
     keepOpen?: boolean;
     mcpEnabled?: boolean;
     role?: string;
-  }): Promise<{
+  }, queueClaim?: symbol): Promise<{
     dispatch: OrchestrationDispatchRecord;
     task: OrchestrationTaskRecord;
     run: OrchestrationRunRecord;
@@ -4497,6 +4713,7 @@ export class OrchestrationService {
     this.assertCanDelegateFrom(from);
     this.store.assertDispatchCapacity();
 
+    if (input.taskId && this.store.getTask(input.taskId)?.queuedLaunch && (!queueClaim || this.claimedLaunches.get(input.taskId) !== queueClaim)) throw new OrchestrationError('task_not_ready', '任务由已批准的队列管理。');
     const reusingTerminal = input.terminal?.trim() || undefined;
     const isReviewRunRequest =
       input.reviewRun === true ||
@@ -4606,6 +4823,17 @@ export class OrchestrationService {
           this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig),
         ),
       );
+    }
+    if (input.retryOfDispatchId) {
+      const previous = this.store.getDispatchContext(input.retryOfDispatchId);
+      if (previous?.codexDeliveryFailure === 'unknown_acceptance') {
+        return this.mutateWorkerResources(previous, () => {
+          if (this.store.getLatestDispatchForTask(previous.taskId)?.id !== previous.id || previous.lastFailureReason !== 'worker_stopped') {
+            throw new OrchestrationError('operation_rejected', '请先停止旧派发。每次待核对派发只能重试一次。');
+          }
+          return this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig);
+        });
+      }
     }
     return this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig);
   }
@@ -4925,6 +5153,16 @@ export class OrchestrationService {
       run = this.store.requireRun(prior.runId);
       if (input.callerPaneId !== undefined) this.resolveBoardCallerContext({ from: input.callerPaneId, runId: run.id });
       const priorTask = this.store.requireTask(prior.taskId);
+      if (prior.codexDeliveryFailure === 'unknown_acceptance' && (ACTIVE_DISPATCH_STATUSES.has(prior.status) || this.codexWorkers.get(prior.assigneeHandle)?.alive)) {
+        throw new OrchestrationError('operation_rejected', '请先核对结果并停止原执行者，再从已核实的基线重新派发。');
+      }
+      if (prior.codexDeliveryFailure === 'unknown_acceptance') {
+        if (!prior.repoRootPath || !prior.baseCommit || input.terminal || input.noWorktree) {
+          throw new OrchestrationError('operation_rejected', '无法确认独立工作树的基线，请先人工核对。');
+        }
+        input = { ...input, cwd: prior.repoRootPath, baseBranch: prior.baseCommit, worktree: true, branch: undefined,
+          readOnly: prior.taskKind === 'research' || prior.taskKind === 'review', taskKind: prior.taskKind };
+      }
       if (priorTask.status === 'completed') {
         const retryContext = mergeTaskContext(priorTask.taskContext, normalizedInputContext);
         createdTask = true;
@@ -4946,6 +5184,7 @@ export class OrchestrationService {
       if (input.callerPaneId !== undefined) this.resolveBoardCallerContext({ from: input.callerPaneId, runId: run.id });
       this.store.promoteReadyTasks(run.id);
       task = this.store.requireTask(existingTask.id);
+
     } else if (input.spec?.trim()) {
       const explicitRunId = input.runId?.trim();
       if (explicitRunId && input.callerPaneId !== undefined) {
@@ -4986,6 +5225,7 @@ export class OrchestrationService {
         taskTitle: input.taskTitle,
         displayName: input.displayName,
         deps: input.deps,
+      codeDeps: input.codeDeps,
         priority: input.priority,
       });
     } else {
@@ -5016,8 +5256,15 @@ export class OrchestrationService {
       this.getDefaultCwd?.() ||
       process.cwd();
 
+    if (reusingTerminal) {
+      const mismatch = this.paneMismatch(reusingTerminal, task.worktreePath ?? baseCwd, launchConfig.cliId);
+      if (mismatch) {
+        if (createdTask) this.failTaskIfReady(task.id);
+        throw new OrchestrationError('terminal_unavailable', mismatch);
+      }
+    }
     const reusingTerminalCwd = reusingTerminal
-      ? this.terminalTracker?.getTerminal(reusingTerminal)?.cwd ?? baseCwd
+      ? this.terminalTracker?.getTerminal(reusingTerminal)?.cwd
       : undefined;
 
     let effectiveBaseBranch = input.baseBranch;
@@ -5059,6 +5306,12 @@ export class OrchestrationService {
           reusingTerminalCwd,
         });
 
+    try {
+      await this.verifyCodeInputs(task, placement.cwd);
+    } catch (error) {
+      if (placement.ownsWorktree) await this.rollbackWorkerResources(undefined, placement.worktreePath);
+      throw error;
+    }
     // A run a session coordinates runs every non-reused Codex task as a headless Worker, even when
     // the pilot setting is off; terminal-coordinated runs keep the read-only pilot gate.
     const runIsSessionCoordinated =
@@ -5129,6 +5382,7 @@ export class OrchestrationService {
     let ctx: OrchestrationDispatchRecord;
     try {
       ctx = this.store.createDispatchContext({
+        approvedQueueLaunch: task.queuedLaunch?.state === 'claimed' && this.claimedLaunches.has(task.id),
         taskId: task.id,
         assigneeHandle: pilot?.id ?? ptyId!,
         assigneePaneId: ptyId,
@@ -5143,6 +5397,7 @@ export class OrchestrationService {
         baseCommit: placement.baseCommit,
         repoRootPath: placement.repoRootPath,
         ownsWorktree: placement.ownsWorktree,
+        taskKind: input.taskKind ?? (readOnlyTask ? 'research' : undefined),
         ownsBranch: placement.ownsBranch,
         isDetachedReviewWorktree: Boolean(reviewDetachedWorktree),
         reviewOfDispatchId: reviewTarget?.id ?? null,
@@ -5243,6 +5498,17 @@ export class OrchestrationService {
     });
 
     let preamble = makePreamble();
+    if (task.queuedLaunch || task.codeDeps?.length) {
+      try {
+        await this.store.waitForPendingWrite();
+        await this.verifyCodeInputs(task, placement.cwd);
+      } catch (error) {
+        if (pilot) await pilot.session.close();
+        await this.rollbackWorkerResources(ownsPane ? ptyId ?? undefined : undefined, placement.ownsWorktree ? placement.worktreePath : null);
+        this.store.failDispatch(ctx.id, 'Worker launch preflight failed before submission', { forceFailTask: true });
+        throw error;
+      }
+    }
     let acceptedByCodex = false;
     if (pilot) {
       const outcome = await this.submitCodexTurn(ctx, pilot.session, preamble);
@@ -5277,6 +5543,13 @@ export class OrchestrationService {
       }
     }
 
+    if (reusingTerminal) {
+      const mismatch = this.paneMismatch(reusingTerminal, placement.cwd, launchConfig.cliId);
+      if (mismatch) {
+        this.store.failDispatch(ctx.id, mismatch, { forceFailTask: true });
+        throw new OrchestrationError('terminal_unavailable', mismatch);
+      }
+    }
     const delivery = acceptedByCodex ? null : await this.deliverAndObserveDispatchTurn(ctx.id, {
       ptyId: ptyId!,
       prompt: preamble,
@@ -5318,7 +5591,8 @@ export class OrchestrationService {
           delivery.startObservation === 'permission',
         ...(delivery.promptDeferred ? {} : { promptSent: true }),
       }) ?? ctx
-      : ctx;
+      : this.store.getDispatchContext(ctx.id)?.stage === 'awaiting_review' ? this.store.getDispatchContext(ctx.id)!
+      : this.store.updateDispatchObservation(ctx.id, 'observed', { refreshHeartbeat: true, promptSent: true }) ?? ctx;
 
     const briefFromRole = callerDispatch
       ? this.resolveRoleNameForDispatch(callerDispatch).toLowerCase() || 'worker'
@@ -5515,6 +5789,7 @@ export class OrchestrationService {
   private failCodexDispatch(dispatchId: string, failure: 'not_accepted' | 'unknown_acceptance', reason: string): void {
     const dispatch = this.store.getDispatchContext(dispatchId);
     if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
+    if (failure === 'unknown_acceptance') return; // submitCodexTurn has already parked and archived it.
     this.store.recordCodexDeliveryFailure(dispatchId, failure);
     this.store.failDispatch(dispatchId, `Codex ${failure}`, {
       forceFailTask: true, summary: this.store.redactDispatchCredentials(reason),
@@ -5536,7 +5811,7 @@ export class OrchestrationService {
 
   private handleCodexExit(dispatchId: string, reason: string, exitCode: number | null): void {
     const dispatch = this.store.getDispatchContext(dispatchId);
-    if (!dispatch?.promptSentAt || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
+    if (!dispatch?.promptSentAt || dispatch.stage === 'needs_reconciliation' || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
     if (exitCode === 0 && dispatch.stage === 'awaiting_review') return;
     this.store.failDispatch(dispatch.id, 'Codex app-server exited', { forceFailTask: true, summary: reason });
     this.cleanupCodexDispatch(dispatch, reason);
@@ -5550,7 +5825,24 @@ export class OrchestrationService {
     try {
       const result = await session.startTurn({ turnKey: dispatch.id, prompt, effort: dispatch.effort ?? null });
       if (result.status !== 'accepted') timeline?.endActiveTurn('failed', result.reason);
-      if (result.status === 'unknown_acceptance') this.failCodexDispatch(dispatch.id, result.status, result.reason);
+      if (result.status === 'unknown_acceptance') {
+        this.store.recordCodexDeliveryFailure(dispatch.id, result.status);
+        this.archiveCodexOutput(session, dispatch.id);
+        this.archiveWorkerTimeline(dispatch.assigneeHandle, dispatch.id);
+        const cwd = dispatch.worktreePath;
+        if (cwd) {
+          const diff = await runGitCommand(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], {
+            cwd, readOnly: true, timeoutMs: 3000, maxBytes: 128 * 1024,
+          }).catch(() => null);
+          const files = await runGitCommand(['ls-files', '--others', '--exclude-standard'], {
+            cwd, readOnly: true, timeoutMs: 3000, maxBytes: 16 * 1024,
+          }).catch(() => null);
+          this.store.recordReconciliationDiff(dispatch.id, diff?.exitCode === 0
+            ? session.redactText([diff.stdout, files?.stdout].filter(Boolean).join('\n')) : null);
+        }
+        await this.store.waitForPendingWrite();
+        this.publishCodexStatus(dispatch, '接单结果需核对', result.reason, { acceptance: result.status });
+      }
       if (result.status === 'accepted' && !session.alive) {
         this.handleCodexExit(dispatch.id, 'Codex disconnected after accepting the turn', null);
       }
@@ -5576,13 +5868,16 @@ export class OrchestrationService {
     if (pending.opaque || messages.length === 0 || messages.length > 2) return pointer;
     const rendered = this.store.redactDispatchCredentials(messages.map((message) => formatBoardPostForAgent(message)).join('\n\n'));
     if (rendered.length > 1_000) return pointer;
+    return `${rendered}\n\n(Full message above from AhaStation; no read_board call is needed for it. Continue the current assignment.)`;
+  }
+
+  private acknowledgeCodexMail(workerId: string, messages: OrchestrationMessageRecord[]): void {
     this.store.markAsDeliveredForConsumer(messages.map((message) => message.id), workerId);
     const member = this.resolveBoardMemberForPane(workerId);
     const maxSeq = Math.max(0, ...messages
       .filter((message) => member && message.runId === member.runId && typeof message.boardSeq === 'number')
       .map((message) => message.boardSeq as number));
     if (member && maxSeq > 0) this.store.advanceMemberCursor(member.runId, member.memberKey, { lastDeliveredSeq: maxSeq });
-    return `${rendered}\n\n(Full message above from AhaStation; no read_board call is needed for it. Continue the current assignment.)`;
   }
 
   private deliverCodexMailbox(workerId: string): void {
@@ -5591,12 +5886,18 @@ export class OrchestrationService {
     if (!session?.alive || session.busy || !pending) return;
     this.codexMailbox.delete(workerId);
     const dispatch = this.store.getActiveDispatchForIdentity(workerId, null);
-    if (!dispatch || this.codexSubmitting.has(dispatch.id)) {
+    if (!dispatch || dispatch.stage === 'needs_reconciliation' || this.codexSubmitting.has(dispatch.id)) {
       if (dispatch) this.codexMailbox.set(workerId, pending);
       return;
     }
-    void this.submitCodexTurn(dispatch, session, this.codexMailboxPrompt(workerId, pending)).then(async (outcome) => {
-      if (outcome.status !== 'accepted') {
+    const prompt = this.codexMailboxPrompt(workerId, pending);
+    const inlined = prompt.endsWith('(Full message above from AhaStation; no read_board call is needed for it. Continue the current assignment.)');
+    void this.submitCodexTurn(dispatch, session, prompt).then(async (outcome) => {
+      if (outcome.status === 'accepted') {
+        const member = this.resolveBoardMemberForPane(workerId);
+        if (member && this.store.recordBoardReceipt(pending.messages.map(m => m.id), member.memberKey, inlined ? 'delivered' : 'notified')) this.emitChanged('board:delivery', member.runId);
+        if (inlined) this.acknowledgeCodexMail(workerId, pending.messages.filter(m => !m.lifecycleRejectedReason && m.type !== 'heartbeat'));
+      } else {
         this.failCodexDispatch(dispatch.id, outcome.status, outcome.reason);
         await session.close();
       }
@@ -5720,6 +6021,7 @@ export class OrchestrationService {
     try {
       nextCtx = this.store.createDispatchContext({
         taskId: followUpTask.id,
+        taskKind: settledDispatch.taskKind,
         assigneeHandle: targetPtyId,
         assigneePaneId: session ? null : targetPtyId,
         ...(session?.sessionId ? { providerSessionId: session.sessionId } : {}),
@@ -5803,6 +6105,7 @@ export class OrchestrationService {
         refs: input.refs,
         kind: input.kind ?? 'post',
       });
+    this.store.linkFollowUpMessage(nextCtx.id, msg.id);
     if (!input.existingMessage) {
       this.store.markAsReadAndDelivered([msg.id]);
     }
@@ -6478,6 +6781,8 @@ export class OrchestrationService {
   }
 
   reset(input: {
+    historyOnly?: boolean;
+    discardRunId?: string;
     all?: boolean;
     tasks?: boolean;
     messages?: boolean;
@@ -6494,6 +6799,13 @@ export class OrchestrationService {
       );
     }
     const scope = scopes[0]!;
+    if (input.historyOnly && scope === 'all') {
+      const result = this.store.clearFinishedHistory(input.discardRunId);
+      this.emitChanged('history:cleared');
+      return result;
+    }
+    const protectedRuns = this.store.listRuns().map(run => ({ id: run.id, reason: this.store.protectedRunReason(run.id) })).filter(run => run.reason);
+    if (protectedRuns.length) throw new OrchestrationError('operation_rejected', protectedRuns.map(run => `${run.id}：${run.reason}`).join('；'), { protectedRuns });
     if (scope === 'all' || scope === 'tasks') {
       if (this.activeCoordinator) {
         try {
@@ -6585,10 +6897,11 @@ export class OrchestrationService {
     if (!this.listCodingAgentsDep) {
       return [];
     }
+    const cwd = callerPaneId ? this.sessionCoordinator(callerPaneId)?.cwd ?? this.terminalTracker?.getTerminal(callerPaneId)?.cwd : undefined;
     return this.listCodingAgentsDep({
       callerPaneId: callerPaneId ?? null,
       includeIdlePanes: true,
-    });
+    }).map(entry => ({ ...entry, idlePanes: entry.idlePanes.filter(pane => !this.paneMismatch(pane.ptyId, cwd, entry.cliId)) }));
   }
 
   approveDispatchProposal(
@@ -6882,6 +7195,7 @@ export class OrchestrationService {
 
     const executeIntegrate = async () => {
       const run = this.store.requireRun(dispatch.runId);
+      if (run.integrationIntent) throw new OrchestrationError('operation_rejected', '上一次 Git 交付尚待核对。');
       const latestDispatch = this.store.getDispatchContext(dispatch.id) ?? dispatch;
       const hasActiveRunIntegrationBranch = this.isRunIntegrationBranchLive(run);
       const sameRunRepo = run.integrationRepoRootPath
@@ -7076,10 +7390,15 @@ export class OrchestrationService {
         }
       }
 
+      const beforePublish: NonNullable<Parameters<typeof integrateWorkerChanges>[0]['beforePublish']> = async evidence => {
+        this.store.updateRunIntegrationState(run.id, { integrationIntent: { ...evidence, repo: mainRepoRoot, dispatchId: latestDispatch.id } });
+        await this.store.waitForPendingWrite();
+      };
       let result: WorkerIntegrationResult;
       let runBranchResult: Awaited<ReturnType<typeof integrateWorkerIntoRunBranch>> | null = null;
       if (useRunIntegrationBranch) {
         runBranchResult = await integrateWorkerIntoRunBranch({
+          beforePublish,
           mainRepoRoot,
           runId: run.id,
           existingBranch: hasActiveRunIntegrationBranch ? run.integrationBranch : null,
@@ -7101,6 +7420,7 @@ export class OrchestrationService {
             ? `refs/heads/${run.integrationBaseBranch.trim()}`
             : null;
         result = await integrateWorkerChanges({
+          beforePublish,
           targetRepoPath: mainRepoRoot,
           worktreePath,
           baseCommit: effectiveIntegrationBaseCommit,
@@ -7150,11 +7470,13 @@ export class OrchestrationService {
 
       this.store.updateDispatchIntegrationState(latestDispatch.id, {
         integrationStatus: 'merged',
+        noChanges: result.noChanges,
         integratedCommit: result.integratedCommit,
         integratedTargetBranch: effectiveUsedRunBranch ? result.targetBranch : (useRunIntegrationBranch ? null : result.targetBranch),
       });
 
       const latestRun = this.store.requireRun(run.id);
+      this.store.updateRunIntegrationState(run.id, { integrationIntent: null });
       if (effectiveUsedRunBranch && runBranchResult) {
         this.store.updateRunIntegrationState(run.id, {
           integrationBranch: runBranchResult.integrationBranch,
@@ -7441,6 +7763,7 @@ export class OrchestrationService {
     const mode: WorkerIntegrateMode = input.mode ?? 'squash';
     const executeFinalize = async () => {
       const run = this.store.requireRun(initialRun.id);
+      if (run.integrationIntent) throw new OrchestrationError('operation_rejected', '上一次 Git 交付尚待核对。');
       if (
         !this.isRunIntegrationBranchLive(run) ||
         !run.integrationBranch ||
@@ -7516,7 +7839,20 @@ export class OrchestrationService {
         input.commitMessage?.trim() ||
         `chore(orchestration): finalize run ${run.id} (${run.objective.slice(0, 72)})`;
 
+      const members: Record<string, string> = {};
+      let sourceHead = '';
       const finalized: RunFinalizeIntegrationResult = await finalizeRunIntegrationBranch({
+        beforePublish: async evidence => {
+          sourceHead = evidence.sourceHead;
+          for (const worker of this.store.listDispatches({ runId: run.id })) {
+            if (worker.integrationStatus === 'merged' && worker.integratedTargetBranch === run.integrationBranch &&
+                worker.integratedCommit && await isGitCommitAncestor(run.integrationRepoRootPath!, worker.integratedCommit, sourceHead)) {
+              members[worker.id] = worker.integratedCommit;
+            }
+          }
+          this.store.updateRunIntegrationState(run.id, { integrationIntent: { ...evidence, repo: run.integrationRepoRootPath!, members } });
+          await this.store.waitForPendingWrite();
+        },
         mainRepoRoot: run.integrationRepoRootPath,
         integrationBranch: run.integrationBranch,
         integrationWorktreePath: run.integrationWorktreePath,
@@ -7576,7 +7912,12 @@ export class OrchestrationService {
         }
       }
 
+
       this.store.updateRunIntegrationState(run.id, {
+        integrationIntent: null,
+        ...(sourceHead && finalized.result.integratedCommit ? { finalizedBatch: {
+          sourceHead, targetCommit: finalized.result.integratedCommit, branch: expectedBaseBranch, members,
+        } } : {}),
         integrationStatus: 'finalized',
         finalizedCommit: finalized.result.integratedCommit,
         integrationHeadCommit: finalized.result.integratedCommit,
@@ -7655,6 +7996,9 @@ export class OrchestrationService {
       acceptance?: string;
       agent?: string;
       taskKind?: OrchestrationTaskKind;
+      deps?: string[];
+      codeDeps?: string[];
+      baseBranch?: string;
       worktree?: boolean;
       model?: string;
       effort?: string;
@@ -7846,6 +8190,9 @@ export class OrchestrationService {
       runId: inferredRunId,
       role,
       task: taskText,
+      deps: [...new Set(input.deps ?? [])].sort(),
+      codeDeps: [...new Set(input.codeDeps ?? [])].sort(),
+      baseBranch: input.baseBranch,
       ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
       planSummary: this.store.redactDispatchCredentials(planSummary),
       requestedAgent,
@@ -7937,6 +8284,25 @@ export class OrchestrationService {
       }
     }
 
+    if (proposalInput.deps.length || proposalInput.codeDeps.length) {
+      const run = this.store.requireRun(dispatchRunId ?? inferredRunId ?? '');
+      if (isReviewDispatch) throw new OrchestrationError('invalid_argument', 'Review dispatches already target an immutable snapshot.');
+      if (input.callerPaneId) this.assertRunCoordinator(run.id, input.callerPaneId);
+      const task = this.store.createTask({
+        runId: run.id, spec: taskText, taskTitle, displayName, taskContext: normalizedTaskContext,
+        deps: proposalInput.deps, codeDeps: proposalInput.codeDeps, singleShot: true,
+        queuedLaunch: {
+          from, callerPaneId: input.callerPaneId, callerCwd: input.callerCwd ?? this.sessionCoordinator(from)?.cwd ?? this.terminalTracker?.getTerminal(from)?.cwd ?? this.getDefaultCwd?.(),
+          authorizedNetwork: Boolean(this.sessionCoordinator(from)?.network), requiresPaneMode: this.isPaneOrchestrationMode(from),
+          coordinatorGeneration: run.consumerGeneration, baseBranch: input.baseBranch, agent: resolvedAgent,
+          role, terminal: input.terminal, model: resolvedModel, effort: resolvedEffort, taskKind: effectiveTaskKind,
+          worktree, authorizeReviews: grantRunAutoReview, state: 'waiting',
+        },
+      });
+      this.emitChanged('task:queued', run.id);
+      return { status: 'queued', task, message: '依赖和派发条件满足后启动。' };
+    }
+
     const candidates = input.terminal?.trim()
       ? [resolvedAgent]
       : [resolvedAgent, ...fallbacks.filter((cli) => cli !== resolvedAgent)];
@@ -7974,6 +8340,7 @@ export class OrchestrationService {
             : isReviewDispatch && !input.task?.trim()
               ? {}
               : { spec: taskText }),
+          taskKind: effectiveTaskKind,
           ...(reviewTargetDispatch ? { reviewOf: reviewTargetDispatch.id } : {}),
           ...(reviewRunTarget ? { reviewRun: reviewRunTarget.id } : {}),
           ...(reviewFocus ? { reviewFocus } : {}),
@@ -7988,6 +8355,7 @@ export class OrchestrationService {
           terminal: input.terminal?.trim() || undefined,
           noWorktree: !worktree,
           callerCwd: input.callerCwd,
+          baseBranch: input.baseBranch,
           mcpEnabled,
           role: role || undefined,
         });
@@ -9063,6 +9431,7 @@ export class OrchestrationService {
       : rawPosts;
     const headSeq = this.store.getHeadBoardSeq(caller.runId);
     const isNamedSeqLookup = Boolean(input.seqs && input.seqs.length > 0);
+    if (!input.isUser && this.store.recordBoardReceipt(posts.map(p => p.id), caller.memberKey, 'delivered')) this.emitChanged('board:delivery', caller.runId);
     if (input.markRead !== false && posts.length > 0 && !isNamedSeqLookup) {
       const maxSeq = Math.max(...posts.map((p) => p.boardSeq ?? 0));
       if (maxSeq > 0) {
@@ -9165,6 +9534,7 @@ export class OrchestrationService {
             lastDeliveredSeq: maxSeq,
           });
         }
+        this.store.recordBoardReceipt(posts.map(p => p.id), caller.memberKey, 'delivered');
         this.store.markAsReadAndDeliveredForConsumer(
           posts.map((p) => p.id),
           caller.fromHandle
@@ -9382,7 +9752,8 @@ export class OrchestrationService {
       if (base.activeCoordinatorRun?.runId !== scope) base.activeCoordinatorRun = null;
       const firewall = this.getReviewFirewallContext(callerPaneId);
       if (firewall) {
-        base.messages = base.messages.filter((message) => !this.isPostHiddenByReviewFirewall(message, firewall));
+        base.messages = base.messages.filter((message) => !this.isPostHiddenByReviewFirewall(message, firewall)).map(({ receipts: _receipts, ...message }) => message);
+        base.runs = base.runs.map(({ finalizedBatches: _batches, integrationIntent: _intent, ...run }) => run);
         base.dispatches = base.dispatches.filter((dispatch) => !firewall.targetDispatchIds.has(dispatch.id));
         base.tasks = base.tasks.filter((task) => !firewall.targetTaskIds.has(task.id));
         base.questions = base.questions.filter(
@@ -9534,7 +9905,7 @@ export class OrchestrationService {
           ['Branch', typeof record.branch === 'string' ? record.branch : null],
           ['OwnsWorktree', record.ownsWorktree ? 'true' : 'false'],
         ],
-        `Worker started. Wait for updates with: ${this.cliCommand} orchestration check --wait`
+        `${dispatch?.startObservation === 'observed' ? 'Worker started' : 'Dispatch observation: ' + (dispatch?.startObservation ?? 'pending')}. Wait for updates with: ${this.cliCommand} orchestration check --wait`
       );
     }
 

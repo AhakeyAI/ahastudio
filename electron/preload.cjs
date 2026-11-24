@@ -207,6 +207,7 @@ const api = {
     workerDiff: (opts) => ipcRenderer.invoke('orchestration:worker-diff', opts),
     workerIntegrate: (opts) => ipcRenderer.invoke('orchestration:worker-integrate', opts),
     runDiff: (opts) => ipcRenderer.invoke('orchestration:run-diff', opts),
+    reconcilePublication: (opts) => ipcRenderer.invoke('orchestration:reconcile-publication', opts),
     runFinalize: (opts) => ipcRenderer.invoke('orchestration:run-finalize', opts),
     runSetAutoReview: (opts) => ipcRenderer.invoke('orchestration:run-set-auto-review', opts),
     reset: (opts) => ipcRenderer.invoke('orchestration:reset', opts),

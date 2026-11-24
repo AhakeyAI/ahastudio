@@ -39,6 +39,7 @@ const runCreateSchema = z
 
 const runUseSchema = z
   .object({
+    takeOverQueue: z.boolean().optional(),
     id: nonEmptyId,
     from: nonEmptyId.optional(),
     paneId: nonEmptyId.optional(),
@@ -65,6 +66,7 @@ const taskCreateSchema = z
     taskTitle: z.string().trim().min(1).max(200).optional(),
     displayName: z.string().trim().min(1).max(200).optional(),
     deps: z.array(nonEmptyId).max(100).optional(),
+    codeDeps: z.array(nonEmptyId).max(100).optional(),
     priority: priorityEnum.optional(),
     worktreePath: z.string().trim().min(1).max(1024).optional(),
   })
@@ -89,6 +91,7 @@ const taskShowSchema = z
 
 const taskUpdateSchema = z
   .object({
+    queueDecision: z.enum(['cancel', 'resume']).optional(),
     id: nonEmptyId,
     status: taskStatusEnum,
   })
@@ -178,6 +181,7 @@ const workerStartSchema = z
     taskTitle: z.string().trim().min(1).max(200).optional(),
     displayName: z.string().trim().min(1).max(200).optional(),
     deps: z.array(nonEmptyId).max(100).optional(),
+    codeDeps: z.array(nonEmptyId).max(100).optional(),
     priority: priorityEnum.optional(),
     retryOfDispatchId: nonEmptyId.optional(),
     cliId: nonEmptyId.optional(),
@@ -278,6 +282,8 @@ const workerAbandonSchema = z
 
 const resetSchema = z
   .object({
+    historyOnly: z.boolean().optional(),
+    discardRunId: nonEmptyId.optional(),
     all: z.boolean().optional(),
     tasks: z.boolean().optional(),
     messages: z.boolean().optional(),
@@ -415,6 +421,9 @@ const delegateTaskSchema = z
     proposalId: z.string().trim().min(1).max(128).optional(),
     agent: nonEmptyId.optional(),
     taskKind: taskKindEnum.optional(),
+    deps: z.array(nonEmptyId).max(100).optional(),
+    codeDeps: z.array(nonEmptyId).max(100).optional(),
+    baseBranch: nonEmptyId.optional(),
     worktree: z.boolean().optional(),
     model: nonEmptyId.optional(),
     effort: nonEmptyId.optional(),
@@ -949,6 +958,13 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     authorize,
     authorizeError,
     handler: (payload) => runAction(async () => ({ ...(await requireService().runDiff(payload ?? {})) })),
+  });
+
+  handleSecure('orchestration:reconcile-publication', {
+    schema: z.object({ runId: nonEmptyId, expectedCommit: z.string().regex(/^[0-9a-f]{40,64}$/), acceptUnpublished: z.boolean().optional() }).strict(),
+    authorize,
+    authorizeError,
+    handler: payload => act(() => requireService().reconcilePublication(payload)),
   });
 
   handleSecure('orchestration:run-finalize', {
