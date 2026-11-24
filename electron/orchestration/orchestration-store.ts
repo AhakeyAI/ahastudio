@@ -3742,6 +3742,7 @@ export class OrchestrationStore {
     const run = this.runs.get(runId);
     if (run?.integrationIntent) return 'Git 操作中断，交付位置待核对';
     if (run?.integrationStatus === 'active' || run?.integrationStatus === 'conflict') return '集成分支尚未交付';
+    if (run?.integrationWorktreePath) return '保留的集成工作树尚未释放';
     for (const task of this.tasks.values()) {
       if (task.runId === runId && task.queuedLaunch) return '有尚未处理的排队任务';
     }

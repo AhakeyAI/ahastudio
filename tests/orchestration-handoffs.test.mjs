@@ -44,6 +44,9 @@ test('history retains a kept worktree after release and deleting its record requ
   store.createRun({ objective: 'next', coordinatorHandle: 'coord' });
   assert.ok(store.getDispatchContext(dispatch.id));
   assert.ok(store.clearFinishedHistory().retained.some(r => r.id === run.id));
+  store.markDispatchReleased(dispatch.id);
+  store.updateRunIntegrationState(run.id, { integrationStatus: 'finalized', integrationWorktreePath: 'retained-integration-tree' });
+  assert.ok(store.clearFinishedHistory().retained.some(r => r.id === run.id));
   assert.equal(store.clearFinishedHistory(run.id).removed.runs, 1);
   assert.equal(store.getDispatchContext(dispatch.id), undefined);
 });
