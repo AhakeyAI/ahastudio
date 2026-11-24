@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -32,7 +33,7 @@ function fakeCodexChild() {
 
 function recordCodexExit(exits) {
   return {
-    onTurnStarted() {}, onTurnCompleted() {}, onApproval: async () => false,
+    onTurnStarted() {}, onTurnCompleted() {}, onRequest: async () => ({ decision: 'decline' }),
     onExit: (reason, code) => exits.push({ reason, code }),
   };
 }
@@ -47,7 +48,7 @@ async function until(read, timeout = 4_000) {
   assert.fail('Expected pilot state did not appear');
 }
 
-async function setup(t, scenario = 'normal', enabled = true) {
+async function setup(t, scenario = 'normal', enabled = true, { confirmMode } = {}) {
   const dir = mkdtempSync(join(cwd, '.codex-pilot-test-'));
   const trace = join(dir, 'rpc.jsonl');
   const agentStatusStore = new AgentStatusStore();
@@ -58,18 +59,21 @@ async function setup(t, scenario = 'normal', enabled = true) {
   const children = [];
   const exits = [];
   const writes = [];
+  const spawnCalls = [];
   let ptyStarts = 0;
   let codexStarts = 0;
   const service = new OrchestrationService({
     store, agentStatusStore, getDefaultCwd: () => cwd,
     settleDelayMs: 0, turnStartObserveTimeoutMs: 250, turnStopSettleMs: 10_000,
+    ...(confirmMode ? { getConfirmMode: () => confirmMode } : {}),
     writePty: async (id, data) => {
       writes.push({ id, data });
       agentStatusStore.ingestHookEvent({ ptyId: id, agentId: 'codex', state: 'working' });
       return { ok: true };
     },
-    spawnWorkerPty: async () => {
+    spawnWorkerPty: async (opts) => {
       ptyStarts++;
+      spawnCalls.push(opts);
       agentStatusStore.registerPane('fallback-pane', { agentId: 'codex' });
       return { ptyId: 'fallback-pane' };
     },
@@ -128,7 +132,7 @@ async function setup(t, scenario = 'normal', enabled = true) {
     return response.json();
   };
   return {
-    dir, service, store, statePath, start, run, getTrace, writes, workers, workerHttp, children, exits,
+    dir, service, store, statePath, start, run, getTrace, writes, spawnCalls, workers, workerHttp, children, exits,
     ptyStarts: () => ptyStarts, codexStarts: () => codexStarts,
   };
 }
@@ -186,6 +190,10 @@ test('independent Worker auth, long stdin input, pending turn and same-thread re
   assert.equal(app.service.workerShow({ dispatchId: first.dispatch.id }).stage, 'awaiting_review');
   const submitted = app.getTrace().filter((message) => message.method === 'turn/start');
   assert.equal(submitted.length, 1);
+  assert.deepEqual(submitted[0].params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+  assert.equal(submitted[0].params.approvalPolicy, 'on-request');
+  const opened = app.getTrace().find((message) => message.method === 'thread/start').params;
+  assert.deepEqual([opened.sandbox, opened.approvalPolicy], ['read-only', 'on-request']);
   assert.ok(submitted[0].params.input[0].text.includes(spec));
   const read = app.service.workerRead({ dispatchId: first.dispatch.id, limit: 3 });
   assert.equal(read.text, '模拟输');
@@ -275,11 +283,109 @@ test('close reuses a bounded wait when neither child error nor close arrives', {
   assert.match(exits[0].reason, /Timed out waiting for Codex app-server to close/);
 });
 
+async function openDriver(t, { scenario = 'normal', onRequest, ...open } = {}) {
+  const dir = mkdtempSync(join(cwd, '.codex-driver-test-'));
+  const trace = join(dir, 'rpc.jsonl');
+  const child = spawn(process.execPath, [join(cwd, 'tests/fixtures/mock-codex-app-server.mjs'), scenario, trace], {
+    cwd, stdio: 'pipe', windowsHide: true,
+  });
+  const turns = [];
+  const requests = [];
+  const session = new CodexAppServerPilot(child, {
+    onTurnStarted() {},
+    onTurnCompleted: (turnKey, result) => turns.push({ turnKey, ...result }),
+    onRequest: async (turnKey, request) => {
+      requests.push(request);
+      return onRequest ? onRequest(request) : { decision: 'decline' };
+    },
+    onExit() {},
+  }, 850);
+  t.after(async () => {
+    await session.close();
+    rmSync(dir, { force: true, recursive: true });
+  });
+  const opened = session.open({ cwd, model: null, policy: 'read-only', ...open });
+  const sent = (method) => readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse)
+    .filter((message) => message.method === method).map((message) => message.params);
+  return { session, opened, turns, requests, sent };
+}
+
+test('each policy maps to a sandbox and approval mode, and a turn can switch policy and model', async (t) => {
+  const { session, opened, turns, sent } = await openDriver(t, { policy: 'workspace-write', model: 'gpt-a' });
+  await opened;
+  const start = sent('thread/start')[0];
+  assert.deepEqual([start.sandbox, start.approvalPolicy, start.model], ['workspace-write', 'on-request', 'gpt-a']);
+
+  assert.equal((await session.startTurn({ turnKey: 'one', prompt: 'first' })).status, 'accepted');
+  await until(() => turns.length === 1);
+  assert.equal((await session.startTurn({
+    turnKey: 'two', prompt: 'second', policy: 'full-auto', model: 'gpt-b', effort: 'high',
+  })).status, 'accepted');
+  await until(() => turns.length === 2);
+  assert.equal((await session.startTurn({ turnKey: 'three', prompt: 'third' })).status, 'accepted');
+  await until(() => turns.length === 3);
+
+  const [first, second, third] = sent('turn/start');
+  assert.deepEqual([first.sandboxPolicy.type, first.approvalPolicy, first.model], ['workspaceWrite', 'on-request', undefined]);
+  assert.deepEqual(
+    [second.sandboxPolicy.type, second.sandboxPolicy.networkAccess, second.approvalPolicy, second.model, second.effort],
+    ['workspaceWrite', false, 'never', 'gpt-b', 'high'],
+    'full-auto stops asking but stays inside the workspace sandbox',
+  );
+  assert.equal(third.approvalPolicy, 'never', 'a policy set on one turn stays in effect');
+});
+
+test('a sandbox Codex did not grant as requested fails the session before any turn', async (t) => {
+  const { session, opened, sent } = await openDriver(t, { scenario: 'sandbox-mismatch', policy: 'read-only' });
+  await assert.rejects(opened, /did not confirm the requested read-only sandbox/);
+  assert.equal(session.sessionId, null);
+  assert.equal((await session.startTurn({ turnKey: 'one', prompt: 'nope' })).status, 'not_accepted');
+  assert.equal(sent('turn/start').length, 0);
+});
+
+test('resume continues the given thread and reports per-turn usage without a baseline', async (t) => {
+  const { session, opened, turns, sent } = await openDriver(t, { resumeSessionId: 'mock-thread-id', policy: 'workspace-write' });
+  assert.equal(await opened, 'mock-thread-id');
+  assert.equal(sent('thread/start').length, 0);
+  const resume = sent('thread/resume')[0];
+  assert.deepEqual([resume.threadId, resume.sandbox, resume.excludeTurns], ['mock-thread-id', 'workspace-write', true]);
+
+  await session.startTurn({ turnKey: 'one', prompt: 'continue' });
+  await until(() => turns.length === 1);
+  // The thread total (23/7) includes turns from before the resume; only this turn's share is known.
+  assert.deepEqual(turns[0].usage, { inputTokens: 11, outputTokens: 3 });
+});
+
+test('a question from Codex is answered through onRequest; secret or unanswered ones are refused', async (t) => {
+  const { session, opened, turns, requests } = await openDriver(t, {
+    onRequest: (request) => (request.kind === 'question' && requests.length === 1
+      ? { answers: { db: ['SQLite'] } } : { decision: 'decline' }),
+  });
+  await opened;
+  await session.startTurn({ turnKey: 'one', prompt: 'ASK_A_QUESTION' });
+  await until(() => turns.length === 1);
+  assert.equal(requests[0].kind, 'question');
+  assert.deepEqual(requests[0].questions, [{
+    id: 'db', header: 'Database', prompt: 'Which database?', allowOther: false,
+    options: [{ label: 'SQLite', description: 'Local file' }, { label: 'Postgres', description: 'Server' }],
+  }]);
+  assert.equal(turns[0].finalText, 'answer: {"db":{"answers":["SQLite"]}}');
+
+  await session.startTurn({ turnKey: 'two', prompt: 'ASK_A_QUESTION' });
+  await until(() => turns.length === 2);
+  assert.equal(turns[1].finalText, 'request refused');
+
+  await session.startTurn({ turnKey: 'three', prompt: 'ASK_A_QUESTION SECRET' });
+  await until(() => turns.length === 3);
+  assert.equal(requests.length, 2, 'a secret question is never forwarded');
+  assert.equal(turns[2].finalText, 'request refused');
+});
+
 test('bounded stderr is included and redacted on startup failure and process exit', async () => {
   const child = fakeCodexChild();
   const exits = [];
   const session = new CodexAppServerPilot(child, recordCodexExit(exits), 850, [stderrSecret]);
-  const opening = session.open(cwd, null);
+  const opening = session.open({ cwd, model: null, policy: 'read-only' });
   child.stderr.write(Buffer.from('discarded-prefix ' + 'a'.repeat(5_000)));
   child.stderr.write(Buffer.from('\nTOML denied credential=' + stderrSecret.slice(0, 10)));
   child.stderr.write(Buffer.from(stderrSecret.slice(10) + '\n末尾'));
@@ -372,6 +478,8 @@ for (const scenario of ['initialize-error', 'rejected']) {
     assert.equal(started.ptyId, 'fallback-pane');
     assert.equal(started.dispatch.executionMode, undefined);
     assert.equal(app.ptyStarts(), 1);
+    assert.ok(app.spawnCalls[0].extraArgs.includes('--sandbox'));
+    assert.ok(app.spawnCalls[0].extraArgs.includes('read-only'));
     assert.ok(app.writes.length);
   });
 }
@@ -390,10 +498,19 @@ for (const scenario of ['timeout', 'disconnect', 'started-then-error']) {
 }
 
 test('PTY remains default, including selected Codex when not read-only', async (t) => {
-  const app = await setup(t, 'normal', false);
-  const started = await app.start('Return from the unchanged PTY path');
+  const disabled = await setup(t, 'normal', false);
+  const started = await disabled.start('Return from the unchanged PTY path');
   assert.equal(started.ptyId, 'fallback-pane');
-  assert.equal(app.codexStarts(), 0);
+  assert.equal(disabled.codexStarts(), 0);
+
+  // Even when the pilot setting is on, a terminal-coordinated writable Codex task still uses PTY.
+  const enabled = await setup(t, 'normal', true);
+  const writable = await enabled.start('Writable task from terminal coordinator', { readOnly: false });
+  assert.equal(writable.ptyId, 'fallback-pane');
+  assert.equal(writable.dispatch.executionMode, undefined);
+  assert.equal(enabled.codexStarts(), 0);
+  assert.equal(enabled.ptyStarts(), 1);
+  assert.ok(!enabled.spawnCalls[0].extraArgs.includes('--sandbox'));
 });
 
 test('approval denial, mailbox turn, interrupt, and archive', async (t) => {
@@ -783,4 +900,148 @@ test('git fallback diff is redacted before it is stored, announced, or shown', a
   assert.match(app.store.getDispatchContext(dispatch.id).codexTurn.diff, /leaked <redacted>/);
   await app.service.waitForPendingWrites();
   assert.doesNotMatch(readFileSync(app.statePath, 'utf8'), new RegExp(stderrSecret));
+});
+
+test('git fallback diff includes untracked new files without modifying the git index', async (t) => {
+  const app = await setup(t);
+  const repo = join(app.dir, 'repo-untracked');
+  const git = (...args) => execFileSync('git', args, { cwd: app.dir, encoding: 'utf8', windowsHide: true });
+  git('clone', '--quiet', '--shared', '--no-checkout', cwd, repo);
+  git('-C', repo, 'sparse-checkout', 'set', '--no-cone', '/README.md');
+  git('-C', repo, 'checkout', '--quiet');
+  writeFileSync(join(repo, 'brand-new-note.txt'), 'hello from worker\n');
+  writeFileSync(join(repo, `secret-${stderrSecret}.txt`), 'secret filename\n');
+  const statusBefore = git('-C', repo, 'status', '--porcelain');
+
+  const { dispatch } = await app.start('Check untracked files in fallback diff', { cwd: repo });
+  const settled = await until(() => app.service.getWorkerTimeline({ dispatchId: dispatch.id })
+    ?.turns[0]?.items.find((item) => item.kind === 'settlement'));
+  assert.equal(settled.diffSource, 'git');
+  assert.match(settled.diff, /brand-new-note\.txt/);
+  assert.match(settled.diff, /secret-<redacted>\.txt/);
+  assert.doesNotMatch(settled.diff, new RegExp(stderrSecret));
+  assert.match(app.store.getDispatchContext(dispatch.id).codexTurn.diff, /brand-new-note\.txt/);
+  // Read-only inspection must never stage or intent-to-add untracked files.
+  assert.equal(git('-C', repo, 'status', '--porcelain'), statusBefore);
+  assert.equal(git('-C', repo, 'diff', '--cached', '--name-only').trim(), '');
+});
+
+test('session Coordinator runs a writable headless Worker in a worktree, integrates via squash and run-finalize, and reaps it', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'aha-codex-e2e-'));
+  const repo = join(root, 'repo');
+  const git = (workdir, ...args) => execFileSync('git', args, { cwd: workdir, encoding: 'utf8', windowsHide: true }).trim();
+  git(root, 'init', '-b', 'main', 'repo');
+  git(repo, 'config', 'user.name', 'Test User');
+  git(repo, 'config', 'user.email', 'test@example.com');
+  writeFileSync(join(repo, 'README.md'), '# Demo\n', 'utf8');
+  git(repo, 'add', '.');
+  git(repo, 'commit', '-m', 'initial commit');
+  const baseHead = git(repo, 'rev-parse', 'HEAD');
+
+  const app = await setup(t, 'normal', false, { confirmMode: 'auto' });
+  t.after(async () => {
+    await app.service.stopCodexWorkers();
+    rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  });
+  const SESSION = 'agent-session-00000000-0000-0000-0000-0000000000e2';
+  app.service.setSessionCoordinators({
+    get: (id) => (id === SESSION ? { cwd: repo, provider: 'codex', active: true, idle: true, network: false } : null),
+  });
+  const callSession = (action, payload) =>
+    dispatchOrchestrationHttpAction(app.service, action, payload, {
+      signal: new AbortController().signal, callerPaneId: SESSION,
+    }).then((reply) => reply.body);
+  const processDead = (pid) => {
+    if (!pid) return true;
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error) {
+      if (error.code !== 'ESRCH') throw error;
+      return true;
+    }
+  };
+
+  // 1. Direct squash integration into main.
+  const started = await callSession('delegate-task', {
+    role: 'writer', task: 'Create hello.txt via WRITE_FILE:hello.txt', agent: 'codex', worktree: true,
+  });
+  assert.equal(started.ok, true, started.error);
+  assert.equal(started.result.status, 'started', JSON.stringify(started.result));
+  const dispatch = started.result.dispatch;
+  const workerId = dispatch.assigneeHandle;
+  const worktreePath = dispatch.worktreePath;
+  const workerBranch = dispatch.branch;
+  const workerChild = app.children[0];
+  assert.equal(dispatch.executionMode, 'codex-app-server');
+  assert.equal(dispatch.assigneePaneId, null);
+  assert.equal(dispatch.ownsPane, false);
+  assert.equal(dispatch.ownsWorktree, true);
+  assert.ok(worktreePath && worktreePath !== repo);
+  assert.ok(workerBranch && workerBranch.startsWith('aha/worker/'));
+  assert.equal(app.ptyStarts(), 0);
+  assert.equal(app.service.getWorkerTimeline({ dispatchId: dispatch.id }).readOnly, false);
+
+  const settled = await until(() => app.service.getWorkerTimeline({ dispatchId: dispatch.id })
+    ?.turns[0]?.items.find((item) => item.kind === 'settlement'));
+  assert.equal(existsSync(join(worktreePath, 'hello.txt')), true);
+  assert.equal(existsSync(join(repo, 'hello.txt')), false);
+  assert.equal(settled.diffSource, 'git');
+  assert.match(settled.diff ?? '', /hello\.txt/);
+  assert.match(app.store.getDispatchContext(dispatch.id).codexTurn.diff ?? '', /hello\.txt/);
+
+  const done = await reportDone(app.workers.get(workerId), 'Wrote hello.txt');
+  assert.equal(done.isError, undefined);
+  assert.equal(app.store.getDispatchContext(dispatch.id).status, 'completed');
+
+  const integrated = await callSession('worker-integrate', { dispatchId: dispatch.id, mode: 'squash' });
+  assert.equal(integrated.ok, true, integrated.error);
+  assert.equal(integrated.result.integrated, true);
+  assert.equal(integrated.result.mode, 'squash');
+  assert.equal(integrated.result.released, true);
+  assert.equal(readFileSync(join(repo, 'hello.txt'), 'utf8'), 'written by mock headless worker (hello.txt)\n');
+  assert.equal(git(repo, 'rev-list', '--count', `${baseHead}..HEAD`), '1');
+
+  const releasedDispatch = app.store.getDispatchContext(dispatch.id);
+  assert.ok(releasedDispatch.releasedAt);
+  assert.equal(releasedDispatch.stage, 'released');
+  assert.equal(releasedDispatch.ownsWorktree, false);
+  assert.equal(existsSync(worktreePath), false);
+  assert.equal(git(repo, 'branch', '--list', workerBranch), '');
+  assert.equal(app.service.hasCodexWorkers(), false);
+  assert.equal(app.service.isPaneAlive(workerId), false);
+  assert.ok(workerChild.exitCode !== null || workerChild.signalCode !== null);
+  assert.equal(processDead(workerChild.pid), true);
+  assert.equal(app.ptyStarts(), 0);
+
+  // 2. Dirty main routes to aha/run/* integration branch, then run-finalize promotes it cleanly.
+  writeFileSync(join(repo, 'user-wip.txt'), 'unsaved local edit\n', 'utf8');
+  const second = await callSession('delegate-task', {
+    role: 'writer-two', task: 'Create staged.txt via WRITE_FILE:staged.txt', agent: 'codex', worktree: true,
+  });
+  assert.equal(second.ok, true, second.error);
+  const secondDispatch = second.result.dispatch;
+  const secondChild = app.children[1];
+  await until(() => app.store.getDispatchContext(secondDispatch.id)?.codexTurn);
+  const secondDone = await reportDone(app.workers.get(secondDispatch.assigneeHandle), 'Wrote staged.txt');
+  assert.equal(secondDone.isError, undefined);
+
+  const staged = await callSession('worker-integrate', { dispatchId: secondDispatch.id, mode: 'squash' });
+  assert.equal(staged.ok, true, staged.error);
+  assert.equal(staged.result.integrated, true);
+  assert.equal(staged.result.usedRunIntegrationBranch, true);
+  assert.equal(staged.result.released, true);
+  assert.equal(existsSync(join(repo, 'staged.txt')), false, 'dirty main stays untouched until finalize');
+  assert.equal(existsSync(secondDispatch.worktreePath), false);
+  assert.equal(app.service.hasCodexWorkers(), false);
+  assert.equal(processDead(secondChild.pid), true);
+
+  rmSync(join(repo, 'user-wip.txt'));
+  const finalized = await callSession('run-finalize', { runId: secondDispatch.runId, mode: 'squash' });
+  assert.equal(finalized.ok, true, finalized.error);
+  assert.equal(finalized.result.integrated, true);
+  assert.equal(finalized.result.removedWorktree, true);
+  assert.equal(finalized.result.removedBranch, true);
+  assert.equal(readFileSync(join(repo, 'staged.txt'), 'utf8'), 'written by mock headless worker (staged.txt)\n');
+  assert.equal(app.ptyStarts(), 0);
 });

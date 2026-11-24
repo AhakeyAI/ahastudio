@@ -618,3 +618,85 @@ test('buildBoardViewModel prefers active runs over stale stopped runs and reflec
   assert.equal(stoppedVm.coordinator?.stageLabel, '已结束');
   assert.equal(stoppedVm.coordinator?.liveActivity, null);
 });
+
+test('a session Coordinator\'s run follows the focused session and its card shows the session\'s live state', () => {
+  const SESSION = 'agent-session-00000000-0000-0000-0000-00000000000a';
+  const snapshot = {
+    ...view.EMPTY_SNAPSHOT,
+    runs: [
+      makeRun('run_term', { createdAt: isoAt(20) }),
+      makeRun('run_1', { coordinatorHandle: SESSION, coordinatorPaneId: SESSION, createdAt: isoAt(10) }),
+    ],
+    tasks: [makeTask('t_scout', { displayName: 'scout' })],
+    dispatches: [makeDispatch('d_scout', 't_scout', {
+      creator: SESSION, parentPaneId: SESSION,
+      assigneeHandle: 'codex-worker-00000000-0000-0000-0000-000000000001', assigneePaneId: null,
+    })],
+  };
+  const card = (session) => {
+    const vm = board.buildBoardViewModel(snapshot, {
+      activePtyId: SESSION,
+      sessionCoordinators: new Map(session ? [[SESSION, session]] : []),
+    });
+    assert.equal(vm.run.id, 'run_1');
+    return [vm.coordinator.status, vm.coordinator.stageLabel, vm.coordinator.cliId];
+  };
+  assert.deepEqual(card({ provider: 'codex', state: 'working' }), ['working', '执行中', 'codex']);
+  assert.deepEqual(card({ provider: 'codex', state: 'waiting' }), ['waiting', '待回答', 'codex']);
+  assert.deepEqual(card({ provider: 'codex', state: 'idle' }), ['idle', '在线', 'codex']);
+  assert.deepEqual(card({ provider: 'codex', state: 'offline' }), ['offline', '离线', 'codex']);
+  assert.deepEqual(card(null), ['offline', '离线', null]);
+  assert.deepEqual(board.buildBoardViewModel(snapshot, { activePtyId: SESSION }).members.map((m) => m.role), ['scout']);
+
+  const state = (status, pendingQuestions = []) => board.sessionCoordinatorState({ status, pendingQuestions });
+  assert.deepEqual(
+    [state('running'), state('running', [{ requestId: 'q' }]), state('idle'), state('starting'), state('suspended'), state('failed')],
+    ['working', 'waiting', 'idle', 'working', 'offline', 'offline'],
+  );
+});
+
+test('a focused session Coordinator with no run of its own shows no run instead of an unrelated fallback', () => {
+  const SESSION = 'agent-session-00000000-0000-0000-0000-00000000000a';
+  const coordinators = new Map([[SESSION, { provider: 'codex', state: 'idle' }]]);
+  const snapshot = {
+    ...view.EMPTY_SNAPSHOT,
+    runs: [
+      makeRun('run_live', { status: 'active' }),
+      makeRun('run_old', {
+        status: 'stopped',
+        coordinatorHandle: 'local-old-coord',
+        coordinatorPaneId: 'local-old-coord',
+        createdAt: isoAt(30),
+      }),
+    ],
+  };
+
+  const vm = board.buildBoardViewModel(snapshot, { activePtyId: SESSION, sessionCoordinators: coordinators });
+  assert.equal(vm.run, null);
+  assert.deepEqual(vm.focusedSessionCoordinator, { provider: 'codex', state: 'idle' });
+
+  // An explicit dropdown selection still opens that run.
+  const picked = board.buildBoardViewModel(snapshot, {
+    activePtyId: SESSION, runId: 'run_live', sessionCoordinators: coordinators,
+  });
+  assert.equal(picked.run.id, 'run_live');
+  assert.equal(picked.focusedSessionCoordinator, null);
+
+  // A run bound to the session, even historical, is still found.
+  const bound = board.buildBoardViewModel(
+    {
+      ...snapshot,
+      runs: [...snapshot.runs, makeRun('run_session', {
+        status: 'stopped', coordinatorHandle: SESSION, coordinatorPaneId: SESSION, createdAt: isoAt(20),
+      })],
+    },
+    { activePtyId: SESSION, sessionCoordinators: coordinators },
+  );
+  assert.equal(bound.run.id, 'run_session');
+  assert.equal(bound.focusedSessionCoordinator, null);
+
+  // A focused terminal pane keeps the generic fallback.
+  const pane = board.buildBoardViewModel(snapshot, { activePtyId: 'local-other', sessionCoordinators: coordinators });
+  assert.equal(pane.run.id, 'run_live');
+  assert.equal(pane.focusedSessionCoordinator, null);
+});

@@ -1,3 +1,4 @@
+import { agentSessionClient, isStandaloneSession } from '../lib/agent-session-client';
 import {
   useCallback,
   useEffect,
@@ -152,6 +153,7 @@ export function LocalTerminalWorkspace({
     orchestrationClient.getSnapshot,
   );
   const agents = useAgentStatuses();
+  const agentSessions = useSyncExternalStore(agentSessionClient.subscribe, agentSessionClient.getSnapshot);
   const fontSize = terminalSessionStore.getFontSize();
   const appearance = terminalSessionStore.getAppearance();
   const appearancePreference = terminalSessionStore.getAppearancePreference();
@@ -232,6 +234,15 @@ export function LocalTerminalWorkspace({
         status,
       };
     });
+  });
+
+  // Orchestrating Agent sessions in this folder are workspace Coordinators, not prompt targets.
+  const sessionTargets = folderWindows.flatMap((win) => {
+    if (win.type !== 'agent-session' || !win.workerId) return [];
+    const session = agentSessions.find((item) => item.id === win.workerId);
+    return session?.orchestration
+      ? [{ sessionId: session.id, windowId: win.id, title: win.title, isActive: win.id === active?.id }]
+      : [];
   });
 
   const panelCwd = activePaneCwd ?? selectedCwd;
@@ -1054,12 +1065,24 @@ export function LocalTerminalWorkspace({
           windows={folderWindows}
           activeWindowId={active?.id ?? null}
           onSelect={selectTab}
-          onClose={stage.closeWindow}
+          onClose={(id) => {
+            const closing = folderWindows.find((win) => win.id === id);
+            // Closing the tab of a direct session ends it; Worker sessions keep running without a tab.
+            if (closing?.type === 'agent-session' && isStandaloneSession(closing.workerId)) {
+              void window.vibeMeet?.agentSessions?.close({ id: closing.workerId });
+            }
+            stage.closeWindow(id);
+          }}
           localOnly
           renderTabBadge={(win) => (win.type === 'agent-session' ? null : <AgentStatusBadge status={windowAgentStatus(win)} />)}
-          onCreate={(type, opts) =>
-            stage.createWindow(type, { ...opts, cwd: selectedCwd ?? opts?.cwd })
-          }
+          onCreate={(type, opts) => {
+            const cwd = selectedCwd ?? opts?.cwd;
+            if (type !== 'agent-session') return stage.createWindow(type, { ...opts, cwd });
+            void agentSessionClient.create({ ...(cwd ? { cwd } : {}), policy: 'workspace-write' }).then((res) => {
+              if (!res.ok) return handleNotify(res.error);
+              void stageWindowStore.createWindow('agent-session', { ...opts, cwd: res.session.cwd, workerId: res.session.id });
+            });
+          }}
         />
         <div className="terminal-tab-actions">
           {active && activeLeafId && (
@@ -1132,8 +1155,10 @@ export function LocalTerminalWorkspace({
           onClose={() => toggleRightPanel(false)}
           worktreeActions={worktreeActions}
           agentTargets={agentTargets}
+          sessionTargets={sessionTargets}
           onAgentPromptSent={focusAgentTarget}
-          activePtyId={activePtyId}
+          onFocusAgentSession={selectTab}
+          activePtyId={activePtyId ?? (activeIsSession ? active?.workerId : undefined)}
         />
       )}
 

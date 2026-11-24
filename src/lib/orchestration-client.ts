@@ -195,6 +195,17 @@ export const orchestrationClient = {
     { ok: true; timeline: WorkerTimelineSnapshot | null } | { ok: false; error: string }
   > {
     const api = typeof window !== 'undefined' ? window.vibeMeet?.orchestration : undefined;
+    const sessions = typeof window !== 'undefined' ? window.vibeMeet?.agentSessions : undefined;
+    // Direct (non-orchestration) sessions; mirrors isStandaloneSession in agent-session-client.
+    if (opts.workerHandle && /^agent-session-[a-f0-9-]{36}$/.test(opts.workerHandle)) {
+      if (!sessions) return { ok: false, error: '会话接口不可用' };
+      try {
+        const res = await sessions.timeline({ id: opts.workerHandle });
+        return res.ok ? { ok: true, timeline: res.timeline } : { ok: false, error: res.error };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
     if (!api?.workerTimelineGet) return { ok: false, error: '会话接口不可用' };
     try {
       const res = await api.workerTimelineGet(opts);

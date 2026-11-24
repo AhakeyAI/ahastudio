@@ -2,9 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { resolve as resolveFsPath } from 'node:path';
 import { runGitCommand } from '../git/git-exec.js';
-import {
-  CODEX_WORKER_ID, type CodexAppServerPilot, type CodexPilotEvents, type CodexTurnResult,
-} from './codex-app-server-pilot.js';
+import type {
+  AgentSessionDriver, AgentSessionEvents, AgentSessionPolicy, AgentTurnResult, TurnDelivery,
+} from './agent-session-driver.js';
+import { SESSION_WAKE_HEADER } from './coordinator-prompt.js';
+import { AGENT_SESSION_ID } from './agent-session-manager.js';
+import { CODEX_WORKER_ID } from './codex-app-server-pilot.js';
 import {
   WorkerTimeline, type WorkerTimelineChange, type WorkerTimelineSnapshot, type WorkerTimelineTurnStatus,
 } from './worker-timeline.js';
@@ -266,6 +269,18 @@ export interface OrchestrationMcpContext {
   pendingProposals: OrchestrationDispatchProposal[];
 }
 
+/** Agent sessions (no PTY) that a person switched into orchestration mode to act as Coordinators. */
+export interface OrchestrationSessionCoordinators {
+  /**
+   * `active`: the session exists, is in orchestration mode, and has not closed or failed.
+   * `idle`: active, between turns, and not waiting on the person.
+   * `network`: whether sandboxed commands in this session may reach the network.
+   */
+  get(sessionId: string): { cwd: string; provider: string; active: boolean; idle?: boolean; network?: boolean } | null;
+  /** Starts a system turn (never counted as the person's message); omitted means sessions are never woken. */
+  wake?(sessionId: string, prompt: string): Promise<TurnDelivery>;
+}
+
 export interface OrchestrationServiceDependencies {
   store: OrchestrationStore;
   agentStatusStore: AgentStatusStore;
@@ -279,7 +294,7 @@ export interface OrchestrationServiceDependencies {
   }) => Promise<WorkerPaneCandidate | null>;
   codexPilot?: {
     enabled: () => boolean;
-    launch: (workerId: string, cwd: string, events: CodexPilotEvents) => CodexAppServerPilot;
+    launch: (workerId: string, cwd: string, events: AgentSessionEvents) => AgentSessionDriver;
   };
   closeWorkerPty?: (ptyId: string) => Promise<unknown> | unknown;
   isPtyAlive?: (ptyId: string) => boolean;
@@ -341,7 +356,8 @@ export class OrchestrationService {
   private readonly writePty: PtyWriteFn;
   private readonly spawnWorkerPty?: OrchestrationServiceDependencies['spawnWorkerPty'];
   private readonly codexPilot?: OrchestrationServiceDependencies['codexPilot'];
-  private readonly codexWorkers = new Map<string, CodexAppServerPilot>();
+  private readonly codexWorkers = new Map<string, AgentSessionDriver>();
+  private sessionCoordinators: OrchestrationSessionCoordinators | null = null;
   private readonly codexSubmitting = new Set<string>();
   /** Pending wake-ups per headless Worker; `opaque` means at least one wake carried no message record. */
   private readonly codexMailbox = new Map<string, { messages: OrchestrationMessageRecord[]; opaque: boolean }>();
@@ -459,6 +475,7 @@ export class OrchestrationService {
         const rendered = msgs.map((m) => formatBoardPostForAgent(m)).join('\n\n');
         return rendered.length <= 1000 ? rendered : null;
       },
+      turnTarget: (id) => this.sessionWakeTarget(id),
       cliCommand: this.cliCommand,
     });
 
@@ -612,13 +629,60 @@ export class OrchestrationService {
     }
   }
 
+  setSessionCoordinators(registry: OrchestrationSessionCoordinators | null): void {
+    this.sessionCoordinators = registry;
+  }
+
+  /** An Agent session left orchestration mode or closed: drop what was waiting on it as Coordinator. */
+  endSessionCoordinator(sessionId: string): void {
+    if (!AGENT_SESSION_ID.test(sessionId)) return;
+    this.approvals.cancelForPane(sessionId);
+    this.proposals.cancelForPane(sessionId);
+    this.waiters.cancel(sessionId);
+    this.waiters.cancelConsumer(sessionId);
+    this.pointerDelivery.retirePane(sessionId);
+    this.emitChanged('pane-mode:changed');
+  }
+
+  /** An orchestrating session finished a turn: deliver what arrived for it meanwhile. */
+  sessionCoordinatorIdle(sessionId: string): void {
+    if (this.isActiveSessionCoordinator(sessionId)) this.pointerDelivery.scheduleRedriveForPane(sessionId);
+  }
+
+  private sessionCoordinator(id: string): ReturnType<OrchestrationSessionCoordinators['get']> {
+    return AGENT_SESSION_ID.test(id) ? this.sessionCoordinators?.get(id) ?? null : null;
+  }
+
+  private sessionWakeTarget(id: string): { idle: boolean; startTurn: (prompt: string) => Promise<TurnDelivery> } | null {
+    if (!AGENT_SESSION_ID.test(id)) return null;
+    const wake = this.sessionCoordinators?.wake?.bind(this.sessionCoordinators);
+    const state = this.sessionCoordinator(id);
+    return {
+      idle: Boolean(wake && state?.active && state.idle),
+      startTurn: (prompt) => wake
+        ? wake(id, `${SESSION_WAKE_HEADER}\n\n${prompt}`)
+        : Promise.resolve({ status: 'not_accepted', reason: 'Agent sessions cannot be woken' }),
+    };
+  }
+
+  private isActiveSessionCoordinator(id: string): boolean {
+    return this.sessionCoordinator(id)?.active ?? false;
+  }
+
+  /** Whether a caller owns a live surface (terminal pane or orchestrating Agent session) to bind runs to. */
+  private isCallerSurface(id: string): boolean {
+    return this.agentStatusStore.get(id) !== null || this.isActiveSessionCoordinator(id);
+  }
+
   isAuthenticatedCallerActive(id: string, discoverTools = false): boolean {
+    if (AGENT_SESSION_ID.test(id)) return this.isActiveSessionCoordinator(id);
     return !CODEX_WORKER_ID.test(id) ||
       (this.isPaneAlive(id) && (discoverTools || Boolean(this.store.getActiveDispatchForIdentity(id, null))));
   }
 
   isPaneAlive(ptyId: string): boolean {
     if (CODEX_WORKER_ID.test(ptyId)) return this.codexWorkers.get(ptyId)?.alive ?? false;
+    if (AGENT_SESSION_ID.test(ptyId)) return this.isActiveSessionCoordinator(ptyId);
     if (this.exitedPanes.has(ptyId)) {
       return false;
     }
@@ -677,9 +741,11 @@ export class OrchestrationService {
     return { dispatch: this.store.getDispatchContext(dispatch.id) ?? dispatch, interrupted };
   }
 
-  private createWorkerTimeline(workerId: string, model: string | null, redact: (text: string) => string): WorkerTimeline {
+  private createWorkerTimeline(
+    workerId: string, model: string | null, readOnly: boolean, redact: (text: string) => string,
+  ): WorkerTimeline {
     const timeline = new WorkerTimeline({
-      workerHandle: workerId, cliId: 'codex', model, readOnly: true,
+      workerHandle: workerId, cliId: 'codex', model, readOnly,
       redact: (text) => this.store.redactDispatchCredentials(redact(text)),
       now: this.clock,
       onPatch: (change) => {
@@ -761,8 +827,8 @@ export class OrchestrationService {
 
   private retireFinishedCodexWorkers(runId?: string): void {
     for (const [workerId, codex] of this.codexWorkers) {
-      if (!codex.alive || !codex.latestDispatchId || this.store.getActiveDispatchForIdentity(workerId, null)) continue;
-      const dispatch = this.store.getDispatchContext(codex.latestDispatchId);
+      if (!codex.alive || !codex.latestTurnKey || this.store.getActiveDispatchForIdentity(workerId, null)) continue;
+      const dispatch = this.store.getDispatchContext(codex.latestTurnKey);
       if (!dispatch || dispatch.retained || (runId && dispatch.runId !== runId)) continue;
       const run = this.store.getRun(dispatch.runId);
       if (run?.status === 'active') continue;
@@ -814,7 +880,7 @@ export class OrchestrationService {
     paneId?: string;
   }): { run: OrchestrationRunRecord } {
     const handle = input.from?.trim() || 'coordinator';
-    const paneId = input.paneId?.trim() || (this.agentStatusStore.get(handle) ? handle : null);
+    const paneId = input.paneId?.trim() || (this.isCallerSurface(handle) ? handle : null);
     const run = this.store.createRun({
       id: input.id,
       objective: input.objective,
@@ -837,7 +903,7 @@ export class OrchestrationService {
     paneId?: string;
   }): { run: OrchestrationRunRecord } {
     const handle = input.from?.trim() || 'coordinator';
-    const paneId = input.paneId?.trim() || (this.agentStatusStore.get(handle) ? handle : null);
+    const paneId = input.paneId?.trim() || (this.isCallerSurface(handle) ? handle : null);
     const run = this.store.bindRun({
       runId: input.id,
       coordinatorHandle: handle,
@@ -1991,6 +2057,9 @@ export class OrchestrationService {
       );
     }
 
+    if (AGENT_SESSION_ID.test(assignee)) {
+      throw new OrchestrationError('terminal_is_coordinator', 'An Agent session coordinates runs; choose a worker terminal.');
+    }
     if (inject && !this.isPaneAlive(assignee)) {
       throw new OrchestrationError(
         'no_agent_detected',
@@ -2001,7 +2070,7 @@ export class OrchestrationService {
     const paneStatus = this.agentStatusStore.get(assignee);
 
     const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
-    const parentPaneId = this.agentStatusStore.get(from)
+    const parentPaneId = this.isCallerSurface(from)
       ? from
       : (callerDispatch?.assigneePaneId ?? this.store.getRun(task.runId)?.coordinatorPaneId ?? null);
     const ctx = this.store.createDispatchContext({
@@ -4423,7 +4492,7 @@ export class OrchestrationService {
     briefBoardSeq?: number;
   }> {
     const from = input.from?.trim() || 'coordinator';
-    if (CODEX_WORKER_ID.test(from)) throw new OrchestrationError('operation_rejected', 'Headless read-only Workers cannot start other Workers.');
+    if (CODEX_WORKER_ID.test(from)) throw new OrchestrationError('operation_rejected', 'Headless Workers cannot start other Workers.');
     const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
     this.assertCanDelegateFrom(from);
     this.store.assertDispatchCapacity();
@@ -4459,6 +4528,12 @@ export class OrchestrationService {
       throw new OrchestrationError(
         'terminal_is_coordinator',
         `Terminal ${reusingTerminal} is the caller's own terminal. Choose a different worker terminal.`
+      );
+    }
+    if (reusingTerminal && AGENT_SESSION_ID.test(reusingTerminal)) {
+      throw new OrchestrationError(
+        'terminal_is_coordinator',
+        `${reusingTerminal} is an Agent session, not a worker terminal.`
       );
     }
     if (reusingTerminal && (CODEX_WORKER_ID.test(reusingTerminal) || !this.isPaneAlive(reusingTerminal))) {
@@ -4895,7 +4970,7 @@ export class OrchestrationService {
           run = this.store.updateRunStatus(run.id, 'active');
         }
       } else {
-        const callerPane = callerStatus ? from : undefined;
+        const callerPane = callerStatus || this.isActiveSessionCoordinator(from) ? from : undefined;
         run = this.runCreate({
           objective: input.taskTitle?.trim() || input.spec.trim().slice(0, 120),
           from,
@@ -4927,7 +5002,7 @@ export class OrchestrationService {
       );
     }
 
-    const parentPaneId = callerStatus
+    const parentPaneId = callerStatus || this.isActiveSessionCoordinator(from)
       ? from
       : (callerDispatch?.assigneePaneId ?? run.coordinatorPaneId ?? null);
     const parentTerminal = parentPaneId ? this.terminalTracker?.getTerminal(parentPaneId) : null;
@@ -4937,6 +5012,7 @@ export class OrchestrationService {
       callerDispatch?.worktreePath ||
       input.callerCwd?.trim() ||
       parentTerminal?.cwd ||
+      (parentPaneId ? this.sessionCoordinator(parentPaneId)?.cwd : undefined) ||
       this.getDefaultCwd?.() ||
       process.cwd();
 
@@ -4983,10 +5059,26 @@ export class OrchestrationService {
           reusingTerminalCwd,
         });
 
-    const usePilot = !reusingTerminal && launchConfig.cliId === 'codex' &&
-      (input.readOnly === true || Boolean(reviewTarget || reviewRunTarget)) && this.codexPilot?.enabled();
+    // A run a session coordinates runs every non-reused Codex task as a headless Worker, even when
+    // the pilot setting is off; terminal-coordinated runs keep the read-only pilot gate.
+    const runIsSessionCoordinated =
+      AGENT_SESSION_ID.test(run.coordinatorPaneId ?? '') || this.isActiveSessionCoordinator(from);
+    const readOnlyTask = input.readOnly === true || Boolean(reviewTarget || reviewRunTarget);
+    const usePilot = !reusingTerminal && launchConfig.cliId === 'codex' && Boolean(
+      this.codexPilot && (runIsSessionCoordinated || (readOnlyTask && this.codexPilot.enabled())),
+    );
+    const workerPolicy: AgentSessionPolicy = readOnlyTask ? 'read-only' : 'workspace-write';
+    const coordinatorSession =
+      (run.coordinatorPaneId && this.isActiveSessionCoordinator(run.coordinatorPaneId)
+        ? this.sessionCoordinator(run.coordinatorPaneId)
+        : null) ??
+      (this.isActiveSessionCoordinator(from) ? this.sessionCoordinator(from) : null);
+    const workerNetwork = runIsSessionCoordinated && Boolean(coordinatorSession?.network);
     const pilot = usePilot
-      ? await this.openCodexWorker(placement.cwd ?? process.cwd(), launchConfig.model)
+      ? await this.openCodexWorker(placement.cwd ?? process.cwd(), launchConfig.model, {
+          policy: workerPolicy,
+          network: workerNetwork,
+        })
       : null;
 
     const spawnPane = async (): Promise<string> => {
@@ -4996,7 +5088,7 @@ export class OrchestrationService {
           task,
           cliId: launchConfig.cliId,
           cwd: placement.cwd,
-          extraArgs: usePilot
+          extraArgs: usePilot && readOnlyTask
             ? [...launchConfig.extraArgs, '--sandbox', 'read-only', '--ask-for-approval', 'on-request']
             : launchConfig.extraArgs,
         });
@@ -5146,6 +5238,7 @@ export class OrchestrationService {
       canDispatchSubWorkers: ctx.executionMode !== 'codex-app-server' && ctx.depth < this.maxDepth,
       mcpEnabled: ctx.executionMode === 'codex-app-server' || effectiveMcpEnabled,
       headless: ctx.executionMode === 'codex-app-server',
+      leaveUncommitted: ctx.executionMode === 'codex-app-server' && !readOnlyTask,
       role: preambleRole,
     });
 
@@ -5277,11 +5370,15 @@ export class OrchestrationService {
     };
   }
 
-  private async openCodexWorker(cwd: string, model: string | null) {
+  private async openCodexWorker(
+    cwd: string, model: string | null, options: { policy: AgentSessionPolicy; network: boolean },
+  ) {
     if (this.disposed || !this.codexPilot) return null;
     const id = `codex-worker-${randomUUID()}`;
-    let session: CodexAppServerPilot | undefined;
-    const timeline = this.createWorkerTimeline(id, model, (text) => session?.redactText(text) ?? text);
+    let session: AgentSessionDriver | undefined;
+    const timeline = this.createWorkerTimeline(
+      id, model, options.policy === 'read-only', (text) => session?.redactText(text) ?? text,
+    );
     try {
       session = this.codexPilot.launch(id, cwd, {
         onTimeline: (dispatchId, event) => {
@@ -5295,14 +5392,15 @@ export class OrchestrationService {
           if (updated && !waiting) this.store.updateDispatchStage(dispatchId, 'working');
         },
         onTurnCompleted: (dispatchId, result) => this.completeCodexTurn(id, cwd, dispatchId, result),
-        onApproval: (dispatchId, request) => {
+        onRequest: async (dispatchId, request) => {
           const dispatch = this.store.getDispatchContext(dispatchId);
-          return dispatch?.assigneeHandle === id
-            ? this.approvals.holdCodexRequest(dispatch, request)
-            : Promise.resolve(false);
+          // Only approvals can be answered from the approval lane; anything else fails closed.
+          const allowed = request.kind === 'approval' && dispatch?.assigneeHandle === id &&
+            await this.approvals.holdCodexRequest(dispatch, request);
+          return { decision: allowed ? 'accept' : 'decline' };
         },
         onExit: (reason, exitCode) => {
-          const dispatchId = session?.latestDispatchId;
+          const dispatchId = session?.latestTurnKey;
           if (session && dispatchId) this.archiveCodexOutput(session, dispatchId);
           timeline.endActiveTurn(session?.closing ? 'interrupted' : 'failed', reason);
           timeline.setMeta({ alive: false });
@@ -5319,7 +5417,7 @@ export class OrchestrationService {
         },
       });
       this.codexWorkers.set(id, session);
-      const sessionId = await session.open(cwd, model);
+      const sessionId = await session.open({ cwd, model, policy: options.policy, network: options.network });
       if (!session.alive || this.disposed) throw new Error('Codex app-server closed during initialization');
       timeline.setMeta({ providerSessionId: sessionId });
       return { id, session, sessionId };
@@ -5332,7 +5430,7 @@ export class OrchestrationService {
     }
   }
 
-  private archiveCodexOutput(session: CodexAppServerPilot, dispatchId: string): void {
+  private archiveCodexOutput(session: AgentSessionDriver, dispatchId: string): void {
     const result = session.read(dispatchId, 0, undefined, true);
     if (result) this.store.archiveDispatchOutput(dispatchId, result.text);
   }
@@ -5351,7 +5449,7 @@ export class OrchestrationService {
     this.emitChanged('dispatch:codex-status', dispatch.runId);
   }
 
-  private completeCodexTurn(workerId: string, cwd: string, dispatchId: string, result: CodexTurnResult): void {
+  private completeCodexTurn(workerId: string, cwd: string, dispatchId: string, result: AgentTurnResult): void {
     const session = this.codexWorkers.get(workerId);
     if (session) this.archiveCodexOutput(session, dispatchId);
     this.approvals.cancelForDispatch(dispatchId, 'Codex turn ended');
@@ -5386,9 +5484,31 @@ export class OrchestrationService {
     } else {
       // Working-tree files can contain Worker credentials; redact before the diff is stored or published.
       const redactDiff = (diff: string) => this.store.redactDispatchCredentials(session?.redactText(diff) ?? diff);
-      void runGitCommand(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], {
-        cwd, readOnly: true, maxBytes: 128 * 1024, timeoutMs: 3_000,
-      }).then((git) => announce(git.exitCode === 0 ? redactDiff(git.stdout) : null), () => announce(null));
+      void Promise.all([
+        runGitCommand(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], {
+          cwd, readOnly: true, maxBytes: 128 * 1024, timeoutMs: 3_000,
+        }),
+        runGitCommand(['ls-files', '--others', '--exclude-standard', '-z'], {
+          cwd, readOnly: true, maxBytes: 32 * 1024, timeoutMs: 3_000,
+        }),
+      ]).then(([git, untracked]) => {
+        if (git.exitCode !== 0) {
+          announce(null);
+          return;
+        }
+        const rawUntracked = untracked.exitCode === 0 || untracked.truncated ? untracked.stdout : '';
+        const safeUntracked = untracked.truncated
+          ? rawUntracked.slice(0, Math.max(0, rawUntracked.lastIndexOf('\0')))
+          : rawUntracked;
+        const untrackedPaths = safeUntracked.split('\0').filter(Boolean);
+        const untrackedDiff = untrackedPaths
+          .map((file) => `diff --git a/${file} b/${file}\nnew file (untracked)\n--- /dev/null\n+++ b/${file}`)
+          .join('\n');
+        const combined = untrackedPaths.length === 0
+          ? git.stdout
+          : `${[git.stdout.trimEnd(), untrackedDiff].filter(Boolean).join('\n')}\n`;
+        announce(redactDiff(combined));
+      }, () => announce(null));
     }
   }
 
@@ -5423,12 +5543,12 @@ export class OrchestrationService {
     this.publishCodexStatus(dispatch, 'Codex Worker exited before report_done', reason, { exitCode });
   }
 
-  private async submitCodexTurn(dispatch: OrchestrationDispatchRecord, session: CodexAppServerPilot, prompt: string) {
+  private async submitCodexTurn(dispatch: OrchestrationDispatchRecord, session: AgentSessionDriver, prompt: string) {
     this.codexSubmitting.add(dispatch.id);
     const timeline = this.workerTimelines.get(dispatch.assigneeHandle);
     timeline?.beginTurn({ dispatchId: dispatch.id, prompt });
     try {
-      const result = await session.startTurn(dispatch.id, prompt, dispatch.effort ?? null);
+      const result = await session.startTurn({ turnKey: dispatch.id, prompt, effort: dispatch.effort ?? null });
       if (result.status !== 'accepted') timeline?.endActiveTurn('failed', result.reason);
       if (result.status === 'unknown_acceptance') this.failCodexDispatch(dispatch.id, result.status, result.reason);
       if (result.status === 'accepted' && !session.alive) {
@@ -5712,6 +5832,7 @@ export class OrchestrationService {
       previousDispatchId: settledDispatch.id,
       mcpEnabled: Boolean(session) || followUpMcpEnabled,
       headless: Boolean(session),
+      leaveUncommitted: Boolean(session) && this.workerTimelines.get(targetPtyId)?.getHeader().readOnly === false,
       role: followUpRole,
     });
 
@@ -6029,7 +6150,8 @@ export class OrchestrationService {
     const repoRootPath =
       dispatch.repoRootPath ??
       (dispatch.parentPaneId
-        ? this.terminalTracker?.getTerminal(dispatch.parentPaneId)?.cwd
+        ? this.terminalTracker?.getTerminal(dispatch.parentPaneId)?.cwd ??
+          this.sessionCoordinator(dispatch.parentPaneId)?.cwd
         : undefined) ??
       this.getDefaultCwd?.() ??
       null;
@@ -6269,8 +6391,10 @@ export class OrchestrationService {
     }
 
     const repoRootPath =
+      dispatch.repoRootPath ??
       (dispatch.parentPaneId
-        ? this.terminalTracker?.getTerminal(dispatch.parentPaneId)?.cwd
+        ? this.terminalTracker?.getTerminal(dispatch.parentPaneId)?.cwd ??
+          this.sessionCoordinator(dispatch.parentPaneId)?.cwd
         : undefined) ??
       this.getDefaultCwd?.() ??
       null;
@@ -6439,11 +6563,14 @@ export class OrchestrationService {
   }
 
   isPaneOrchestrationMode(ptyId: string): boolean {
-    return this.orchestrationModePanes.has(ptyId.trim());
+    const cleanId = ptyId.trim();
+    if (AGENT_SESSION_ID.test(cleanId)) return this.isActiveSessionCoordinator(cleanId);
+    return this.orchestrationModePanes.has(cleanId);
   }
 
   recordUserPromptTurn(ptyId: string, source: UserTurnSource = 'hook'): number {
     const cleanId = ptyId.trim();
+    if (source === 'session' && !AGENT_SESSION_ID.test(cleanId)) return this.proposals.getUserTurn(cleanId);
     if (
       source === 'pty' &&
       this.agentStatusStore.get(cleanId)?.state === 'working' &&
@@ -7624,6 +7751,7 @@ export class OrchestrationService {
     const coordinatorCliId =
       this.agentStatusStore.get(from)?.agentId ??
       this.terminalTracker?.getTerminal(from)?.cliId ??
+      this.sessionCoordinator(from)?.provider ??
       null;
     const authorCliId = reviewTargetDispatch?.cliId ?? null;
     const authorCliIds = reviewRunTarget
@@ -8191,7 +8319,7 @@ export class OrchestrationService {
 
   private isMcpEnabledForPane(ptyId: string): boolean {
     const clean = ptyId.trim();
-    if (CODEX_WORKER_ID.test(clean)) return this.isPaneAlive(clean);
+    if (CODEX_WORKER_ID.test(clean) || AGENT_SESSION_ID.test(clean)) return this.isPaneAlive(clean);
     if (!clean || !this.isMcpEnabledForCliDep) return false;
     const cliId =
       this.agentStatusStore.get(clean)?.agentId ??
@@ -9180,8 +9308,10 @@ export class OrchestrationService {
 
       const coordPaneId = run.coordinatorPaneId;
       const coordStatus = coordPaneId ? this.agentStatusStore.get(coordPaneId) : null;
-      const coordinatorIdle =
-        !coordStatus || coordStatus.state === 'idle' || coordStatus.state === 'done';
+      const coordSession = coordPaneId ? this.sessionCoordinator(coordPaneId) : null;
+      const coordinatorIdle = coordSession?.active
+        ? coordSession.idle === true
+        : !coordStatus || coordStatus.state === 'idle' || coordStatus.state === 'done';
       const coordinatorHasWaiter = Boolean(
         (coordPaneId &&
           (this.waiters.hasActiveWaiterFor(coordPaneId) ||

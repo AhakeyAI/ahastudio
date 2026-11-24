@@ -1,4 +1,5 @@
 import type {
+  AgentSessionInfo,
   OrchestrationBoardPostKind,
   OrchestrationDispatchProposal,
   OrchestrationDispatchRecord,
@@ -120,6 +121,8 @@ export interface BoardViewModel {
   pendingProposals: OrchestrationDispatchProposal[];
   attentionCount: number;
   durationLabel: string;
+  /** Set when the focused Agent session is a Coordinator with no run of its own yet. */
+  focusedSessionCoordinator: { provider: string; state: SessionCoordinatorState } | null;
 }
 
 export interface BoardGraphNode {
@@ -387,7 +390,7 @@ function runStatusDisplayLabel(status: OrchestrationRunRecord['status']): string
 
 function pickTargetRun(
   snapshot: OrchestrationSnapshot,
-  opts: { runId?: string | null; activePtyId?: string | null },
+  opts: { runId?: string | null; activePtyId?: string | null; sessionFocus?: boolean },
 ): OrchestrationRunRecord | null {
   const sorted = sortRuns(snapshot.runs);
   if (sorted.length === 0) return null;
@@ -433,6 +436,10 @@ function pickTargetRun(
       const activeForPane = findBoundRunForPty(opts.activePtyId, activeRuns);
       if (activeForPane) return activeForPane;
     }
+    if (opts.sessionFocus) {
+      // A focused session Coordinator shows only its own runs, never an unrelated one.
+      return opts.activePtyId ? findBoundRunForPty(opts.activePtyId, sorted) : null;
+    }
     const activeCoordRunId = snapshot.activeCoordinatorRun?.runId;
     if (activeCoordRunId) {
       const found = activeRuns.find((r) => r.id === activeCoordRunId);
@@ -445,12 +452,24 @@ function pickTargetRun(
     const historicalForPane = findBoundRunForPty(opts.activePtyId, sorted);
     if (historicalForPane) return historicalForPane;
   }
+  if (opts.sessionFocus) return null;
   const activeCoordRunId = snapshot.activeCoordinatorRun?.runId;
   if (activeCoordRunId) {
     const found = sorted.find((r) => r.id === activeCoordRunId);
     if (found) return found;
   }
   return sorted[0] ?? null;
+}
+
+export type SessionCoordinatorState = 'working' | 'waiting' | 'idle' | 'offline';
+
+/** How an orchestrating Agent session looks as the Coordinator of its run. */
+export function sessionCoordinatorState(
+  info: Pick<AgentSessionInfo, 'status'> & { pendingQuestions: readonly unknown[] },
+): SessionCoordinatorState {
+  if (info.status === 'running') return info.pendingQuestions.length > 0 ? 'waiting' : 'working';
+  if (info.status === 'starting') return 'working';
+  return info.status === 'idle' ? 'idle' : 'offline';
 }
 
 export function buildBoardViewModel(
@@ -460,11 +479,19 @@ export function buildBoardViewModel(
     agentStatuses?: AgentStatusLookup;
     activePtyId?: string | null;
     livePaneIds?: ReadonlySet<string>;
+    /** Orchestrating Agent sessions by id; they have no terminal status of their own. */
+    sessionCoordinators?: ReadonlyMap<string, { provider: string; state: SessionCoordinatorState }>;
   } = {},
 ): BoardViewModel {
   const runs = sortRuns(snapshot.runs);
   const hasAnyActiveRun = runs.some((r) => r.status === 'active');
-  const run = pickTargetRun(snapshot, opts);
+  const focusedSessionCoordinator =
+    (opts.activePtyId ? opts.sessionCoordinators?.get(opts.activePtyId) : undefined) ?? null;
+  const run = pickTargetRun(snapshot, {
+    runId: opts.runId,
+    activePtyId: opts.activePtyId,
+    sessionFocus: Boolean(focusedSessionCoordinator),
+  });
   const pendingProposalsAll = (snapshot.pendingProposals ?? []).filter(
     (p) => p.status === 'pending',
   );
@@ -491,6 +518,7 @@ export function buildBoardViewModel(
       pendingProposals: pendingProposalsAll,
       attentionCount: pendingProposalsAll.length,
       durationLabel: '0 posts',
+      focusedSessionCoordinator,
     };
   }
 
@@ -507,7 +535,8 @@ export function buildBoardViewModel(
     run.coordinatorPaneId ??
     (run.coordinatorHandle.startsWith('local-') ? run.coordinatorHandle : null);
   const coordAgentStatus = coordPtyId ? opts.agentStatuses?.get(coordPtyId) : undefined;
-  const coordCliId = coordAgentStatus?.agentId ?? null;
+  const coordSession = coordPtyId ? opts.sessionCoordinators?.get(coordPtyId) : undefined;
+  const coordCliId = coordAgentStatus?.agentId ?? coordSession?.provider ?? null;
 
   roleByHandle.set('coordinator', 'coordinator');
   roleByHandle.set(`run:${run.id}`, 'coordinator');
@@ -627,7 +656,9 @@ export function buildBoardViewModel(
 
   const coordLatestPost = latestPostByRole.get('coordinator') ?? null;
   const coordPaneAlive =
-    Boolean(coordAgentStatus) || Boolean(coordPtyId && opts.livePaneIds?.has(coordPtyId));
+    Boolean(coordAgentStatus) ||
+    Boolean(coordPtyId && opts.livePaneIds?.has(coordPtyId)) ||
+    Boolean(coordSession && coordSession.state !== 'offline');
   let coordStatus: BoardCoordinatorCard['status'];
   let coordStageLabel: string;
   let coordTone: StatusTone;
@@ -636,13 +667,13 @@ export function buildBoardViewModel(
     coordStageLabel =
       run.status === 'completed' ? '已完成' : run.status === 'failed' ? '失败' : '已结束';
     coordTone = run.status === 'completed' ? 'ok' : run.status === 'failed' ? 'error' : 'neutral';
-  } else if (coordAgentStatus?.state === 'working') {
+  } else if (coordAgentStatus?.state === 'working' || coordSession?.state === 'working') {
     coordStatus = 'working';
     coordStageLabel = '执行中';
     coordTone = 'accent';
-  } else if (coordAgentStatus?.state === 'waiting') {
+  } else if (coordAgentStatus?.state === 'waiting' || coordSession?.state === 'waiting') {
     coordStatus = 'waiting';
-    coordStageLabel = coordAgentStatus.waitKind === 'question' ? '待回答' : '待授权';
+    coordStageLabel = coordAgentStatus && coordAgentStatus.waitKind !== 'question' ? '待授权' : '待回答';
     coordTone = 'warn';
   } else if (coordPaneAlive) {
     coordStatus = 'idle';
@@ -881,6 +912,7 @@ export function buildBoardViewModel(
     pendingProposals,
     attentionCount,
     durationLabel: formatPostsDurationLabel(posts, run.createdAt),
+    focusedSessionCoordinator: null,
   };
 }
 

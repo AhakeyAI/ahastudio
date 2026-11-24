@@ -3,57 +3,38 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { augmentedPath, resolveBinaryFromPath } from '../bin-resolve.js';
+import type {
+  AgentOutputSlice, AgentSessionDriver, AgentSessionEvents, AgentSessionPolicy, TurnDelivery,
+} from './agent-session-driver.js';
 import { spawnWindowsCodexJob } from './windows-codex-job.js';
 import type {
   WorkerTimelineEvent, WorkerTimelineFileChange, WorkerTimelineItemStatus, WorkerTimelineItemUpdate,
 } from './worker-timeline.js';
 
 export const CODEX_WORKER_ID = /^codex-worker-[a-f0-9-]{36}$/;
-const APPROVALS = { approvalPolicy: 'on-request', approvalsReviewer: 'user' };
+const POLICIES: Record<AgentSessionPolicy, { sandbox: string; sandboxType: string; approvalPolicy: string }> = {
+  'read-only': { sandbox: 'read-only', sandboxType: 'readOnly', approvalPolicy: 'on-request' },
+  'workspace-write': { sandbox: 'workspace-write', sandboxType: 'workspaceWrite', approvalPolicy: 'on-request' },
+  // Still sandboxed to the workspace; it only stops asking.
+  'full-auto': { sandbox: 'workspace-write', sandboxType: 'workspaceWrite', approvalPolicy: 'never' },
+};
 const OUTPUT_LIMIT = 512 * 1024;
 const STDERR_LIMIT = 4 * 1024;
 const CHILD_CLOSE_TIMEOUT_MS = 3_000;
 
 type Obj = Record<string, unknown>;
 type RpcId = string | number;
-type Delivery = { status: 'accepted' } | {
-  status: 'not_accepted' | 'unknown_acceptance'; reason: string;
-};
-
-export interface CodexTurnResult {
-  turnId: string;
-  stopReason: string;
-  finalText: string;
-  diff: string | null;
-  usage: Record<string, number> | null;
-  error: string | null;
-}
 
 interface ActiveTurn {
-  dispatchId: string;
+  turnKey: string;
   id: string | null;
   messages: Map<string, string>;
-  usageBaseline: Record<string, number>;
+  /** Thread token total before this turn; null when unknown (first turn after a resume). */
+  usageBaseline: Record<string, number> | null;
   diff: string | null;
   usage: Record<string, number> | null;
   idle: Promise<void>;
   finish: () => void;
-}
-
-export interface CodexApproval {
-  method: string;
-  toolInput: string;
-  message?: string;
-  signal: AbortSignal;
-}
-
-export interface CodexPilotEvents {
-  onTurnStarted: (dispatchId: string) => void;
-  onTurnCompleted: (dispatchId: string, result: CodexTurnResult) => void;
-  onApproval: (dispatchId: string, request: CodexApproval) => Promise<boolean>;
-  onExit: (reason: string, exitCode: number | null) => void;
-  /** Normalized process events for the active turn; text is already pilot-redacted. */
-  onTimeline?: (dispatchId: string, event: WorkerTimelineEvent) => void;
 }
 
 class RpcRejection extends Error {}
@@ -235,11 +216,55 @@ export function enabledCodexPilot(platform: NodeJS.Platform, setting: boolean, o
   return platform === 'win32' && (override === '1' || (override !== '0' && setting));
 }
 
+// These calls are part of the Worker dispatch contract and still use Worker-scoped auth.
+const WORKER_APPROVED_MCP_TOOLS = ['report_done', 'read_board', 'ask_coordinator', 'post_message'] as const;
+
+/**
+ * Coordinator tools a session runs without a Codex prompt: reads, plus calls the orchestration
+ * service already gates (delegate_task waits for the person's confirmation in chat or in the UI).
+ * Tools that stop Workers or write Git history keep Codex's approval prompt.
+ */
+export const COORDINATOR_APPROVED_MCP_TOOLS = [
+  'delegate_task', 'team_status', 'list_coding_agents', 'read_board', 'board_wait', 'team_wait',
+  'post_message', 'message_worker', 'inspect_worker_diff', 'inspect_run_diff',
+] as const;
+
+/**
+ * The approved tools for a session launched with `policy`. `full-auto` maps to Codex's `never`
+ * approval policy, under which a tool call that still needs approval fails outright, so
+ * `manage_worker` must be pre-approved there. `integrate_worker` and `finalize_run_integration`
+ * are never approved: changing Git history always needs the person.
+ */
+export function coordinatorApprovedMcpTools(policy: AgentSessionPolicy): readonly string[] {
+  return policy === 'full-auto'
+    ? [...COORDINATOR_APPROVED_MCP_TOOLS, 'manage_worker']
+    : COORDINATOR_APPROVED_MCP_TOOLS;
+}
+
+export function codexMcpConfigArgs(
+  node: string, mcp: { serverPath: string; env: Record<string, string>; approvedTools?: readonly string[] },
+): string[] {
+  const mcpEnv = Object.entries(mcp.env).map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join(', ');
+  return [
+    '-c', `mcp_servers.aha.command=${JSON.stringify(node)}`,
+    '-c', `mcp_servers.aha.args=${JSON.stringify([mcp.serverPath])}`,
+    '-c', `mcp_servers.aha.env={ ${mcpEnv} }`,
+    '-c', 'mcp_servers.aha.enabled=true',
+    '-c', 'mcp_servers.aha.required=true',
+    ...(mcp.approvedTools ?? WORKER_APPROVED_MCP_TOOLS)
+      .flatMap((tool) => ['-c', `mcp_servers.aha.tools.${tool}.approval_mode="approve"`]),
+  ];
+}
+
 export function launchCodexPilot(options: {
   cwd: string;
-  mcpServerPath: string;
-  mcpEnv: Record<string, string>;
-  events: CodexPilotEvents;
+  /**
+   * Aha MCP wiring for an orchestration Worker or an orchestrating session; a plain session runs
+   * without it. `requiredTool` must be listed before the thread is usable (default report_done) and
+   * `approvedTools` run without a Codex approval prompt (default report_done, read_board, ask_coordinator, and post_message).
+   */
+  mcp?: { serverPath: string; env: Record<string, string>; requiredTool?: string; approvedTools?: readonly string[] };
+  events: AgentSessionEvents;
 }): CodexAppServerPilot {
   const codex = resolveBinaryFromPath('codex');
   const node = resolveBinaryFromPath('node');
@@ -248,19 +273,7 @@ export function launchCodexPilot(options: {
   const entry = join(dirname(codex), 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
   if (wrapper && !existsSync(entry)) throw new Error('Codex npm entry point was not found');
 
-  const mcpEnv = Object.entries(options.mcpEnv)
-    .map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join(', ');
-  const args = [
-    'app-server', '--stdio',
-    '-c', `mcp_servers.aha.command=${JSON.stringify(node)}`,
-    '-c', `mcp_servers.aha.args=${JSON.stringify([options.mcpServerPath])}`,
-    '-c', `mcp_servers.aha.env={ ${mcpEnv} }`,
-    '-c', 'mcp_servers.aha.enabled=true',
-    '-c', 'mcp_servers.aha.required=true',
-    // These two calls are part of the dispatch contract and still use Worker-scoped auth.
-    '-c', 'mcp_servers.aha.tools.report_done.approval_mode="approve"',
-    '-c', 'mcp_servers.aha.tools.read_board.approval_mode="approve"',
-  ];
+  const args = ['app-server', '--stdio', ...(options.mcp ? codexMcpConfigArgs(node, options.mcp) : [])];
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath() };
   for (const key of Object.keys(env)) {
     if (key.toUpperCase().startsWith('AHA_')) delete env[key];
@@ -271,21 +284,28 @@ export function launchCodexPilot(options: {
     ? spawnWindowsCodexJob(executable, argv, options.cwd, env)
     : spawn(executable, argv, { cwd: options.cwd, env, windowsHide: true, stdio: 'pipe' });
   return new CodexAppServerPilot(child, options.events, 30_000, [
-    options.mcpEnv.AHA_WORKER_TOKEN, options.mcpEnv.AHA_AGENT_HOOK_TOKEN,
-  ].filter((value): value is string => Boolean(value)));
+    options.mcp?.env.AHA_WORKER_TOKEN, options.mcp?.env.AHA_SESSION_TOKEN, options.mcp?.env.AHA_AGENT_HOOK_TOKEN,
+  ].filter((value): value is string => Boolean(value)), options.mcp ? options.mcp.requiredTool ?? 'report_done' : null);
 }
 
-export class CodexAppServerPilot {
+export class CodexAppServerPilot implements AgentSessionDriver {
+  readonly provider = 'codex' as const;
+  readonly capabilities = {
+    resume: true, steer: false,
+    policies: ['read-only', 'workspace-write', 'full-auto'] as readonly AgentSessionPolicy[],
+  };
   private readonly pending = new Map<number, (error: Error | null, value?: unknown) => void>();
   private readonly disconnect = new AbortController();
   private seq = 0;
-  private tokenTotal: Record<string, number> = {};
+  private tokenTotal: Record<string, number> | null = {};
+  private policy: AgentSessionPolicy = 'read-only';
+  private network = false;
   private threadId: string | null = null;
   private active: ActiveTurn | null = null;
   private output = '';
   private stderrTail = Buffer.alloc(0);
   private offset = 0;
-  private outputDispatchId: string | null = null;
+  private outputTurnKey: string | null = null;
   private disconnected = false;
   private stopping = false;
   private stopPromise: Promise<void> | null = null;
@@ -293,9 +313,11 @@ export class CodexAppServerPilot {
 
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
-    private readonly events: CodexPilotEvents,
+    private readonly events: AgentSessionEvents,
     private readonly requestTimeoutMs = 30_000,
     private readonly secrets: readonly string[] = [],
+    /** Aha MCP tool the thread must expose before it is usable; null for sessions without Aha MCP. */
+    private readonly requiredMcpTool: string | null = 'report_done',
   ) {
     this.childClosed = new Promise((resolve) => {
       child.once('close', (code, signal) => {
@@ -338,23 +360,38 @@ export class CodexAppServerPilot {
   get sessionId(): string | null { return this.threadId; }
   get busy(): boolean { return this.active !== null; }
   get closing(): boolean { return this.stopping; }
-  get latestDispatchId(): string | null { return this.outputDispatchId; }
+  get latestTurnKey(): string | null { return this.outputTurnKey; }
 
-  async open(cwd: string, model: string | null): Promise<string> {
+  async open({ cwd, model, policy, resumeSessionId, network = false, developerInstructions }: {
+    cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string; network?: boolean;
+    developerInstructions?: string;
+  }): Promise<string> {
+    const wanted = POLICIES[policy];
     try {
       await this.request('initialize', {
         clientInfo: { name: 'ahastation', title: 'AhaStation', version: '0.1.0' },
       });
       this.write({ method: 'initialized' });
-      const result = object(await this.request('thread/start', {
-        cwd, ...(model ? { model } : {}), sandbox: 'read-only', ...APPROVALS,
-      }));
+      const settings = {
+        cwd, ...(model ? { model } : {}), sandbox: wanted.sandbox,
+        approvalPolicy: wanted.approvalPolicy, approvalsReviewer: 'user',
+        ...(developerInstructions ? { developerInstructions } : {}),
+      };
+      const result = object(resumeSessionId
+        ? await this.request('thread/resume', { threadId: resumeSessionId, ...settings, excludeTurns: true })
+        : await this.request('thread/start', settings));
       const id = string(object(result.thread).id);
       if (!id) throw new Error('Codex did not return a thread ID');
-      if (object(result.sandbox).type !== 'readOnly' || result.approvalPolicy !== 'on-request') {
-        throw new Error('Codex did not confirm the requested read-only sandbox and approvals');
+      if (resumeSessionId && id !== resumeSessionId) throw new Error('Codex resumed a different thread');
+      if (object(result.sandbox).type !== wanted.sandboxType || result.approvalPolicy !== wanted.approvalPolicy) {
+        throw new Error(`Codex did not confirm the requested ${policy} sandbox and approvals`);
       }
+      this.policy = policy;
+      this.network = network;
+      // The resumed thread's running token total is unknown until Codex reports it.
+      if (resumeSessionId) this.tokenTotal = null;
       this.threadId = id;
+      if (!this.requiredMcpTool) return id;
       // Codex may cache an empty MCP catalog prepared before the first turn.
       const inventory = object(await this.request('mcpServerStatus/list', {
         threadId: id, serverName: 'aha', detail: 'toolsAndAuthOnly',
@@ -362,8 +399,9 @@ export class CodexAppServerPilot {
       const servers: unknown[] = Array.isArray(inventory.data) ? inventory.data : [];
       const aha = servers.map(object).find((server) => server.name === 'aha');
       const tools = Object.values(object(aha?.tools)).map(object);
-      if (!tools.some((tool) => tool.name === 'report_done' || tool.name === 'mcp__aha__report_done')) {
-        throw new Error('Aha MCP did not expose report_done to the Codex thread');
+      const required = this.requiredMcpTool;
+      if (!tools.some((tool) => tool.name === required || tool.name === `mcp__aha__${required}`)) {
+        throw new Error(`Aha MCP did not expose ${required} to the Codex thread`);
       }
       return id;
     } catch (error) {
@@ -384,18 +422,23 @@ export class CodexAppServerPilot {
     });
   }
 
-  async startTurn(dispatchId: string, prompt: string, effort: string | null): Promise<Delivery> {
+  async startTurn({ turnKey, prompt, effort, model, policy, network }: {
+    turnKey: string; prompt: string; effort?: string | null; model?: string | null; policy?: AgentSessionPolicy;
+    network?: boolean;
+  }): Promise<TurnDelivery> {
     if (!this.alive || !this.threadId || this.active) {
       return { status: 'not_accepted', reason: 'Codex thread is closed or busy' };
     }
+    const wanted = POLICIES[policy ?? this.policy];
+    const networkAccess = network ?? this.network;
     let finish!: () => void;
     const idle = new Promise<void>((resolve) => { finish = resolve; });
     const turn: ActiveTurn = {
-      dispatchId, id: null, messages: new Map(), diff: null, usage: null, usageBaseline: this.tokenTotal, idle, finish,
+      turnKey, id: null, messages: new Map(), diff: null, usage: null, usageBaseline: this.tokenTotal, idle, finish,
     };
     this.active = turn;
-    if (this.outputDispatchId !== dispatchId) {
-      this.outputDispatchId = dispatchId;
+    if (this.outputTurnKey !== turnKey) {
+      this.outputTurnKey = turnKey;
       this.output = '';
       this.offset = 0;
     }
@@ -404,11 +447,16 @@ export class CodexAppServerPilot {
         threadId: this.threadId,
         input: [{ type: 'text', text: prompt, text_elements: [] }],
         ...(effort ? { effort } : {}),
-        sandboxPolicy: { type: 'readOnly', networkAccess: false },
-        ...APPROVALS,
+        ...(model ? { model } : {}),
+        sandboxPolicy: wanted.sandboxType === 'readOnly'
+          ? { type: 'readOnly', networkAccess }
+          : { type: 'workspaceWrite', writableRoots: [], networkAccess, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
+        approvalPolicy: wanted.approvalPolicy, approvalsReviewer: 'user',
       }));
       const id = string(object(result.turn).id);
       if (!id) throw new Error('Codex did not acknowledge a turn ID');
+      if (policy) this.policy = policy;
+      if (network !== undefined) this.network = network;
       this.observeStart(turn, id);
       return { status: 'accepted' };
     } catch (error) {
@@ -421,8 +469,8 @@ export class CodexAppServerPilot {
     }
   }
 
-  read(dispatchId: string, cursor = 0, limit = 8_000, screen = false) {
-    if (this.outputDispatchId !== dispatchId) return null;
+  read(turnKey: string, cursor = 0, limit = 8_000, screen = false): AgentOutputSlice | null {
+    if (this.outputTurnKey !== turnKey) return null;
     const start = screen ? this.offset : Math.min(Math.max(Math.floor(cursor), this.offset), this.offset + this.output.length);
     limit = Math.max(1, Math.min(256_000, Math.floor(limit)));
     const text = this.output.slice(start - this.offset, screen ? undefined : start - this.offset + limit);
@@ -569,9 +617,10 @@ export class CodexAppServerPilot {
       const tokenUsage = object(params.tokenUsage);
       const total = numericFields(tokenUsage.total);
       const last = numericFields(tokenUsage.last);
-      turn.usage = Object.keys(total).length === 0 ? last : Object.fromEntries(
+      const before = turn.usageBaseline;
+      turn.usage = Object.keys(total).length === 0 || !before ? last : Object.fromEntries(
         Object.entries(total).map(([key, count]) => {
-          const baseline = turn.usageBaseline[key] ?? 0;
+          const baseline = before[key] ?? 0;
           return [key, count >= baseline ? count - baseline : last[key] ?? count];
         }),
       );
@@ -590,7 +639,7 @@ export class CodexAppServerPilot {
         }
       }
       this.finishTurn(turn);
-      this.events.onTurnCompleted(turn.dispatchId, {
+      this.events.onTurnCompleted(turn.turnKey, {
         turnId, stopReason: string(reportedTurn.status) ?? 'unknown',
         finalText: this.redact([...turn.messages.values()].at(-1) ?? ''),
         usage: turn.usage,
@@ -604,7 +653,7 @@ export class CodexAppServerPilot {
     if (turn.id) return;
     turn.id = id;
     this.timeline(turn, { type: 'turn_started', turnId: id });
-    this.events.onTurnStarted(turn.dispatchId);
+    this.events.onTurnStarted(turn.turnKey);
   }
 
   private emitTimeline(turn: ActiveTurn, method: string, params: Obj): void {
@@ -615,7 +664,7 @@ export class CodexAppServerPilot {
   private timeline(turn: ActiveTurn, event: WorkerTimelineEvent): void {
     if (!this.events.onTimeline) return;
     try {
-      this.events.onTimeline(turn.dispatchId, this.redactEvent(event));
+      this.events.onTimeline(turn.turnKey, this.redactEvent(event));
     } catch (error) {
       console.warn('[orchestration] Codex timeline listener failed:', error);
     }
@@ -665,8 +714,41 @@ export class CodexAppServerPilot {
     }
   }
 
+  private async askUser(turn: ActiveTurn, method: string, params: Obj): Promise<Record<string, string[]> | null> {
+    const asked = (Array.isArray(params.questions) ? params.questions : []).map(object);
+    // A secret typed into the question lane would land in the transcript.
+    if (asked.length === 0 || asked.some((question) => question.isSecret === true)) return null;
+    const questions = asked.map((question) => ({
+      id: string(question.id) ?? '', header: this.redact(string(question.header) ?? ''),
+      prompt: this.redact(string(question.question) ?? ''),
+      allowOther: question.isOther === true || !Array.isArray(question.options) || question.options.length === 0,
+      options: (Array.isArray(question.options) ? question.options : []).map(object).map((option) => ({
+        label: string(option.label) ?? '', description: string(option.description) ?? '',
+      })),
+    }));
+    try {
+      const response = await this.events.onRequest(turn.turnKey, {
+        kind: 'question', method, toolInput: '', questions, signal: this.disconnect.signal,
+      });
+      return 'answers' in response ? response.answers : null;
+    } catch {
+      return null;
+    }
+  }
+
   private async replyToServer(id: RpcId, method: string, params: Obj): Promise<void> {
     const turn = this.active;
+    if (method === 'item/tool/requestUserInput' && turn && !this.stopping &&
+      params.threadId === this.threadId && (!turn.id || params.turnId === turn.id)) {
+      const answers = await this.askUser(turn, method, params);
+      if (this.disconnected) return;
+      if (answers) {
+        this.write({ id, result: {
+          answers: Object.fromEntries(Object.entries(answers).map(([key, value]) => [key, { answers: value }])),
+        } });
+        return;
+      }
+    }
     const mcpConfirmation = method === 'mcpServer/elicitation/request';
     const approval = method === 'item/commandExecution/requestApproval' ||
       method === 'item/fileChange/requestApproval' || method === 'item/permissions/requestApproval' ||
@@ -687,7 +769,8 @@ export class CodexAppServerPilot {
     let allowed = false;
     if (!this.stopping && matchesTurn && supportsConfirmation) {
       try {
-        allowed = await this.events.onApproval(turn.dispatchId, {
+        const response = await this.events.onRequest(turn.turnKey, {
+          kind: 'approval',
           method,
           toolInput: this.redact(mcpConfirmation
             ? JSON.stringify({ server: params.serverName, metadata: params._meta, schema })
@@ -695,6 +778,7 @@ export class CodexAppServerPilot {
           message: this.redact(string(params.reason ?? params.message) ?? '') || undefined,
           signal: this.disconnect.signal,
         });
+        allowed = 'decision' in response && response.decision === 'accept';
       } catch {
         // Fail closed if the host cannot record the approval.
       }

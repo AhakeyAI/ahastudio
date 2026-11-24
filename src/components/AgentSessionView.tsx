@@ -1,8 +1,9 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { ArrowDown, ChevronRight, CircleAlert, CircleCheck, Hourglass, Square } from 'lucide-react';
+import { ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Hourglass, Square, Workflow } from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
 import { countDiffStats, parseUnifiedDiff } from '../lib/git-panel-model';
+import { agentSessionClient, isStandaloneSession } from '../lib/agent-session-client';
 import { orchestrationClient } from '../lib/orchestration-client';
 import { stageWindowStore, type StageWindow } from '../lib/stage-window-store';
 import { terminalSessionStore } from '../lib/terminal-session-store';
@@ -13,10 +14,13 @@ import {
   pendingApprovals,
   splitDiffByFile,
   splitDispatchPrompt,
+  splitSystemWake,
   totalTokenUsage,
   turnHasLiveItem,
 } from '../lib/worker-timeline-model';
 import type {
+  AgentSessionInfo,
+  AgentSessionPolicy,
   OrchestrationDispatchRecord,
   OrchestrationDispatchStage,
   WorkerTimelineFileChange,
@@ -153,6 +157,21 @@ const TimelineItem = memo(function TimelineItem({ item }: { item: WorkerTimeline
   );
 });
 
+/** A turn AhaStation started (Worker news, stall reminder): shown apart from what the person typed. */
+function SystemWakeRow({ text, generation }: { text: string; generation: number }) {
+  const body = useMemo(() => splitSystemWake(text).body, [text]);
+  return (
+    <div className="asv-wake" data-asv-row>
+      <div className="asv-wake-head">
+        <BellRing size={12} aria-hidden="true" />
+        <span className="asv-wake-label">系统唤醒</span>
+        <span>第 {generation} 轮 · AhaStation 自动发送，不算你的回复</span>
+      </div>
+      <SessionMarkdown text={body} variant="bubble" />
+    </div>
+  );
+}
+
 function turnFootText(turn: WorkerTimelineTurn): string {
   const elapsed = turn.completedAt ? formatDuration(turn.completedAt - turn.startedAt) : '';
   const label = turn.status === 'interrupted' ? '已中断' : turn.status === 'failed' ? '失败' : '';
@@ -165,7 +184,9 @@ const TurnView = memo(function TurnView({ turn, minHeight }: { turn: WorkerTimel
   const foot = running ? '' : turnFootText(turn);
   return (
     <section className={`asv-turn is-${turn.status}`} aria-label={`第 ${turn.generation} 轮`} style={minHeight ? { minHeight } : undefined}>
-      <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} />
+      {turn.origin === 'system'
+        ? <SystemWakeRow text={turn.prompt} generation={turn.generation} />
+        : <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} />}
       {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}
       {blocks.map((block) =>
         block.type === 'group' ? <WorkGroup key={block.id} block={block} /> : <TimelineItem key={block.item.id} item={block.item} />,
@@ -181,6 +202,15 @@ const TurnView = memo(function TurnView({ turn, minHeight }: { turn: WorkerTimel
   );
 });
 
+const SESSION_STATUS_LABELS: Record<AgentSessionInfo['status'], string> = {
+  starting: '启动中',
+  idle: '就绪',
+  running: '工作中',
+  suspended: '待恢复',
+  closed: '已结束',
+  failed: '失败',
+};
+
 function latestDispatchFor(dispatches: OrchestrationDispatchRecord[], workerId?: string, dispatchId?: string) {
   const mine = dispatches.filter((d) => (workerId && d.assigneeHandle === workerId) || d.id === dispatchId);
   return mine.sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1) ?? null;
@@ -190,14 +220,23 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const [reloadKey, setReloadKey] = useState(0);
   const { timeline, loading, error } = useWorkerTimeline(win.workerId, win.dispatchId, reloadKey);
   const snapshot = useSyncExternalStore(orchestrationClient.subscribe, orchestrationClient.getSnapshot);
-  const dispatch = latestDispatchFor(snapshot.dispatches, win.workerId ?? timeline?.workerHandle, win.dispatchId);
+  // A direct session belongs to the person at the keyboard; it has no dispatch, task, or report_done.
+  const direct = isStandaloneSession(win.workerId);
+  const directSessions = useSyncExternalStore(agentSessionClient.subscribe, agentSessionClient.getSnapshot);
+  const info = direct ? directSessions.find((entry) => entry.id === win.workerId) : undefined;
+  const [nextPolicy, setNextPolicy] = useState<AgentSessionPolicy | null>(null);
+  const [nextNetwork, setNextNetwork] = useState<boolean | null>(null);
+  const policy = nextPolicy ?? info?.policy;
+  const network = nextNetwork ?? info?.network ?? false;
+  const resumable = Boolean(info?.providerSessionId) && (info?.status === 'suspended' || info?.status === 'failed');
+  const dispatch = direct ? null : latestDispatchFor(snapshot.dispatches, win.workerId ?? timeline?.workerHandle, win.dispatchId);
   const task = dispatch ? snapshot.tasks.find((t) => t.id === dispatch.taskId) : undefined;
   const role = task?.displayName?.trim().replace(/^@+/, '');
-  const title = role ? `@${role}` : task?.taskTitle || win.title;
+  const title = direct ? info?.title || win.title : role ? `@${role}` : task?.taskTitle || win.title;
   const usage = totalTokenUsage(timeline);
   const running = Boolean(activeTimelineTurn(timeline));
-  const alive = Boolean(timeline?.alive);
-  const cwd = dispatch?.worktreePath ?? win.cwd ?? null;
+  const alive = direct ? info?.status === 'idle' || info?.status === 'running' || resumable : Boolean(timeline?.alive);
+  const cwd = info?.cwd ?? dispatch?.worktreePath ?? win.cwd ?? null;
   const targetDispatchId = dispatch?.id ?? win.dispatchId;
   const approvals = useMemo(() => pendingApprovals(timeline), [timeline]);
   const questions = useMemo(
@@ -205,7 +244,15 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     [snapshot.questions, targetDispatchId],
   );
   const appearance = useSyncExternalStore(terminalSessionStore.subscribe, terminalSessionStore.getAppearance);
-  const session = useMemo(() => ({ cwd, appearance, onNotify }), [cwd, appearance, onNotify]);
+  const sessionId = direct ? win.workerId : undefined;
+  const session = useMemo(() => ({
+    cwd, appearance, onNotify,
+    ...(sessionId ? {
+      resolveApproval: async (requestId: string, allow: boolean, reason?: string) =>
+        (await window.vibeMeet?.agentSessions?.respond({ id: sessionId, requestId, allow, ...(reason ? { reason } : {}) }))
+          ?? { ok: false, error: '会话接口不可用' },
+    } : {}),
+  }), [cwd, appearance, onNotify, sessionId]);
 
   const dockRef = useRef<HTMLDivElement>(null);
   const [dockHeight, setDockHeight] = useState(0);
@@ -244,6 +291,21 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   };
 
   const send = async (text: string) => {
+    if (sessionId) {
+      const sessions = window.vibeMeet?.agentSessions;
+      if (!sessions) return false;
+      const ok = await run('send', () => sessions.send({
+        id: sessionId, text,
+        ...(nextPolicy && nextPolicy !== info?.policy ? { policy: nextPolicy } : {}),
+        ...(nextNetwork !== null && nextNetwork !== info?.network ? { network: nextNetwork } : {}),
+      }));
+      if (ok) {
+        setNextPolicy(null);
+        setNextNetwork(null);
+        scroll.scrollToEnd();
+      }
+      return ok;
+    }
     if (!targetDispatchId || !api) return false;
     const [first = '', ...rest] = text.split('\n');
     const long = first.length > 200;
@@ -258,17 +320,50 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   };
 
   const stop = () => {
+    if (sessionId) {
+      void run('stop', async () => window.vibeMeet?.agentSessions?.close({ id: sessionId }));
+      return;
+    }
     if (!targetDispatchId || !api?.workerStop) return;
     void run('stop', () => api.workerStop!({ dispatchId: targetDispatchId, reason: 'Stopped from Agent session' }));
   };
 
+  const answer = async (requestId: string, answers: Record<string, string[]> | null) => {
+    if (!sessionId) return false;
+    return run('answer', async () => window.vibeMeet?.agentSessions?.answer({ id: sessionId, requestId, answers }));
+  };
+
   const interrupt = () => {
+    if (sessionId) {
+      void run('interrupt', async () => window.vibeMeet?.agentSessions?.interrupt({ id: sessionId }));
+      return;
+    }
     if (!targetDispatchId || !api?.workerInterrupt) return;
     void run('interrupt', () => api.workerInterrupt!({ dispatchId: targetDispatchId }));
   };
 
+  // Switching replaces the Codex process, so it waits until nothing is running or waiting on the person.
+  const canToggleOrchestration = Boolean(
+    info?.providerSessionId && !running && approvals.length === 0 && !info.pendingQuestions.length &&
+      (info.status === 'idle' || resumable),
+  );
+  const toggleOrchestration = () => {
+    if (!sessionId || !info) return;
+    const enabled = !info.orchestration;
+    void run('orchestration', async () => window.vibeMeet?.agentSessions?.setOrchestration({ id: sessionId, enabled }))
+      .then((ok) => {
+        if (ok) onNotify?.(enabled ? '已开启编排模式：这个会话可以派发和管理 Worker' : '已关闭编排模式');
+      });
+  };
+
   const stage = dispatch?.stage;
-  const stageLabel = stage ? STAGE_LABELS[stage] ?? stage : timeline ? (alive ? '运行中' : '已结束') : '';
+  const stageLabel = direct
+    ? (info ? SESSION_STATUS_LABELS[info.status] : '已结束')
+    : stage ? STAGE_LABELS[stage] ?? stage : timeline ? (alive ? '运行中' : '已结束') : '';
+  const emptyText = !direct ? '这个 Worker 还没有可回放的过程记录。'
+    : !info ? '这个会话已经结束。'
+      : info.status === 'failed' && !resumable ? `会话无法启动：${info.error ?? '未知错误'}`
+        : info.status === 'starting' ? '正在启动 Codex…' : '发一条消息开始。';
 
   return (
     <AgentSessionContext.Provider value={session}>
@@ -279,12 +374,26 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
           {task?.taskTitle && role && <span className="asv-subtitle">{task.taskTitle}</span>}
           <span className="asv-spacer" />
           {stageLabel && (
-            <span className={`asv-stage${stage ? ` is-${stage}` : ''}`}>
+            <span className={`asv-stage${stage ? ` is-${stage}` : info?.status === 'running' ? ' is-working' : info?.status === 'failed' ? ' is-failed' : ''}`}>
               <i className="asv-stage-dot" aria-hidden="true" />
               {stageLabel}
             </span>
           )}
-          {alive && (
+          {direct && info && info.status !== 'closed' && (
+            <button
+              type="button"
+              className={`asv-btn asv-orchestration${info.orchestration ? ' is-on' : ''}`}
+              aria-pressed={info.orchestration}
+              disabled={!canToggleOrchestration || busy === 'orchestration'}
+              title={canToggleOrchestration
+                ? (info.orchestration ? '关闭后这个会话不再派发和管理 Worker' : '开启后这个会话作为协调者派发和管理 Worker')
+                : '本轮结束后才能切换编排模式'}
+              onClick={toggleOrchestration}
+            >
+              <Workflow size={12} /> {busy === 'orchestration' ? '切换中…' : info.orchestration ? '编排模式 · 开' : '编排模式'}
+            </button>
+          )}
+          {alive && !(direct && resumable) && (
             <button type="button" className="asv-btn is-quiet-danger" disabled={busy === 'stop'} onClick={stop}>
               <Square size={10} fill="currentColor" /> 停止
             </button>
@@ -300,7 +409,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
                 <button type="button" className="asv-btn" onClick={() => setReloadKey((k) => k + 1)}>重试</button>
               </div>
             )}
-            {!loading && !error && !timeline && <div className="asv-empty">这个 Worker 还没有可回放的过程记录。</div>}
+            {!loading && !error && !timeline?.turns.length && (!timeline || direct) && <div className="asv-empty">{emptyText}</div>}
             {timeline?.turns.map((turn) => (
               <TurnView key={turn.key} turn={turn} minHeight={turn.key === scroll.anchoredTurnKey ? scroll.anchoredMinHeight : undefined} />
             ))}
@@ -324,7 +433,13 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             cwd={cwd}
             branch={dispatch?.branch ?? null}
             model={timeline?.model ?? dispatch?.model ?? null}
-            readOnly={timeline?.readOnly ?? true}
+            readOnly={timeline?.readOnly}
+            direct={direct}
+            {...(direct && policy ? { policy, onPolicyChange: setNextPolicy } : {})}
+            {...(direct ? {
+              network, onNetworkChange: setNextNetwork, resumable,
+              directQuestions: info?.pendingQuestions ?? [], onAnswer: answer,
+            } : {})}
             usage={usage}
             onSend={send}
             onInterrupt={interrupt}

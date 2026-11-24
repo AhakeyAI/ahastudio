@@ -11,7 +11,8 @@ import { normalizeWorkerCliId } from './worker-launch-catalog.js';
 export const DEFAULT_PROPOSAL_HOLD_TIMEOUT_MS = 120_000;
 export const DEFAULT_PROPOSAL_TTL_MS = 10 * 60_000;
 
-export type UserTurnSource = 'hook' | 'pty';
+/** `session`: a message the person sent from an Agent session's input box started a turn. */
+export type UserTurnSource = 'hook' | 'pty' | 'session';
 
 export interface DispatchProposalOverrides {
   agent?: string;
@@ -126,15 +127,16 @@ export class DispatchProposalManager {
   }
 
   /**
-   * Advance the user-turn counter for a pane. Only Enter typed in the renderer ('pty') counts:
-   * prompt-submit hooks also fire for text AhaStation itself types into the terminal (mailbox
-   * pointers, stall nudges, `aha terminal send`), so a hook alone never proves a person answered.
+   * Advance the user-turn counter for a pane. Only Enter typed in the renderer ('pty') or a
+   * person's message that started an Agent session turn ('session') counts: prompt-submit hooks
+   * also fire for text AhaStation itself types into the terminal (mailbox pointers, stall nudges,
+   * `aha terminal send`), so a hook alone never proves a person answered.
    */
   recordUserTurn(ptyId: string, source: UserTurnSource = 'hook'): number {
     const cleanId = ptyId.trim();
     if (!cleanId) return 0;
     const state = this.getOrCreatePaneState(cleanId);
-    if (source !== 'pty') return state.userTurn;
+    if (source !== 'pty' && source !== 'session') return state.userTurn;
 
     state.userTurn += 1;
     for (const [id, entry] of state.chatProposals) {

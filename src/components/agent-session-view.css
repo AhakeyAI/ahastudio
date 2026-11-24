@@ -81,6 +81,7 @@
 .asv-btn:disabled { opacity: 0.5; cursor: default; }
 .asv-btn.is-primary { border-color: var(--asv-ink-strong); background: var(--asv-ink-strong); color: var(--workspace-bg); }
 .asv-btn.is-primary:hover:not(:disabled) { background: var(--asv-ink); }
+.asv-btn.asv-orchestration.is-on { border-color: var(--workspace-accent); color: var(--workspace-accent); }
 .asv-btn.is-quiet-danger { border-color: transparent; background: none; color: var(--asv-ink-2); }
 .asv-btn.is-quiet-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--asv-bad) 10%, transparent); color: var(--asv-bad); }
 .asv-text-btn {
@@ -160,6 +161,22 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+.asv-wake {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  margin-bottom: 6px;
+  padding: 9px 12px;
+  border-left: 2px solid color-mix(in srgb, var(--workspace-accent) 55%, transparent);
+  border-radius: 4px 10px 10px 4px;
+  background: var(--asv-tint);
+  color: var(--asv-ink);
+  overflow-wrap: anywhere;
+}
+.asv-wake-head { display: flex; align-items: center; gap: 6px; color: var(--asv-ink-2); font-size: 12px; }
+.asv-wake-label { color: var(--asv-ink-strong); font-weight: 600; }
 
 /* ---- Assistant prose ---- */
 
@@ -400,6 +417,14 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-chip { display: inline-flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; }
 .asv-chip > span { overflow: hidden; text-overflow: ellipsis; }
 .asv-chip > svg { flex: none; opacity: 0.8; }
+.asv-chip-toggle { padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.asv-chip-toggle.is-on { color: var(--asv-ink-strong); }
+.asv-chip-toggle:disabled { cursor: default; opacity: 0.6; }
+.asv-banner-qa { display: flex; flex-direction: column; gap: 6px; }
+.asv-banner-qa .asv-banner-input { flex: none; width: 100%; }
+.asv-policy select { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; outline: none; padding: 0; }
+.asv-policy select:focus-visible { text-decoration: underline; }
+.asv-policy select:disabled { cursor: default; }
 .asv-strip-spacer { flex: 1; }
 
 .asv-to-bottom {

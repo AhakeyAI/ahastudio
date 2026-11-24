@@ -128,6 +128,8 @@ export interface WorkerTimelineTurn {
   turnId: string | null;
   generation: number;
   prompt: string;
+  /** `system`: AhaStation started the turn (a wake-up), not the person or a dispatch brief. */
+  origin?: 'system';
   startedAt: number;
   completedAt: number | null;
   status: WorkerTimelineTurnStatus;
@@ -365,6 +367,8 @@ export interface WorkerTimelineOptions {
   redact?: (text: string) => string;
   now?: () => number;
   onPatch?: (patch: WorkerTimelineChange) => void;
+  /** Earlier turns to continue from, e.g. a session saved before the app restarted. */
+  initial?: WorkerTimelineSnapshot;
 }
 
 /** One mutation's effect; item and turn are live references, cloned when a patch is flushed. */
@@ -396,6 +400,24 @@ export class WorkerTimeline {
     this.redact = options.redact ?? ((text) => text);
     this.now = options.now ?? Date.now;
     this.onPatch = options.onPatch;
+    if (options.initial) this.restore(options.initial);
+  }
+
+  private restore(initial: WorkerTimelineSnapshot): void {
+    this.header.providerSessionId = initial.providerSessionId;
+    for (const turn of structuredClone(initial.turns)) {
+      // A turn still running when the snapshot was taken can never finish now.
+      if (turn.status === 'running') {
+        turn.status = 'interrupted';
+        turn.stopReason = 'interrupted';
+        turn.completedAt ??= turn.startedAt;
+        for (const item of turn.items) {
+          if ('status' in item && item.status === 'running') item.status = 'failed';
+        }
+      }
+      this.turns.push(turn);
+      this.generation = Math.max(this.generation, turn.generation);
+    }
   }
 
   get workerHandle(): string { return this.header.workerHandle; }
@@ -410,12 +432,12 @@ export class WorkerTimeline {
     return this.turns.some((turn) => turn.dispatchId === dispatchId);
   }
 
-  setMeta(meta: Partial<Pick<WorkerTimelineHeader, 'alive' | 'providerSessionId' | 'model'>>): void {
+  setMeta(meta: Partial<Pick<WorkerTimelineHeader, 'alive' | 'providerSessionId' | 'model' | 'readOnly'>>): void {
     Object.assign(this.header, meta);
     this.changed(null, null);
   }
 
-  beginTurn(input: { dispatchId: string; prompt: string; startedAt?: number }): WorkerTimelineTurn {
+  beginTurn(input: { dispatchId: string; prompt: string; startedAt?: number; origin?: 'system' }): WorkerTimelineTurn {
     const running = this.activeTurn;
     if (running) this.finishTurn(running, { status: 'interrupted', stopReason: 'superseded' });
     this.generation += 1;
@@ -425,6 +447,7 @@ export class WorkerTimeline {
       turnId: null,
       generation: this.generation,
       prompt: capHead(this.redact(input.prompt), TIMELINE_LIMITS.prompt),
+      ...(input.origin ? { origin: input.origin } : {}),
       startedAt: input.startedAt ?? this.now(),
       completedAt: null,
       status: 'running',

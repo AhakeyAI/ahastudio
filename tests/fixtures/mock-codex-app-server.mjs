@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const [scenario, trace] = process.argv.slice(2);
 const history = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const threadId = 'mock-thread-id';
+let threadCwd = process.cwd();
 let turnNumber = 0;
 let turnId;
 let approvalId;
@@ -59,19 +61,24 @@ for await (const line of history) {
     send(scenario === 'initialize-error'
       ? { id, error: { code: -32602, message: 'mock initialization rejected' } }
       : { id, result: { userAgent: 'mock-codex' } });
-  } else if (method === 'thread/start') {
-    assert.equal(params.sandbox, 'read-only');
-    assert.equal(params.approvalPolicy, 'on-request');
-    send({ id, result: { thread: { id: threadId }, sandbox: { type: 'readOnly' }, approvalPolicy: 'on-request' } });
+  } else if (method === 'thread/start' || method === 'thread/resume') {
+    if (method === 'thread/resume') assert.equal(params.threadId, threadId);
+    if (typeof params.cwd === 'string' && params.cwd) threadCwd = params.cwd;
+    const granted = scenario === 'sandbox-mismatch' ? 'workspace-write' : params.sandbox;
+    send({ id, result: {
+      thread: { id: threadId },
+      sandbox: { type: granted === 'read-only' ? 'readOnly' : 'workspaceWrite' },
+      approvalPolicy: params.approvalPolicy,
+    } });
   } else if (method === 'mcpServerStatus/list') {
     assert.equal(params.threadId, threadId);
     assert.equal(params.serverName, 'aha');
     if (scenario === 'catalog-wait') await delay(250);
-    send({ id, result: { data: [{ name: 'aha', tools: { report_done: { name: 'report_done' } } }] } });
+    send({ id, result: { data: [{ name: 'aha', tools: {
+      report_done: { name: 'report_done' }, delegate_task: { name: 'delegate_task' },
+    } }] } });
   } else if (method === 'turn/start') {
     assert.equal(params.threadId, threadId);
-    assert.deepEqual(params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
-    assert.equal(params.approvalPolicy, 'on-request');
     const prompt = params.input[0].text;
     if (scenario === 'timeout') continue;
     if (scenario === 'rejected') {
@@ -100,12 +107,27 @@ for await (const line of history) {
         params: { threadId, turnId, serverName: 'aha', message: 'Approve tool call?',
           mode: 'form', requestedSchema: { type: 'object', properties: {} } },
       });
+    } else if (prompt.includes('ASK_A_QUESTION')) {
+      approvalId = 'question-' + turnNumber;
+      send({
+        id: approvalId, method: 'item/tool/requestUserInput',
+        params: { threadId, turnId, itemId: 'ask', isBlocking: true, autoResolutionMs: null, questions: [{
+          id: 'db', header: 'Database', question: 'Which database?', isOther: false,
+          isSecret: prompt.includes('SECRET'),
+          options: [{ label: 'SQLite', description: 'Local file' }, { label: 'Postgres', description: 'Server' }],
+        }] },
+      });
     } else if (prompt.includes('ASK_FOR_APPROVAL')) {
       approvalId = 'approval-' + turnNumber;
       send({
         id: approvalId, method: 'item/commandExecution/requestApproval',
         params: { threadId, turnId, command: 'Get-Location', availableDecisions: ['accept', 'decline'] },
       });
+    } else if (prompt.includes('WRITE_FILE')) {
+      const match = /WRITE_FILE:([^\s]+)/.exec(prompt);
+      const target = basename(match?.[1] ?? 'worker-output.txt') || 'worker-output.txt';
+      writeFileSync(join(threadCwd, target), `written by mock headless worker (${target})\n`, 'utf8');
+      completed('completed', `Wrote ${target}`);
     } else {
       completed('completed', '模拟输出 ' + turnNumber);
     }
@@ -115,6 +137,10 @@ for await (const line of history) {
     send({ id, result: {} });
     completed('interrupted', '');
   } else if (id === approvalId && result) {
-    completed('completed', 'approval decision: ' + (result.decision ?? result.action));
+    completed('completed', result.answers
+      ? 'answer: ' + JSON.stringify(result.answers)
+      : 'approval decision: ' + (result.decision ?? result.action));
+  } else if (id === approvalId) {
+    completed('completed', 'request refused');
   }
 }

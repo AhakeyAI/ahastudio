@@ -61,6 +61,9 @@ node --import ./tests/register-electron-stub.mjs --test --test-concurrency=2 tes
 
 - Headless Workers authenticate with their own `AHA_WORKER_ID` / `AHA_WORKER_TOKEN`; they have
   `assigneePaneId = null`, `ownsPane = false`, and `providerSessionId` = the provider thread id.
+- Session-coordinated Codex Workers run headless: read-only tasks use `read-only` and writable
+  tasks use `workspace-write`, with the sandbox rooted at the Worker's working directory (its
+  worktree when isolated).
 - A finished turn never settles a dispatch. Only `report_done` does; otherwise the turn ends as
   "pending confirmation" with the final text and a redacted diff.
 - Delivery failures: only `not_accepted` (failed before the turn started) may fall back to PTY.

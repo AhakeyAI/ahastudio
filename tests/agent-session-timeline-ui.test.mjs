@@ -49,6 +49,25 @@ async function loadMarkdownRenderer() {
   return (mod.default ?? mod).render;
 }
 
+/** Bundles SessionComposer with React's server renderer so static chips can be verified. */
+async function loadComposerRenderer() {
+  const outfile = join(dir, 'session-composer.cjs');
+  await build({
+    stdin: {
+      contents: `
+        import { createElement } from 'react';
+        import { renderToStaticMarkup } from 'react-dom/server';
+        import { SessionComposer } from './src/components/agent-session/SessionComposer.tsx';
+        export const render = (props) => renderToStaticMarkup(createElement(SessionComposer, props));`,
+      resolveDir: fileURLToPath(new URL('..', import.meta.url)),
+      loader: 'js',
+    },
+    outfile, bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', logLevel: 'silent',
+  });
+  const mod = await import(pathToFileURL(outfile).href);
+  return (mod.default ?? mod).render;
+}
+
 /** Loads a fresh stage store whose persistence goes to `disk` instead of the Electron bridge. */
 async function loadStageStore(disk) {
   globalThis.__stageTest = {
@@ -239,6 +258,13 @@ test('dispatch prompts split into the task body and the orchestration wrapper', 
   assert.match(mcp.system, /report_done/);
   assert.match(mcp.system, /delegate_task/);
 
+  const writable = model.splitDispatchPrompt(buildDispatchPreamble({
+    ...base, taskSpec: spec, mcpEnabled: true, headless: true, leaveUncommitted: true, role: 'builder',
+    worktreePath: 'C:/repo/wt', branch: 'aha/worker/x',
+  }));
+  assert.equal(writable.body, spec);
+  assert.match(writable.system, /Do not run `git commit`/);
+
   const followUp = model.splitDispatchPrompt(buildDispatchPreamble({
     ...base, taskSpec: 'Also check tests', mcpEnabled: true, headless: true, role: 'reviewer', isFollowUp: true,
   }));
@@ -390,4 +416,35 @@ test('workspace state schema accepts persisted agent-session windows', async (t)
   assert.deepEqual(await call('get', {}), { ok: true, state });
   const rejected = await call('set', { ...state, windows: [{ ...state.windows[1], type: 'agent-session-x' }] });
   assert.equal(rejected.ok, false);
+});
+
+test('a system wake-up turn shows its messages without the header that tells the agent it is not the user', async () => {
+  const { SESSION_WAKE_HEADER } = await import('../dist-electron/orchestration/coordinator-prompt.js');
+  assert.deepEqual(model.splitSystemWake(`${SESSION_WAKE_HEADER}\r\n\n@api 已完成\n下一步？`), {
+    body: '@api 已完成\n下一步？', header: SESSION_WAKE_HEADER,
+  });
+  assert.deepEqual(model.splitSystemWake('[AhaStation system] note'), { body: '[AhaStation system] note', header: null });
+  assert.deepEqual(model.splitSystemWake(SESSION_WAKE_HEADER), { body: SESSION_WAKE_HEADER, header: null });
+});
+
+test('SessionComposer shows non-switchable read-only and writable labels for Workers', async () => {
+  const render = await loadComposerRenderer();
+  const baseProps = {
+    alive: true, running: false, sending: false, interrupting: false,
+    approvals: [], questions: [], cwd: 'C:/repo/wt', branch: 'aha/worker/x', model: 'gpt-5',
+    usage: null, onSend: async () => true, onInterrupt: () => {},
+  };
+
+  const readOnlyHtml = render({ ...baseProps, direct: false, readOnly: true });
+  assert.match(readOnlyHtml, /<span class="asv-chip">[\s\S]*<span>只读<\/span><\/span>/);
+  assert.doesNotMatch(readOnlyHtml, /<select\b/);
+
+  const writableHtml = render({ ...baseProps, direct: false, readOnly: false });
+  assert.match(writableHtml, /<span class="asv-chip">[\s\S]*<span>可写 · 需确认<\/span><\/span>/);
+  assert.doesNotMatch(writableHtml, /<select\b/);
+
+  const directHtml = render({
+    ...baseProps, direct: true, readOnly: false, policy: 'workspace-write', onPolicyChange: () => {},
+  });
+  assert.match(directHtml, /<select\b/);
 });

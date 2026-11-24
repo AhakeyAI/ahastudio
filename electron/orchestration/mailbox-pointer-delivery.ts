@@ -3,6 +3,7 @@ import {
   type PtyWriteFn,
 } from '../agent/agent-prompt-delivery.js';
 import type { AgentPaneStatus, AgentStatusStore } from '../agent/agent-status-store.js';
+import type { TurnDelivery } from './agent-session-driver.js';
 import { formatMessagePointer } from './orchestration-messaging.js';
 import type { RuntimeMessageWaiters } from './mailbox-waiters.js';
 import { ACTIVE_DISPATCH_STATUSES } from './orchestration-lifecycle-graph.js';
@@ -23,6 +24,11 @@ export interface MailboxPointerDeliveryDependencies {
   findPendingBoardPostsForPane?: (ptyId: string) => OrchestrationMessageRecord[];
   shouldDeliverMessageToPane?: (msg: OrchestrationMessageRecord, ptyId: string) => boolean;
   formatDirectDeliveryText?: (msgs: OrchestrationMessageRecord[], ptyId: string) => string | null;
+  /**
+   * Targets woken by starting a whole turn instead of typing into a terminal (orchestrating Agent
+   * sessions); null for terminal panes. Delivery waits until the target is idle.
+   */
+  turnTarget?: (id: string) => { idle: boolean; startTurn: (prompt: string) => Promise<TurnDelivery> } | null;
   cliCommand?: string;
   debounceMs?: number;
   settleDelayMs?: number;
@@ -239,6 +245,8 @@ export class MailboxPointerDelivery {
 
   private isPaneSettledForPointer(ptyId: string): boolean {
     if (!this.isPaneAlive(ptyId)) return false;
+    const target = this.deps.turnTarget?.(ptyId);
+    if (target) return target.idle;
     const pane = this.deps.agentStatusStore.get(ptyId);
     if (!pane) return false;
     // Notices end with Enter; a plain shell would try to run them as a command.
@@ -420,17 +428,22 @@ export class MailboxPointerDelivery {
           held?.id
         );
       }
-      const res = await deliverPromptToPty(
-        {
-          ptyId,
-          prompt: promptText.trim(),
-          submit: true,
-          settleDelayMs: this.settleDelayMs,
-          agentId: this.deps.agentStatusStore.get(ptyId)?.agentId ?? null,
-          isPaneAlive: this.deps.isPaneAlive ? () => this.deps.isPaneAlive!(ptyId) : undefined,
-        },
-        this.deps.writePty
-      );
+      const target = this.deps.turnTarget?.(ptyId);
+      // After unknown acceptance the agent may already have the messages; sending them again
+      // would repeat the wake-up, so only a turn that never started gives them back.
+      const res = target
+        ? { ok: (await target.startTurn(promptText.trim())).status !== 'not_accepted' }
+        : await deliverPromptToPty(
+          {
+            ptyId,
+            prompt: promptText.trim(),
+            submit: true,
+            settleDelayMs: this.settleDelayMs,
+            agentId: this.deps.agentStatusStore.get(ptyId)?.agentId ?? null,
+            isPaneAlive: this.deps.isPaneAlive ? () => this.deps.isPaneAlive!(ptyId) : undefined,
+          },
+          this.deps.writePty
+        );
       if (!res.ok) {
         this.deps.store.markAsUndeliveredForConsumer(ids, ptyId);
         state.deferredUntilIdle = true;

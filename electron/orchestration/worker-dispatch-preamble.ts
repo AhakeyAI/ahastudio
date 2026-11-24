@@ -30,6 +30,8 @@ export interface BuildDispatchPreambleInput {
   redactText?: (text: string) => string;
   mcpEnabled?: boolean;
   headless?: boolean;
+  /** Headless writable Codex Workers stay inside their worktree sandbox, so they leave edits uncommitted for integration. */
+  leaveUncommitted?: boolean;
   role?: string | null;
 }
 
@@ -169,6 +171,9 @@ function renderDispatchPreamble(
       '',
       `- Need clarification or blocked? Call MCP tool \`ask_coordinator\` (wait=true).`,
       `- When finished or blocked, call MCP tool \`report_done\` with outcome & brief summary.`,
+      ...(input.leaveUncommitted
+        ? [`- Do not run \`git commit\`; leave your changes uncommitted in the workspace and call \`report_done\` so the coordinator can integrate them.`]
+        : []),
       ...(input.canDispatchSubWorkers
         ? [`- Sub-tasks permitted: use MCP tools \`delegate_task\` and \`team_wait\` if needed.`]
         : []),
