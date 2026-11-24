@@ -1149,6 +1149,11 @@ export class OrchestrationStore {
       updatedAt: now,
     };
     this.tasks.set(task.id, task);
+    if (input.queuedLaunch && run.status !== 'active') {
+      run.status = 'active';
+      run.endedAt = null;
+      run.updatedAt = now;
+    }
     this.promoteReadyTasks(run.id);
     this.persist();
     return cloneTaskRecord(task);

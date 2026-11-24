@@ -500,6 +500,19 @@ for (const scenario of ['timeout', 'disconnect', 'started-then-error']) {
   });
 }
 
+test('an accepted headless pointer advances notification cursor; the exact board read proves delivery', async t => {
+  const app = await setup(t);
+  const worker = (await app.start('Read the board', { role: 'scout', displayName: 'scout' })).dispatch;
+  await until(() => app.store.getDispatchContext(worker.id)?.codexTurn);
+  await app.service.boardPost({ from: 'coordinator-pane', runId: app.run.id, text: '@scout pointer-marker ' + 'x'.repeat(1400) });
+  const post = app.store.listBoardPosts(app.run.id).find(m => m.body.includes('pointer-marker'));
+  assert.ok(post);
+  await until(() => app.store.getMessageById(post.id).receipts?.scout === 'notified');
+  assert.ok(app.store.getMemberCursor(app.run.id, 'scout').lastDeliveredSeq >= post.boardSeq);
+  app.service.boardRead({ from: worker.assigneeHandle, runId: app.run.id, seqs: [post.boardSeq] });
+  assert.equal(app.store.getMessageById(post.id).receipts.scout, 'delivered');
+});
+
 for (const delivery of ['mailbox', 'follow-up']) {
   test(delivery + ' with unknown acceptance preserves the active attempt without re-sending', async t => {
     const app = await setup(t, 'second-timeout');

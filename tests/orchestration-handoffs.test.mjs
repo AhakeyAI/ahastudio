@@ -54,7 +54,9 @@ test('two code dependencies require both latest handoffs and cannot be claimed b
   const make = id => store.createTask({ id, runId: run.id, spec: id });
   const a = make('a'), c = make('c');
   const queue = { from: 'coord', state: 'waiting', coordinatorGeneration: 1, agent: 'codex', role: 'b', worktree: true, authorizeReviews: false };
+  store.updateRunStatus(run.id, 'stopped');
   const b = store.createTask({ runId: run.id, spec: 'b', codeDeps: [a.id, c.id], queuedLaunch: queue });
+  assert.equal(store.requireRun(run.id).status, 'active', 'newly approved work reopens the run');
   for (const parent of [a, c]) {
     const dispatch = store.createDispatchContext({ taskId: parent.id, assigneeHandle: parent.id });
     store.settleWorkerReport({ taskId: parent.id, dispatchId: dispatch.id, outcome: 'completed' });
