@@ -1,33 +1,24 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import {
-  ArrowDown, BellRing, ChevronRight, CircleAlert, CircleCheck, Cpu, Eraser, FileText, Folder, History, Hourglass,
-  Image as ImageIcon, Minimize2, PencilLine, Sparkles, Square, Workflow,
-} from 'lucide-react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { ArrowDown, Cpu, Folder, History, Square, Workflow } from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
-import { countDiffStats, parseUnifiedDiff } from '../lib/git-panel-model';
 import { agentSessionClient, codexCatalogClient, isStandaloneSession, usageLimitsClient } from '../lib/agent-session-client';
 import { summarizeUsage, type UsageSummary } from '../lib/usage-limits';
 import type { GoalCommandAction } from '../lib/composer-slash-commands';
 import { effortLabel } from '../lib/composer-tokens';
 import { composerDrafts } from '../lib/composer-drafts';
+import { createSessionFileLinkChecker } from '../lib/session-file-link-checker';
 import { folderName } from '../lib/session-title';
+import { selectTurnAnswerItemIds } from '../lib/session-turn-model';
 import { orchestrationClient } from '../lib/orchestration-client';
 import { stageWindowStore, type StageWindow } from '../lib/stage-window-store';
 import { terminalSessionStore } from '../lib/terminal-session-store';
 import {
   activeTimelineTurn,
   currentThreadHasTurns,
-  formatDuration,
-  groupTimelineItems,
   pendingApprovals,
-  splitDiffByFile,
-  splitDispatchPrompt,
-  splitSystemWake,
   totalTokenUsage,
-  turnHasLiveItem,
 } from '../lib/worker-timeline-model';
-import { summarizeTurnChanges } from '../lib/turn-changes';
 import type {
   AgentSessionInfo,
   AgentSessionPolicy,
@@ -35,20 +26,20 @@ import type {
   CodexModelOption,
   OrchestrationDispatchRecord,
   OrchestrationDispatchStage,
-  WorkerTimelineFileChange,
-  WorkerTimelineItem,
-  WorkerTimelineTurn,
 } from '../types';
-import { CopyButton, DiffBlock } from './agent-session/SessionCode';
 import type { FeedbackBannerState } from './agent-session/ComposerBanners';
 import { SessionComposer, type ComposerHandle, type ComposerSlashControl } from './agent-session/SessionComposer';
-import { SessionMarkdown } from './agent-session/SessionMarkdown';
 import { SessionTitle } from './agent-session/SessionTitle';
 import { SessionEmptyState } from './agent-session/SessionEmptyState';
 import { SessionHistoryPanel } from './agent-session/SessionHistoryPanel';
-import { FileChangeRows, LiveTimer, WorkGroup, WorkItemRow } from './agent-session/SessionWorkLog';
-import { AgentSessionContext, useAgentSession } from './agent-session/session-context';
-import { TurnChangesCard } from './agent-session/TurnChangesCard';
+import { TurnView } from './agent-session/SessionTurnView';
+import { AgentSessionContext } from './agent-session/session-context';
+import {
+  SessionDisclosureContext,
+  SessionReplyRevealsContext,
+  useSessionDisclosures,
+  useSessionReplyReveals,
+} from './agent-session/session-disclosure-store';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
 import './agent-session-view.css';
 
@@ -66,226 +57,6 @@ const STAGE_LABELS: Record<OrchestrationDispatchStage, string> = {
 
 /** Space kept between the last timeline row and the floating composer. */
 const DOCK_GAP = 16;
-const LONG_PROMPT_CHARS = 1200;
-const LONG_PROMPT_LINES = 16;
-
-type Item<K extends WorkerTimelineItem['kind']> = Extract<WorkerTimelineItem, { kind: K }>;
-
-/** Hover actions under a message; shown by CSS so rows hold no hover state. */
-function MessageActions({ text, onEdit }: { text: string; onEdit?: () => void }) {
-  if (!text.trim()) return null;
-  return (
-    <span className="asv-msg-actions">
-      <CopyButton text={text} label="复制" className="asv-act" />
-      {onEdit && (
-        <button type="button" className="asv-act" aria-label="编辑后重发" title="编辑后重发（填回输入框，不会自动发送）" onClick={onEdit}>
-          <PencilLine size={13} />
-        </button>
-      )}
-    </span>
-  );
-}
-
-function UserBubble({ text, caption, attachments, editable = false }: {
-  text: string; caption?: string; attachments?: WorkerTimelineTurn['attachments']; editable?: boolean;
-}) {
-  const { editMessage } = useAgentSession();
-  const parts = useMemo(() => splitDispatchPrompt(text), [text]);
-  const long = parts.body.length > LONG_PROMPT_CHARS || parts.body.split('\n').length > LONG_PROMPT_LINES;
-  const [expanded, setExpanded] = useState(false);
-  const [showSystem, setShowSystem] = useState(false);
-  const origin = parts.system ? (parts.followUp ? '追加派发' : '编排派发') : null;
-  return (
-    <div className="asv-user" data-asv-row>
-      {parts.body && (
-        <div className={`asv-bubble${long && !expanded ? ' is-clamped' : ''}`}>
-          <SessionMarkdown text={parts.body} variant="bubble" />
-        </div>
-      )}
-      {attachments && attachments.length > 0 && (
-        <div className="asv-user-attachments">
-          {attachments.map((item, index) => (
-            <span key={`${item.kind}:${item.name}:${index}`} className={`asv-attach-pill is-${item.kind}`}>
-              {item.kind === 'skill' ? <Sparkles size={11} aria-hidden="true" />
-                : item.kind === 'image' ? <ImageIcon size={11} aria-hidden="true" /> : <FileText size={11} aria-hidden="true" />}
-              {item.kind === 'skill' ? `$${item.name}` : item.name}
-            </span>
-          ))}
-        </div>
-      )}
-      {(parts.body || long || parts.system || caption) && (
-        <div className="asv-user-meta">
-          <MessageActions
-            text={parts.body}
-            {...(editable && editMessage && !parts.system ? { onEdit: () => editMessage(parts.body) } : {})}
-          />
-          {long && (
-            <button type="button" className="asv-text-btn" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
-              {expanded ? '收起' : '展开全部'}
-            </button>
-          )}
-          {parts.system && (
-            <button type="button" className="asv-text-btn" aria-expanded={showSystem} onClick={() => setShowSystem((value) => !value)}>
-              <ChevronRight size={11} className="asv-text-btn-chevron" aria-hidden="true" />
-              编排指令
-            </button>
-          )}
-          {[origin, caption].filter(Boolean).join(' · ')}
-        </div>
-      )}
-      {showSystem && parts.system && <pre className="asv-system">{parts.system}</pre>}
-    </div>
-  );
-}
-
-function SettlementBlock({ item }: { item: Item<'settlement'> }) {
-  const [showDiff, setShowDiff] = useState(false);
-  const files = useMemo<WorkerTimelineFileChange[]>(
-    () =>
-      showDiff && item.diff
-        ? splitDiffByFile(item.diff).map((file) => ({
-            path: file.path,
-            change: 'update',
-            movePath: null,
-            diff: file.diff,
-            truncated: false,
-            ...countDiffStats(parseUnifiedDiff(file.diff)),
-          }))
-        : [],
-    [showDiff, item.diff],
-  );
-  if (item.settlement === 'report_done') {
-    const ok = item.outcome === 'completed' && item.verdict !== 'reject';
-    return (
-      <div className={`asv-settle ${ok ? 'is-ok' : 'is-bad'}`} data-asv-row>
-        <div className="asv-settle-head">
-          {ok ? <CircleCheck size={15} /> : <CircleAlert size={15} />}
-          <span className="asv-settle-title">已提交结果</span>
-          {item.outcome && <span className="asv-tag">{item.outcome}</span>}
-          {item.verdict && <span className="asv-tag">verdict · {item.verdict}</span>}
-        </div>
-        {item.summary && <SessionMarkdown text={item.summary} />}
-        {item.findings.length > 0 && (
-          <ul className="asv-findings">
-            {item.findings.map((finding, i) => <li key={i}>{finding}</li>)}
-          </ul>
-        )}
-      </div>
-    );
-  }
-  return (
-    <div className="asv-settle is-pending" data-asv-row>
-      <div className="asv-settle-head">
-        <Hourglass size={15} />
-        <span className="asv-settle-title">本轮已结束，结果待确认</span>
-        {item.stopReason && <span className="asv-tag">{item.stopReason}</span>}
-      </div>
-      <div className="asv-settle-note">Worker 没有调用 report_done。请先核对输出与差异，再决定下一步。</div>
-      {item.diff !== null && (
-        <>
-          <button type="button" className="asv-text-btn" aria-expanded={showDiff} onClick={() => setShowDiff((value) => !value)}>
-            <ChevronRight size={11} className="asv-text-btn-chevron" aria-hidden="true" />
-            {item.diffSource === 'git' ? '工作区差异（git diff）' : '工作区差异'}
-          </button>
-          {showDiff && (
-            !item.diff.trim() ? <div className="asv-settle-note">工作区没有差异</div>
-              : files.length === 1 && !files[0]!.path ? <DiffBlock diff={item.diff} />
-                : <FileChangeRows files={files} />
-          )}
-        </>
-      )}
-    </div>
-  );
-}
-
-const TimelineItem = memo(function TimelineItem({ item, inlineDiff }: { item: WorkerTimelineItem; inlineDiff: boolean }) {
-  if (item.kind === 'settlement') return <SettlementBlock item={item} />;
-  if (item.kind !== 'message') return <WorkItemRow item={item} inlineDiff={inlineDiff} />;
-  if (item.role === 'user') return <UserBubble text={item.text} caption="追加指令" />;
-  const streaming = item.status === 'running';
-  return (
-    <div className="asv-assistant" data-asv-row>
-      <SessionMarkdown text={item.text} streaming={streaming} />
-      {!streaming && <div className="asv-assistant-foot"><MessageActions text={item.text} /></div>}
-    </div>
-  );
-});
-
-/** A turn AhaStation started (Worker news, stall reminder): shown apart from what the person typed. */
-function SystemWakeRow({ text, generation }: { text: string; generation: number }) {
-  const body = useMemo(() => splitSystemWake(text).body, [text]);
-  return (
-    <div className="asv-wake" data-asv-row>
-      <div className="asv-wake-head">
-        <BellRing size={12} aria-hidden="true" />
-        <span className="asv-wake-label">系统唤醒</span>
-        <span>第 {generation} 轮 · AhaStation 自动发送，不算你的回复</span>
-      </div>
-      <SessionMarkdown text={body} variant="bubble" />
-    </div>
-  );
-}
-
-function turnFootText(turn: WorkerTimelineTurn): string {
-  const elapsed = turn.completedAt ? formatDuration(turn.completedAt - turn.startedAt) : '';
-  const label = turn.status === 'interrupted' ? '已中断' : turn.status === 'failed' ? '失败' : '';
-  return [label, elapsed && `用时 ${elapsed}`, turn.error].filter(Boolean).join(' · ');
-}
-
-/** Marks where `/clear` started a fresh provider thread while keeping earlier turns visible (adapted from T3 Code `FreshSessionRow`, MIT). */
-const FreshSessionDivider = memo(function FreshSessionDivider() {
-  return (
-    <div className="asv-fresh-divider" role="separator" aria-label="新上下文">
-      <span className="asv-fresh-divider-line" aria-hidden="true" />
-      <span className="asv-fresh-divider-label">
-        <Eraser size={11} aria-hidden="true" />
-        <span>新上下文</span>
-      </span>
-      <span className="asv-fresh-divider-line" aria-hidden="true" />
-    </div>
-  );
-});
-
-const TurnView = memo(function TurnView({ turn, minHeight }: { turn: WorkerTimelineTurn; minHeight?: number }) {
-  const { cwd } = useAgentSession();
-  const blocks = useMemo(() => groupTimelineItems(turn.items), [turn.items]);
-  const running = turn.status === 'running';
-  const foot = running ? '' : turnFootText(turn);
-  const changes = useMemo(() => (running ? null : summarizeTurnChanges(turn.items, cwd)), [running, turn.items, cwd]);
-  const hasCard = Boolean(changes?.files.length);
-  const isCompactTurn = turn.commandKind === 'compact';
-  const renderBlock = (block: (typeof blocks)[number]) =>
-    block.type === 'group' ? <WorkGroup key={block.id} block={block} />
-      : <TimelineItem key={block.item.id} item={block.item} inlineDiff={!hasCard} />;
-  const isSettlement = (block: (typeof blocks)[number]) => block.type === 'item' && block.item.kind === 'settlement';
-  return (
-    <section className={`asv-turn is-${turn.status}`} aria-label={`第 ${turn.generation} 轮`} style={minHeight ? { minHeight } : undefined}>
-      {turn.freshContext && <FreshSessionDivider />}
-      {turn.origin === 'system' ? (
-        <SystemWakeRow text={turn.prompt} generation={turn.generation} />
-      ) : isCompactTurn ? (
-        <div className="asv-turn-cmd" data-asv-row>
-          <Minimize2 size={12} aria-hidden="true" />
-          <span>压缩上下文</span>
-          <span className="asv-turn-cmd-meta">第 {turn.generation} 轮 · /compact</span>
-        </div>
-      ) : (
-        <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} attachments={turn.attachments} editable={turn.commandKind !== 'goal'} />
-      )}
-      {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}
-      {blocks.filter((block) => !isSettlement(block)).map(renderBlock)}
-      {hasCard && <TurnChangesCard changes={changes!} />}
-      {blocks.filter(isSettlement).map(renderBlock)}
-      {running && !turnHasLiveItem(turn) && (
-        <div className="asv-working">
-          <span className="asv-shimmer">{isCompactTurn ? '正在压缩上下文' : '工作中'}</span>
-          <LiveTimer startedAt={turn.startedAt} />
-        </div>
-      )}
-      {foot && <div className={`asv-turn-foot is-${turn.status}`}>{foot}</div>}
-    </section>
-  );
-});
 
 const SESSION_STATUS_LABELS: Record<AgentSessionInfo['status'], string> = {
   starting: '启动中',
@@ -335,15 +106,42 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const composerRef = useRef<ComposerHandle>(null);
   const editMessage = useCallback((text: string) => composerRef.current?.fill(text), []);
   const canEdit = Boolean(sessionId) && alive;
-  const session = useMemo(() => ({
-    cwd, appearance, onNotify,
-    ...(sessionId ? {
-      resolveApproval: async (requestId: string, allow: boolean, reason?: string) =>
-        (await window.vibeMeet?.agentSessions?.respond({ id: sessionId, requestId, allow, ...(reason ? { reason } : {}) }))
-          ?? { ok: false, error: '会话接口不可用' },
-    } : {}),
-    ...(canEdit ? { editMessage } : {}),
-  }), [cwd, appearance, onNotify, sessionId, canEdit, editMessage]);
+  const disclosures = useSessionDisclosures();
+  const fileLinkExistence = useMemo(() => createSessionFileLinkChecker(cwd), [cwd]);
+  const prevFileCheckRunning = useRef<{ existence: typeof fileLinkExistence; running: boolean }>({
+    existence: fileLinkExistence,
+    running,
+  });
+  useEffect(() => {
+    const prev = prevFileCheckRunning.current;
+    prevFileCheckRunning.current = { existence: fileLinkExistence, running };
+    if (fileLinkExistence && prev.existence === fileLinkExistence && prev.running && !running) {
+      fileLinkExistence.recheck();
+    }
+  }, [fileLinkExistence, running]);
+
+  const { assistantRowKeys, loadedAssistantIds, latestResponseKey } = useMemo(() => {
+    const keys: string[] = [];
+    let latest: string | null = null;
+    for (const turn of timeline?.turns ?? []) {
+      const answerIds = selectTurnAnswerItemIds(turn.items);
+      for (const item of turn.items) {
+        if (item.kind === 'message' && item.role === 'assistant') {
+          const rowKey = `${turn.key}:${item.id}`;
+          keys.push(rowKey);
+          if (turn.status !== 'running' && item.status !== 'running' && answerIds.has(item.id) && item.text.trim()) {
+            latest = rowKey;
+          }
+        }
+      }
+    }
+    return {
+      assistantRowKeys: keys,
+      loadedAssistantIds: new Set(keys),
+      latestResponseKey: latest,
+    };
+  }, [timeline?.turns]);
+  const replyReveals = useSessionReplyReveals(assistantRowKeys, loadedAssistantIds, !loading && timeline !== null);
 
   const dockRef = useRef<HTMLDivElement>(null);
   const [dockHeight, setDockHeight] = useState(0);
@@ -359,6 +157,17 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   }, []);
   const composerInset = dockHeight + DOCK_GAP;
   const scroll = useTimelineScroll({ lastTurnKey: timeline?.turns.at(-1)?.key ?? null, composerInset });
+
+  const session = useMemo(() => ({
+    cwd, appearance, onNotify, fileLinkExistence,
+    scrollElementToTop: scroll.scrollElementToTop,
+    ...(sessionId ? {
+      resolveApproval: async (requestId: string, allow: boolean, reason?: string) =>
+        (await window.vibeMeet?.agentSessions?.respond({ id: sessionId, requestId, allow, ...(reason ? { reason } : {}) }))
+          ?? { ok: false, error: '会话接口不可用' },
+    } : {}),
+    ...(canEdit ? { editMessage } : {}),
+  }), [cwd, appearance, onNotify, fileLinkExistence, scroll.scrollElementToTop, sessionId, canEdit, editMessage]);
 
   const [busy, setBusy] = useState<string | null>(null);
   const api = window.vibeMeet?.orchestration;
@@ -680,10 +489,12 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const emptyText = !direct ? '这个 Worker 还没有可回放的过程记录。'
     : !info ? '这个会话已经结束。'
       : info.status === 'failed' && !resumable ? `会话无法启动：${info.error ?? '未知错误'}`
-        : info.status === 'starting' ? '正在启动 Codex…' : '发一条消息开始。';
+        : info.status === 'starting' ? '正在启动会话…' : '发一条消息开始。';
 
   return (
     <AgentSessionContext.Provider value={session}>
+      <SessionDisclosureContext.Provider value={disclosures}>
+        <SessionReplyRevealsContext.Provider value={replyReveals}>
       <div className="agent-session-view" data-running={running || undefined}>
         <header className="asv-header">
           <TerminalProfileIcon id={timeline?.cliId ?? win.localCliId ?? 'codex'} size={16} />
@@ -707,7 +518,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               type="button"
               className={`asv-btn is-ghost${historyOpen ? ' is-pressed' : ''}`}
               aria-pressed={historyOpen}
-              title="这个文件夹里以前的 Codex 会话"
+              title="这个文件夹里以前的历史会话"
               onClick={() => setHistoryOpen((value) => !value)}
             >
               <History size={13} /> 历史
@@ -754,7 +565,13 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
                 )
             )}
             {timeline?.turns.map((turn) => (
-              <TurnView key={turn.key} turn={turn} minHeight={turn.key === scroll.anchoredTurnKey ? scroll.anchoredMinHeight : undefined} />
+              <TurnView
+                key={turn.key}
+                turn={turn}
+                minHeight={turn.key === scroll.anchoredTurnKey ? scroll.anchoredMinHeight : undefined}
+                stopping={busy === 'interrupt' && turn.status === 'running'}
+                latestResponseKey={latestResponseKey}
+              />
             ))}
           </div>
         </div>
@@ -809,6 +626,8 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
           <SessionHistoryPanel cwd={cwd} onClose={closeHistory} onOpened={closeHistory} {...(onNotify ? { onNotify } : {})} />
         )}
       </div>
+        </SessionReplyRevealsContext.Provider>
+      </SessionDisclosureContext.Provider>
     </AgentSessionContext.Provider>
   );
 }

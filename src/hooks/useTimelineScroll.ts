@@ -20,6 +20,7 @@ export interface TimelineScroll {
   anchoredTurnKey: string | null;
   anchoredMinHeight: number;
   scrollToEnd: () => void;
+  scrollElementToTop: (el: HTMLElement) => void;
   onScroll: () => void;
   onClickCapture: (event: MouseEvent<HTMLElement>) => void;
 }
@@ -62,6 +63,39 @@ export function useTimelineScroll(opts: {
     pinToEnd();
   }, [pinToEnd, setMode]);
 
+  const scrollElementToTop = useCallback(
+    (el: HTMLElement) => {
+      const scroller = scrollerRef.current;
+      if (!scroller) {
+        el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+        return;
+      }
+      // Cancel any pending disclosure adjustment and release stick-to-bottom before scrolling up.
+      disclosureRef.current = null;
+      const targetTop = Math.max(
+        0,
+        scroller.scrollTop + (el.getBoundingClientRect().top - scroller.getBoundingClientRect().top) - TIMELINE_ANCHOR_OFFSET,
+      );
+      const reducedMotion =
+        typeof window !== 'undefined' &&
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const nextMode: TimelineScrollMode =
+        distanceFromEnd({ scrollTop: targetTop, scrollHeight: scroller.scrollHeight, clientHeight: scroller.clientHeight }) <=
+        TIMELINE_END_THRESHOLD
+          ? 'following-end'
+          : 'free-scrolling';
+      setMode(nextMode);
+      lastScrollTopRef.current = targetTop;
+      if (typeof scroller.scrollTo === 'function') {
+        scroller.scrollTo({ top: targetTop, behavior: reducedMotion ? 'auto' : 'smooth' });
+      } else {
+        scroller.scrollTop = targetTop;
+      }
+    },
+    [setMode],
+  );
+
   const onScroll = useCallback(() => {
     const scroller = scrollerRef.current;
     if (!scroller) return;
@@ -74,7 +108,13 @@ export function useTimelineScroll(opts: {
   const onClickCapture = useCallback((event: MouseEvent<HTMLElement>) => {
     const toggle = (event.target as Element).closest?.('[aria-expanded]');
     if (!toggle) return;
-    disclosureRef.current = { row: toggle.closest('[data-asv-row]') ?? toggle, at: performance.now() };
+    const scope = toggle.hasAttribute('data-asv-disclosure-scope-trigger')
+      ? toggle.closest('[data-asv-disclosure-scope]')
+      : null;
+    disclosureRef.current = {
+      row: scope ?? toggle.closest('[data-asv-row]') ?? toggle,
+      at: performance.now(),
+    };
   }, []);
 
   const measureAnchor = useCallback(() => {
@@ -132,5 +172,5 @@ export function useTimelineScroll(opts: {
     setAnchoredTurnKey(modeRef.current === 'following-end' ? opts.lastTurnKey : null);
   }, [opts.lastTurnKey, pinToEnd]);
 
-  return { scrollerRef, contentRef, following, anchoredTurnKey, anchoredMinHeight, scrollToEnd, onScroll, onClickCapture };
+  return { scrollerRef, contentRef, following, anchoredTurnKey, anchoredMinHeight, scrollToEnd, scrollElementToTop, onScroll, onClickCapture };
 }

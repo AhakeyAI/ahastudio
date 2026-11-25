@@ -1,16 +1,25 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+// Semantic tool-run sentences, clickable file target pills, call outcome counts, lazy details,
+// bounded reasoning disclosure, and notice cards adapted from Orca (https://github.com/stablyai/orca).
+// Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
+
+import { memo, useId, useLayoutEffect, useRef, type ReactNode } from 'react';
 import {
+  Bot,
   Brain,
   Check,
   ChevronRight,
   Circle,
   CircleDot,
   CircleX,
+  Eye,
   FilePenLine,
+  Folder,
   Globe,
   Info,
+  ListChecks,
   ListTodo,
   Plug,
+  Search,
   ShieldAlert,
   ShieldCheck,
   ShieldX,
@@ -18,19 +27,33 @@ import {
   TriangleAlert,
   Wrench,
 } from 'lucide-react';
+import { useSharedNow } from '../../hooks/useSharedNow';
+import {
+  describeReasoningHeadline,
+  reasoningDisclosureKey,
+  reasoningMarkdown,
+} from '../../lib/session-turn-model';
+import {
+  describeWorkItemLine,
+  extractInlineDiffFromText,
+  formatLazyToolArgs,
+  summarizeDisplayPath,
+  summarizeWorkRun,
+  type WorkIconName,
+} from '../../lib/session-work-log-model';
 import {
   fileChangeTotals,
   formatDuration,
   formatElapsed,
-  groupSummary,
-  liveGroupItem,
   unwrapShellCommand,
   type TimelineBlock,
 } from '../../lib/worker-timeline-model';
 import type { WorkerTimelineFileChange, WorkerTimelineItem } from '../../types';
 import { DiffBlock } from './SessionCode';
 import { SessionMarkdown } from './SessionMarkdown';
+import { SessionReasoningBody } from './SessionTurnChrome';
 import { openSessionTarget, useAgentSession } from './session-context';
+import { useSessionDisclosure } from './session-disclosure-store';
 
 type Item<K extends WorkerTimelineItem['kind']> = Extract<WorkerTimelineItem, { kind: K }>;
 
@@ -39,17 +62,71 @@ const LIVE_EDGE_PX = 4;
 
 const firstLine = (text: string) => text.split('\n').find((line) => line.trim())?.trim() ?? '';
 
-/** Ticks once a second while mounted; rows only mount it for work that is still running. */
+function WorkGlyph({ name, size = ICON.size }: { name: WorkIconName; size?: number }) {
+  const props = { size, strokeWidth: ICON.strokeWidth, 'aria-hidden': true as const };
+  switch (name) {
+    case 'brain': return <Brain {...props} />;
+    case 'eye': return <Eye {...props} />;
+    case 'search': return <Search {...props} />;
+    case 'folder': return <Folder {...props} />;
+    case 'square-terminal': return <SquareTerminal {...props} />;
+    case 'pencil': return <FilePenLine {...props} />;
+    case 'globe': return <Globe {...props} />;
+    case 'plug': return <Plug {...props} />;
+    case 'bot': return <Bot {...props} />;
+    case 'list-checks': return <ListChecks {...props} />;
+    case 'wrench': return <Wrench {...props} />;
+  }
+}
+
+/** Shared visibility-gated second timer; rows only mount it for work that is still running. */
 export function LiveTimer({ startedAt }: { startedAt: number }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
+  const now = useSharedNow(1_000, true);
   return <span className="asv-row-time">{formatElapsed(startedAt, now)}</span>;
 }
 
-function Trailing({ item, bad }: { item: { status: string; durationMs?: number | null; startedAt: number | null; completedAt: number | null }; bad?: ReactNode }) {
+/** Clickable workspace file pill inside a work-log row; sits above the row trigger so opening never toggles the row. */
+export function SessionToolFileTarget({
+  path,
+  label,
+  openable = true,
+}: {
+  path: string;
+  label?: string;
+  openable?: boolean;
+}) {
+  const session = useAgentSession();
+  const shown = label ? summarizeDisplayPath(label) : summarizeDisplayPath(path);
+  if (!openable) {
+    return (
+      <span className="asv-file-pill is-static" title={path}>
+        {shown}
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="asv-file-pill"
+      title={path}
+      aria-label={`打开文件 ${path}`}
+      onClick={(event) => {
+        event.stopPropagation();
+        void openSessionTarget(path, session);
+      }}
+    >
+      {shown}
+    </button>
+  );
+}
+
+function Trailing({
+  item,
+  bad,
+}: {
+  item: { status: string; durationMs?: number | null; startedAt: number | null; completedAt: number | null };
+  bad?: ReactNode;
+}) {
   if (item.status === 'running') return item.startedAt ? <LiveTimer startedAt={item.startedAt} /> : null;
   const duration = item.durationMs ?? (item.startedAt && item.completedAt ? item.completedAt - item.startedAt : null);
   return (
@@ -60,7 +137,7 @@ function Trailing({ item, bad }: { item: { status: string; durationMs?: number |
   );
 }
 
-/** One borderless line of the work log; when it has detail the whole line toggles it in place. */
+/** One borderless line of the work log; details mount lazily only when open. */
 export function WorkLogRow({
   icon,
   label,
@@ -68,6 +145,10 @@ export function WorkLogRow({
   tone,
   wrap = false,
   defaultOpen = false,
+  disclosureKey,
+  hasDetail,
+  tooltip,
+  renderDetail,
   children,
 }: {
   icon: ReactNode;
@@ -76,27 +157,36 @@ export function WorkLogRow({
   tone?: 'bad' | 'warn';
   wrap?: boolean;
   defaultOpen?: boolean;
+  disclosureKey?: string;
+  hasDetail?: boolean;
+  /** Optional full hover tooltip placed on the overlay expand button. */
+  tooltip?: string;
+  /** Lazily evaluated only when the row is expanded, avoiding work on collapsed rows. */
+  renderDetail?: () => ReactNode;
   children?: ReactNode;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
-  const line = (
-    <>
-      <span className="asv-row-icon">{icon}</span>
-      <span className={`asv-row-label${wrap ? ' is-wrap' : ''}`}>{label}</span>
-      {trailing && <span className="asv-row-trailing">{trailing}</span>}
-      {children && <ChevronRight size={13} className="asv-row-chevron" aria-hidden="true" />}
-    </>
-  );
+  const labelId = useId();
+  const { open, setOpen } = useSessionDisclosure(disclosureKey, defaultOpen);
+  const expandable = hasDetail ?? Boolean(renderDetail || children);
   return (
     <div className="asv-row" data-asv-row data-open={open || undefined} data-tone={tone}>
-      {children ? (
-        <button type="button" className="asv-row-line" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-          {line}
-        </button>
-      ) : (
-        <div className="asv-row-line">{line}</div>
-      )}
-      {children && open && <div className="asv-row-detail">{children}</div>}
+      <div className={`asv-row-line${expandable ? ' is-expandable' : ''}`}>
+        {expandable && (
+          <button
+            type="button"
+            className="asv-row-trigger"
+            aria-expanded={open}
+            aria-labelledby={labelId}
+            title={tooltip}
+            onClick={() => setOpen(!open)}
+          />
+        )}
+        <span className="asv-row-icon">{icon}</span>
+        <span id={labelId} className={`asv-row-label${wrap ? ' is-wrap' : ''}`}>{label}</span>
+        {trailing && <span className="asv-row-trailing">{trailing}</span>}
+        {expandable && <ChevronRight size={13} className="asv-row-chevron" aria-hidden="true" />}
+      </div>
+      {expandable && open && <div className="asv-row-detail">{renderDetail ? renderDetail() : children}</div>}
     </div>
   );
 }
@@ -123,78 +213,142 @@ function LiveOutput({ text, live }: { text: string; live: boolean }) {
   );
 }
 
-function ReasoningRow({ item }: { item: Item<'reasoning'> }) {
-  const live = item.status === 'running';
-  const body = item.summary && item.text ? `${item.summary}\n\n${item.text}` : item.summary || item.text;
+function ReasoningRow({
+  item,
+  turnKey,
+  turnRunning,
+}: {
+  item: Item<'reasoning'>;
+  turnKey?: string;
+  turnRunning: boolean;
+}) {
+  const live = turnRunning && item.status === 'running';
+  const body = reasoningMarkdown(item);
   const preview = firstLine(body).replace(/^[#*\s]+|\*+$/g, '');
+  const headline = describeReasoningHeadline(item, { turnRunning });
+  const key = turnKey ? reasoningDisclosureKey(turnKey, item.id) : undefined;
   return (
     <WorkLogRow
       icon={<Brain {...ICON} />}
+      disclosureKey={key}
+      hasDetail={Boolean(body)}
       label={
         <>
-          <span className={live ? 'asv-shimmer' : undefined}>{live ? '思考中' : '思考'}</span>
+          <span className={live ? 'asv-shimmer' : undefined}>{headline}</span>
           {preview && <span className="asv-row-dim">{preview}</span>}
         </>
       }
-      trailing={<Trailing item={item} />}
-    >
-      {body ? <SessionMarkdown text={body} variant="muted" streaming={live} /> : null}
-    </WorkLogRow>
+      trailing={live && item.startedAt ? <LiveTimer startedAt={item.startedAt} /> : undefined}
+      renderDetail={() => (
+        <SessionReasoningBody markdown={body} disclosureKey={key} streaming={live} />
+      )}
+    />
   );
 }
 
-function CommandRow({ item }: { item: Item<'command'> }) {
+function CommandDetail({ item, display, live }: { item: Item<'command'>; display: string; live: boolean }) {
+  const inlineDiff = !live ? extractInlineDiffFromText(item.output) : null;
+  return (
+    <>
+      {item.cwd && <div className="asv-detail-note is-mono">{item.cwd}</div>}
+      {(display !== item.command.trim() || display.includes('\n')) && (
+        <pre className="asv-output is-command">{item.command}</pre>
+      )}
+      {inlineDiff ? (
+        <DiffBlock diff={inlineDiff} />
+      ) : (
+        item.output && <LiveOutput text={item.output} live={live} />
+      )}
+      {item.outputTruncated && <div className="asv-detail-note">输出较长，已截断</div>}
+    </>
+  );
+}
+
+function CommandRow({ item, turnKey }: { item: Item<'command'>; turnKey?: string }) {
   const live = item.status === 'running';
   const display = unwrapShellCommand(item.command);
   const failed = item.exitCode !== null && item.exitCode !== 0;
+  const line = describeWorkItemLine(item);
   const hasDetail = Boolean(item.output || item.cwd || display !== item.command.trim() || display.includes('\n'));
+  const disclosureKey = turnKey ? `item:${turnKey}:${item.id}` : undefined;
   return (
     <WorkLogRow
-      icon={<SquareTerminal {...ICON} />}
+      icon={<WorkGlyph name={line.icon} />}
       tone={failed || item.status === 'failed' ? 'bad' : undefined}
-      label={<code className={`asv-row-code${live ? ' asv-shimmer' : ''}`}>{firstLine(display)}</code>}
-      trailing={<Trailing item={item} bad={failed ? <span className="asv-row-bad">exit {item.exitCode}</span> : null} />}
-    >
-      {hasDetail ? (
+      disclosureKey={disclosureKey}
+      hasDetail={hasDetail}
+      tooltip={line.targetTitle || undefined}
+      label={
         <>
-          {item.cwd && <div className="asv-detail-note is-mono">{item.cwd}</div>}
-          {(display !== item.command.trim() || display.includes('\n')) && <pre className="asv-output is-command">{item.command}</pre>}
-          {item.output && <LiveOutput text={item.output} live={live} />}
-          {item.outputTruncated && <div className="asv-detail-note">输出较长，已截断</div>}
+          {line.verb && <span className={live ? 'asv-shimmer' : undefined}>{line.verb}</span>}
+          {line.fileTarget ? (
+            <SessionToolFileTarget
+              path={line.fileTarget.path}
+              label={line.fileTarget.label}
+              openable={line.fileTarget.openable}
+            />
+          ) : line.codeStyle ? (
+            <code className={`asv-row-code${live && !line.verb ? ' asv-shimmer' : ''}`} title={line.targetTitle}>
+              {line.target}
+            </code>
+          ) : (
+            <span className="asv-row-dim" title={line.targetTitle}>{line.target}</span>
+          )}
         </>
-      ) : null}
-    </WorkLogRow>
+      }
+      trailing={<Trailing item={item} bad={failed ? <span className="asv-row-bad">exit {item.exitCode}</span> : null} />}
+      renderDetail={() => <CommandDetail item={item} display={display} live={live} />}
+    />
   );
 }
 
-const toolName = (item: Item<'tool_call'>) =>
-  item.toolType === 'search' ? '搜索' : item.server ? `${item.server} · ${item.tool}` : item.tool;
+function ToolDetail({ item, live, filePath }: { item: Item<'tool_call'>; live: boolean; filePath?: string }) {
+  const argsDiff = extractInlineDiffFromText(item.args);
+  const outputDiff = !live && !argsDiff ? extractInlineDiffFromText(item.output) : null;
+  const inlineDiff = argsDiff ?? outputDiff;
+  const formattedArgs = !argsDiff && item.args ? formatLazyToolArgs(item.args) : '';
+  return (
+    <>
+      {inlineDiff && <DiffBlock diff={inlineDiff} path={filePath} />}
+      {formattedArgs && <pre className="asv-output is-command">{formattedArgs}</pre>}
+      {item.output && !outputDiff && (
+        <LiveOutput text={item.output} live={live} />
+      )}
+      {item.error && <div className="asv-detail-error">{item.error}</div>}
+    </>
+  );
+}
 
-function ToolRow({ item }: { item: Item<'tool_call'> }) {
+function ToolRow({ item, turnKey }: { item: Item<'tool_call'>; turnKey?: string }) {
   const live = item.status === 'running';
-  const Icon = item.toolType === 'search' ? Globe : item.toolType === 'mcp' ? Plug : Wrench;
-  const hint = live && item.progress ? item.progress : firstLine(item.args);
   const failed = Boolean(item.error) || item.status === 'failed';
+  const line = describeWorkItemLine(item);
+  const hasDetail = Boolean(item.args || item.output || item.error);
+  const disclosureKey = turnKey ? `item:${turnKey}:${item.id}` : undefined;
   return (
     <WorkLogRow
-      icon={<Icon {...ICON} />}
+      icon={<WorkGlyph name={line.icon} />}
       tone={failed ? 'bad' : undefined}
+      disclosureKey={disclosureKey}
+      hasDetail={hasDetail}
+      tooltip={line.targetTitle || undefined}
       label={
         <>
-          <span className={live ? 'asv-shimmer' : undefined}>{toolName(item)}</span>
-          {hint && <span className="asv-row-dim">{hint}</span>}
+          <span className={live ? 'asv-shimmer' : undefined}>{line.verb}</span>
+          {line.fileTarget ? (
+            <SessionToolFileTarget
+              path={line.fileTarget.path}
+              label={line.fileTarget.label}
+              openable={line.fileTarget.openable}
+            />
+          ) : (
+            line.target && <span className="asv-row-dim" title={line.targetTitle}>{line.target}</span>
+          )}
         </>
       }
       trailing={<Trailing item={item} bad={failed ? <span className="asv-row-bad">失败</span> : null} />}
-    >
-      {item.args || item.output || item.error ? (
-        <>
-          {item.args && <pre className="asv-output is-command">{item.args}</pre>}
-          {item.output && <LiveOutput text={item.output} live={live} />}
-          {item.error && <div className="asv-detail-error">{item.error}</div>}
-        </>
-      ) : null}
-    </WorkLogRow>
+      renderDetail={() => <ToolDetail item={item} live={live} filePath={line.fileTarget?.path} />}
+    />
   );
 }
 
@@ -215,9 +369,11 @@ function FileDiff({ file }: { file: WorkerTimelineFileChange }) {
     <>
       <div className="asv-file-head">
         {file.movePath && <span className="asv-detail-note is-mono">→ {file.movePath}</span>}
-        <button type="button" className="asv-text-btn" onClick={() => void openSessionTarget(file.movePath ?? file.path, session)}>
-          打开文件
-        </button>
+        {file.change !== 'delete' && (
+          <button type="button" className="asv-text-btn" onClick={() => void openSessionTarget(file.movePath ?? file.path, session)}>
+            打开文件
+          </button>
+        )}
       </div>
       <DiffBlock diff={file.diff} path={file.movePath ?? file.path} change={file.change} />
       {file.truncated && <div className="asv-detail-note">差异较长，已截断</div>}
@@ -225,41 +381,57 @@ function FileDiff({ file }: { file: WorkerTimelineFileChange }) {
   );
 }
 
-export function FileChangeRows({ files }: { files: readonly WorkerTimelineFileChange[] }) {
+export function FileChangeRows({ files, keyPrefix }: { files: readonly WorkerTimelineFileChange[]; keyPrefix?: string }) {
   return (
     <div className="asv-row-list">
-      {files.map((file) => (
-        <WorkLogRow
-          key={file.path}
-          icon={<FilePenLine {...ICON} />}
-          label={
-            <>
-              <span>{CHANGE_VERB[file.change]}</span>
-              <code className="asv-row-code">{file.path}</code>
-            </>
-          }
-          trailing={<DiffStat added={file.added} removed={file.removed} />}
-        >
-          <FileDiff file={file} />
-        </WorkLogRow>
-      ))}
+      {files.map((file, index) => {
+        const target = file.movePath ?? file.path;
+        return (
+          <WorkLogRow
+            key={`${file.path}:${index}`}
+            disclosureKey={keyPrefix ? `${keyPrefix}:file:${file.path}:${index}` : undefined}
+            hasDetail={Boolean(file.diff)}
+            icon={<FilePenLine {...ICON} />}
+            label={
+              <>
+                <span>{CHANGE_VERB[file.change]}</span>
+                <SessionToolFileTarget path={target} label={file.path} openable={file.change !== 'delete'} />
+              </>
+            }
+            trailing={<DiffStat added={file.added} removed={file.removed} />}
+            renderDetail={() => <FileDiff file={file} />}
+          />
+        );
+      })}
     </div>
   );
 }
 
 /** `inlineDiff` is off once the turn's change card lists the same diffs, so the row stays a one-line note. */
-function FileChangeRow({ item, inlineDiff }: { item: Item<'file_change'>; inlineDiff: boolean }) {
+function FileChangeRow({ item, inlineDiff, turnKey }: { item: Item<'file_change'>; inlineDiff: boolean; turnKey?: string }) {
   const live = item.status === 'running';
   const totals = fileChangeTotals(item.files);
   const single = item.files.length === 1 ? item.files[0]! : null;
+  const hasDetail = inlineDiff && item.files.length > 0;
+  const disclosureKey = turnKey ? `item:${turnKey}:${item.id}` : undefined;
   return (
     <WorkLogRow
       icon={<FilePenLine {...ICON} />}
       tone={item.status === 'failed' ? 'bad' : undefined}
+      disclosureKey={disclosureKey}
+      hasDetail={hasDetail}
       label={
         <>
-          <span className={live ? 'asv-shimmer' : undefined}>{single ? CHANGE_VERB[single.change] : `编辑了 ${item.files.length} 个文件`}</span>
-          {single && <code className="asv-row-code">{single.path}</code>}
+          <span className={live ? 'asv-shimmer' : undefined}>
+            {single ? CHANGE_VERB[single.change] : `编辑了 ${item.files.length} 个文件`}
+          </span>
+          {single && (
+            <SessionToolFileTarget
+              path={single.movePath ?? single.path}
+              label={single.path}
+              openable={single.change !== 'delete'}
+            />
+          )}
         </>
       }
       trailing={
@@ -268,20 +440,24 @@ function FileChangeRow({ item, inlineDiff }: { item: Item<'file_change'>; inline
           <DiffStat added={totals.added} removed={totals.removed} />
         </>
       }
-    >
-      {!inlineDiff ? null : single ? <FileDiff file={single} /> : item.files.length > 0 ? <FileChangeRows files={item.files} /> : null}
-    </WorkLogRow>
+      renderDetail={() =>
+        single ? <FileDiff file={single} /> : <FileChangeRows files={item.files} keyPrefix={disclosureKey} />
+      }
+    />
   );
 }
 
 const APPROVAL_STATUS = { pending: '等待授权', approved: '已允许', denied: '已拒绝', expired: '已过期' } as const;
 
-function ApprovalRow({ item }: { item: Item<'approval'> }) {
+function ApprovalRow({ item, turnKey }: { item: Item<'approval'>; turnKey?: string }) {
   const Icon = item.status === 'approved' ? ShieldCheck : item.status === 'pending' ? ShieldAlert : ShieldX;
+  const hasDetail = Boolean(item.input || item.reason || (item.resolution && item.status !== 'pending'));
   return (
     <WorkLogRow
       icon={<Icon {...ICON} />}
       tone={item.status === 'pending' ? 'warn' : item.status === 'approved' ? undefined : 'bad'}
+      disclosureKey={turnKey ? `item:${turnKey}:${item.id}` : undefined}
+      hasDetail={hasDetail}
       label={
         <>
           <span>授权请求</span>
@@ -289,15 +465,14 @@ function ApprovalRow({ item }: { item: Item<'approval'> }) {
         </>
       }
       trailing={<span className={`asv-row-status is-${item.status}`}>{APPROVAL_STATUS[item.status]}</span>}
-    >
-      {item.input || item.reason || item.resolution ? (
+      renderDetail={() => (
         <>
           {item.input && <pre className="asv-output is-command">{item.input}</pre>}
           {item.reason && <div className="asv-detail-note">{item.reason}</div>}
           {item.resolution && item.status !== 'pending' && <div className="asv-detail-note">{item.resolution}</div>}
         </>
-      ) : null}
-    </WorkLogRow>
+      )}
+    />
   );
 }
 
@@ -324,67 +499,133 @@ function PlanBlock({ item }: { item: Item<'plan'> }) {
             ))}
           </ul>
         )}
-        {item.text && <SessionMarkdown text={item.text} variant="muted" />}
+        {item.text && <SessionMarkdown text={item.text} variant="muted" linkifyFilePaths />}
       </div>
     </div>
   );
 }
 
-function NoticeRow({ item }: { item: Item<'notice'> }) {
-  const Icon = item.level === 'error' ? CircleX : item.level === 'warning' ? TriangleAlert : Info;
+/** Framed callout for warnings and errors; subtle inline row for informational notices. */
+export function SessionNoticeRow({
+  level,
+  text,
+}: {
+  level: 'info' | 'warning' | 'error';
+  text: string;
+}) {
+  const Icon = level === 'error' ? CircleX : level === 'warning' ? TriangleAlert : Info;
+  if (level === 'info') {
+    return (
+      <div className="asv-notice is-info" data-asv-row>
+        <Icon size={14} className="asv-notice-icon" aria-hidden="true" />
+        <span className="asv-notice-text">{text}</span>
+      </div>
+    );
+  }
   return (
-    <WorkLogRow
-      icon={<Icon {...ICON} />}
-      tone={item.level === 'error' ? 'bad' : item.level === 'warning' ? 'warn' : undefined}
-      wrap
-      label={item.text}
-    />
+    <div
+      className={`asv-notice is-${level}`}
+      role={level === 'error' ? 'alert' : 'status'}
+      data-asv-row
+    >
+      <Icon size={15} className="asv-notice-icon" aria-hidden="true" />
+      <p className="asv-notice-text">{text}</p>
+    </div>
   );
 }
 
 /** Rows for every item kind that reads as "work" rather than as a message. */
-export const WorkItemRow = memo(function WorkItemRow({ item, inlineDiff = true }: { item: WorkerTimelineItem; inlineDiff?: boolean }) {
+export const WorkItemRow = memo(function WorkItemRow({
+  item,
+  inlineDiff = true,
+  turnKey,
+  turnRunning = false,
+}: {
+  item: WorkerTimelineItem;
+  inlineDiff?: boolean;
+  turnKey?: string;
+  turnRunning?: boolean;
+}) {
   switch (item.kind) {
-    case 'reasoning': return <ReasoningRow item={item} />;
-    case 'command': return <CommandRow item={item} />;
-    case 'tool_call': return <ToolRow item={item} />;
-    case 'file_change': return <FileChangeRow item={item} inlineDiff={inlineDiff} />;
-    case 'approval': return <ApprovalRow item={item} />;
+    case 'reasoning': return <ReasoningRow item={item} turnKey={turnKey} turnRunning={turnRunning} />;
+    case 'command': return <CommandRow item={item} turnKey={turnKey} />;
+    case 'tool_call': return <ToolRow item={item} turnKey={turnKey} />;
+    case 'file_change': return <FileChangeRow item={item} inlineDiff={inlineDiff} turnKey={turnKey} />;
+    case 'approval': return <ApprovalRow item={item} turnKey={turnKey} />;
     case 'plan': return <PlanBlock item={item} />;
-    case 'notice': return <NoticeRow item={item} />;
+    case 'notice': return <SessionNoticeRow level={item.level} text={item.text} />;
     default: return null;
   }
 });
 
-function liveLabel(item: WorkerTimelineItem): string {
-  switch (item.kind) {
-    case 'reasoning': return '思考中';
-    case 'command': return `运行 ${firstLine(unwrapShellCommand(item.command))}`;
-    case 'tool_call': return `调用 ${toolName(item)}`;
-    default: return '工作中';
-  }
-}
-
-export function WorkGroup({ block }: { block: Extract<TimelineBlock, { type: 'group' }> }) {
-  const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const open = userOpen ?? block.running;
+/** Semantic Chinese work-run group with outcome counts, completion check, and lazy-mounted member list. */
+export function WorkGroup({
+  block,
+  turnKey,
+  turnRunning = false,
+}: {
+  block: Extract<TimelineBlock, { type: 'group' }>;
+  turnKey?: string;
+  turnRunning?: boolean;
+}) {
+  const disclosureKey = turnKey ? `group:${turnKey}:${block.id}` : undefined;
+  const { open, setOpen } = useSessionDisclosure(disclosureKey, false);
+  const summary = summarizeWorkRun(block.items, { live: block.running });
   const first = block.items[0]?.startedAt;
+
   return (
-    <div className="asv-group" data-asv-row data-open={open || undefined}>
-      <button type="button" className="asv-row-line" aria-expanded={open} onClick={() => setUserOpen(!open)}>
-        <span className="asv-row-icon"><ChevronRight size={14} className="asv-group-chevron" aria-hidden="true" /></span>
-        <span className="asv-row-label">
-          {block.running && !open ? (
-            <span className="asv-shimmer">{liveLabel(liveGroupItem(block))}</span>
-          ) : (
-            <span>{groupSummary(block)}</span>
+    <div
+      className="asv-group"
+      data-asv-row
+      data-open={open || undefined}
+      data-asv-work-run-state={block.running ? 'live' : 'settled'}
+    >
+      <button
+        type="button"
+        className="asv-row-line is-expandable asv-group-head"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
+        <span className="asv-row-icon">
+          <WorkGlyph name={summary.icon} size={14} />
+        </span>
+        <span className="asv-group-summary">
+          <span className={`asv-group-sentence${block.running ? ' asv-shimmer' : ''}`}>
+            {summary.sentence}
+          </span>
+          {summary.failedCount > 0 && (
+            <span className="asv-run-badge is-bad" aria-label={`${summary.failedCount} 项调用失败`}>
+              · {summary.failedCount} 项失败
+            </span>
+          )}
+          {summary.declinedCount > 0 && (
+            <span className="asv-run-badge is-warn" aria-label={`${summary.declinedCount} 项调用已拒绝`}>
+              · {summary.declinedCount} 项已拒绝
+            </span>
+          )}
+          {!block.running && summary.succeeded && (
+            <Check size={12} className="asv-run-ok" aria-hidden="true" />
+          )}
+          {block.running && summary.latestPreview && !open && (
+            <span className="asv-group-preview">{summary.latestPreview}</span>
           )}
         </span>
-        {block.running && first && <span className="asv-row-trailing"><LiveTimer startedAt={first} /></span>}
+        <span className="asv-row-trailing">
+          {block.running && first ? (
+            <LiveTimer startedAt={first} />
+          ) : (
+            !block.running && block.durationMs !== null && block.durationMs >= 100 && (
+              <span className="asv-row-time">{formatDuration(block.durationMs)}</span>
+            )
+          )}
+          <ChevronRight size={13} className="asv-group-chevron" aria-hidden="true" />
+        </span>
       </button>
       {open && (
         <div className="asv-group-body">
-          {block.items.map((item) => <WorkItemRow key={item.id} item={item} />)}
+          {block.items.map((item) => (
+            <WorkItemRow key={item.id} item={item} turnKey={turnKey} turnRunning={turnRunning} />
+          ))}
         </div>
       )}
     </div>
