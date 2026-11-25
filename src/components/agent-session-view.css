@@ -21,6 +21,7 @@
   --asv-file-link-border: color-mix(in srgb, var(--asv-link) 34%, transparent);
   --asv-file-link-bg: color-mix(in srgb, var(--asv-link) 9%, transparent);
   --asv-file-link-border-hover: color-mix(in srgb, var(--asv-link) 56%, transparent);
+  --asv-file-link-bg-hover: color-mix(in srgb, var(--asv-link) 14%, transparent);
   --asv-file-pill-border: color-mix(in srgb, var(--asv-ink) 10%, transparent);
   --asv-file-pill-bg: var(--asv-tint);
   --asv-shadow: 0 1px 2px rgb(0 0 0 / 5%), 0 8px 24px -12px rgb(0 0 0 / 18%);
@@ -40,11 +41,12 @@
   --asv-warn: #f0b35a;
   --asv-add: #86efac;
   --asv-del: #fca5a5;
-  /* Matches Orca's dark --chat-link luminance (~7:1 on #1e1e1e) so links stand out from plain inline code. */
-  --asv-link: color-mix(in srgb, var(--workspace-accent) 70%, #99cbff);
-  --asv-file-link-border: color-mix(in srgb, var(--asv-link) 44%, transparent);
+  /* Matches Orca's dark --chat-link luminance (~7.5:1 on #1e1e1e) so links stand out clearly from plain inline code. */
+  --asv-link: color-mix(in srgb, var(--workspace-accent) 62%, #9ed0ff);
+  --asv-file-link-border: color-mix(in srgb, var(--asv-link) 48%, transparent);
   --asv-file-link-bg: color-mix(in srgb, var(--asv-link) 14%, transparent);
-  --asv-file-link-border-hover: color-mix(in srgb, var(--asv-link) 68%, transparent);
+  --asv-file-link-border-hover: color-mix(in srgb, var(--asv-link) 72%, transparent);
+  --asv-file-link-bg-hover: color-mix(in srgb, var(--asv-link) 20%, transparent);
   --asv-file-pill-border: color-mix(in srgb, var(--asv-ink) 15%, transparent);
   --asv-file-pill-bg: color-mix(in srgb, var(--asv-ink) 6%, var(--workspace-bg));
   --asv-shadow: 0 14px 32px -18px rgb(0 0 0 / 75%);
@@ -337,6 +339,8 @@
   pointer-events: none;
 }
 .asv-user-meta { display: flex; align-items: center; gap: 10px; padding-right: 4px; color: var(--asv-ink-2); font-size: 12px; }
+/* Pull hover-only action row into the inter-row gap so regular user bubbles stay visually close to the turn status bar. */
+.asv-user-meta.is-hover-only { margin-bottom: -8px; }
 .asv-system {
   align-self: stretch;
   max-height: 260px;
@@ -376,10 +380,10 @@
 
 /* ---- Message actions: revealed on hover or keyboard focus; gently visible on latest reply ---- */
 
-.asv-msg-actions { display: inline-flex; align-items: center; gap: 2px; opacity: 0; transition: opacity 120ms ease; }
-.asv-msg-actions.is-visible { opacity: 0.72; }
+.asv-msg-actions { display: inline-flex; align-items: center; gap: 2px; opacity: 0; pointer-events: none; transition: opacity 120ms ease; }
+.asv-msg-actions.is-visible { opacity: 0.72; pointer-events: auto; }
 :is(.asv-user, .asv-assistant):hover .asv-msg-actions,
-.asv-msg-actions:focus-within { opacity: 1; }
+.asv-msg-actions:focus-within { opacity: 1; pointer-events: auto; }
 .asv-act {
   display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0;
   border: 0; border-radius: 6px; background: none; color: var(--asv-ink-2); cursor: pointer;
@@ -394,7 +398,11 @@
   opacity: 0.75;
   user-select: none;
 }
-@media (hover: none) { .asv-msg-actions { opacity: 1; } }
+@media (hover: none) {
+  .asv-msg-actions { opacity: 1; pointer-events: auto; }
+  .asv-row-chevron { opacity: 0.55; }
+  .asv-attach-thumb > button { opacity: 0.9; }
+}
 
 /* ---- Work log ---- */
 
@@ -721,20 +729,25 @@
 .asv-md-link {
   color: var(--asv-link);
   cursor: pointer;
-  text-decoration: none;
-  text-decoration-color: color-mix(in srgb, currentcolor 42%, transparent);
+  text-decoration-line: underline;
+  text-decoration-color: color-mix(in srgb, currentcolor 40%, transparent);
   text-underline-offset: 0.25em;
   word-break: normal;
   overflow-wrap: anywhere;
+  transition: text-decoration-color 120ms ease;
 }
-.asv-md-link:hover { text-decoration: underline; }
+.asv-md-link:hover { text-decoration-color: currentcolor; }
 .asv-md-link :is(code, strong) { color: inherit; }
+/* Bordered file-link code chips already read as interactive targets; skip double underline at rest. */
+.asv-md-link[data-file-link]:has(> code) { text-decoration-line: none; }
 .asv-md-link[data-file-link] > code {
   border-color: var(--asv-file-link-border);
   background: var(--asv-file-link-bg);
+  transition: border-color 120ms ease, background-color 120ms ease;
 }
 .asv-md-link[data-file-link]:hover > code {
   border-color: var(--asv-file-link-border-hover);
+  background: var(--asv-file-link-bg-hover);
 }
 .asv-md-table { max-width: 100%; overflow-x: auto; }
 .asv-md table { width: auto; min-width: min(100%, 320px); border-collapse: collapse; font-size: 0.928em; overflow-wrap: normal; word-break: normal; }
@@ -745,8 +758,12 @@
 .asv-md.is-bubble :is(h1, h2, h3, h4, h5, h6) { margin-top: 0.9em; font-size: 1em; }
 [data-asv-tone="faint"] .asv-md :is(h1, h2, h3, h4, h5, h6, strong, a, code, pre) { color: inherit; }
 [data-asv-tone="faint"] .asv-md .asv-md-link[data-file-link] > code {
-  border-color: color-mix(in srgb, var(--asv-ink-2) 24%, transparent);
+  border-color: color-mix(in srgb, var(--asv-ink-2) 26%, transparent);
   background: color-mix(in srgb, var(--asv-ink-2) 8%, transparent);
+}
+[data-asv-tone="faint"] .asv-md .asv-md-link[data-file-link]:hover > code {
+  border-color: color-mix(in srgb, var(--asv-ink-2) 48%, transparent);
+  background: color-mix(in srgb, var(--asv-ink-2) 14%, transparent);
 }
 
 /* Fade newly revealed words and blocks with opacity only, preserving line geometry. */
@@ -817,7 +834,7 @@
   background: linear-gradient(to bottom, transparent, var(--workspace-bg) 28px);
   pointer-events: none;
 }
-.asv-dock-inner { display: flex; flex-direction: column; gap: 6px; width: 100%; max-width: var(--asv-width); margin: 0 auto; pointer-events: auto; }
+.asv-dock-inner { display: flex; flex-direction: column; gap: 6px; width: 100%; max-width: var(--asv-width); margin: 0 auto; pointer-events: auto; container-type: inline-size; }
 .asv-banner-lane { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
 .asv-banner { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--asv-warn) 35%, var(--asv-line)); border-radius: 14px; background: color-mix(in srgb, var(--asv-warn) 6%, var(--asv-surface)); box-shadow: var(--asv-shadow); font-size: 13px; }
 .asv-banner.is-question { border-color: color-mix(in srgb, var(--workspace-accent) 35%, var(--asv-line)); background: color-mix(in srgb, var(--workspace-accent) 5%, var(--asv-surface)); }
@@ -969,6 +986,7 @@
   flex-direction: column;
   gap: 10px;
   width: 232px;
+  max-width: calc(100vw - 32px);
   padding: 10px 12px;
   border: 1px solid var(--asv-line);
   border-radius: 10px;
@@ -977,6 +995,7 @@
   color: var(--asv-ink);
   font-size: 12px;
   white-space: normal;
+  box-sizing: border-box;
 }
 .asv-chip > .asv-usage-pop { overflow: visible; }
 .asv-usage-title { color: var(--asv-ink-strong); font-weight: 600; }
@@ -1009,13 +1028,19 @@
 .asv-pop-anchor { position: relative; display: inline-flex; min-width: 0; }
 .asv-pop {
   position: absolute; bottom: calc(100% + 8px); z-index: 30; display: flex; flex-direction: column; gap: 4px;
-  width: 300px; max-height: min(460px, 62vh); padding: 6px; overflow: hidden;
+  width: 300px; max-width: calc(100vw - 32px); max-height: min(460px, 62vh); padding: 6px; overflow: hidden;
   border: 1px solid color-mix(in srgb, var(--asv-ink) 12%, transparent); border-radius: 14px;
   background: var(--asv-surface); box-shadow: 0 2px 6px rgb(0 0 0 / 6%), 0 18px 40px -16px rgb(0 0 0 / 28%);
+  box-sizing: border-box;
   animation: asv-pop-in 120ms ease-out;
 }
 .asv-pop.is-start { left: 0; }
 .asv-pop.is-end { right: 0; }
+/* On narrow panes and handheld screens, anchor popovers to the composer card so wide panels never clip offscreen. */
+@container (max-width: 520px) {
+  .asv-pop-anchor { position: static; }
+  .agent-session-view .asv-pop { left: 6px; right: 6px; width: auto; max-width: none; }
+}
 @keyframes asv-pop-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 .asv-pop-section { display: flex; flex: none; flex-direction: column; gap: 2px; min-height: 0; }
 .asv-pop-section:has(.asv-pop-list) { flex: 0 1 auto; }
@@ -1231,18 +1256,24 @@
   border-radius: 999px;
 }
 
-/* Keep transcript chrome, icon controls, and composer pills proportioned under handheld mode's global 44px button floor. */
+/* Keep transcript chrome, icon controls, composer pills, and history panels proportioned under handheld mode's global 44px button floor. */
 html.handheld .agent-session-view { --asv-gutter: 14px; }
 html.handheld .agent-session-view .asv-header { height: 44px; }
+html.handheld .agent-session-view .asv-history { top: 44px; }
 html.handheld .agent-session-view .asv-title.is-editable { min-height: 0; }
 html.handheld .agent-session-view .asv-title-input { height: 32px; min-height: 32px; }
-html.handheld .agent-session-view .asv-btn { height: 32px; min-height: 32px; }
-html.handheld .agent-session-view .asv-text-btn { min-height: 28px; }
+html.handheld :is(.agent-session-view, .asv-history) .asv-btn { height: 32px; min-height: 32px; }
+html.handheld :is(.agent-session-view, .asv-history) .asv-text-btn { min-height: 28px; }
 html.handheld .agent-session-view .asv-turn-bar { min-height: 36px; }
+html.handheld .agent-session-view .asv-user-meta.is-hover-only { margin-bottom: -6px; }
+html.handheld .agent-session-view .asv-msg-actions { opacity: 0.72; pointer-events: auto; }
+html.handheld .agent-session-view :is(.asv-user, .asv-assistant):hover .asv-msg-actions,
+html.handheld .agent-session-view .asv-msg-actions:focus-within { opacity: 1; }
 html.handheld .agent-session-view .asv-row-line,
 html.handheld .agent-session-view .asv-activity-line { min-height: 34px; }
+html.handheld .agent-session-view .asv-row-chevron { opacity: 0.55; }
 html.handheld .agent-session-view .asv-file-pill { min-height: 24px; line-height: 22px; }
-html.handheld .agent-session-view .asv-act { width: 30px; height: 30px; min-width: 30px; min-height: 30px; }
+html.handheld :is(.agent-session-view, .asv-history) .asv-act { width: 30px; height: 30px; min-width: 30px; min-height: 30px; }
 html.handheld .agent-session-view .asv-code-head { height: 36px; }
 html.handheld .agent-session-view :is(.asv-copy, .asv-code-btn) {
   width: 30px;
@@ -1257,12 +1288,15 @@ html.handheld .agent-session-view .asv-to-bottom { width: 36px; height: 36px; mi
 html.handheld .agent-session-view .asv-queue-row { height: auto; min-height: 36px; }
 html.handheld .agent-session-view .asv-attach-thumb > button,
 html.handheld .agent-session-view .asv-attach-file > button { width: 22px; height: 22px; min-width: 22px; min-height: 22px; }
+html.handheld .agent-session-view .asv-attach-thumb > button { opacity: 0.9; }
 html.handheld .agent-session-view .asv-switch { min-height: 16px; }
 html.handheld .agent-session-view .asv-tabs > button { height: 32px; min-height: 32px; }
 html.handheld .agent-session-view .asv-chip-toggle:not(.asv-composer-ctrl) { min-height: 28px; }
 html.handheld .agent-session-view .asv-skill-name { min-height: 28px; }
 html.handheld .agent-session-view .asv-banner-input,
-html.handheld .agent-session-view .asv-history-search { height: 36px; min-height: 36px; }
+html.handheld :is(.agent-session-view, .asv-history) .asv-history-search { height: 36px; min-height: 36px; }
+html.handheld :is(.agent-session-view, .asv-history) .asv-history-tab { min-height: 32px; padding-top: 4px; }
+html.handheld :is(.agent-session-view, .asv-history) .asv-history-main { min-height: 44px; }
 html.handheld .agent-session-view .asv-catalog-search input { min-height: 0; }
 html.handheld .agent-session-view .asv-tool-btn,
 html.handheld .agent-session-view .asv-composer-ctrl,
@@ -1274,6 +1308,7 @@ html.handheld .agent-session-view .asv-tool-btn.is-icon { width: 34px; }
 html.handheld .agent-session-view .asv-round-btn { width: 36px; height: 36px; min-width: 36px; min-height: 36px; }
 html.handheld .agent-session-view .asv-effort { height: 32px; min-height: 32px; }
 html.handheld .agent-session-view .asv-pop-row { min-height: 44px; }
+html.handheld .agent-session-view .asv-suggest-row { min-height: 36px; }
 
 .asv-to-bottom {
   position: absolute;

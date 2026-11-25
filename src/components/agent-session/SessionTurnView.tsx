@@ -98,16 +98,20 @@ function UserBubble({
   const [showSystem, setShowSystem] = useState(false);
   const origin = parts.system ? (parts.followUp ? '追加派发' : '编排派发') : null;
   const metaLabel = [origin, caption].filter(Boolean).join(' · ');
+  const hasVisibleMeta = Boolean(long || parts.system || metaLabel);
+  const hasBody = parts.body.trim().length > 0;
+  const hasAttachments = Boolean(attachments && attachments.length > 0);
+  if (!hasBody && !hasAttachments && !hasVisibleMeta) return null;
   return (
     <div className="asv-user" data-asv-row>
-      {parts.body && (
+      {hasBody && (
         <div className={`asv-bubble${long && !expanded ? ' is-clamped' : ''}`}>
           <SessionMarkdown text={parts.body} variant="bubble" />
         </div>
       )}
-      {attachments && attachments.length > 0 && (
+      {hasAttachments && (
         <div className="asv-user-attachments">
-          {attachments.map((item, index) => (
+          {attachments!.map((item, index) => (
             <span key={`${item.kind}:${item.name}:${index}`} className={`asv-attach-pill is-${item.kind}`}>
               {item.kind === 'skill' ? <Sparkles size={11} aria-hidden="true" />
                 : item.kind === 'image' ? <ImageIcon size={11} aria-hidden="true" /> : <FileText size={11} aria-hidden="true" />}
@@ -116,8 +120,8 @@ function UserBubble({
           ))}
         </div>
       )}
-      {(parts.body.trim() || long || parts.system || metaLabel) && (
-        <div className="asv-user-meta">
+      {(hasBody || hasVisibleMeta) && (
+        <div className={`asv-user-meta${!hasVisibleMeta ? ' is-hover-only' : ''}`}>
           <MessageActions
             text={parts.body}
             {...(editable && editMessage && !parts.system ? { onEdit: () => editMessage(parts.body) } : {})}

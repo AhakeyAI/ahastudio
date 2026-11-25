@@ -490,8 +490,8 @@ test('SessionEmptyState has no hardcoded Codex copy and TurnView renders live re
   assert.match(settledHtml, /已工作 18s/);
   assert.doesNotMatch(settledHtml, /asv-turn-bar-hint|思考了 1 次、运行了 1 条命令/, 'collapsed settled turn bar stays minimal without verbose summary hint');
   assert.match(settledHtml, /aria-label="第 2 轮"/, 'section retains accessible turn landmark');
-  assert.doesNotMatch(settledHtml, /<div class="asv-user-meta">[\s\S]*?第 2 轮[\s\S]*?<\/div>/, 'regular user bubble omits always-visible round caption');
-  assert.match(settledHtml, /<div class="asv-user-meta">[\s\S]*?aria-label="复制"[\s\S]*?aria-label="编辑后重发"[\s\S]*?<\/div>/, 'regular user bubble keeps hover copy and edit actions');
+  assert.doesNotMatch(settledHtml, /<div class="asv-user-meta[^"]*">[\s\S]*?第 2 轮[\s\S]*?<\/div>/, 'regular user bubble omits always-visible round caption');
+  assert.match(settledHtml, /<div class="asv-user-meta is-hover-only">[\s\S]*?aria-label="复制"[\s\S]*?aria-label="编辑后重发"[\s\S]*?<\/div>/, 'regular user bubble keeps hover copy and edit actions in compact hover-only row');
   assert.doesNotMatch(settledHtml, /隐藏的内部推理/, 'folded intermediate reasoning is hidden while collapsed');
   assert.match(settledHtml, /修复已完成。/);
   assert.match(settledHtml, /asv-msg-actions is-visible/);
@@ -523,9 +523,10 @@ test('SessionEmptyState has no hardcoded Codex copy and TurnView renders live re
   assert.match(specialUserHtml, /编排指令/, 'orchestration dispatch keeps system-preamble toggle');
   assert.match(specialUserHtml, /编排派发/, 'orchestration dispatch keeps origin label');
   assert.match(specialUserHtml, /追加指令/, 'mid-turn steer keeps caption');
-  assert.doesNotMatch(specialUserHtml, /<div class="asv-user-meta">[\s\S]*?第 4 轮[\s\S]*?<\/div>/);
+  assert.doesNotMatch(specialUserHtml, /<div class="asv-user-meta[^"]*">[\s\S]*?第 4 轮[\s\S]*?<\/div>/);
+  assert.doesNotMatch(specialUserHtml, /asv-user-meta is-hover-only/, 'prompts with visible metadata do not collapse meta margin');
 
-  // Attachment-only / whitespace-only user prompt without caption omits empty `.asv-user-meta`.
+  // Attachment-only / whitespace-only user prompt without caption omits empty `.asv-user-meta`; completely empty prompt omits `.asv-user`.
   const attachmentOnlyHtml = ui.renderTurn({
     turn: {
       key: 'd1#5', dispatchId: 'd1', turnId: 't5', generation: 5, prompt: '   ',
@@ -535,7 +536,16 @@ test('SessionEmptyState has no hardcoded Codex copy and TurnView renders live re
     },
   });
   assert.match(attachmentOnlyHtml, /spec\.md/);
-  assert.doesNotMatch(attachmentOnlyHtml, /class="asv-user-meta"/, 'empty prompt omits empty user meta container');
+  assert.doesNotMatch(attachmentOnlyHtml, /asv-user-meta/, 'empty prompt omits empty user meta container');
+
+  const emptyPromptHtml = ui.renderTurn({
+    turn: {
+      key: 'd1#6', dispatchId: 'd1', turnId: 't6', generation: 6, prompt: '   ',
+      startedAt: 1_000, completedAt: 2_000, status: 'completed', stopReason: null, usage: null, error: null,
+      items: [{ id: 'm_empty', kind: 'message', status: 'completed', role: 'assistant', text: '收到。', startedAt: 1_200, completedAt: 1_800 }],
+    },
+  });
+  assert.doesNotMatch(emptyPromptHtml, /class="asv-user"/, 'blank prompt without attachments omits empty user row');
 
   // Failed turn with turn.error & unexplained command failure renders both outside the fold.
   const failedHtml = ui.renderTurn({
