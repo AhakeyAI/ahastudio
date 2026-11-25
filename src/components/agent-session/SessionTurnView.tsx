@@ -21,7 +21,6 @@ import {
 } from 'lucide-react';
 import { countDiffStats, parseUnifiedDiff } from '../../lib/git-panel-model';
 import { describeTurnActivity, planTurnFold } from '../../lib/session-turn-model';
-import { formatWorkRunSentence } from '../../lib/session-work-log-model';
 import { summarizeTurnChanges } from '../../lib/turn-changes';
 import {
   groupTimelineItems,
@@ -98,6 +97,7 @@ function UserBubble({
   const [expanded, setExpanded] = useState(false);
   const [showSystem, setShowSystem] = useState(false);
   const origin = parts.system ? (parts.followUp ? '追加派发' : '编排派发') : null;
+  const metaLabel = [origin, caption].filter(Boolean).join(' · ');
   return (
     <div className="asv-user" data-asv-row>
       {parts.body && (
@@ -116,7 +116,7 @@ function UserBubble({
           ))}
         </div>
       )}
-      {(parts.body || long || parts.system || caption) && (
+      {(parts.body.trim() || long || parts.system || metaLabel) && (
         <div className="asv-user-meta">
           <MessageActions
             text={parts.body}
@@ -133,7 +133,7 @@ function UserBubble({
               编排指令
             </button>
           )}
-          {[origin, caption].filter(Boolean).join(' · ')}
+          {metaLabel || null}
         </div>
       )}
       {showSystem && parts.system && <pre className="asv-system">{parts.system}</pre>}
@@ -364,10 +364,6 @@ export const TurnView = memo(function TurnView({
     [turn.items, liveReasoningId, expanded, fold.foldedItemIds],
   );
   const blocks = useMemo(() => groupTimelineItems(visibleItems), [visibleItems]);
-  const summaryHint = useMemo(
-    () => (fold.foldable ? formatWorkRunSentence(fold.foldedItems, { live: false }) : ''),
-    [fold],
-  );
   const isCompactTurn = turn.commandKind === 'compact';
   const renderBlock = (block: (typeof blocks)[number]) =>
     block.type === 'group' ? (
@@ -397,7 +393,7 @@ export const TurnView = memo(function TurnView({
           <span className="asv-turn-cmd-meta">第 {turn.generation} 轮 · /compact</span>
         </div>
       ) : (
-        <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} attachments={turn.attachments} editable={turn.commandKind !== 'goal'} />
+        <UserBubble text={turn.prompt} attachments={turn.attachments} editable={turn.commandKind !== 'goal'} />
       )}
       <div className="asv-turn-body" data-asv-disclosure-scope="">
         <SessionTurnStatusBar
@@ -407,7 +403,6 @@ export const TurnView = memo(function TurnView({
           commandKind={turn.commandKind}
           foldable={fold.foldable}
           expanded={turnOpen}
-          summaryHint={summaryHint}
           onToggleExpanded={fold.foldable ? toggleTurnExpanded : undefined}
         />
         {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}

@@ -68,7 +68,7 @@ const ui = await bundleEntry(
       return renderToStaticMarkup(
         createElement(
           AgentSessionContext.Provider,
-          { value: { cwd: options.cwd ?? 'C:/repo', appearance: 'light' } },
+          { value: { cwd: options.cwd ?? 'C:/repo', appearance: 'light', ...(options.editMessage ? { editMessage: options.editMessage } : {}) } },
           createElement(
             SessionDisclosureContext.Provider,
             { value: store },
@@ -470,28 +470,72 @@ test('SessionEmptyState has no hardcoded Codex copy and TurnView renders live re
   assert.match(runningOpenReasoningHtml, /class="asv-reasoning-body" data-asv-tone="faint"/);
   assert.match(runningOpenReasoningHtml, /排查登录流程/);
 
-  // Settled turn folds intermediate work behind status bar while keeping final answer + restrained controls + settlement.
-  const settledHtml = ui.renderTurn({
-    turn: {
-      key: 'd1#2', dispatchId: 'd1', turnId: 't2', generation: 2, prompt: '修复并发刷新',
-      startedAt: 1_000, completedAt: 19_000, status: 'completed', stopReason: null, usage: null, error: null,
-      items: [
-        { id: 'r2', kind: 'reasoning', status: 'completed', summary: '隐藏的内部推理', text: '', startedAt: 1_500, completedAt: 4_500 },
-        { id: 'c2', kind: 'command', status: 'completed', command: 'npm test', cwd: null, output: 'pass', outputTruncated: false, exitCode: 0, durationMs: 3_000, startedAt: 5_000, completedAt: 8_000 },
-        { id: 'm2', kind: 'message', status: 'completed', role: 'assistant', text: '修复已完成。', startedAt: 9_000, completedAt: 18_500 },
-        { id: 's2', kind: 'settlement', settlement: 'report_done', stopReason: null, outcome: 'completed', verdict: 'approve', findings: [], summary: '已通过', diff: null, diffSource: null, startedAt: 19_000, completedAt: 19_000 },
-      ],
-    },
-    latestResponseKey: 'd1#2:m2',
-  });
+  // Settled turn folds intermediate work behind a minimal status bar (no verbose summary hint or round caption below regular bubbles),
+  // while keeping final answer + restrained controls + settlement.
+  const settledTurn = {
+    key: 'd1#2', dispatchId: 'd1', turnId: 't2', generation: 2, prompt: '修复并发刷新',
+    startedAt: 1_000, completedAt: 19_000, status: 'completed', stopReason: null, usage: null, error: null,
+    items: [
+      { id: 'r2', kind: 'reasoning', status: 'completed', summary: '隐藏的内部推理', text: '', startedAt: 1_500, completedAt: 4_500 },
+      { id: 'c2', kind: 'command', status: 'completed', command: 'npm test', cwd: null, output: 'pass', outputTruncated: false, exitCode: 0, durationMs: 3_000, startedAt: 5_000, completedAt: 8_000 },
+      { id: 'm2', kind: 'message', status: 'completed', role: 'assistant', text: '修复已完成。', startedAt: 9_000, completedAt: 18_500 },
+      { id: 's2', kind: 'settlement', settlement: 'report_done', stopReason: null, outcome: 'completed', verdict: 'approve', findings: [], summary: '已通过', diff: null, diffSource: null, startedAt: 19_000, completedAt: 19_000 },
+    ],
+  };
+  const settledHtml = ui.renderTurn(
+    { turn: settledTurn, latestResponseKey: 'd1#2:m2' },
+    { editMessage: () => {} },
+  );
   assert.match(settledHtml, /data-asv-turn-status="settled" aria-expanded="false"/);
   assert.match(settledHtml, /已工作 18s/);
-  assert.match(settledHtml, /思考了 1 次、运行了 1 条命令/);
+  assert.doesNotMatch(settledHtml, /asv-turn-bar-hint|思考了 1 次、运行了 1 条命令/, 'collapsed settled turn bar stays minimal without verbose summary hint');
+  assert.match(settledHtml, /aria-label="第 2 轮"/, 'section retains accessible turn landmark');
+  assert.doesNotMatch(settledHtml, /<div class="asv-user-meta">[\s\S]*?第 2 轮[\s\S]*?<\/div>/, 'regular user bubble omits always-visible round caption');
+  assert.match(settledHtml, /<div class="asv-user-meta">[\s\S]*?aria-label="复制"[\s\S]*?aria-label="编辑后重发"[\s\S]*?<\/div>/, 'regular user bubble keeps hover copy and edit actions');
   assert.doesNotMatch(settledHtml, /隐藏的内部推理/, 'folded intermediate reasoning is hidden while collapsed');
   assert.match(settledHtml, /修复已完成。/);
   assert.match(settledHtml, /asv-msg-actions is-visible/);
   assert.match(settledHtml, /aria-label="滚动到此回复顶部"/);
   assert.match(settledHtml, /已提交结果/);
+
+  // Expanding the settled turn reveals the semantic WorkGroup summary inside the turn body.
+  const expandedSettledHtml = ui.renderTurn(
+    { turn: settledTurn, latestResponseKey: 'd1#2:m2' },
+    { openKeys: ['turn:d1#2'] },
+  );
+  assert.match(expandedSettledHtml, /data-asv-turn-status="settled" aria-expanded="true"/);
+  assert.match(expandedSettledHtml, /思考了 1 次、运行了 1 条命令/, 'semantic work-run summary appears inside expanded turn');
+
+  // Long user prompts, mid-turn steers, and orchestration dispatches keep their expand/preamble/origin controls.
+  const longPrompt = Array.from({ length: 20 }, (_, i) => `第 ${i + 1} 行需求说明`).join('\n');
+  const specialUserHtml = ui.renderTurn({
+    turn: {
+      key: 'd1#4', dispatchId: 'd1', turnId: 't4', generation: 4,
+      prompt: `[Worker @reviewer]\nWorkspace: C:/repo\nBranch: feat/x\n\n- Use report_done\n\nTask:\n${longPrompt}`,
+      startedAt: 1_000, completedAt: 5_000, status: 'completed', stopReason: null, usage: null, error: null,
+      items: [
+        { id: 'u_steer', kind: 'message', status: 'completed', role: 'user', text: '再补跑一遍边界用例', startedAt: 2_000, completedAt: 2_000 },
+        { id: 'm_done', kind: 'message', status: 'completed', role: 'assistant', text: '已补充。', startedAt: 3_000, completedAt: 4_500 },
+      ],
+    },
+  });
+  assert.match(specialUserHtml, /展开全部/, 'long prompt keeps expand toggle');
+  assert.match(specialUserHtml, /编排指令/, 'orchestration dispatch keeps system-preamble toggle');
+  assert.match(specialUserHtml, /编排派发/, 'orchestration dispatch keeps origin label');
+  assert.match(specialUserHtml, /追加指令/, 'mid-turn steer keeps caption');
+  assert.doesNotMatch(specialUserHtml, /<div class="asv-user-meta">[\s\S]*?第 4 轮[\s\S]*?<\/div>/);
+
+  // Attachment-only / whitespace-only user prompt without caption omits empty `.asv-user-meta`.
+  const attachmentOnlyHtml = ui.renderTurn({
+    turn: {
+      key: 'd1#5', dispatchId: 'd1', turnId: 't5', generation: 5, prompt: '   ',
+      attachments: [{ kind: 'file', name: 'spec.md' }],
+      startedAt: 1_000, completedAt: 2_000, status: 'completed', stopReason: null, usage: null, error: null,
+      items: [{ id: 'm_att', kind: 'message', status: 'completed', role: 'assistant', text: '收到。', startedAt: 1_200, completedAt: 1_800 }],
+    },
+  });
+  assert.match(attachmentOnlyHtml, /spec\.md/);
+  assert.doesNotMatch(attachmentOnlyHtml, /class="asv-user-meta"/, 'empty prompt omits empty user meta container');
 
   // Failed turn with turn.error & unexplained command failure renders both outside the fold.
   const failedHtml = ui.renderTurn({

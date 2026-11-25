@@ -22,7 +22,6 @@ export const SessionTurnStatusBar = memo(function SessionTurnStatusBar({
   commandKind,
   foldable,
   expanded,
-  summaryHint,
   onToggleExpanded,
 }: {
   status: WorkerTimelineTurn['status'];
@@ -31,7 +30,6 @@ export const SessionTurnStatusBar = memo(function SessionTurnStatusBar({
   commandKind?: WorkerTimelineTurn['commandKind'];
   foldable: boolean;
   expanded: boolean;
-  summaryHint?: string;
   onToggleExpanded?: () => void;
 }) {
   const active = turnStatus === 'running';
@@ -47,9 +45,6 @@ export const SessionTurnStatusBar = memo(function SessionTurnStatusBar({
     <>
       {active && <span className="asv-turn-bar-dot" aria-hidden="true" />}
       <span className={`asv-turn-bar-label is-${status.tone}`}>{status.label}</span>
-      {interactive && summaryHint && !expanded && (
-        <span className="asv-turn-bar-hint">· {summaryHint}</span>
-      )}
       {interactive && (
         <ChevronRight
           size={13}

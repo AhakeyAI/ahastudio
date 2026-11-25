@@ -17,6 +17,12 @@
   --asv-warn: #b45309;
   --asv-add: #15803d;
   --asv-del: #b91c1c;
+  --asv-link: var(--workspace-accent);
+  --asv-file-link-border: color-mix(in srgb, var(--asv-link) 34%, transparent);
+  --asv-file-link-bg: color-mix(in srgb, var(--asv-link) 9%, transparent);
+  --asv-file-link-border-hover: color-mix(in srgb, var(--asv-link) 56%, transparent);
+  --asv-file-pill-border: color-mix(in srgb, var(--asv-ink) 10%, transparent);
+  --asv-file-pill-bg: var(--asv-tint);
   --asv-shadow: 0 1px 2px rgb(0 0 0 / 5%), 0 8px 24px -12px rgb(0 0 0 / 18%);
   --asv-mono: var(--font-mono, ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace);
 
@@ -34,6 +40,13 @@
   --asv-warn: #f0b35a;
   --asv-add: #86efac;
   --asv-del: #fca5a5;
+  /* Matches Orca's dark --chat-link luminance (~7:1 on #1e1e1e) so links stand out from plain inline code. */
+  --asv-link: color-mix(in srgb, var(--workspace-accent) 70%, #99cbff);
+  --asv-file-link-border: color-mix(in srgb, var(--asv-link) 44%, transparent);
+  --asv-file-link-bg: color-mix(in srgb, var(--asv-link) 14%, transparent);
+  --asv-file-link-border-hover: color-mix(in srgb, var(--asv-link) 68%, transparent);
+  --asv-file-pill-border: color-mix(in srgb, var(--asv-ink) 15%, transparent);
+  --asv-file-pill-bg: color-mix(in srgb, var(--asv-ink) 6%, var(--workspace-bg));
   --asv-shadow: 0 14px 32px -18px rgb(0 0 0 / 75%);
 }
 
@@ -195,28 +208,29 @@
 /* ---- Turn working status bar & live activity line (adapted from Orca, MIT) ---- */
 
 .asv-turn-bar-wrap { min-width: 0; }
-.asv-turn-bar {
+.agent-session-view .asv-turn-bar {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   width: 100%;
   min-width: 0;
-  min-height: 28px;
-  padding: 2px 2px 6px;
+  min-height: 30px;
+  padding: 2px 0 6px;
   border: 0;
   border-bottom: 1px solid var(--asv-line);
   border-radius: 0;
   background: none;
   color: var(--asv-ink-2);
   font: inherit;
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 1.4;
   font-variant-numeric: tabular-nums;
   text-align: left;
   box-sizing: border-box;
 }
-.asv-turn-bar.is-interactive { cursor: pointer; transition: color 120ms ease; }
-.asv-turn-bar.is-interactive:hover { color: var(--asv-ink-strong); }
+.agent-session-view .asv-turn-bar.is-interactive { cursor: pointer; transition: color 120ms ease; }
+.agent-session-view .asv-turn-bar.is-interactive:hover { color: var(--asv-ink-strong); }
+.agent-session-view .asv-turn-bar.is-interactive:focus-visible { border-radius: 4px; outline-offset: -2px; }
 .asv-turn-bar-dot {
   flex: none;
   width: 6px;
@@ -228,18 +242,10 @@
 .asv-turn-bar-label { flex: none; white-space: nowrap; }
 .asv-turn-bar-label.is-failed { color: var(--asv-bad); }
 .asv-turn-bar-label.is-interrupted { color: var(--asv-warn); }
-.asv-turn-bar-hint {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  color: var(--asv-ink-2);
-  opacity: 0.78;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.asv-turn-bar.is-interactive:hover .asv-turn-bar-hint { opacity: 1; }
-.asv-turn-bar-chevron { flex: none; margin-left: 2px; opacity: 0.75; transition: transform 140ms ease; }
-.asv-turn-bar-wrap[data-open] .asv-turn-bar-chevron { transform: rotate(90deg); opacity: 1; }
+.asv-turn-bar-chevron { flex: none; opacity: 0.72; transition: transform 140ms ease, opacity 120ms ease; }
+.asv-turn-bar.is-interactive:hover .asv-turn-bar-chevron,
+.asv-turn-bar-wrap[data-open] .asv-turn-bar-chevron { opacity: 1; }
+.asv-turn-bar-wrap[data-open] .asv-turn-bar-chevron { transform: rotate(90deg); }
 
 .asv-activity { display: flex; flex-direction: column; min-width: 0; }
 .asv-activity-line {
@@ -309,7 +315,7 @@
 
 /* ---- User bubble ---- */
 
-.asv-user { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; min-width: 0; margin-bottom: 6px; }
+.asv-user { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; min-width: 0; margin-bottom: 0; }
 .asv-bubble {
   position: relative;
   max-width: min(85%, 640px);
@@ -505,9 +511,9 @@
   min-height: 0;
   height: auto;
   padding: 0 6px;
-  border: 1px solid color-mix(in srgb, var(--asv-ink) 10%, transparent);
+  border: 1px solid var(--asv-file-pill-border);
   border-radius: 5px;
-  background: var(--asv-tint);
+  background: var(--asv-file-pill-bg);
   color: var(--asv-ink);
   font-family: var(--asv-mono);
   font-size: 12px;
@@ -519,9 +525,9 @@
   transition: border-color 120ms ease, color 120ms ease, background-color 120ms ease;
 }
 .agent-session-view .asv-file-pill:hover {
-  border-color: color-mix(in srgb, var(--workspace-accent) 42%, transparent);
-  background: color-mix(in srgb, var(--workspace-accent) 8%, var(--asv-tint));
-  color: var(--workspace-accent);
+  border-color: color-mix(in srgb, var(--asv-link) 48%, transparent);
+  background: color-mix(in srgb, var(--asv-link) 11%, var(--asv-file-pill-bg));
+  color: var(--asv-link);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
@@ -531,8 +537,8 @@
   text-decoration: line-through;
 }
 .agent-session-view .asv-file-pill.is-static:hover {
-  border-color: color-mix(in srgb, var(--asv-ink) 10%, transparent);
-  background: var(--asv-tint);
+  border-color: var(--asv-file-pill-border);
+  background: var(--asv-file-pill-bg);
   color: var(--asv-ink);
   text-decoration: line-through;
 }
@@ -713,7 +719,7 @@
   box-decoration-break: clone;
 }
 .asv-md-link {
-  color: var(--workspace-accent);
+  color: var(--asv-link);
   cursor: pointer;
   text-decoration: none;
   text-decoration-color: color-mix(in srgb, currentcolor 42%, transparent);
@@ -724,11 +730,11 @@
 .asv-md-link:hover { text-decoration: underline; }
 .asv-md-link :is(code, strong) { color: inherit; }
 .asv-md-link[data-file-link] > code {
-  border-color: color-mix(in srgb, var(--workspace-accent) 32%, transparent);
-  background: color-mix(in srgb, var(--workspace-accent) 8%, transparent);
+  border-color: var(--asv-file-link-border);
+  background: var(--asv-file-link-bg);
 }
 .asv-md-link[data-file-link]:hover > code {
-  border-color: color-mix(in srgb, var(--workspace-accent) 52%, transparent);
+  border-color: var(--asv-file-link-border-hover);
 }
 .asv-md-table { max-width: 100%; overflow-x: auto; }
 .asv-md table { width: auto; min-width: min(100%, 320px); border-collapse: collapse; font-size: 0.928em; overflow-wrap: normal; word-break: normal; }
@@ -1225,7 +1231,39 @@
   border-radius: 999px;
 }
 
-/* Keep composer pills proportioned and circular buttons 1:1 under handheld mode's global 44px button floor. */
+/* Keep transcript chrome, icon controls, and composer pills proportioned under handheld mode's global 44px button floor. */
+html.handheld .agent-session-view { --asv-gutter: 14px; }
+html.handheld .agent-session-view .asv-header { height: 44px; }
+html.handheld .agent-session-view .asv-title.is-editable { min-height: 0; }
+html.handheld .agent-session-view .asv-title-input { height: 32px; min-height: 32px; }
+html.handheld .agent-session-view .asv-btn { height: 32px; min-height: 32px; }
+html.handheld .agent-session-view .asv-text-btn { min-height: 28px; }
+html.handheld .agent-session-view .asv-turn-bar { min-height: 36px; }
+html.handheld .agent-session-view .asv-row-line,
+html.handheld .agent-session-view .asv-activity-line { min-height: 34px; }
+html.handheld .agent-session-view .asv-file-pill { min-height: 24px; line-height: 22px; }
+html.handheld .agent-session-view .asv-act { width: 30px; height: 30px; min-width: 30px; min-height: 30px; }
+html.handheld .agent-session-view .asv-code-head { height: 36px; }
+html.handheld .agent-session-view :is(.asv-copy, .asv-code-btn) {
+  width: 30px;
+  height: 30px;
+  min-width: 30px;
+  min-height: 30px;
+  opacity: 0.85;
+}
+html.handheld .agent-session-view .asv-icon-btn { width: 32px; height: 32px; min-width: 32px; min-height: 32px; }
+html.handheld .agent-session-view .asv-changes-row { height: auto; min-height: 34px; padding-top: 4px; padding-bottom: 4px; }
+html.handheld .agent-session-view .asv-to-bottom { width: 36px; height: 36px; min-width: 36px; min-height: 36px; }
+html.handheld .agent-session-view .asv-queue-row { height: auto; min-height: 36px; }
+html.handheld .agent-session-view .asv-attach-thumb > button,
+html.handheld .agent-session-view .asv-attach-file > button { width: 22px; height: 22px; min-width: 22px; min-height: 22px; }
+html.handheld .agent-session-view .asv-switch { min-height: 16px; }
+html.handheld .agent-session-view .asv-tabs > button { height: 32px; min-height: 32px; }
+html.handheld .agent-session-view .asv-chip-toggle:not(.asv-composer-ctrl) { min-height: 28px; }
+html.handheld .agent-session-view .asv-skill-name { min-height: 28px; }
+html.handheld .agent-session-view .asv-banner-input,
+html.handheld .agent-session-view .asv-history-search { height: 36px; min-height: 36px; }
+html.handheld .agent-session-view .asv-catalog-search input { min-height: 0; }
 html.handheld .agent-session-view .asv-tool-btn,
 html.handheld .agent-session-view .asv-composer-ctrl,
 html.handheld .agent-session-view .asv-composer-actions .asv-usage {
