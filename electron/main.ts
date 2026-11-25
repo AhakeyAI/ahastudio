@@ -1,4 +1,5 @@
 import { app, BrowserWindow, nativeTheme, protocol, screen, session } from 'electron';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -525,19 +526,29 @@ app.whenReady().then(async () => {
   const orchestrationIpc = registerOrchestrationIpc(ipcCtx);
   const { AgentSessionManager } = await import('./orchestration/agent-session-manager.js');
   const { registerAgentSessionsIpc } = await import('./ipc/agent-sessions.js');
-  const agentSessions = new AgentSessionManager({
-    launch: (sessionId, cwd, events, { orchestration, policy }) => {
-      if (!orchestration) return launchCodexPilot({ cwd, events });
-      const mcpServerPath = resolveActiveMcpServerPath();
-      if (!agentHookServer || !mcpServerPath) throw new Error('Aha MCP Server is unavailable');
-      return launchCodexPilot({
-        cwd, events,
-        mcp: {
-          serverPath: mcpServerPath, env: agentHookServer.envForSession(sessionId),
-          requiredTool: 'delegate_task', approvedTools: coordinatorApprovedMcpTools(policy),
-        },
-      });
+  const { DriverRegistry, nativeDriverEntries } = await import('./agent-drivers/driver-registry.js');
+  const { driverCapabilities } = await import('./agent-drivers/driver-capabilities.js');
+  // Codex keeps its own app-server pilot (catalog, history, orchestration); the rest are ACP or Pi.
+  const driverRegistry = new DriverRegistry([
+    {
+      id: 'codex', label: 'Codex', command: 'codex', capabilities: driverCapabilities('codex'),
+      launch: (sessionId, cwd, events, { orchestration, policy }) => {
+        if (!orchestration) return launchCodexPilot({ cwd, events });
+        const mcpServerPath = resolveActiveMcpServerPath();
+        if (!agentHookServer || !mcpServerPath) throw new Error('Aha MCP Server is unavailable');
+        return launchCodexPilot({
+          cwd, events,
+          mcp: {
+            serverPath: mcpServerPath, env: agentHookServer.envForSession(sessionId),
+            requiredTool: 'delegate_task', approvedTools: coordinatorApprovedMcpTools(policy),
+          },
+        });
+      },
     },
+    ...nativeDriverEntries(),
+  ]);
+  const agentSessions = new AgentSessionManager({
+    launch: (sessionId, cwd, events, options) => driverRegistry.launch(sessionId, cwd, events, options),
     coordinatorInstructions: (sessionId, { policy }) =>
       coordinatorInstructions({
         ...orchestrationService.getMcpContextForPane(sessionId),
@@ -561,7 +572,16 @@ app.whenReady().then(async () => {
   const codexCatalog = new CodexCatalog(() => launchCodexPilot({ cwd: app.getPath('home'), events: noSessionEvents }));
   const agentSessionsIpc = registerAgentSessionsIpc(ipcCtx, agentSessions, {
     catalog: codexCatalog,
+    drivers: driverRegistry,
     attachmentsDir: () => join(app.getPath('userData'), 'agent-session-attachments'),
+    terminal: {
+      // Main opens the pane with the resume arguments it built, so the renderer never supplies argv.
+      open: ({ cliId, args, cwd }) => shellPtyCtrl.createPty({
+        terminalId: `handoff-${randomUUID().replace(/-/g, '').slice(0, 12)}`, cliId, cwd, extraArgs: args,
+        appearance: nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
+      }),
+      isAlive: shellPtyCtrl.isPtyAlive,
+    },
   });
   const offPtyExit = shellPtyCtrl.onPtyExit((ptyId) => {
     orchestrationService.markPtyExited(ptyId);

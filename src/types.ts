@@ -111,10 +111,46 @@ export type AgentGoalAction =
   | { type: 'resume' }
   | { type: 'set'; objective: string };
 
+// Mirrors electron/agent-drivers/driver-capabilities.ts.
+export type AgentDriverId = 'codex' | 'antigravity' | 'grok' | 'opencode' | 'pi';
+
+export interface AgentDriverCapabilities {
+  policies: AgentSessionPolicy[];
+  policyNeedsRelaunch: boolean;
+  network: boolean;
+  models: boolean;
+  efforts: boolean;
+  images: boolean;
+  compact: boolean;
+  goal: boolean;
+  feedback: boolean;
+  usageLimits: boolean;
+  skills: boolean;
+  plugins: boolean;
+  history: boolean;
+  orchestration: boolean;
+  rename: boolean;
+  resume: boolean;
+  terminalResume: boolean;
+}
+
+// Mirrors AgentDriverSummary in electron/agent-drivers/driver-registry.ts.
+export interface AgentDriverSummary {
+  id: AgentDriverId;
+  label: string;
+  command: string;
+  installed: boolean;
+  capabilities: AgentDriverCapabilities;
+}
+
 // Mirrors electron/orchestration/agent-session-manager.ts.
 export interface AgentSessionInfo {
   id: string;
-  provider: 'codex' | 'claude' | 'acp';
+  provider: AgentDriverId;
+  /** Older main processes omit it; the renderer then assumes Codex. */
+  capabilities?: AgentDriverCapabilities;
+  /** The conversation continues in a terminal pane until it is taken back. */
+  handoff?: { ptyId: string | null; at: number } | null;
   title: string;
   cwd: string;
   model: string | null;
@@ -234,8 +270,15 @@ export type AgentTurnAttachment =
 
 export interface AgentSessionsApi {
   list: () => AgentSessionResult<{ sessions: AgentSessionInfo[] }>;
-  create: (opts: { cwd?: string; policy: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean }) =>
-    AgentSessionResult<{ session: AgentSessionInfo }>;
+  create: (opts: {
+    cwd?: string; provider?: AgentDriverId; policy: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
+  }) => AgentSessionResult<{ session: AgentSessionInfo }>;
+  /** Native drivers and whether their CLI is installed. */
+  drivers?: () => AgentSessionResult<{ drivers: AgentDriverSummary[] }>;
+  /** Suspends the session and continues it in a new terminal pane with the CLI's resume flags. */
+  handoff?: (opts: { id: string }) => AgentSessionResult<{ ptyId: string; cliId: AgentDriverId; cwd: string }>;
+  /** Takes a handed-off session back once its terminal has exited. */
+  reclaim?: (opts: { id: string }) => AgentSessionResult;
   send: (opts: {
     id: string; text: string; policy?: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
     freshContext?: boolean; attachments?: AgentTurnAttachment[];
@@ -247,7 +290,8 @@ export interface AgentSessionsApi {
   }) => AgentSessionResult<{ queued: boolean }>;
   unqueue?: (opts: { id: string; messageId: string }) => AgentSessionResult<{ message: AgentQueuedMessage }>;
   resumeQueue?: (opts: { id: string }) => AgentSessionResult;
-  models: () => AgentSessionResult<{ models: CodexModelOption[] }>;
+  /** Codex's catalog, or with `id` the models that session's driver offered. */
+  models: (opts?: { id?: string }) => AgentSessionResult<{ models: CodexModelOption[] }>;
   rateLimits?: () => AgentSessionResult<{ limits: CodexRateLimits }>;
   skills: (opts: { id: string; reload?: boolean }) => AgentSessionResult<{ skills: CodexSkillOption[] }>;
   setSkillEnabled: (opts: { id: string; path: string; enabled: boolean }) => AgentSessionResult;

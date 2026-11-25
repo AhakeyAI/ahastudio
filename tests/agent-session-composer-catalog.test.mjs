@@ -296,7 +296,10 @@ test('a message carries only listed skills and images saved for its session, and
   assert.equal((await call('send', { id, text: 'x', attachments: [{ type: 'file', path: join(cwd, 'package.json') }] })).ok, false,
     'a file outside the session folder is refused');
 
-  assert.deepEqual((await call('search-files', { id, query: 'demo' })).files, [{ path: 'src/demo.ts', fileName: 'demo.ts' }]);
+  // `@` searches the session's own folder (here the repo), independent of the driver.
+  const found = (await call('search-files', { id, query: 'agent-session-manager.ts' })).files;
+  assert.equal(found[0].path, 'electron/orchestration/agent-session-manager.ts');
+  assert.equal(found[0].fileName, 'agent-session-manager.ts');
   assert.deepEqual((await call('search-files', { id, query: '  ' })).files, []);
   assert.deepEqual((await call('plugins', { id })).plugins.map((plugin) => plugin.id), ['docs@mock-market']);
   assert.deepEqual((await call('models', {})).models.map((model) => model.id), ['mock-large', 'mock-mini']);

@@ -1,6 +1,9 @@
+import type { AgentDriverId } from '../agent-drivers/driver-capabilities.js';
+import type { CodexModelOption } from './codex-catalog.js';
 import type { WorkerTimelineEvent } from './worker-timeline.js';
 
-export type AgentProvider = 'codex' | 'claude' | 'acp';
+/** The native driver behind a session; stored sessions without one are Codex. */
+export type AgentProvider = AgentDriverId;
 
 /**
  * How much the agent may do on its own. `read-only` cannot change files; `workspace-write` may edit
@@ -130,6 +133,8 @@ export interface AgentSessionDriver {
   interrupt(): Promise<boolean>;
   /** Names the provider's conversation, so its own history shows the same title. False if it could not. */
   setName?(name: string): Promise<boolean>;
+  /** Models the live process offered for this conversation; Codex lists its own through `CodexCatalog`. */
+  models?(): CodexModelOption[];
   /** Compacts the provider conversation's context window (Codex `thread/compact/start`). */
   compactThread?(turnKey: string): Promise<TurnDelivery>;
   /** Uploads thread logs and an optional reason to the provider (Codex `feedback/upload`). */

@@ -25,6 +25,11 @@ Certain ported, adapted, or bundled components retain their original upstream co
   - `src/lib/terminal-appearance.ts` (Builtin Tango Light palette)
   - `src/components/TerminalBrandIcons.tsx` (adapted SVG brand icon components)
   - `src/assets/cli-icons/antigravity.png`, `src/assets/cli-icons/grok.png`, `src/assets/cli-icons/qoder.png`
+  - `electron/agent-drivers/jsonl-rpc.ts` (JSON-lines framing and call correlation adapted from `src/main/jsonl-rpc/peer.ts`, `peer-reply.ts`, and `src/main/acp/transport/acp-json-rpc-peer.ts`)
+  - `electron/agent-drivers/acp/acp-session-driver.ts`, `acp-dialects.ts`, `acp-form-elicitation.ts` (ACP session setup, permission answering, timeline translation, the Antigravity / Grok / OpenCode dialects and launch specs, and form elicitation adapted from `src/main/acp/**`, `src/main/antigravity/antigravity-acp-launch-spec.ts`)
+  - `electron/agent-drivers/pi/pi-session-driver.ts` (`pi --mode rpc` protocol, message/tool mapping, extension dialogs, and launch arguments adapted from `src/main/pi/rpc/**`)
+  - `electron/agent-drivers/driver-capabilities.ts` (`terminalResumeArgs`, adapted from `src/shared/agent-launch/startup/agent-resume-argv.ts`)
+  - `tests/fixtures/orca-acp/*.jsonl`, `tests/fixtures/orca-pi/*.jsonl` (recorded protocol sessions copied unchanged from `src/main/acp/fixtures/` and `src/main/pi/rpc/__fixtures__/`)
 
 ## 2. Visual Studio Code (`https://github.com/microsoft/vscode`)
 
