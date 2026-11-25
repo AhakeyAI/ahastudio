@@ -49,13 +49,14 @@ const LONG_PROMPT_LINES = 16;
 type Item<K extends WorkerTimelineItem['kind']> = Extract<WorkerTimelineItem, { kind: K }>;
 
 function formatClockTime(timestamp: number | null): string {
-  if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) return '';
+  // Reject non-positive epoch sentinels (e.g. reopened history turns without per-item timestamps).
+  if (typeof timestamp !== 'number' || !Number.isFinite(timestamp) || timestamp <= 0) return '';
   const date = new Date(timestamp);
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
 function formatFullTime(timestamp: number | null): string | undefined {
-  if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) return undefined;
+  if (typeof timestamp !== 'number' || !Number.isFinite(timestamp) || timestamp <= 0) return undefined;
   return new Date(timestamp).toLocaleString();
 }
 
@@ -214,13 +215,20 @@ const AssistantMessageRow = memo(function AssistantMessageRow({
   showActions: boolean;
   isLatestResponse: boolean;
 }) {
+  const { scrollElementToTop } = useAgentSession();
   const rowRef = useRef<HTMLDivElement>(null);
   const streaming = item.status === 'running';
   const canShowControls = !streaming && !turnRunning && showActions && item.text.trim().length > 0;
   const clock = formatClockTime(item.completedAt);
   const scrollToTop = useCallback(() => {
-    rowRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' });
-  }, []);
+    const el = rowRef.current;
+    if (!el) return;
+    if (scrollElementToTop) {
+      scrollElementToTop(el);
+    } else {
+      el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }
+  }, [scrollElementToTop]);
 
   return (
     <div
@@ -341,8 +349,9 @@ export const TurnView = memo(function TurnView({
   const changes = useMemo(() => (running ? null : summarizeTurnChanges(turn.items, cwd)), [running, turn.items, cwd]);
   const hasCard = Boolean(changes?.files.length);
   const fold = useMemo(() => planTurnFold(turn, { hasChangesCard: hasCard }), [turn, hasCard]);
-  const turnDisclosure = useSessionDisclosure(`turn:${turn.key}`, false);
-  const expanded = running || !fold.foldable || turnDisclosure.open;
+  const { open: turnOpen, setOpen: setTurnOpen } = useSessionDisclosure(`turn:${turn.key}`, false);
+  const toggleTurnExpanded = useCallback(() => setTurnOpen(!turnOpen), [setTurnOpen, turnOpen]);
+  const expanded = running || !fold.foldable || turnOpen;
   const activity = useMemo(() => describeTurnActivity(turn, { stopping: running && stopping }), [turn, running, stopping]);
   const liveReasoningId = activity?.reasoning?.item.id ?? null;
   const visibleItems = useMemo(
@@ -390,21 +399,26 @@ export const TurnView = memo(function TurnView({
       ) : (
         <UserBubble text={turn.prompt} caption={`第 ${turn.generation} 轮`} attachments={turn.attachments} editable={turn.commandKind !== 'goal'} />
       )}
-      <SessionTurnStatusBar
-        turn={turn}
-        foldable={fold.foldable}
-        expanded={turnDisclosure.open}
-        summaryHint={summaryHint}
-        onToggleExpanded={fold.foldable ? () => turnDisclosure.setOpen(!turnDisclosure.open) : undefined}
-      />
-      {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}
-      {blocks.filter((block) => !isSettlement(block)).map(renderBlock)}
-      {hasCard && <TurnChangesCard changes={changes!} />}
-      {blocks.filter(isSettlement).map(renderBlock)}
-      {!running && turn.error && (
-        <SessionNoticeRow level={turn.status === 'failed' ? 'error' : 'warning'} text={turn.error} />
-      )}
-      {activity && <SessionTurnActivityLine turnKey={turn.key} activity={activity} />}
+      <div className="asv-turn-body" data-asv-disclosure-scope="">
+        <SessionTurnStatusBar
+          status={turn.status}
+          startedAt={turn.startedAt}
+          completedAt={turn.completedAt}
+          commandKind={turn.commandKind}
+          foldable={fold.foldable}
+          expanded={turnOpen}
+          summaryHint={summaryHint}
+          onToggleExpanded={fold.foldable ? toggleTurnExpanded : undefined}
+        />
+        {turn.itemsTrimmed && <div className="asv-turn-note">部分较早的过程记录已截断</div>}
+        {blocks.filter((block) => !isSettlement(block)).map(renderBlock)}
+        {hasCard && <TurnChangesCard changes={changes!} />}
+        {blocks.filter(isSettlement).map(renderBlock)}
+        {!running && turn.error && (
+          <SessionNoticeRow level={turn.status === 'failed' ? 'error' : 'warning'} text={turn.error} />
+        )}
+        {activity && <SessionTurnActivityLine turnKey={turn.key} activity={activity} />}
+      </div>
     </section>
   );
 });

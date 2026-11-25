@@ -34,7 +34,10 @@ export function describeTurnStatus(
     const verb = turn.commandKind === 'compact' ? '正在压缩上下文' : '正在工作';
     return { active: true, tone: 'running', label: `${verb} ${duration}` };
   }
-  const durationMs = turn.completedAt !== null ? Math.max(0, turn.completedAt - turn.startedAt) : null;
+  // Reopened history turns may lack timestamps (`startedAt === 0` or `completedAt === null`); omit bogus `0s`.
+  const hasDuration =
+    turn.startedAt > 0 && turn.completedAt !== null && turn.completedAt >= turn.startedAt;
+  const durationMs = hasDuration ? turn.completedAt! - turn.startedAt : null;
   const duration = durationMs !== null ? formatTurnDuration(durationMs) : '';
   if (turn.status === 'interrupted') {
     return {
@@ -81,7 +84,13 @@ export function describeReasoningHeadline(
   if (options.turnRunning && item.status === 'running') {
     return '思考中';
   }
-  if (item.status === 'completed' && item.startedAt !== null && item.completedAt !== null) {
+  if (
+    item.status === 'completed' &&
+    item.startedAt !== null &&
+    item.completedAt !== null &&
+    item.startedAt > 0 &&
+    item.completedAt > item.startedAt
+  ) {
     const seconds = Math.max(1, Math.round((item.completedAt - item.startedAt) / 1000));
     return `思考了 ${formatTurnDuration(seconds * 1000)}`;
   }
@@ -157,11 +166,11 @@ export function describeTurnActivity(
 function itemHasFailure(item: WorkerTimelineItem): boolean {
   switch (item.kind) {
     case 'command':
-      return item.status === 'failed' || (item.exitCode !== null && item.exitCode !== 0);
+      return item.status === 'failed' || item.status === 'declined' || (item.exitCode !== null && item.exitCode !== 0);
     case 'tool_call':
-      return item.status === 'failed' || Boolean(item.error);
+      return item.status === 'failed' || item.status === 'declined' || Boolean(item.error);
     case 'file_change':
-      return item.status === 'failed';
+      return item.status === 'failed' || item.status === 'declined';
     case 'approval':
       return item.status === 'denied' || item.status === 'expired';
     case 'notice':
@@ -184,7 +193,6 @@ export function selectTurnAnswerItemIds(items: readonly WorkerTimelineItem[]): R
   const answers = new Set<string>();
   let latestAnswerId: string | null = null;
   let previousVisible: { id: string; index: number; isProse: boolean } | null = null;
-  let lastThoughtIndex = -1;
   const splitFrom = new Map<string, string>();
 
   for (let index = 0; index < items.length; index += 1) {
@@ -198,7 +206,6 @@ export function selectTurnAnswerItemIds(items: readonly WorkerTimelineItem[]): R
       continue;
     }
     if (item.kind === 'reasoning') {
-      lastThoughtIndex = index;
       continue;
     }
     if (item.kind === 'notice' && item.level === 'info') {
@@ -206,11 +213,9 @@ export function selectTurnAnswerItemIds(items: readonly WorkerTimelineItem[]): R
     }
     const prose = isAssistantProse(item);
     if (prose && previousVisible?.isProse) {
-      if (lastThoughtIndex > previousVisible.index) {
-        splitFrom.set(item.id, previousVisible.id);
-      } else {
-        answers.add(previousVisible.id);
-      }
+      // Chain consecutive prose pieces so they stay visible together iff the tail piece is an answer,
+      // while back-to-back pre-tool narration folds cleanly once work follows.
+      splitFrom.set(item.id, previousVisible.id);
     }
     previousVisible = { id: item.id, index, isProse: prose };
     if (prose) {

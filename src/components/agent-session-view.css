@@ -147,7 +147,7 @@
 
 /* ---- Timeline ---- */
 
-.asv-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: none; scrollbar-gutter: stable both-edges; }
+.asv-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: none; scrollbar-gutter: stable both-edges; isolation: isolate; }
 .asv-content {
   display: flex;
   flex-direction: column;
@@ -185,10 +185,11 @@
 .asv-start-example:focus-visible { outline: 2px solid var(--workspace-accent); outline-offset: 1px; }
 .asv-empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 64px 0; color: var(--asv-ink-2); font-size: 13px; text-align: center; }
 .asv-turn { display: flex; flex-direction: column; gap: 10px; min-width: 0; box-sizing: border-box; }
+.asv-turn-body { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .asv-turn-note { color: var(--asv-ink-2); font-size: 12px; }
 .asv-turn-foot { color: var(--asv-ink-2); font-size: 12px; font-variant-numeric: tabular-nums; }
 .asv-turn-foot.is-failed { color: var(--asv-bad); }
-.asv-turn > [data-asv-row]:not(.asv-assistant, .asv-user, .asv-wake, .asv-turn-bar-wrap) + .asv-assistant { margin-top: 6px; }
+.asv-turn-body > [data-asv-row]:not(.asv-assistant, .asv-user, .asv-wake, .asv-turn-bar-wrap) + .asv-assistant { margin-top: 6px; }
 .asv-working { display: flex; align-items: center; gap: 8px; min-height: 24px; padding-left: 2px; font-size: 13px; }
 
 /* ---- Turn working status bar & live activity line (adapted from Orca, MIT) ---- */
@@ -283,9 +284,13 @@
 .asv-activity-line:hover .asv-activity-chevron,
 .asv-activity[data-open] .asv-activity-chevron { opacity: 0.95; }
 .asv-activity[data-open] .asv-activity-chevron { transform: rotate(90deg); }
-.asv-activity-trigger {
+.agent-session-view .asv-activity-trigger {
   position: absolute;
   inset: 0;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
   border: 0;
   border-radius: 6px;
   background: none;
@@ -389,6 +394,8 @@
 
 .asv-row, .asv-group, .asv-plan { min-width: 0; }
 .asv-row-line {
+  position: relative;
+  isolation: isolate;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -407,8 +414,21 @@
   text-align: left;
   box-sizing: content-box;
 }
-button.asv-row-line { cursor: pointer; }
-button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink); }
+.asv-row-line.is-expandable { cursor: pointer; }
+.asv-row-line.is-expandable:hover { background: var(--asv-hover); color: var(--asv-ink); }
+.agent-session-view .asv-row-trigger {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+}
 .asv-row-icon { display: inline-flex; flex: none; align-items: center; justify-content: center; width: 20px; height: 20px; color: var(--asv-ink-2); opacity: 0.85; }
 .asv-row-label { display: flex; flex: 1; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap; }
 .asv-row-label > * { flex: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -423,7 +443,9 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-row-status.is-approved { color: var(--asv-ok); }
 .asv-row-status.is-denied, .asv-row-status.is-expired { color: var(--asv-bad); }
 .asv-row-chevron { flex: none; opacity: 0; transition: transform 120ms ease, opacity 120ms ease; }
-.asv-row-line:hover .asv-row-chevron, .asv-row-line:focus-visible .asv-row-chevron, .asv-row[data-open] > .asv-row-line .asv-row-chevron { opacity: 0.7; }
+.asv-row-line:hover .asv-row-chevron,
+.asv-row-line:focus-within .asv-row-chevron,
+.asv-row[data-open] > .asv-row-line .asv-row-chevron { opacity: 0.7; }
 .asv-row[data-open] > .asv-row-line .asv-row-chevron { transform: rotate(90deg); }
 .asv-row[data-tone="bad"] > .asv-row-line .asv-row-icon { color: var(--asv-bad); opacity: 1; }
 .asv-row[data-tone="warn"] > .asv-row-line .asv-row-icon { color: var(--asv-warn); opacity: 1; }
@@ -472,12 +494,16 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 }
 .asv-group-body { display: flex; flex-direction: column; min-width: 0; margin-left: 9px; padding-left: 12px; border-left: 1px solid var(--asv-line); }
 
-/* Clickable workspace file target pill inside work-log rows. */
-.asv-file-pill {
+/* Clickable workspace file target pill inside work-log rows; sits above `.asv-row-trigger`. */
+.agent-session-view .asv-file-pill {
+  position: relative;
+  z-index: 2;
   display: inline-flex;
   align-items: center;
   max-width: 100%;
   min-width: 0;
+  min-height: 0;
+  height: auto;
   padding: 0 6px;
   border: 1px solid color-mix(in srgb, var(--asv-ink) 10%, transparent);
   border-radius: 5px;
@@ -492,19 +518,19 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
   cursor: pointer;
   transition: border-color 120ms ease, color 120ms ease, background-color 120ms ease;
 }
-.asv-file-pill:hover {
+.agent-session-view .asv-file-pill:hover {
   border-color: color-mix(in srgb, var(--workspace-accent) 42%, transparent);
   background: color-mix(in srgb, var(--workspace-accent) 8%, var(--asv-tint));
   color: var(--workspace-accent);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
-.asv-file-pill.is-static {
+.agent-session-view .asv-file-pill.is-static {
   cursor: default;
   opacity: 0.75;
   text-decoration: line-through;
 }
-.asv-file-pill.is-static:hover {
+.agent-session-view .asv-file-pill.is-static:hover {
   border-color: color-mix(in srgb, var(--asv-ink) 10%, transparent);
   background: var(--asv-tint);
   color: var(--asv-ink);
@@ -779,6 +805,7 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 
 .asv-dock {
   position: absolute;
+  z-index: 4;
   inset: auto 0 0;
   padding: 0 var(--asv-gutter) 6px;
   background: linear-gradient(to bottom, transparent, var(--workspace-bg) 28px);
@@ -1212,6 +1239,7 @@ html.handheld .agent-session-view .asv-pop-row { min-height: 44px; }
 
 .asv-to-bottom {
   position: absolute;
+  z-index: 5;
   left: 50%;
   display: inline-flex;
   align-items: center;

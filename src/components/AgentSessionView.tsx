@@ -141,17 +141,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       latestResponseKey: latest,
     };
   }, [timeline?.turns]);
-  const replyReveals = useSessionReplyReveals(assistantRowKeys, loadedAssistantIds, !loading);
-
-  const session = useMemo(() => ({
-    cwd, appearance, onNotify, fileLinkExistence,
-    ...(sessionId ? {
-      resolveApproval: async (requestId: string, allow: boolean, reason?: string) =>
-        (await window.vibeMeet?.agentSessions?.respond({ id: sessionId, requestId, allow, ...(reason ? { reason } : {}) }))
-          ?? { ok: false, error: '会话接口不可用' },
-    } : {}),
-    ...(canEdit ? { editMessage } : {}),
-  }), [cwd, appearance, onNotify, fileLinkExistence, sessionId, canEdit, editMessage]);
+  const replyReveals = useSessionReplyReveals(assistantRowKeys, loadedAssistantIds, !loading && timeline !== null);
 
   const dockRef = useRef<HTMLDivElement>(null);
   const [dockHeight, setDockHeight] = useState(0);
@@ -167,6 +157,17 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   }, []);
   const composerInset = dockHeight + DOCK_GAP;
   const scroll = useTimelineScroll({ lastTurnKey: timeline?.turns.at(-1)?.key ?? null, composerInset });
+
+  const session = useMemo(() => ({
+    cwd, appearance, onNotify, fileLinkExistence,
+    scrollElementToTop: scroll.scrollElementToTop,
+    ...(sessionId ? {
+      resolveApproval: async (requestId: string, allow: boolean, reason?: string) =>
+        (await window.vibeMeet?.agentSessions?.respond({ id: sessionId, requestId, allow, ...(reason ? { reason } : {}) }))
+          ?? { ok: false, error: '会话接口不可用' },
+    } : {}),
+    ...(canEdit ? { editMessage } : {}),
+  }), [cwd, appearance, onNotify, fileLinkExistence, scroll.scrollElementToTop, sessionId, canEdit, editMessage]);
 
   const [busy, setBusy] = useState<string | null>(null);
   const api = window.vibeMeet?.orchestration;

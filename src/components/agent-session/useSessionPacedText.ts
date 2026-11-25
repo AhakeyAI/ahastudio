@@ -15,7 +15,7 @@ import {
 import { SessionReplyRevealsContext } from './session-disclosure-store';
 
 const WORD_FADE_MS = 300;
-const useIsomorphicLayoutEffect = typeof window !== 'undefined' ? useLayoutEffect : useEffect;
+const useIsomorphicLayoutEffect = typeof document !== 'undefined' ? useLayoutEffect : useEffect;
 
 const FRAMES: NativeChatTextRevealFrames = {
   now: () => (typeof performance !== 'undefined' ? performance.now() : Date.now()),

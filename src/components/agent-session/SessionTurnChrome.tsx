@@ -16,25 +16,31 @@ import { useSessionDisclosure } from './session-disclosure-store';
 
 /** Turn working clock beneath the prompt; once settled with folded steps, toggles turn process details. */
 export const SessionTurnStatusBar = memo(function SessionTurnStatusBar({
-  turn,
+  status: turnStatus,
+  startedAt,
+  completedAt,
+  commandKind,
   foldable,
   expanded,
   summaryHint,
   onToggleExpanded,
 }: {
-  turn: Pick<WorkerTimelineTurn, 'key' | 'status' | 'startedAt' | 'completedAt' | 'commandKind'>;
+  status: WorkerTimelineTurn['status'];
+  startedAt: number;
+  completedAt: number | null;
+  commandKind?: WorkerTimelineTurn['commandKind'];
   foldable: boolean;
   expanded: boolean;
   summaryHint?: string;
   onToggleExpanded?: () => void;
 }) {
-  const active = turn.status === 'running';
+  const active = turnStatus === 'running';
   const now = useSharedNow(1_000, active);
   const [fallbackStartedAt] = useState(() => Date.now());
   const elapsedSeconds = active
-    ? Math.max(0, Math.floor((now - (turn.startedAt || fallbackStartedAt)) / 1000))
+    ? Math.max(0, Math.floor((now - (startedAt > 0 ? startedAt : fallbackStartedAt)) / 1000))
     : 0;
-  const status = describeTurnStatus(turn, elapsedSeconds);
+  const status = describeTurnStatus({ status: turnStatus, startedAt, completedAt, commandKind }, elapsedSeconds);
   const interactive = !active && foldable && Boolean(onToggleExpanded);
 
   const inner = (
@@ -62,6 +68,7 @@ export const SessionTurnStatusBar = memo(function SessionTurnStatusBar({
           className={`asv-turn-bar is-interactive is-${status.tone}`}
           data-asv-turn-status="settled"
           aria-expanded={expanded}
+          data-asv-disclosure-scope-trigger="true"
           aria-label={`${status.label}，展开或收起本轮过程详情`}
           onClick={onToggleExpanded}
         >

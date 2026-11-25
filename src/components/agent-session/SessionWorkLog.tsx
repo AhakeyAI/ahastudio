@@ -2,7 +2,7 @@
 // bounded reasoning disclosure, and notice cards adapted from Orca (https://github.com/stablyai/orca).
 // Copyright (c) 2026 Lovecast Inc. — MIT License. See THIRD_PARTY_NOTICES.md.
 
-import { memo, useLayoutEffect, useRef, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react';
+import { memo, useId, useLayoutEffect, useRef, type ReactNode } from 'react';
 import {
   Bot,
   Brain,
@@ -85,7 +85,7 @@ export function LiveTimer({ startedAt }: { startedAt: number }) {
   return <span className="asv-row-time">{formatElapsed(startedAt, now)}</span>;
 }
 
-/** Clickable workspace file pill inside a work-log row; stops propagation so opening does not toggle the row. */
+/** Clickable workspace file pill inside a work-log row; sits above the row trigger so opening never toggles the row. */
 export function SessionToolFileTarget({
   path,
   label,
@@ -96,7 +96,7 @@ export function SessionToolFileTarget({
   openable?: boolean;
 }) {
   const session = useAgentSession();
-  const shown = label ?? summarizeDisplayPath(path);
+  const shown = label ? summarizeDisplayPath(label) : summarizeDisplayPath(path);
   if (!openable) {
     return (
       <span className="asv-file-pill is-static" title={path}>
@@ -104,27 +104,19 @@ export function SessionToolFileTarget({
       </span>
     );
   }
-  const open = (event: MouseEvent | KeyboardEvent) => {
-    event.stopPropagation();
-    void openSessionTarget(path, session);
-  };
   return (
-    <span
-      role="link"
-      tabIndex={0}
+    <button
+      type="button"
       className="asv-file-pill"
       title={path}
       aria-label={`打开文件 ${path}`}
-      onClick={open}
-      onKeyDown={(event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          open(event);
-        }
+      onClick={(event) => {
+        event.stopPropagation();
+        void openSessionTarget(path, session);
       }}
     >
       {shown}
-    </span>
+    </button>
   );
 }
 
@@ -155,6 +147,7 @@ export function WorkLogRow({
   defaultOpen = false,
   disclosureKey,
   hasDetail,
+  tooltip,
   renderDetail,
   children,
 }: {
@@ -166,29 +159,33 @@ export function WorkLogRow({
   defaultOpen?: boolean;
   disclosureKey?: string;
   hasDetail?: boolean;
+  /** Optional full hover tooltip placed on the overlay expand button. */
+  tooltip?: string;
   /** Lazily evaluated only when the row is expanded, avoiding work on collapsed rows. */
   renderDetail?: () => ReactNode;
   children?: ReactNode;
 }) {
+  const labelId = useId();
   const { open, setOpen } = useSessionDisclosure(disclosureKey, defaultOpen);
   const expandable = hasDetail ?? Boolean(renderDetail || children);
-  const line = (
-    <>
-      <span className="asv-row-icon">{icon}</span>
-      <span className={`asv-row-label${wrap ? ' is-wrap' : ''}`}>{label}</span>
-      {trailing && <span className="asv-row-trailing">{trailing}</span>}
-      {expandable && <ChevronRight size={13} className="asv-row-chevron" aria-hidden="true" />}
-    </>
-  );
   return (
     <div className="asv-row" data-asv-row data-open={open || undefined} data-tone={tone}>
-      {expandable ? (
-        <button type="button" className="asv-row-line" aria-expanded={open} onClick={() => setOpen(!open)}>
-          {line}
-        </button>
-      ) : (
-        <div className="asv-row-line">{line}</div>
-      )}
+      <div className={`asv-row-line${expandable ? ' is-expandable' : ''}`}>
+        {expandable && (
+          <button
+            type="button"
+            className="asv-row-trigger"
+            aria-expanded={open}
+            aria-labelledby={labelId}
+            title={tooltip}
+            onClick={() => setOpen(!open)}
+          />
+        )}
+        <span className="asv-row-icon">{icon}</span>
+        <span id={labelId} className={`asv-row-label${wrap ? ' is-wrap' : ''}`}>{label}</span>
+        {trailing && <span className="asv-row-trailing">{trailing}</span>}
+        {expandable && <ChevronRight size={13} className="asv-row-chevron" aria-hidden="true" />}
+      </div>
       {expandable && open && <div className="asv-row-detail">{renderDetail ? renderDetail() : children}</div>}
     </div>
   );
@@ -280,6 +277,7 @@ function CommandRow({ item, turnKey }: { item: Item<'command'>; turnKey?: string
       tone={failed || item.status === 'failed' ? 'bad' : undefined}
       disclosureKey={disclosureKey}
       hasDetail={hasDetail}
+      tooltip={line.targetTitle || undefined}
       label={
         <>
           {line.verb && <span className={live ? 'asv-shimmer' : undefined}>{line.verb}</span>}
@@ -305,14 +303,15 @@ function CommandRow({ item, turnKey }: { item: Item<'command'>; turnKey?: string
 }
 
 function ToolDetail({ item, live, filePath }: { item: Item<'tool_call'>; live: boolean; filePath?: string }) {
-  const inlineDiff =
-    extractInlineDiffFromText(item.args) ?? (!live ? extractInlineDiffFromText(item.output) : null);
-  const formattedArgs = item.args ? formatLazyToolArgs(item.args) : '';
+  const argsDiff = extractInlineDiffFromText(item.args);
+  const outputDiff = !live && !argsDiff ? extractInlineDiffFromText(item.output) : null;
+  const inlineDiff = argsDiff ?? outputDiff;
+  const formattedArgs = !argsDiff && item.args ? formatLazyToolArgs(item.args) : '';
   return (
     <>
       {inlineDiff && <DiffBlock diff={inlineDiff} path={filePath} />}
-      {!inlineDiff && formattedArgs && <pre className="asv-output is-command">{formattedArgs}</pre>}
-      {item.output && (!inlineDiff || extractInlineDiffFromText(item.output) === null) && (
+      {formattedArgs && <pre className="asv-output is-command">{formattedArgs}</pre>}
+      {item.output && !outputDiff && (
         <LiveOutput text={item.output} live={live} />
       )}
       {item.error && <div className="asv-detail-error">{item.error}</div>}
@@ -332,6 +331,7 @@ function ToolRow({ item, turnKey }: { item: Item<'tool_call'>; turnKey?: string 
       tone={failed ? 'bad' : undefined}
       disclosureKey={disclosureKey}
       hasDetail={hasDetail}
+      tooltip={line.targetTitle || undefined}
       label={
         <>
           <span className={live ? 'asv-shimmer' : undefined}>{line.verb}</span>
@@ -384,12 +384,12 @@ function FileDiff({ file }: { file: WorkerTimelineFileChange }) {
 export function FileChangeRows({ files, keyPrefix }: { files: readonly WorkerTimelineFileChange[]; keyPrefix?: string }) {
   return (
     <div className="asv-row-list">
-      {files.map((file) => {
+      {files.map((file, index) => {
         const target = file.movePath ?? file.path;
         return (
           <WorkLogRow
-            key={file.path}
-            disclosureKey={keyPrefix ? `${keyPrefix}:file:${file.path}` : undefined}
+            key={`${file.path}:${index}`}
+            disclosureKey={keyPrefix ? `${keyPrefix}:file:${file.path}:${index}` : undefined}
             hasDetail={Boolean(file.diff)}
             icon={<FilePenLine {...ICON} />}
             label={
@@ -582,9 +582,8 @@ export function WorkGroup({
     >
       <button
         type="button"
-        className="asv-row-line asv-group-head"
+        className="asv-row-line is-expandable asv-group-head"
         aria-expanded={open}
-        aria-live="polite"
         onClick={() => setOpen(!open)}
       >
         <span className="asv-row-icon">

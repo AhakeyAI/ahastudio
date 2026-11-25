@@ -78,7 +78,7 @@ const PLAN_TOOLS = new Set(['todowrite', 'todo_write', 'update_plan']);
 const COMMAND_TOOLS = new Set(['exec', 'bash', 'shell', 'local_shell', 'run_command', 'terminal']);
 
 const SHELL_CHAIN_RE = /[|;&><`\n]/;
-const SIMPLE_READ_CMD_RE = /^(?:cat|head|tail|nl|bat|get-content|gc|type)\b/i;
+const SIMPLE_READ_CMD_RE = /^(?:cat|head|tail|nl|bat|get-content|gc|type|sed)\b/i;
 const SIMPLE_SEARCH_CMD_RE = /^(?:rg|grep|egrep|fgrep|ack|ag|findstr|select-string|sls|git\s+grep)\b/i;
 const SIMPLE_LIST_CMD_RE = /^(?:ls|dir|tree|get-childitem|gci|find)\b/i;
 
@@ -132,18 +132,67 @@ function tokenizeSimpleShell(command: string): string[] {
   return tokens;
 }
 
-/** Extract a single file path from simple read commands like `cat src/a.ts` or `Get-Content src/a.ts`. */
+function readFlagTakesValue(cmd: string, flag: string): boolean {
+  switch (cmd) {
+    case 'head':
+    case 'tail':
+      return /^-(?:n|c|-?lines|-?bytes)$/i.test(flag);
+    case 'get-content':
+    case 'gc':
+      return /^-(?:totalcount|head|tail|first|last|encoding|readcount|delimiter)$/i.test(flag);
+    case 'bat':
+      return /^-(?:r|-?line-range|l|-?language|-?theme)$/i.test(flag);
+    case 'nl':
+      return /^-(?:b|w|s|v|i)$/i.test(flag);
+    default:
+      // `cat -n` / `cat -b` and `type` take no separate value arguments.
+      return false;
+  }
+}
+
+function looksLikeSingleFileTarget(target: string): boolean {
+  if (!target || target === '-' || target.startsWith('$') || /[*?]/.test(target)) return false;
+  return /[\\/]/.test(target) || /\.[a-z0-9]{1,10}$/i.test(target);
+}
+
+/** Extract a single file path from simple read commands like `cat -n src/a.ts`, `sed -n '1,80p' src/a.ts`, or `Get-Content src/a.ts`. */
 export function extractReadCommandFilePath(unwrappedCommand: string): string | null {
   if (!unwrappedCommand || SHELL_CHAIN_RE.test(unwrappedCommand)) return null;
   if (!SIMPLE_READ_CMD_RE.test(unwrappedCommand)) return null;
   const tokens = tokenizeSimpleShell(unwrappedCommand);
   if (tokens.length < 2) return null;
+  const cmd = stripQuotes(tokens[0]!).toLowerCase();
+
+  // Strictly match read-only `sed -n '<range>p' <file>` without in-place or multi-script flags.
+  if (cmd === 'sed') {
+    let hasQuiet = false;
+    const positional: string[] = [];
+    for (let i = 1; i < tokens.length; i += 1) {
+      const raw = tokens[i]!;
+      if (raw === '-n' || raw === '--quiet' || raw === '--silent') {
+        hasQuiet = true;
+        continue;
+      }
+      if (raw.startsWith('-')) return null;
+      positional.push(stripQuotes(raw));
+    }
+    if (!hasQuiet || positional.length !== 2) return null;
+    if (!/^\d+(?:,(?:\d+|\$))?p$/.test(positional[0]!)) return null;
+    const target = positional[1]!;
+    return looksLikeSingleFileTarget(target) ? target : null;
+  }
+
   const positional: string[] = [];
   for (let i = 1; i < tokens.length; i += 1) {
     const raw = tokens[i]!;
+    if (raw === '--') {
+      for (let j = i + 1; j < tokens.length; j += 1) {
+        positional.push(stripQuotes(tokens[j]!));
+      }
+      break;
+    }
     if (raw.startsWith('-')) {
-      // Skip value argument for flags like `-n 50` or `-TotalCount 20`.
-      if (/^-(?:n|c|lines|bytes|totalcount|head|tail|first|last)$/i.test(raw)) {
+      if (readFlagTakesValue(cmd, raw)) {
         i += 1;
       }
       continue;
@@ -152,11 +201,7 @@ export function extractReadCommandFilePath(unwrappedCommand: string): string | n
   }
   if (positional.length !== 1) return null;
   const target = positional[0]!;
-  if (!target || target === '-' || target.startsWith('$') || /[*?]/.test(target)) return null;
-  if (/[\\/]/.test(target) || /\.[a-z0-9]{1,10}$/i.test(target)) {
-    return target;
-  }
-  return null;
+  return looksLikeSingleFileTarget(target) ? target : null;
 }
 
 export function classifyWorkItem(item: WorkerTimelineItem): WorkCategory | null {
@@ -570,18 +615,129 @@ export function formatLazyToolArgs(args: string): string {
     : formatted;
 }
 
-/** Detect an inline unified diff inside a tool call's arguments or output when expanded. */
+const UNIFIED_HUNK_LINE_RE = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m;
+const STANDALONE_DIFF_START_RE = /^(?:diff --git |--- [^\n]+\n\+\+\+ |@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@|\*\*\* Begin Patch\b)/;
+
+function splitDiffLines(text: string): string[] {
+  if (!text) return [];
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  return lines;
+}
+
+/** Convert Codex `*** Begin Patch` blocks into standard unified hunks that `parseUnifiedDiff` highlights cleanly. */
+function convertApplyPatchToUnifiedDiff(patch: string): string | null {
+  const lines = patch.replace(/\r\n/g, '\n').split('\n');
+  const out: string[] = [];
+  let inHunk = false;
+  let hunkHeaderTail = '';
+  let hunkLines: string[] = [];
+  let sawChange = false;
+
+  const flushHunk = () => {
+    if (!inHunk) return;
+    let oldCount = 0;
+    let newCount = 0;
+    for (const line of hunkLines) {
+      if (line.startsWith('+')) newCount += 1;
+      else if (line.startsWith('-')) oldCount += 1;
+      else if (!line.startsWith('\\')) {
+        oldCount += 1;
+        newCount += 1;
+      }
+    }
+    if (oldCount > 0 || newCount > 0) {
+      out.push(`@@ -1,${oldCount} +1,${newCount} @@${hunkHeaderTail}`);
+      out.push(...hunkLines);
+      sawChange = true;
+    }
+    inHunk = false;
+    hunkHeaderTail = '';
+    hunkLines = [];
+  };
+
+  for (const line of lines) {
+    if (line.startsWith('*** Begin Patch') || line.startsWith('*** End Patch')) {
+      flushHunk();
+      continue;
+    }
+    const fileMatch = /^\*\*\* (?:Update|Add|Delete) File:\s*(.+)$/.exec(line);
+    if (fileMatch) {
+      flushHunk();
+      const file = fileMatch[1]!.trim();
+      out.push(`--- a/${file}`, `+++ b/${file}`);
+      continue;
+    }
+    if (line.startsWith('*** Move to:')) {
+      continue;
+    }
+    if (line.startsWith('@@')) {
+      flushHunk();
+      inHunk = true;
+      hunkHeaderTail = line.length > 2 ? line.slice(2) : '';
+      continue;
+    }
+    if (inHunk) {
+      if (line.startsWith('+') || line.startsWith('-') || line.startsWith(' ') || line.startsWith('\\')) {
+        hunkLines.push(line);
+      } else if (line === '') {
+        hunkLines.push(' ');
+      }
+    } else if (line.startsWith('+') || line.startsWith('-')) {
+      // `*** Add File` blocks in apply_patch omit an explicit `@@` header.
+      inHunk = true;
+      hunkHeaderTail = '';
+      hunkLines.push(line);
+    }
+  }
+  flushHunk();
+  return sawChange ? out.join('\n') : null;
+}
+
+function synthesizeReplacementDiff(oldText: string, newText: string): string | null {
+  if (oldText === newText) return null;
+  const oldLines = splitDiffLines(oldText);
+  const newLines = splitDiffLines(newText);
+  if (oldLines.length === 0 && newLines.length === 0) return null;
+  return [
+    `@@ -1,${oldLines.length} +1,${newLines.length} @@`,
+    ...oldLines.map((line) => `-${line}`),
+    ...newLines.map((line) => `+${line}`),
+  ].join('\n');
+}
+
+function normalizeStandaloneDiff(text: string): string | null {
+  const normalized = text.replace(/\r\n/g, '\n');
+  const trimmedStart = normalized.replace(/^\s+/, '');
+  if (!STANDALONE_DIFF_START_RE.test(trimmedStart)) return null;
+  if (trimmedStart.startsWith('*** Begin Patch')) {
+    return convertApplyPatchToUnifiedDiff(trimmedStart);
+  }
+  return UNIFIED_HUNK_LINE_RE.test(trimmedStart) ? trimmedStart : null;
+}
+
+/** Detect an inline unified diff inside a tool call's arguments or standalone diff output when expanded. */
 export function extractInlineDiffFromText(text: string): string | null {
   if (!text) return null;
-  const normalized = text.replace(/\r\n/g, '\n');
-  if (normalized.includes('diff --git ') || /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m.test(normalized)) {
-    return normalized;
-  }
-  const obj = parseToolArgsObject(normalized);
-  if (obj && typeof obj.patch === 'string' && obj.patch.trim()) {
+  const standalone = normalizeStandaloneDiff(text);
+  if (standalone) return standalone;
+  const obj = parseToolArgsObject(text);
+  if (!obj) return null;
+  if (typeof obj.patch === 'string' && obj.patch.trim()) {
     const patch = obj.patch.replace(/\r\n/g, '\n');
-    if (patch.includes('@@') || patch.includes('*** Begin Patch')) {
-      return patch;
+    const converted = normalizeStandaloneDiff(patch);
+    if (converted) return converted;
+    if (patch.includes('@@')) return convertApplyPatchToUnifiedDiff(patch);
+  }
+  const pairs: Array<[unknown, unknown]> = [
+    [obj.old_string, obj.new_string],
+    [obj.old_str, obj.new_str],
+    [obj.oldText, obj.newText],
+  ];
+  for (const [oldVal, newVal] of pairs) {
+    if (typeof oldVal === 'string' && typeof newVal === 'string') {
+      const diff = synthesizeReplacementDiff(oldVal, newVal);
+      if (diff) return diff;
     }
   }
   return null;

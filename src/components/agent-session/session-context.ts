@@ -14,6 +14,8 @@ export interface AgentSessionContextValue {
   resolveApproval?: (approvalId: string, allow: boolean, reason?: string) => Promise<{ ok: boolean; error?: string }>;
   /** Direct sessions only: puts an earlier message back in the composer so it can be edited and sent again. */
   editMessage?: (text: string) => void;
+  /** Scroll a timeline row's top cleanly to the anchor offset while releasing stick-to-bottom. */
+  scrollElementToTop?: (el: HTMLElement) => void;
 }
 
 export const AgentSessionContext = createContext<AgentSessionContextValue>({ cwd: null, appearance: 'light' });

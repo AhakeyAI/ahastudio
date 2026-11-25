@@ -8,21 +8,14 @@ type ClockEntry = {
   listeners: Set<() => void>;
   timer: ReturnType<typeof setInterval> | null;
   onVisibility: (() => void) | null;
+  subscribe: (listener: () => void) => () => void;
+  getSnapshot: () => number;
 };
 
 const clocks = new Map<number, ClockEntry>();
 
 function isDocumentVisible(): boolean {
   return typeof document === 'undefined' || document.visibilityState !== 'hidden';
-}
-
-function getClock(intervalMs: number): ClockEntry {
-  let entry = clocks.get(intervalMs);
-  if (!entry) {
-    entry = { now: Date.now(), listeners: new Set(), timer: null, onVisibility: null };
-    clocks.set(intervalMs, entry);
-  }
-  return entry;
 }
 
 function notifyClock(entry: ClockEntry): void {
@@ -44,44 +37,60 @@ function stopClock(entry: ClockEntry): void {
   }
 }
 
+function getClock(intervalMs: number): ClockEntry {
+  let entry = clocks.get(intervalMs);
+  if (!entry) {
+    const created: ClockEntry = {
+      now: Date.now(),
+      listeners: new Set(),
+      timer: null,
+      onVisibility: null,
+      subscribe: (listener: () => void) => {
+        const wasEmpty = created.listeners.size === 0;
+        created.listeners.add(listener);
+        if (wasEmpty) {
+          created.now = Date.now();
+          startClock(intervalMs, created);
+          if (typeof document !== 'undefined') {
+            created.onVisibility = () => {
+              if (isDocumentVisible()) {
+                notifyClock(created);
+                startClock(intervalMs, created);
+              } else {
+                stopClock(created);
+              }
+            };
+            document.addEventListener('visibilitychange', created.onVisibility);
+          }
+        }
+        return () => {
+          created.listeners.delete(listener);
+          if (created.listeners.size === 0) {
+            stopClock(created);
+            if (created.onVisibility && typeof document !== 'undefined') {
+              document.removeEventListener('visibilitychange', created.onVisibility);
+              created.onVisibility = null;
+            }
+          }
+        };
+      },
+      getSnapshot: () => created.now,
+    };
+    clocks.set(intervalMs, created);
+    entry = created;
+  }
+  return entry;
+}
+
 const noopSubscribe = () => () => {};
+const getInactiveSnapshot = () => 0;
 
 /** Shared visibility-gated epoch clock; pauses intervals in hidden tabs and catches up on focus. */
 export function useSharedNow(intervalMs = 1_000, active = true): number {
-  const subscribe = (listener: () => void) => {
-    const entry = getClock(intervalMs);
-    const wasEmpty = entry.listeners.size === 0;
-    entry.listeners.add(listener);
-    if (wasEmpty) {
-      entry.now = Date.now();
-      startClock(intervalMs, entry);
-      if (typeof document !== 'undefined') {
-        entry.onVisibility = () => {
-          if (isDocumentVisible()) {
-            notifyClock(entry);
-            startClock(intervalMs, entry);
-          } else {
-            stopClock(entry);
-          }
-        };
-        document.addEventListener('visibilitychange', entry.onVisibility);
-      }
-    }
-    return () => {
-      entry.listeners.delete(listener);
-      if (entry.listeners.size === 0) {
-        stopClock(entry);
-        if (entry.onVisibility && typeof document !== 'undefined') {
-          document.removeEventListener('visibilitychange', entry.onVisibility);
-          entry.onVisibility = null;
-        }
-      }
-    };
-  };
-
+  const clock = active ? getClock(intervalMs) : null;
   return useSyncExternalStore(
-    active ? subscribe : noopSubscribe,
-    () => (active ? getClock(intervalMs).now : Date.now()),
-    () => Date.now(),
+    clock ? clock.subscribe : noopSubscribe,
+    clock ? clock.getSnapshot : getInactiveSnapshot,
+    getInactiveSnapshot,
   );
 }

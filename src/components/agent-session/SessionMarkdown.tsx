@@ -4,8 +4,10 @@
 
 import {
   Children,
+  createContext,
   isValidElement,
   memo,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -18,6 +20,7 @@ import {
 } from 'react';
 import Markdown, { type Components, type ExtraProps, type Options } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { parseFileLinkLocation } from '../../lib/shared/file-links/file-link-location';
 import {
   linkNativeChatFilePaths,
   rewriteFileDestinationLinks,
@@ -31,7 +34,7 @@ import { CodeBlock } from './SessionCode';
 import { openSessionTarget, useAgentSession } from './session-context';
 
 const WORD_FADE_SETTLE_MS = 300;
-const useIsomorphicLayoutEffect = typeof window !== 'undefined' ? useLayoutEffect : useEffect;
+const useIsomorphicLayoutEffect = typeof document !== 'undefined' ? useLayoutEffect : useEffect;
 
 /** Elements whose renderers read their text directly or fade as one unit. */
 const UNSPLIT_TAGS = new Set(['a', 'code', 'pre', 'kbd', 'svg', 'math']);
@@ -217,27 +220,37 @@ function useWorkspaceFileLinkExists(
   return streaming ? snapshot.peek : snapshot.check;
 }
 
+export interface ResolvedSessionLinkTarget {
+  /** Human-readable target shown in the tooltip (retains `:line[:column]` when present). */
+  title: string;
+  /** Target passed to `shellPty.openLink` (strips `:line[:column]` so Windows/POSIX local path resolution succeeds). */
+  openTarget: string;
+  isFile: boolean;
+}
+
 /** Target handed to the main process, or null when the href is not something we open. */
-function linkTarget(href: string | undefined): { target: string; isFile: boolean } | null {
+export function resolveSessionLinkTarget(href: string | undefined): ResolvedSessionLinkTarget | null {
   const route = routeNativeChatHref(href);
-  if (route.kind === 'web') return { target: route.url, isFile: false };
+  if (route.kind === 'web') return { title: route.url, openTarget: route.url, isFile: false };
   if (route.kind === 'file') {
-    return {
-      target: route.line ? `${route.pathText}:${route.line}` : route.pathText,
-      isFile: true,
-    };
+    const title = route.line ? `${route.pathText}:${route.line}` : route.pathText;
+    const openTarget =
+      route.pathKind === 'literal'
+        ? route.pathText
+        : (parseFileLinkLocation(route.pathText)?.pathText ?? route.pathText);
+    return { title, openTarget, isFile: true };
   }
   return null;
 }
 
 /** Hrefs are kept only as data: every link is opened through IPC and never navigates the window. */
-const keepRoutableHref = (url: string): string => (linkTarget(url) ? url : '');
+const keepRoutableHref = (url: string): string => (resolveSessionLinkTarget(url) ? url : '');
 
 function SessionLink({ href, children }: { href?: string; children?: ReactNode }) {
   const session = useAgentSession();
-  const resolved = linkTarget(href);
+  const resolved = resolveSessionLinkTarget(href);
   if (!resolved) return <span className="asv-md-deadlink">{children}</span>;
-  const open = () => void openSessionTarget(resolved.target, session);
+  const open = () => void openSessionTarget(resolved.openTarget, session);
   const onKeyDown = (event: KeyboardEvent) => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
@@ -250,7 +263,7 @@ function SessionLink({ href, children }: { href?: string; children?: ReactNode }
       data-file-link={resolved.isFile ? 'true' : undefined}
       role="link"
       tabIndex={0}
-      title={resolved.target}
+      title={resolved.title}
       onClick={open}
       onKeyDown={onKeyDown}
     >
@@ -259,43 +272,65 @@ function SessionLink({ href, children }: { href?: string; children?: ReactNode }
   );
 }
 
-function createMarkdownComponents(options: {
+interface SessionMarkdownMeta {
   rowKey?: string;
   plainCode: boolean;
-  fadeWords: boolean;
-}): Components {
-  const { rowKey, plainCode, fadeWords } = options;
-  return {
-    a: ({ href, children }) => <SessionLink href={href}>{children}</SessionLink>,
-    // Remote images would fetch on render, so they are shown as a link to open on request.
-    img: ({ src, alt }) => (
-      <SessionLink href={typeof src === 'string' ? src : undefined}>{alt || '图片'}</SessionLink>
-    ),
-    table: ({ children }) => (
-      <div className="asv-md-table">
-        <table>{children}</table>
-      </div>
-    ),
-    pre: ({ node, children }) => {
-      const child = Children.toArray(children)[0];
-      if (!isValidElement<{ className?: string; children?: ReactNode }>(child)) {
-        return <pre>{children}</pre>;
-      }
-      const info = /language-(\S+)/.exec(child.props.className ?? '')?.[1] ?? '';
-      const line = node?.position?.start?.line;
-      const disclosureKey = rowKey && line !== undefined ? `code-wrap:${rowKey}:${line}` : undefined;
-      return (
-        <CodeBlock
-          info={info}
-          code={String(child.props.children ?? '').replace(/\n$/, '')}
-          disclosureKey={disclosureKey}
-          plain={plainCode}
-        />
-      );
-    },
-    ...(fadeWords ? { span: SessionMarkdownWords } : {}),
-  };
 }
+
+const SessionMarkdownMetaContext = createContext<SessionMarkdownMeta>({ plainCode: false });
+
+function extractCodeText(children: ReactNode): string {
+  if (typeof children === 'string') return children;
+  if (Array.isArray(children)) return children.map((part) => (typeof part === 'string' ? part : String(part ?? ''))).join('');
+  return String(children ?? '');
+}
+
+const SessionMarkdownAnchor: NonNullable<Components['a']> = ({ href, children }) => (
+  <SessionLink href={href}>{children}</SessionLink>
+);
+
+// Remote images would fetch on render, so they are shown as a link to open on request.
+const SessionMarkdownImage: NonNullable<Components['img']> = ({ src, alt }) => (
+  <SessionLink href={typeof src === 'string' ? src : undefined}>{alt || '图片'}</SessionLink>
+);
+
+const SessionMarkdownTable: NonNullable<Components['table']> = ({ children }) => (
+  <div className="asv-md-table">
+    <table>{children}</table>
+  </div>
+);
+
+const SessionMarkdownPre: NonNullable<Components['pre']> = ({ node, children }) => {
+  const { rowKey, plainCode } = useContext(SessionMarkdownMetaContext);
+  const child = Children.toArray(children)[0];
+  if (!isValidElement<{ className?: string; children?: ReactNode }>(child)) {
+    return <pre>{children}</pre>;
+  }
+  const info = /language-(\S+)/.exec(child.props.className ?? '')?.[1] ?? '';
+  const line = node?.position?.start?.line;
+  const disclosureKey = rowKey && line !== undefined ? `code-wrap:${rowKey}:${line}` : undefined;
+  return (
+    <CodeBlock
+      info={info}
+      code={extractCodeText(child.props.children).replace(/\n$/, '')}
+      disclosureKey={disclosureKey}
+      plain={plainCode}
+    />
+  );
+};
+
+// Module-level component maps keep CodeBlock/table/link component identities constant when fadeWords flips.
+const STATIC_MARKDOWN_COMPONENTS: Components = {
+  a: SessionMarkdownAnchor,
+  img: SessionMarkdownImage,
+  table: SessionMarkdownTable,
+  pre: SessionMarkdownPre,
+};
+
+const FADE_MARKDOWN_COMPONENTS: Components = {
+  ...STATIC_MARKDOWN_COMPONENTS,
+  span: SessionMarkdownWords,
+};
 
 /**
  * Agent and task text as GitHub-flavoured Markdown. Raw HTML in the source is never parsed: it
@@ -334,31 +369,28 @@ export const SessionMarkdown = memo(function SessionMarkdown({
         : BASE_REMARK_PLUGINS,
     [resolvedExists],
   );
-  const components = useMemo(
-    () =>
-      createMarkdownComponents({
-        rowKey,
-        plainCode: variant === 'muted',
-        fadeWords,
-      }),
-    [rowKey, variant, fadeWords],
+  const meta = useMemo<SessionMarkdownMeta>(
+    () => ({ rowKey, plainCode: variant === 'muted' }),
+    [rowKey, variant],
   );
 
   return (
-    <div
-      className={`asv-md is-${variant}`}
-      data-streaming={streaming || undefined}
-      data-word-fade={wordFadeArmed ? '' : undefined}
-      data-block-fade={wordFadeArmed && streaming ? '' : undefined}
-    >
-      <Markdown
-        remarkPlugins={remarkPlugins}
-        rehypePlugins={fadeWords ? WORD_FADE_REHYPE_PLUGINS : undefined}
-        components={components}
-        urlTransform={keepRoutableHref}
+    <SessionMarkdownMetaContext.Provider value={meta}>
+      <div
+        className={`asv-md is-${variant}`}
+        data-streaming={streaming || undefined}
+        data-word-fade={wordFadeArmed ? '' : undefined}
+        data-block-fade={wordFadeArmed && streaming ? '' : undefined}
       >
-        {text}
-      </Markdown>
-    </div>
+        <Markdown
+          remarkPlugins={remarkPlugins}
+          rehypePlugins={fadeWords ? WORD_FADE_REHYPE_PLUGINS : undefined}
+          components={fadeWords ? FADE_MARKDOWN_COMPONENTS : STATIC_MARKDOWN_COMPONENTS}
+          urlTransform={keepRoutableHref}
+        >
+          {text}
+        </Markdown>
+      </div>
+    </SessionMarkdownMetaContext.Provider>
   );
 });

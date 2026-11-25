@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { build } from 'esbuild';
+import { resolveTerminalLinkPath } from '../dist-electron/ipc/shell-pty.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'aha-orca-transcript-'));
 test.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -38,6 +39,8 @@ const helpers = await bundleEntry(
     export * from './src/lib/session-turn-model.ts';
     export * from './src/lib/session-work-log-model.ts';
     export * from './src/lib/session-file-link-checker.ts';
+    export { parseUnifiedDiff } from './src/lib/git-panel-model.ts';
+    export { resolveSessionLinkTarget } from './src/components/agent-session/SessionMarkdown.tsx';
   `,
 );
 
@@ -504,4 +507,166 @@ test('SessionEmptyState has no hardcoded Codex copy and TurnView renders live re
   assert.match(failedHtml, /npm test/);
   assert.match(failedHtml, /role="alert"/);
   assert.match(failedHtml, /进程意外退出/);
+});
+
+test('regression checks: file link IPC target stripping, history zero timestamps, read flags, inline diffs, folding, and non-nested row triggers', () => {
+  // 1. File links strip `:line[:col]` for shell-pty:open-link while keeping `:line` in the tooltip.
+  const relLink = helpers.resolveSessionLinkTarget('src/auth/refresh.ts:18');
+  assert.deepEqual(relLink, {
+    title: 'src/auth/refresh.ts:18',
+    openTarget: 'src/auth/refresh.ts',
+    isFile: true,
+  });
+  const baseCwd = process.platform === 'win32' ? 'C:\\repo' : '/repo';
+  assert.ok(
+    resolveTerminalLinkPath(relLink.openTarget, baseCwd),
+    'stripped openTarget passes real electron resolveTerminalLinkPath',
+  );
+  const fileUriLink = helpers.resolveSessionLinkTarget('file:///C:/repo/src/auth/refresh.ts#L12');
+  assert.deepEqual(fileUriLink, {
+    title: 'C:/repo/src/auth/refresh.ts:12',
+    openTarget: 'C:/repo/src/auth/refresh.ts',
+    isFile: true,
+  });
+  const encodedLoc = helpers.resolveSessionLinkTarget('#aha-native-chat-file=src%2Fauth%2Frefresh.ts%3A18%3A5');
+  assert.deepEqual(encodedLoc, {
+    title: 'src/auth/refresh.ts:18:5',
+    openTarget: 'src/auth/refresh.ts',
+    isFile: true,
+  });
+  assert.deepEqual(helpers.resolveSessionLinkTarget('https://example.com/docs'), {
+    title: 'https://example.com/docs',
+    openTarget: 'https://example.com/docs',
+    isFile: false,
+  });
+
+  // 2. Reopened history turns with 0 or equal timestamps never show bogus `0s`, `1s`, or `1970-01-01` clock times.
+  assert.equal(
+    helpers.describeTurnStatus({ status: 'completed', startedAt: 0, completedAt: 0 }, 0).label,
+    '已完成',
+  );
+  assert.equal(
+    helpers.describeTurnStatus({ status: 'failed', startedAt: 0, completedAt: 0 }, 0).label,
+    '已失败',
+  );
+  assert.equal(
+    helpers.describeReasoningHeadline({ status: 'completed', startedAt: 0, completedAt: 0 }, { turnRunning: false }),
+    '已思考',
+  );
+  assert.equal(
+    helpers.describeReasoningHeadline({ status: 'completed', startedAt: 5_000, completedAt: 5_000 }, { turnRunning: false }),
+    '已思考',
+  );
+  const historyTurnHtml = ui.renderTurn({
+    turn: {
+      key: 'h1#1', dispatchId: 'h1', turnId: 't1', generation: 1, prompt: '历史问题',
+      startedAt: 0, completedAt: 0, status: 'completed', stopReason: null, usage: null, error: null,
+      items: [
+        { id: 'm1', kind: 'message', status: 'completed', role: 'assistant', text: '历史回复', startedAt: 0, completedAt: 0 },
+      ],
+    },
+    latestResponseKey: 'h1#1:m1',
+  });
+  assert.match(historyTurnHtml, /已完成/);
+  assert.doesNotMatch(historyTurnHtml, /已工作 0s/);
+  assert.doesNotMatch(historyTurnHtml, /<time\b/, 'epoch-0 historical items omit bogus 1970 clock timestamps');
+
+  // 3. Read command detection handles `cat -n`, PowerShell `-Encoding utf8 -Path`, and read-only `sed -n`, rejecting `sed -i`.
+  assert.equal(helpers.extractReadCommandFilePath('cat -n src/auth/refresh.ts'), 'src/auth/refresh.ts');
+  assert.equal(helpers.extractReadCommandFilePath('head -n 50 src/auth/refresh.ts'), 'src/auth/refresh.ts');
+  assert.equal(helpers.extractReadCommandFilePath('Get-Content -Encoding utf8 -Path src/auth/refresh.ts'), 'src/auth/refresh.ts');
+  assert.equal(helpers.extractReadCommandFilePath("sed -n '1,120p' src/auth/refresh.ts"), 'src/auth/refresh.ts');
+  assert.equal(helpers.extractReadCommandFilePath("sed -i 's/a/b/' src/auth/refresh.ts"), null);
+
+  // 4. Inline diff extraction ignores `@@` buried inside test failure logs, while normalizing apply_patch and old_string/new_string.
+  const testLog = 'FAIL tests/foo.test.mjs\n  × expected match\n@@ -1,2 +1,2 @@\n-old\n+new';
+  assert.equal(helpers.extractInlineDiffFromText(testLog), null, 'command test logs are not truncated by DiffBlock');
+
+  const applyPatchArgs = JSON.stringify({
+    patch: '*** Begin Patch\n*** Update File: src/a.ts\n@@\n const a = 1;\n-const b = 2;\n+const b = 3;\n*** End Patch',
+  });
+  const normalizedPatch = helpers.extractInlineDiffFromText(applyPatchArgs);
+  assert.ok(normalizedPatch, 'Codex apply_patch args normalize to unified diff');
+  const patchRows = helpers.parseUnifiedDiff(normalizedPatch);
+  assert.ok(patchRows.some((r) => r.kind === 'hunk'));
+  assert.ok(patchRows.some((r) => r.kind === 'del' && r.text === 'const b = 2;'));
+  assert.ok(patchRows.some((r) => r.kind === 'add' && r.text === 'const b = 3;'));
+
+  const editArgs = JSON.stringify({ file_path: 'src/a.ts', old_string: 'oldVal()', new_string: 'newVal()' });
+  const editDiff = helpers.extractInlineDiffFromText(editArgs);
+  assert.ok(editDiff, 'old_string/new_string tool args synthesize a unified diff');
+  const editRows = helpers.parseUnifiedDiff(editDiff);
+  assert.ok(editRows.some((r) => r.kind === 'del' && r.text === 'oldVal()'));
+  assert.ok(editRows.some((r) => r.kind === 'add' && r.text === 'newVal()'));
+
+  // 5. Back-to-back pre-tool narration folds cleanly together; back-to-back final replies stay visible; unexplained declined steps never hide.
+  const preToolFold = helpers.planTurnFold(
+    {
+      status: 'completed',
+      items: [
+        { id: 'm1', kind: 'message', status: 'completed', role: 'assistant', text: '第一步检查。', startedAt: 1, completedAt: 2 },
+        { id: 'm2', kind: 'message', status: 'completed', role: 'assistant', text: '马上执行命令。', startedAt: 2, completedAt: 3 },
+        { id: 'c1', kind: 'command', status: 'completed', command: 'npm test', cwd: null, output: 'ok', outputTruncated: false, exitCode: 0, durationMs: 10, startedAt: 3, completedAt: 4 },
+        { id: 'm3', kind: 'message', status: 'completed', role: 'assistant', text: '全部通过。', startedAt: 4, completedAt: 5 },
+      ],
+    },
+    { hasChangesCard: false },
+  );
+  assert.equal(preToolFold.foldedItemIds.has('m1'), true, 'earlier pre-tool narration folds');
+  assert.equal(preToolFold.foldedItemIds.has('m2'), true, 'later pre-tool narration folds');
+  assert.equal(preToolFold.foldedItemIds.has('m3'), false, 'final reply stays visible');
+
+  const multiFinalAnswers = helpers.selectTurnAnswerItemIds([
+    { id: 'm1', kind: 'message', status: 'completed', role: 'assistant', text: '第一段总结。', startedAt: 1, completedAt: 2 },
+    { id: 'm2', kind: 'message', status: 'completed', role: 'assistant', text: '第二段补充。', startedAt: 2, completedAt: 3 },
+  ]);
+  assert.deepEqual([...multiFinalAnswers].sort(), ['m1', 'm2']);
+
+  const declinedFold = helpers.planTurnFold(
+    {
+      status: 'interrupted',
+      items: [
+        { id: 'c_declined', kind: 'command', status: 'declined', command: 'rm -rf dist', cwd: null, output: '', outputTruncated: false, exitCode: null, durationMs: null, startedAt: 1, completedAt: 2 },
+      ],
+    },
+    { hasChangesCard: false },
+  );
+  assert.equal(declinedFold.foldedItemIds.has('c_declined'), false, 'unexplained declined step stays visible');
+
+  // 6. Expandable WorkLogRow renders sibling `.asv-row-trigger` and `button.asv-file-pill` (never nested `<button>` inside `<button>`), and WorkGroup omits `aria-live` from the toggle button.
+  const readRowHtml = ui.renderWorkItem({
+    item: {
+      id: 'c_cat', kind: 'command', status: 'completed', command: 'bash -lc "cat -n src/auth/refresh.ts"',
+      cwd: 'C:/repo', output: '1 export {}', outputTruncated: false, exitCode: 0, durationMs: 20, startedAt: 1, completedAt: 2,
+    },
+    turnKey: 'd1#1',
+  });
+  assert.match(readRowHtml, /<div class="asv-row-line is-expandable"><button type="button" class="asv-row-trigger" aria-expanded="false"[^>]*><\/button>/, 'expand trigger is an empty sibling button with no nested interactive controls');
+  assert.match(readRowHtml, /<button type="button" class="asv-file-pill"/);
+
+  const groupHtml = ui.renderWorkGroup({
+    block: {
+      type: 'group', id: 'group:c1', running: true, durationMs: null,
+      items: [
+        { id: 'c1', kind: 'command', status: 'completed', command: 'ls', cwd: null, output: '', outputTruncated: false, exitCode: 0, durationMs: 10, startedAt: 1, completedAt: 2 },
+        { id: 'c2', kind: 'command', status: 'running', command: 'npm test', cwd: null, output: '', outputTruncated: false, exitCode: null, durationMs: null, startedAt: 2, completedAt: null },
+      ],
+    },
+    turnKey: 'd1#1',
+  });
+  assert.doesNotMatch(groupHtml, /<button[^>]*aria-live=/, 'WorkGroup toggle omits aria-live so LiveTimer ticks do not spam announcements');
+
+  // 7. Settled foldable turn exposes disclosure scope attributes so useTimelineScroll reveals expanded rows.
+  const scopeTurnHtml = ui.renderTurn({
+    turn: {
+      key: 'd1#9', dispatchId: 'd1', turnId: 't9', generation: 9, prompt: 'test',
+      startedAt: 1_000, completedAt: 5_000, status: 'completed', stopReason: null, usage: null, error: null,
+      items: [
+        { id: 'c1', kind: 'command', status: 'completed', command: 'ls', cwd: null, output: '', outputTruncated: false, exitCode: 0, durationMs: 10, startedAt: 1_100, completedAt: 1_200 },
+        { id: 'm1', kind: 'message', status: 'completed', role: 'assistant', text: 'done', startedAt: 2_000, completedAt: 4_500 },
+      ],
+    },
+  });
+  assert.match(scopeTurnHtml, /class="asv-turn-body" data-asv-disclosure-scope=""/);
+  assert.match(scopeTurnHtml, /data-asv-disclosure-scope-trigger="true"/);
 });
