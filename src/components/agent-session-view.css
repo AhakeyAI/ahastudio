@@ -188,8 +188,119 @@
 .asv-turn-note { color: var(--asv-ink-2); font-size: 12px; }
 .asv-turn-foot { color: var(--asv-ink-2); font-size: 12px; font-variant-numeric: tabular-nums; }
 .asv-turn-foot.is-failed { color: var(--asv-bad); }
-.asv-turn > [data-asv-row]:not(.asv-assistant, .asv-user, .asv-wake) + .asv-assistant { margin-top: 8px; }
+.asv-turn > [data-asv-row]:not(.asv-assistant, .asv-user, .asv-wake, .asv-turn-bar-wrap) + .asv-assistant { margin-top: 6px; }
 .asv-working { display: flex; align-items: center; gap: 8px; min-height: 24px; padding-left: 2px; font-size: 13px; }
+
+/* ---- Turn working status bar & live activity line (adapted from Orca, MIT) ---- */
+
+.asv-turn-bar-wrap { min-width: 0; }
+.asv-turn-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  padding: 2px 2px 6px;
+  border: 0;
+  border-bottom: 1px solid var(--asv-line);
+  border-radius: 0;
+  background: none;
+  color: var(--asv-ink-2);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+  box-sizing: border-box;
+}
+.asv-turn-bar.is-interactive { cursor: pointer; transition: color 120ms ease; }
+.asv-turn-bar.is-interactive:hover { color: var(--asv-ink-strong); }
+.asv-turn-bar-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--workspace-accent);
+  animation: asv-pulse 1.6s steps(8) infinite;
+}
+.asv-turn-bar-label { flex: none; white-space: nowrap; }
+.asv-turn-bar-label.is-failed { color: var(--asv-bad); }
+.asv-turn-bar-label.is-interrupted { color: var(--asv-warn); }
+.asv-turn-bar-hint {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--asv-ink-2);
+  opacity: 0.78;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.asv-turn-bar.is-interactive:hover .asv-turn-bar-hint { opacity: 1; }
+.asv-turn-bar-chevron { flex: none; margin-left: 2px; opacity: 0.75; transition: transform 140ms ease; }
+.asv-turn-bar-wrap[data-open] .asv-turn-bar-chevron { transform: rotate(90deg); opacity: 1; }
+
+.asv-activity { display: flex; flex-direction: column; min-width: 0; }
+.asv-activity-line {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  min-width: 0;
+  margin: 0 -4px;
+  padding: 2px 4px;
+  border-radius: 6px;
+  color: var(--asv-ink-2);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.asv-activity-line.is-disclosable:hover { background: var(--asv-hover); }
+.asv-spinner {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 1.75px solid color-mix(in srgb, var(--asv-ink-2) 26%, transparent);
+  border-top-color: var(--workspace-accent);
+  border-radius: 50%;
+  box-sizing: border-box;
+  animation: asv-spin 850ms linear infinite;
+}
+.asv-activity-label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--asv-ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.asv-activity-label.is-stopping { color: var(--asv-warn); }
+.asv-activity-chevron {
+  flex: none;
+  color: var(--asv-ink-2);
+  opacity: 0.5;
+  transition: transform 140ms ease, opacity 120ms ease;
+}
+.asv-activity-line:hover .asv-activity-chevron,
+.asv-activity[data-open] .asv-activity-chevron { opacity: 0.95; }
+.asv-activity[data-open] .asv-activity-chevron { transform: rotate(90deg); }
+.asv-activity-trigger {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+}
+
+.asv-reasoning-body {
+  max-height: 320px;
+  overflow-y: auto;
+  margin-top: 4px;
+  padding: 4px 8px 4px 14px;
+  border-left: 1.5px solid var(--asv-line);
+  color: var(--asv-ink-2);
+  font-size: 13px;
+}
 
 /* ---- User bubble ---- */
 
@@ -250,11 +361,12 @@
 /* ---- Assistant prose ---- */
 
 .asv-assistant { min-width: 0; padding: 2px 0; }
-.asv-assistant-foot { display: flex; height: 24px; margin: 4px 0 -8px -4px; }
+.asv-assistant-foot { display: flex; align-items: center; min-height: 24px; margin: 4px 0 -4px -4px; }
 
-/* ---- Message actions: revealed on hover or keyboard focus, never per-row state ---- */
+/* ---- Message actions: revealed on hover or keyboard focus; gently visible on latest reply ---- */
 
 .asv-msg-actions { display: inline-flex; align-items: center; gap: 2px; opacity: 0; transition: opacity 120ms ease; }
+.asv-msg-actions.is-visible { opacity: 0.72; }
 :is(.asv-user, .asv-assistant):hover .asv-msg-actions,
 .asv-msg-actions:focus-within { opacity: 1; }
 .asv-act {
@@ -263,6 +375,14 @@
 }
 .asv-act:hover { background: var(--asv-hover); color: var(--asv-ink-strong); }
 .asv-act[data-copied] { color: var(--asv-ok); }
+.asv-msg-time {
+  margin-left: 4px;
+  color: var(--asv-ink-2);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+  user-select: none;
+}
 @media (hover: none) { .asv-msg-actions { opacity: 1; } }
 
 /* ---- Work log ---- */
@@ -310,9 +430,113 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-row[data-tone="warn"] > .asv-row-line { color: var(--asv-ink); }
 .asv-row-detail { display: flex; flex-direction: column; gap: 8px; min-width: 0; margin: 2px 0 8px 26px; }
 .asv-row-list { display: flex; flex-direction: column; min-width: 0; }
-.asv-group-chevron { transition: transform 120ms ease; }
+.asv-group-chevron { flex: none; opacity: 0.65; transition: transform 120ms ease, opacity 120ms ease; }
+.asv-group-head:hover .asv-group-chevron,
+.asv-group[data-open] > .asv-row-line .asv-group-chevron { opacity: 1; }
 .asv-group[data-open] > .asv-row-line .asv-group-chevron { transform: rotate(90deg); }
+.asv-group-summary {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+.asv-group-sentence {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.asv-group-head:hover .asv-group-sentence { color: var(--asv-ink-strong); }
+.asv-run-badge {
+  flex: none;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.asv-run-badge.is-bad { color: var(--asv-bad); }
+.asv-run-badge.is-warn { color: var(--asv-warn); }
+.asv-run-ok { flex: none; color: var(--asv-ink-2); opacity: 0.7; }
+.asv-group-preview {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--asv-ink-2);
+  font-family: var(--asv-mono);
+  font-size: 11.5px;
+  opacity: 0.72;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .asv-group-body { display: flex; flex-direction: column; min-width: 0; margin-left: 9px; padding-left: 12px; border-left: 1px solid var(--asv-line); }
+
+/* Clickable workspace file target pill inside work-log rows. */
+.asv-file-pill {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-width: 0;
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--asv-ink) 10%, transparent);
+  border-radius: 5px;
+  background: var(--asv-tint);
+  color: var(--asv-ink);
+  font-family: var(--asv-mono);
+  font-size: 12px;
+  line-height: 20px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease, background-color 120ms ease;
+}
+.asv-file-pill:hover {
+  border-color: color-mix(in srgb, var(--workspace-accent) 42%, transparent);
+  background: color-mix(in srgb, var(--workspace-accent) 8%, var(--asv-tint));
+  color: var(--workspace-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.asv-file-pill.is-static {
+  cursor: default;
+  opacity: 0.75;
+  text-decoration: line-through;
+}
+.asv-file-pill.is-static:hover {
+  border-color: color-mix(in srgb, var(--asv-ink) 10%, transparent);
+  background: var(--asv-tint);
+  color: var(--asv-ink);
+  text-decoration: line-through;
+}
+
+/* Framed warning/error notices and subtle inline info notices (adapted from Orca, MIT). */
+.asv-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.asv-notice-icon { flex: none; margin-top: 2px; }
+.asv-notice-text { margin: 0; min-width: 0; flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
+.asv-notice.is-info { padding: 2px 2px; color: var(--asv-ink-2); font-size: 12.5px; }
+.asv-notice.is-warning {
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--asv-warn) 32%, var(--asv-line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--asv-warn) 6%, var(--asv-surface));
+  color: var(--asv-warn);
+}
+.asv-notice.is-error {
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--asv-bad) 34%, var(--asv-line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--asv-bad) 6%, var(--asv-surface));
+  color: var(--asv-bad);
+}
 
 .asv-output {
   max-height: 384px;
@@ -385,7 +609,8 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 @keyframes asv-shimmer { from { background-position: 100% 0; } to { background-position: -66% 0; } }
 @media (prefers-reduced-motion: reduce) {
   .asv-shimmer { animation: none; background: none; color: var(--asv-ink); }
-  .asv-stage-dot { animation: none !important; }
+  .asv-stage-dot, .asv-turn-bar-dot, .asv-spinner { animation: none !important; }
+  .asv-turn-bar-chevron, .asv-activity-chevron, .asv-group-chevron, .asv-row-chevron { transition: none; }
 }
 
 /* ---- Diff ---- */
@@ -429,60 +654,125 @@ button.asv-row-line:hover { background: var(--asv-hover); color: var(--asv-ink);
 .asv-findings { margin: 0; padding-left: 20px; font-size: 13px; }
 .asv-findings li + li { margin-top: 4px; }
 
-/* ---- Markdown ---- */
+/* ---- Markdown (typography & zero-layout-shift word fade adapted from Orca, MIT) ---- */
 
 .asv-md { min-width: 0; overflow-wrap: anywhere; }
 .asv-md > :first-child { margin-top: 0; }
 .asv-md > :last-child { margin-bottom: 0; }
 .asv-md :is(p, ul, ol, blockquote, .asv-code, .asv-md-table) { margin: 0.65em 0; }
-.asv-md :is(h1, h2, h3, h4, h5, h6) { margin: 1.25em 0 0.5em; color: var(--asv-ink-strong); font-weight: 600; line-height: 1.3; }
-.asv-md h1 { font-size: 1.25em; }
-.asv-md h2 { font-size: 1.125em; }
-.asv-md h3 { font-size: 1em; }
-.asv-md :is(h4, h5, h6) { font-size: 0.925em; }
+.asv-md :is(h1, h2, h3, h4, h5, h6) { margin: 1.2em 0 0.45em; color: var(--asv-ink-strong); font-weight: 600; line-height: 1.32; }
+.asv-md h1 { font-size: 1.286em; }
+.asv-md h2 { font-size: 1.143em; }
+.asv-md h3 { font-size: 1.071em; }
+.asv-md :is(h4, h5, h6) { font-size: 0.95em; }
 .asv-md :is(ul, ol) { padding-left: 1.4em; }
 .asv-md ul { list-style: disc; }
 .asv-md ul ul { list-style: circle; }
 .asv-md ol { list-style: decimal; }
-.asv-md li + li { margin-top: 0.25em; }
+.asv-md li + li { margin-top: 0.22em; }
 .asv-md li > :is(ul, ol) { margin: 0.25em 0; }
 .asv-md li.task-list-item { list-style: none; }
-.asv-md li.task-list-item input { margin: 0 0.4em 0.15em -1.4em; vertical-align: middle; }
-.asv-md strong { font-weight: 650; }
-.asv-md blockquote { padding-left: 0.8em; border-left: 2px solid color-mix(in srgb, currentcolor 30%, transparent); color: var(--asv-ink-2); }
+.asv-md li.task-list-item input { margin: 0 0.4em 0.15em -1.4em; vertical-align: middle; pointer-events: none; }
+.asv-md :is(strong, b) { font-weight: 600; }
+.asv-md blockquote { padding-left: 0.85em; border-left: 2px solid color-mix(in srgb, currentcolor 28%, transparent); color: var(--asv-ink-2); }
 .asv-md hr { margin: 1.1em 0; border: 0; border-top: 1px solid var(--asv-line); }
 .asv-md :not(pre) > code {
-  padding: 0.1em 0.35em;
+  padding: 0.08em 0.34em;
+  border: 1px solid color-mix(in srgb, var(--asv-ink) 10%, transparent);
   border-radius: 5px;
-  background: color-mix(in srgb, var(--asv-ink-strong) 9%, transparent);
+  background: color-mix(in srgb, var(--asv-ink-strong) 7%, transparent);
   font-family: var(--asv-mono);
-  font-size: 0.86em;
+  font-size: 0.857em;
   -webkit-box-decoration-break: clone;
   box-decoration-break: clone;
 }
-.asv-md-link { color: var(--workspace-accent); cursor: pointer; text-decoration: none; }
-.asv-md-link:hover { text-decoration: underline; text-underline-offset: 2px; }
+.asv-md-link {
+  color: var(--workspace-accent);
+  cursor: pointer;
+  text-decoration: none;
+  text-decoration-color: color-mix(in srgb, currentcolor 42%, transparent);
+  text-underline-offset: 0.25em;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+.asv-md-link:hover { text-decoration: underline; }
+.asv-md-link :is(code, strong) { color: inherit; }
+.asv-md-link[data-file-link] > code {
+  border-color: color-mix(in srgb, var(--workspace-accent) 32%, transparent);
+  background: color-mix(in srgb, var(--workspace-accent) 8%, transparent);
+}
+.asv-md-link[data-file-link]:hover > code {
+  border-color: color-mix(in srgb, var(--workspace-accent) 52%, transparent);
+}
 .asv-md-table { max-width: 100%; overflow-x: auto; }
-.asv-md table { width: auto; min-width: min(100%, 320px); border-collapse: collapse; font-size: 0.925em; overflow-wrap: normal; word-break: normal; }
+.asv-md table { width: auto; min-width: min(100%, 320px); border-collapse: collapse; font-size: 0.928em; overflow-wrap: normal; word-break: normal; }
 .asv-md th { color: var(--asv-ink-strong); font-weight: 600; text-align: left; }
-.asv-md :is(th, td) { padding: 6px 12px 6px 0; border-bottom: 1px solid var(--asv-line); vertical-align: top; }
+.asv-md :is(th, td) { min-width: 72px; padding: 6px 12px 6px 0; border-bottom: 1px solid var(--asv-line); vertical-align: top; overflow-wrap: break-word; }
 .asv-md tbody tr:last-child td { border-bottom: 0; }
 .asv-md.is-muted { color: var(--asv-ink-2); font-size: 13px; }
 .asv-md.is-bubble :is(h1, h2, h3, h4, h5, h6) { margin-top: 0.9em; font-size: 1em; }
+[data-asv-tone="faint"] .asv-md :is(h1, h2, h3, h4, h5, h6, strong, a, code, pre) { color: inherit; }
+[data-asv-tone="faint"] .asv-md .asv-md-link[data-file-link] > code {
+  border-color: color-mix(in srgb, var(--asv-ink-2) 24%, transparent);
+  background: color-mix(in srgb, var(--asv-ink-2) 8%, transparent);
+}
+
+/* Fade newly revealed words and blocks with opacity only, preserving line geometry. */
 @media (prefers-reduced-motion: no-preference) {
-  /* New blocks of a streaming answer fade in once instead of popping. */
-  .asv-md[data-streaming] > * { transition: opacity 500ms ease-out; }
-  @starting-style { .asv-md[data-streaming] > * { opacity: 0; } }
+  .asv-md[data-word-fade] :is([data-word], a, :not(pre) > code),
+  .asv-md[data-block-fade] > :is(pre, div, table, hr) {
+    transition: opacity 300ms ease-out;
+  }
+  @starting-style {
+    .asv-md[data-word-fade] :is([data-word], a, :not(pre) > code),
+    .asv-md[data-block-fade] > :is(pre, div, table, hr) {
+      opacity: 0;
+    }
+  }
 }
 
 .asv-code { overflow: hidden; border: 1px solid var(--asv-line); border-radius: 10px; background: var(--asv-tint); }
-.asv-code-head { display: flex; align-items: center; justify-content: space-between; height: 30px; padding: 0 6px 0 12px; color: var(--asv-ink-2); font-size: 12px; }
-.asv-code-lang { font-family: var(--asv-mono); }
-.asv-code pre { margin: 0; padding: 2px 12px 12px; overflow-x: auto; font-family: var(--asv-mono); font-size: 12.5px; line-height: 1.55; overflow-wrap: normal; }
+.asv-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 30px;
+  padding: 0 6px 0 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--asv-line) 75%, transparent);
+  color: var(--asv-ink-2);
+  font-size: 12px;
+}
+.asv-code-lang { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
+.asv-code-actions { display: inline-flex; flex: none; align-items: center; gap: 2px; }
+.asv-code pre { margin: 0; padding: 10px 12px 12px; overflow-x: auto; font-family: var(--asv-mono); font-size: 12.5px; line-height: 1.55; overflow-wrap: normal; }
 .asv-code code { font-family: inherit; white-space: pre; }
-.asv-copy { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: 6px; background: none; color: var(--asv-ink-2); cursor: pointer; opacity: 0.55; transition: opacity 120ms ease; }
-.asv-code:hover .asv-copy, .asv-copy:focus-visible, .asv-copy[data-copied] { opacity: 1; }
-.asv-copy:hover { background: var(--asv-hover); color: var(--asv-ink); }
+.asv-code[data-wrapped] pre { overflow-x: hidden; white-space: pre-wrap; overflow-wrap: anywhere; }
+.asv-code[data-wrapped] code { white-space: pre-wrap; }
+.asv-copy,
+.asv-code-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--asv-ink-2);
+  cursor: pointer;
+  opacity: 0.58;
+  transition: opacity 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+.asv-code:hover :is(.asv-copy, .asv-code-btn),
+.asv-copy:focus-visible,
+.asv-code-btn:focus-visible,
+.asv-copy[data-copied],
+.asv-code-btn[aria-pressed="true"] { opacity: 1; }
+.asv-copy:hover,
+.asv-code-btn:hover { background: var(--asv-hover); color: var(--asv-ink); }
+.asv-code-btn[aria-pressed="true"] { background: var(--asv-hover); color: var(--asv-ink-strong); }
 .asv-copy[data-copied] { color: var(--asv-ok); }
 
 /* ---- Dock: banners, composer, context strip ---- */

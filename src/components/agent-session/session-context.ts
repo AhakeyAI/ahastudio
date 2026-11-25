@@ -1,5 +1,6 @@
 import { createContext, useContext } from 'react';
 import type { CodeHighlightAppearance } from '../../lib/code-syntax-highlight';
+import type { NativeChatFileLinkExistence } from '../../lib/shared/native-chat/native-chat-file-link-existence';
 
 export interface AgentSessionContextValue {
   /** Directory that relative file links and changed-file paths resolve against. */
@@ -7,6 +8,8 @@ export interface AgentSessionContextValue {
   /** Picks the syntax theme for code blocks and diffs. */
   appearance: CodeHighlightAppearance;
   onNotify?: (message: string) => void;
+  /** Workspace file-existence checker for inline clickable file path references in Markdown. */
+  fileLinkExistence?: NativeChatFileLinkExistence | null;
   /** Set when approvals are answered somewhere other than the orchestration approval lane. */
   resolveApproval?: (approvalId: string, allow: boolean, reason?: string) => Promise<{ ok: boolean; error?: string }>;
   /** Direct sessions only: puts an earlier message back in the composer so it can be edited and sent again. */

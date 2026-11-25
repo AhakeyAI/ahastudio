@@ -494,7 +494,7 @@ export function SessionComposer(props: SessionComposerProps) {
   const queueing = Boolean(queue && props.running && !localSlashCommand);
   const blocked = Boolean(props.direct && props.running && !queue && !localSlashCommand);
   const placeholder = props.direct
-    ? (queueing ? '正在工作，现在发送会排队，本轮结束后自动发出' : props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : toolbar ? '给 Codex 发消息，/ 斜杠命令，$ 选技能，@ 引用文件' : '给 Codex 发消息')
+    ? (queueing ? '正在工作，现在发送会排队，本轮结束后自动发出' : props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : toolbar ? '给助手发消息，/ 斜杠命令，$ 选技能，@ 引用文件' : '给助手发消息')
     : (props.running ? '补充指令，本轮结束后送达' : '给 Worker 发送追加指令');
 
   const handleEditTrigger = (text: string, caret: number) => {
