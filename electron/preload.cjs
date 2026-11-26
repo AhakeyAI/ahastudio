@@ -88,6 +88,11 @@ const api = {
   writeClipboardText: (text) => ipcRenderer.invoke('clipboard:write-text', text),
   relaunchApp: () => ipcRenderer.invoke('app:relaunch'),
   setThemeSource: (source) => ipcRenderer.invoke('theme:set-source', source),
+  onThemeChanged: (cb) => {
+    const listener = (_, state) => cb(state);
+    ipcRenderer.on('theme:changed', listener);
+    return () => ipcRenderer.removeListener('theme:changed', listener);
+  },
 
   onDisplayChanged: (cb) => {
     const listener = () => cb();

@@ -1,6 +1,6 @@
 import { Terminal, GitBranch } from 'lucide-react';
 import { BackendAvatar } from './BackendAvatar';
-import { ClaudeIcon, GeminiIcon, OpenAIIcon, OpenCodeIcon, PiIcon, QwenIcon } from './TerminalBrandIcons';
+import { ClaudeIcon, KimiIcon, GeminiIcon, OpenAIIcon, OpenCodeIcon, PiIcon, QwenIcon } from './TerminalBrandIcons';
 
 const BRAND_ICONS: Record<string, typeof OpenAIIcon> = {
   claude: ClaudeIcon,
@@ -9,6 +9,7 @@ const BRAND_ICONS: Record<string, typeof OpenAIIcon> = {
   opencode: OpenCodeIcon,
   pi: PiIcon,
   qwen: QwenIcon,
+  kimi: KimiIcon,
 };
 
 export function TerminalProfileIcon({ id, size = 16 }: { id?: string; size?: number }) {
@@ -16,7 +17,7 @@ export function TerminalProfileIcon({ id, size = 16 }: { id?: string; size?: num
   if (BrandIcon) return <span className="terminal-profile-icon" style={{ width: size, height: size }} aria-hidden="true">
     <BrandIcon size={size} />
   </span>;
-  if (id && ['antigravity', 'grok', 'kimi', 'qoder'].includes(id)) {
+  if (id && ['antigravity', 'grok', 'qoder'].includes(id)) {
     return <span className="terminal-profile-icon" style={{ width: size, height: size }} aria-hidden="true"><BackendAvatar iconId={id} size={size} /></span>;
   }
   return <span className={`terminal-profile-icon profile-${id ?? 'shell'}`} style={{ width: size, height: size }} aria-hidden="true">

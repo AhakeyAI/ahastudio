@@ -53,6 +53,11 @@ export function registerDesktopIpc(): void {
     }
     return { shouldUseDarkColors: nativeTheme.shouldUseDarkColors };
   });
+  nativeTheme.on('updated', () => {
+    for (const wc of webContents.getAllWebContents()) {
+      wc.send('theme:changed', { shouldUseDarkColors: nativeTheme.shouldUseDarkColors });
+    }
+  });
 
   ipcMain.handle('settings:get-ui-preferences', () => ({
     handheldMode: getSettings().handheldMode ?? 'auto',

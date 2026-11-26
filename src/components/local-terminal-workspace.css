@@ -98,10 +98,10 @@
 }
 .terminal-workspace-toolbar { grid-row: 1; grid-column: 1; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-right: 1px solid var(--workspace-line); border-bottom: 1px solid var(--workspace-line); background: var(--workspace-sidebar); overflow: hidden; }
 .terminal-workspace-brand { font-weight: 600; letter-spacing: -0.01em; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.terminal-workspace-toolbar button, .terminal-workspace-toolbar-extra button, .terminal-directory-heading button, .terminal-directory-row button:last-child, .local-terminal-footer button {
+.terminal-workspace-toolbar button, .terminal-workspace-toolbar-extra button, .terminal-directory-heading button, .terminal-directory-row > .stage-tab-add > button, .local-terminal-footer button {
   border: 0; background: transparent; color: var(--workspace-muted); display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 4px; cursor: pointer; flex-shrink: 0;
 }
-.terminal-workspace-toolbar button:hover, .terminal-workspace-toolbar-extra button:hover, .terminal-directory-heading button:hover, .terminal-directory-row button:last-child:hover, .local-terminal-footer button:hover { background: var(--workspace-hover); color: var(--workspace-ink-strong); }
+.terminal-workspace-toolbar button:hover, .terminal-workspace-toolbar-extra button:hover, .terminal-directory-heading button:hover, .terminal-directory-row > .stage-tab-add > button:hover, .local-terminal-footer button:hover { background: var(--workspace-hover); color: var(--workspace-ink-strong); }
 .terminal-workspace-sidebar { grid-column: 1; grid-row: 2; display: flex; flex-direction: column; min-height: 0; background: var(--workspace-sidebar); border-right: 1px solid var(--workspace-line); padding: 14px 8px 8px; }
 .terminal-directory-search { display: flex; align-items: center; gap: 7px; padding: 7px 9px; border-radius: 5px; background: var(--workspace-input-bg); color: var(--workspace-muted); }
 .terminal-directory-search input { background: transparent; border: 0; width: 100%; min-width: 0; font: inherit; color: var(--workspace-ink); outline: none; }
@@ -112,7 +112,7 @@
 .terminal-directory-row:hover { background: var(--workspace-hover-subtle); }
 .terminal-directory-row.is-selected { background: var(--workspace-selected); }
 .terminal-directory-row > button:first-child { display: flex; align-items: center; gap: 8px; padding: 9px; min-width: 0; flex: 1; text-align: left; background: none; border: 0; color: var(--workspace-ink); font-weight: 500; cursor: pointer; }
-.terminal-directory-row span, .terminal-directory-session > span:not(.terminal-profile-icon) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-directory-row > button > span, .terminal-directory-session > span:not(.terminal-profile-icon) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .terminal-directory-row svg { flex-shrink: 0; }
 .terminal-directory-session { display: flex; align-items: center; gap: 7px; width: calc(100% - 12px); margin: 3px 0 0 12px; padding: 8px; border: 0; border-radius: 5px; background: transparent; cursor: pointer; text-align: left; color: var(--workspace-ink-soft); }
 .terminal-directory-session.is-active { background: var(--workspace-selected); color: var(--workspace-ink-strong); }

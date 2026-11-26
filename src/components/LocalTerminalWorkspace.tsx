@@ -1,4 +1,6 @@
 import { agentSessionClient, isStandaloneSession } from '../lib/agent-session-client';
+import { SessionCreateMenu } from './SessionCreateMenu';
+import { createWorkspaceSession } from '../lib/create-workspace-session';
 import { SessionHistoryPanel } from './agent-session/SessionHistoryPanel';
 import {
   useCallback,
@@ -962,22 +964,18 @@ export function LocalTerminalWorkspace({
                         </span>
                       ) : null;
                     })()}
-                    <button
-                      type="button"
-                      title="在此目录打开终端"
-                      aria-label={`在 ${folderName(path)} 打开终端`}
-                      onClick={() => {
+                    <SessionCreateMenu
+                      localOnly
+                      label={`在 ${folderName(path)} 新建终端或会话`}
+                      onCreate={(type, opts) => {
                         selectFolder(path);
-                        stage.createWindow('terminal', {
-                          localCliId: 'shell',
-                          shellId: 'default',
-                          cwd: path,
-                          title: '终端',
-                        });
+                        void createWorkspaceSession(type, opts, path, handleNotify);
                       }}
-                    >
-                      <Plus size={14} />
-                    </button>
+                      {...(window.vibeMeet?.agentSessions?.history ? { onOpenHistory: () => {
+                        selectFolder(path);
+                        setHistoryOpen(true);
+                      } } : {})}
+                    />
                   </div>
                   {(query && !path.toLowerCase().includes(query.toLowerCase())
                     ? matchingLineage
@@ -1079,13 +1077,7 @@ export function LocalTerminalWorkspace({
           renderTabBadge={(win) => (win.type === 'agent-session' ? null : <AgentStatusBadge status={windowAgentStatus(win)} />)}
           {...(selectedCwd && window.vibeMeet?.agentSessions?.history ? { onOpenHistory: () => setHistoryOpen(true) } : {})}
           onCreate={(type, opts) => {
-            const cwd = selectedCwd ?? opts?.cwd;
-            if (type !== 'agent-session') return stage.createWindow(type, { ...opts, cwd });
-            const provider = (['codex', 'antigravity', 'grok', 'opencode', 'pi'] as const).find((id) => id === opts?.localCliId) ?? 'codex';
-            void agentSessionClient.create({ ...(cwd ? { cwd } : {}), provider, policy: 'workspace-write' }).then((res) => {
-              if (!res.ok) return handleNotify(res.error);
-              void stageWindowStore.createWindow('agent-session', { ...opts, cwd: res.session.cwd, workerId: res.session.id });
-            });
+            void createWorkspaceSession(type, opts, selectedCwd, handleNotify);
           }}
         />
         <div className="terminal-tab-actions">

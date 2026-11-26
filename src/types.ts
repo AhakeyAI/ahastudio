@@ -387,6 +387,7 @@ export interface VibeMeetApi {
     source: 'system' | 'light' | 'dark',
   ) => Promise<{ shouldUseDarkColors: boolean }>;
   onDisplayChanged?: (cb: () => void) => () => void;
+  onThemeChanged?: (cb: (state: { shouldUseDarkColors: boolean }) => void) => () => void;
 
   shellPty: {
     listClis: () => Promise<{ ok: true; clis: LocalCliInfo[] } | { ok: false; error: string }>;

@@ -66,6 +66,15 @@ colorSchemeMedia?.addEventListener?.('change', (event) => {
   if (appearancePreference !== 'system') return;
   applyResolvedAppearance(event.matches ? 'dark' : 'light');
 });
+// Native theme events also reach background windows whose media-query change
+// notification may be delayed. Keep matchMedia as the browser-only fallback.
+if (typeof window !== 'undefined') {
+  window.vibeMeet?.onThemeChanged?.(({ shouldUseDarkColors }) => {
+    if (appearancePreference === 'system') {
+      applyResolvedAppearance(shouldUseDarkColors ? 'dark' : 'light');
+    }
+  });
+}
 
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
   window.addEventListener('storage', (event) => {
@@ -79,6 +88,7 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
       syncSessionsTheme();
     }
     notify();
+    if (nextPref === 'system') syncElectronThemeSource(nextPref);
   });
 }
 

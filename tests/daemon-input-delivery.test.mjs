@@ -244,3 +244,18 @@ os.write(1, ('SHA256:' + hashlib.sha256(data).hexdigest()).encode())
     if (!exited) pty.kill(); // Only the process created by this test.
   }
 });
+
+test('a reopened window gets a fresh input queue while detached pending bytes stay cancelled', async () => {
+  const svc=new DaemonTerminalSessions({dataDir:'/unused'},{data(){},exit(){}},()=>'/unused');
+  const writes=[];let acknowledge;
+  svc.getClient=async()=>({input:async(id,data)=>{writes.push({id,data});if(data.startsWith('a'))await new Promise(r=>{acknowledge=r;});return{ok:true};}});
+  const old=svc.input('old','a'.repeat(9000));
+  while(!acknowledge)await new Promise(r=>setImmediate(r));
+  svc.detachAll();
+  const fresh=await svc.input('new','fresh-window-input');
+  acknowledge();
+  assert.equal((await old).ok,false,'old pending/tail input must remain cancelled');
+  assert.equal(fresh.ok,true,'new renderer must not reuse a permanently stopped queue');
+  assert.equal(writes.filter(w=>w.data.startsWith('a')).length,1,'never resend detached bytes');
+  assert.equal(writes.find(w=>w.data==='fresh-window-input')?.data,'fresh-window-input');
+});
