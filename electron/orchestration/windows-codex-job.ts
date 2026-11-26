@@ -4,6 +4,7 @@ import { win32 } from 'node:path';
 // The job owns Codex and its MCP/command descendants. Windows closes the job on
 // launcher exit, including after a crash. The launcher also watches Electron.
 const launcher = String.raw`
+$ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
 try {
   $file = $env:AHA_PILOT_JOB_FILE

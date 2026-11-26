@@ -85,7 +85,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const [nextPolicy, setNextPolicy] = useState<AgentSessionPolicy | null>(null);
   const [nextNetwork, setNextNetwork] = useState<boolean | null>(null);
   const [nextModel, setNextModel] = useState<string | null>(null);
-  const [nextEffort, setNextEffort] = useState<string | null>(null);
+  const [nextEffort, setNextEffort] = useState<string | null | undefined>(undefined);
   const policy = nextPolicy ?? info?.policy;
   const network = nextNetwork ?? info?.network ?? false;
   const caps = sessionCapabilities(info);
@@ -207,13 +207,13 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
         ...(nextPolicy && nextPolicy !== info?.policy ? { policy: nextPolicy } : {}),
         ...(nextNetwork !== null && nextNetwork !== info?.network ? { network: nextNetwork } : {}),
         ...(nextModel && nextModel !== info?.model ? { model: nextModel } : {}),
-        ...(nextEffort && nextEffort !== info?.effort ? { effort: nextEffort } : {}),
+        ...(nextEffort !== undefined && nextEffort !== info?.effort ? { effort: nextEffort } : {}),
       }));
       if (ok) {
         setNextPolicy(null);
         setNextNetwork(null);
         setNextModel(null);
-        setNextEffort(null);
+        setNextEffort(undefined);
         scroll.scrollToEnd();
       }
       return ok;
@@ -389,7 +389,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       if (live && match) setModelName(match.displayName);
     }, () => {});
     return () => { live = false; };
-  }, [direct, headerModelId, sessionId, info?.provider]);
+  }, [direct, headerModelId, sessionId, info?.provider, info?.status]);
   const modelText = headerModelId
     ? `${modelName ?? headerModelId}${direct && info?.effort ? ` · ${effortLabel(info.effort)}` : ''}`
     : null;
@@ -678,12 +678,13 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               toolbar: {
                 sessionId,
                 provider: info.provider,
+                sessionStatus: info.status,
                 capabilities: caps,
                 modelId: nextModel ?? info.model,
-                effort: nextEffort ?? info.effort,
+                effort: nextEffort !== undefined ? nextEffort : info.effort,
                 onModelChange: (model: CodexModelOption) => {
                   setNextModel(model.id);
-                  const effort = nextEffort ?? info.effort;
+                  const effort = nextEffort !== undefined ? nextEffort : info.effort;
                   if (!model.efforts.some((option) => option.value === effort)) setNextEffort(model.defaultEffort);
                 },
                 onEffortChange: setNextEffort,

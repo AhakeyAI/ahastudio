@@ -7,8 +7,11 @@ export const CODEX_CAPABILITIES: AgentDriverCapabilities = {
   plugins: true, history: true, orchestration: true, rename: true, resume: true, terminalResume: true,
 };
 
+export const SESSION_DRIVER_IDS: readonly AgentDriverId[] = ['codex', 'claude', 'antigravity', 'grok', 'opencode', 'pi'];
+
 export const DRIVER_LABELS: Record<AgentDriverId, string> = {
   codex: 'Codex',
+  claude: 'Claude Code',
   antigravity: 'Antigravity',
   grok: 'Grok',
   opencode: 'OpenCode',

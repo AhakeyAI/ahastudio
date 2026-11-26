@@ -110,9 +110,9 @@ export class PiSessionDriver implements AgentSessionDriver {
     return this.available;
   }
 
-  async open({ model, policy }: {
-    cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string; network?: boolean;
-    developerInstructions?: string;
+  async open({ model, effort, policy }: {
+    cwd: string; model: string | null; effort?: string | null; policy: AgentSessionPolicy; resumeSessionId?: string;
+    network?: boolean; developerInstructions?: string;
   }): Promise<string> {
     if (policy !== this.options.policy) throw new Error('Pi 的权限档位在启动时确定');
     try {
@@ -120,6 +120,10 @@ export class PiSessionDriver implements AgentSessionDriver {
       if (!this.sessionFile) throw new Error('Pi 没有返回会话文件');
       this.available = await this.listModels().catch(() => []);
       if (model && model !== this.effectiveModel) await this.setModel(model);
+      if (effort && effort !== this.thinking) {
+        const offered = this.available.find((entry) => entry.id === this.effectiveModel)?.efforts.map((option) => option.value);
+        if ((offered ?? PI_THINKING_LEVELS as readonly string[]).includes(effort)) await this.setThinking(effort);
+      }
       return this.sessionFile;
     } catch (error) {
       throw new Error(this.proc.withStderr(describe(error)));

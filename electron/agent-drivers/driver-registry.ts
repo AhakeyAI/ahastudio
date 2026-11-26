@@ -1,7 +1,12 @@
+import { randomUUID } from 'node:crypto';
 import type { AgentSessionDriver, AgentSessionEvents, AgentSessionPolicy } from '../orchestration/agent-session-driver.js';
 import { AcpSessionDriver } from './acp/acp-session-driver.js';
 import { ACP_LAUNCH_SPECS } from './acp/acp-dialects.js';
 import { resolveAgentCommand, spawnAgentProcess } from './agent-process.js';
+import {
+  CLAUDE_PARENT_SESSION_ENV_KEYS, CLAUDE_SESSION_ENV, claudeLaunchArgs,
+} from './claude/claude-protocol.js';
+import { ClaudeSessionDriver } from './claude/claude-session-driver.js';
 import {
   AGENT_DRIVER_IDS, driverCapabilities, normalizeDriverId, type AgentDriverCapabilities, type AgentDriverId,
 } from './driver-capabilities.js';
@@ -64,8 +69,26 @@ export class DriverRegistry {
   }
 }
 
-/** ACP and Pi drivers, launched as the person's own installed CLIs. */
+/** Claude Code, ACP, and Pi drivers, launched as the person's own installed CLIs. */
 export function nativeDriverEntries(): AgentDriverEntry[] {
+  const claude: AgentDriverEntry = {
+    id: 'claude', label: 'Claude Code', command: 'claude', capabilities: driverCapabilities('claude'),
+    launch: (_sessionId, cwd, events, { policy, resumeSessionId }) => {
+      const sessionId = resumeSessionId ?? randomUUID();
+      return new ClaudeSessionDriver(
+        spawnAgentProcess({
+          command: 'claude', cwd,
+          args: claudeLaunchArgs({
+            policy,
+            ...(resumeSessionId ? { resumeSessionId } : { sessionId }),
+          }),
+          env: CLAUDE_SESSION_ENV,
+          envToDelete: CLAUDE_PARENT_SESSION_ENV_KEYS,
+        }),
+        events, { sessionId, policy },
+      );
+    },
+  };
   const acp = Object.values(ACP_LAUNCH_SPECS).map((spec): AgentDriverEntry => ({
     id: spec.driver, label: spec.label, command: spec.command, capabilities: driverCapabilities(spec.driver),
     launch: (_sessionId, cwd, events) =>
@@ -81,5 +104,5 @@ export function nativeDriverEntries(): AgentDriverEntry[] {
       events, { policy },
     ),
   };
-  return [...acp, pi];
+  return [claude, ...acp, pi];
 }

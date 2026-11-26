@@ -529,23 +529,31 @@ test('Pi delivery: a refused prompt is not_accepted; a lost reply is unknown_acc
 // --- Capabilities, registry, manager ---
 
 test('capability table: legacy providers fall back to Codex, policies never widen past what a driver enforces', () => {
-  for (const legacy of [undefined, null, 'acp', 'claude', 42]) assert.equal(normalizeDriverId(legacy), 'codex');
+  for (const legacy of [undefined, null, 'acp', 42]) assert.equal(normalizeDriverId(legacy), 'codex');
+  assert.equal(normalizeDriverId('claude'), 'claude');
   assert.equal(normalizeDriverId('pi'), 'pi');
   const codex = AGENT_DRIVER_CAPABILITIES.codex;
   assert.ok(codex.goal && codex.feedback && codex.usageLimits && codex.skills && codex.plugins && codex.history && codex.orchestration && codex.network,
     'Codex keeps every capability it had');
-  for (const id of ['antigravity', 'grok', 'opencode', 'pi']) {
+  for (const id of ['claude', 'antigravity', 'grok', 'opencode', 'pi']) {
     const caps = AGENT_DRIVER_CAPABILITIES[id];
     assert.equal(caps.goal || caps.feedback || caps.usageLimits || caps.skills || caps.plugins || caps.history || caps.orchestration || caps.network, false, id);
   }
+  const claude = AGENT_DRIVER_CAPABILITIES.claude;
+  assert.deepEqual(claude.policies, ['workspace-write', 'read-only', 'full-auto']);
+  assert.equal(claude.policyNeedsRelaunch, false);
+  assert.ok(claude.models && claude.efforts && claude.images && claude.compact && claude.rename && claude.resume && claude.terminalResume);
+  assert.equal(supportedPolicy('claude', 'read-only'), 'read-only');
   assert.equal(supportedPolicy('grok', 'read-only'), 'workspace-write', 'a read-only request for a driver without it still asks');
   assert.equal(supportedPolicy('opencode', 'read-only'), 'read-only');
   assert.equal(supportedPolicy('pi', 'read-only'), 'read-only');
   assert.deepEqual(terminalResumeArgs('codex', 't1'), ['resume', 't1']);
+  assert.deepEqual(terminalResumeArgs('claude', 'c-uuid-1'), ['--resume', 'c-uuid-1']);
   assert.deepEqual(terminalResumeArgs('antigravity', 'c1'), ['--conversation', 'c1']);
   assert.deepEqual(terminalResumeArgs('grok', 's1'), ['--resume', 's1']);
   assert.deepEqual(terminalResumeArgs('opencode', 's1'), ['--session', 's1']);
   assert.deepEqual(terminalResumeArgs('pi', 'C:\\pi\\s.jsonl'), ['--session', 'C:\\pi\\s.jsonl']);
+  assert.equal(terminalResumeArgs('claude', '--evil'), null, 'an id cannot smuggle a flag');
   assert.equal(terminalResumeArgs('grok', '--evil'), null, 'an id cannot smuggle a flag');
 
   const registry = new DriverRegistry([{ id: 'codex', label: 'Codex', command: 'codex', capabilities: codex, launch: () => null }], (command) => (command === 'codex' ? 'C:/codex.cmd' : null));
