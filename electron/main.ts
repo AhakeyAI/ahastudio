@@ -561,6 +561,12 @@ app.whenReady().then(async () => {
   const codexCatalog = new CodexCatalog(() => launchCodexPilot({ cwd: app.getPath('home'), events: noSessionEvents }));
   const agentSessionsIpc = registerAgentSessionsIpc(ipcCtx, agentSessions, {
     catalog: codexCatalog,
+    runtimeCwd: () => {
+      const state = getDefaultWorkspaceStateStore(() => app.getPath('userData')).read();
+      const windows = Array.isArray(state?.windows) ? state.windows : [];
+      const active = windows.find((value) => value && typeof value === 'object' && value.id === state?.activeWindowId);
+      return typeof active?.cwd === 'string' && existsSync(active.cwd) ? active.cwd : app.getPath('home');
+    },
     inspectRuntime: async (cwd, probe) => {
       const { inspectCodexRuntime } = await import('./orchestration/codex-runtime-diagnostics.js');
       return inspectCodexRuntime(cwd, probe, () => launchCodexPilot({ cwd, events: noSessionEvents, diagnostics: true }));

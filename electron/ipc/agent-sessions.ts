@@ -102,6 +102,7 @@ export function registerAgentSessionsIpc(
     /** Models, skills, plugins, and file search; without it the composer offers none of them. */
     catalog?: CodexCatalog;
     inspectRuntime?: (cwd: string, probe: boolean) => Promise<CodexRuntimeReport>;
+    runtimeCwd?: () => string;
     revealRuntimeConfig?: () => void;
     /** Where pasted images are kept, one folder per session; without it images cannot be attached. */
     attachmentsDir?: () => string;
@@ -167,7 +168,7 @@ export function registerAgentSessionsIpc(
   secure('runtime', z.object({ id: id.optional(), probe: z.boolean().optional() }).strict(), async (input) => {
     if (!options.inspectRuntime) throw new Error('当前客户端不支持运行环境检查');
     if (inspecting) throw new Error('诊断正在进行，请稍候');
-    const cwd = input.id ? sessionCwd(input.id) : ctx.getCurrentCwd();
+    const cwd = input.id ? sessionCwd(input.id) : ctx.getCurrentCwd() ?? options.runtimeCwd?.();
     if (!cwd || !isAbsolute(cwd)) throw new Error('请先选择项目文件夹');
     inspecting = true;
     try { return { report: await options.inspectRuntime(cwd, input.probe === true) }; }
