@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { statSync } from 'node:fs';
 import { type PtyHost, resolveDefaultShell } from './pty-host.js';
 import { mergeTerminalProcessEnv, resolveLocalTerminal, type LocalShellId, type OrchestrationCliId } from './local-cli.js';
 import { mergedSubprocessEnv } from './settings-loader.js';
@@ -18,6 +19,13 @@ export interface LocalTerminalLaunch {
 
 export interface LocalTerminalData { ptyId: string; data: string; sequence: number }
 export interface LocalTerminalExit { ptyId: string; exitCode: number | null }
+
+export function assertTerminalWorkingDirectory(cwd: string): void {
+  try {
+    if (statSync(cwd).isDirectory()) return;
+  } catch { /* Report a launch error instead of an empty native exit-1 session. */ }
+  throw new Error(`终端工作目录不可用：${cwd}；请重新选择存在且可访问的项目目录`);
+}
 
 export function mergeCliLaunchArgs(
   mcpArgs: readonly string[],
@@ -68,6 +76,7 @@ export class LocalTerminalSessions {
     const target = payload.terminalId || payload.cliId || payload.shellId
       ? resolveLocalTerminal(payload.cliId, payload.shellId, mergedArgs, { appearance: payload.appearance }) : null;
     const cwd = payload.cwd ?? target?.cwd ?? this.currentCwd() ?? process.cwd();
+    assertTerminalWorkingDirectory(cwd);
     const rawFile = target?.file ?? resolveDefaultShell();
     const baseEnv = mergeTerminalProcessEnv(
       target?.env ?? mergedSubprocessEnv(),

@@ -12,6 +12,7 @@ import { clampTerminalDim } from './terminal-size.js';
 import { PtyInputQueue } from './pty-input-queue.js';
 import {
   mergeCliLaunchArgs,
+  assertTerminalWorkingDirectory,
   type LocalTerminalData,
   type LocalTerminalExit,
   type LocalTerminalLaunch,
@@ -83,7 +84,7 @@ export interface DaemonSessionConfig {
 }
 
 export class DaemonTerminalSessions {
-  private readonly inputQueue = new PtyInputQueue();
+  private inputQueue = new PtyInputQueue();
   private clientPromise: Promise<TerminalClient> | null = null;
   private activeClient: TerminalClient | null = null;
   private unsubEvents: (() => void) | null = null;
@@ -267,6 +268,7 @@ export class DaemonTerminalSessions {
           ? resolveLocalTerminal(payload.cliId, payload.shellId, mergedArgs, { appearance: payload.appearance })
           : null;
       const cwd = resolve(payload.cwd ?? target?.cwd ?? this.currentCwd() ?? process.cwd());
+      assertTerminalWorkingDirectory(cwd);
       const rawFile = target?.file ?? resolveDefaultShell();
       const baseEnv = mergeTerminalProcessEnv(
         target?.env ?? mergedSubprocessEnv(),
@@ -353,6 +355,9 @@ export class DaemonTerminalSessions {
   /** Disconnect client socket on window close without terminating daemon-hosted PTYs. */
   detachAll(): void {
     this.inputQueue.cancelAll();
+    // The service outlives macOS windows. Keep old writes aborted, but let a
+    // reopened renderer accept fresh input through a new queue.
+    this.inputQueue = new PtyInputQueue();
     this.connectionGeneration += 1;
     this.attachedDaemonIds.clear();
     this.resetClientConnection();

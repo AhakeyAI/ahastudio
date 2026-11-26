@@ -194,9 +194,6 @@ __aha_deferred_init() {
   (( \${precmd_functions[(Ie)__aha_osc133_precmd]} )) || precmd_functions+=(__aha_osc133_precmd)
   (( \${preexec_functions[(Ie)__aha_osc133_preexec]} )) || preexec_functions=(__aha_osc133_preexec \${preexec_functions[@]})
   __aha_osc133_precmd
-  if (( \${+functions[__aha_deferred_sched_init]} )); then
-    builtin unfunction __aha_deferred_sched_init
-  fi
   builtin unfunction __aha_deferred_init __aha_deferred_line_init __aha_arm_deferred_init 2>/dev/null || true
 }
 
@@ -205,6 +202,7 @@ __aha_deferred_sched_init() {
   builtin emulate -L zsh
   (( \${+functions[__aha_deferred_init]} )) && __aha_deferred_init
   builtin unset __aha_deferred_sched_armed
+  builtin unfunction __aha_deferred_sched_init
   return $__aha_prompt_status
 }
 

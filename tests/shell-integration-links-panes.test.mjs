@@ -10,6 +10,7 @@ import ts from 'typescript';
 import { ipcMain, shell } from 'electron';
 
 import { applyShellIntegration } from '../dist-electron/shell-integration/index.js';
+import { getZshIntegrationZshenvContent } from '../dist-electron/shell-integration/posix-bootstrap.js';
 import { classifyLinkedFile } from '../dist-electron/ipc/launchable-file-type.js';
 import { registerShellPtyIpc, resolveTerminalLinkPath, workspaceStateSetSchema } from '../dist-electron/ipc/shell-pty.js';
 import { getPtyHost } from '../dist-electron/pty-host.js';
@@ -770,4 +771,17 @@ test('PowerShell shell integration emits native exit code 23 in OSC 133;D withou
     { windowsHide: true, timeout: 10_000 },
   );
   assert.ok(stdout.includes('\x1b]133;D;23\x07'), `Expected OSC 133;D;23 in output, got: ${JSON.stringify(stdout)}`);
+});
+
+test('zsh line initialization retains a queued sched callback until the callback cleans itself up', async t => {
+  if(!existsSync('/bin/zsh'))return;
+  const {execFileSync}=await import('node:child_process');
+  const dir=mkdtempSync(join(tmpdir(),'aha-zsh-sched-'));
+  t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  const content=getZshIntegrationZshenvContent('ahastation-shell-integration');
+  const functions=content.slice(0,content.lastIndexOf('\n__aha_arm_deferred_init\n'));
+  const script=functions+'\n__aha_deferred_init\nprint -r -- "CALLBACK=${+functions[__aha_deferred_sched_init]}"\n__aha_deferred_sched_init\nprint -r -- "CLEAN=${+functions[__aha_deferred_sched_init]}"';
+  const output=execFileSync('/bin/zsh',['-f','-i','-c',script],{env:{...process.env,HOME:dir,ZDOTDIR:dir},encoding:'utf8'});
+  assert.match(output,/CALLBACK=1/);
+  assert.match(output,/CLEAN=0/);
 });
