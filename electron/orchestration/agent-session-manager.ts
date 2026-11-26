@@ -436,11 +436,21 @@ export class AgentSessionManager {
     });
     if (delivery.status === 'accepted') {
       session.hasTurns = true;
-      if (input.model) info.model = input.model;
-      if (input.effort !== undefined) info.effort = input.effort;
+      if (driver.sessionId) info.providerSessionId = driver.sessionId;
+      if (driver.provider !== 'codex') {
+        if (input.model) info.model = driver.effectiveModel ?? input.model;
+        if (driver.effectiveEffort !== undefined) info.effort = driver.effectiveEffort;
+        else if (input.effort !== undefined) info.effort = input.effort;
+      } else {
+        if (input.model) info.model = input.model;
+        if (input.effort !== undefined) info.effort = input.effort;
+      }
       if (input.policy) info.policy = input.policy;
       if (input.network !== undefined) info.network = input.network;
-      timeline.setMeta({ model: info.model, readOnly: info.policy === 'read-only' });
+      timeline.setMeta({
+        model: info.model, readOnly: info.policy === 'read-only',
+        ...(info.providerSessionId ? { providerSessionId: info.providerSessionId } : {}),
+      });
     } else {
       timeline.endActiveTurn('failed', delivery.reason);
       // Unknown acceptance leaves the provider thread in an unknown state; do not send into it again.
@@ -879,13 +889,16 @@ export class AgentSessionManager {
       info.provider = session.driver.provider;
       info.providerSessionId = await session.driver.open({
         cwd: info.cwd, model: info.model, policy: info.policy, network: info.network,
+        ...(rejoin ? { effort: info.effort } : info.effort ? { effort: info.effort } : {}),
         ...(developerInstructions ? { developerInstructions } : {}),
         ...(rejoin && info.providerSessionId ? { resumeSessionId: info.providerSessionId } : {}),
       });
       if (!session.driver.alive) throw new Error(info.error ?? 'The agent closed while starting');
       // What the provider actually uses, e.g. a default from the person's own config.
       info.model = session.driver.effectiveModel ?? info.model;
-      info.effort = session.driver.effectiveEffort ?? info.effort;
+      info.effort = session.driver.provider !== 'codex' && session.driver.effectiveEffort !== undefined
+        ? session.driver.effectiveEffort
+        : (session.driver.effectiveEffort ?? info.effort);
       info.status = 'idle';
       timeline.setMeta({ alive: true, providerSessionId: info.providerSessionId });
       void this.syncName(session);
@@ -920,6 +933,14 @@ export class AgentSessionManager {
       onTurnCompleted: (_turnKey, result) => {
         if (!current()) return;
         this.cancelRequests(session, 'Turn ended');
+        if (session.driver?.sessionId && session.driver.sessionId !== info.providerSessionId) {
+          info.providerSessionId = session.driver.sessionId;
+          timeline.setMeta({ providerSessionId: info.providerSessionId });
+        }
+        if (session.driver && session.driver.provider !== 'codex' && session.driver.effectiveModel && session.driver.effectiveModel !== info.model) {
+          info.model = session.driver.effectiveModel;
+          timeline.setMeta({ model: info.model });
+        }
         timeline.completeTurn({
           turnId: result.turnId, stopReason: result.stopReason, usage: result.usage, error: result.error,
           status: result.stopReason === 'completed' ? 'completed'

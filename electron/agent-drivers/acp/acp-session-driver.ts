@@ -175,9 +175,9 @@ export class AcpSessionDriver implements AgentSessionDriver {
     }));
   }
 
-  async open({ cwd, model, policy, resumeSessionId }: {
-    cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string; network?: boolean;
-    developerInstructions?: string;
+  async open({ cwd, model, effort, policy, resumeSessionId }: {
+    cwd: string; model: string | null; effort?: string | null; policy: AgentSessionPolicy; resumeSessionId?: string;
+    network?: boolean; developerInstructions?: string;
   }): Promise<string> {
     try {
       const initialized = await this.initialize();
@@ -198,6 +198,9 @@ export class AcpSessionDriver implements AgentSessionDriver {
       this.acpSessionId = id;
       this.readSessionOptions(response);
       if (model && model !== this.currentModel) await this.setModel(model);
+      if (effort && effort !== this.currentEffort && this.effortConfigId && this.effortValues.some((option) => option.value === effort)) {
+        await this.setEffort(effort);
+      }
       await this.applyPolicy(policy);
       return id;
     } catch (error) {

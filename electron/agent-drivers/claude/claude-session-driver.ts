@@ -186,9 +186,9 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     return this.modelOptions;
   }
 
-  async open({ model, policy, resumeSessionId }: {
-    cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string; network?: boolean;
-    developerInstructions?: string;
+  async open({ model, effort, policy, resumeSessionId }: {
+    cwd: string; model: string | null; effort?: string | null; policy: AgentSessionPolicy; resumeSessionId?: string;
+    network?: boolean; developerInstructions?: string;
   }): Promise<string> {
     try {
       const init = asObject(await this.rpc.request(
@@ -230,9 +230,12 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
 
       if (model && model !== this.currentModel) await this.setModel(model);
       const activeOpt = this.modelOptions.find((entry) => entry.id === this.currentModel || entry.model === this.currentModel);
-      if (activeOpt && activeOpt.efforts.length === 0 && this.currentEffort !== null) {
-        this.currentEffort = null;
-        this.refreshModelOptions();
+      if (activeOpt && activeOpt.efforts.length === 0) {
+        if (this.currentEffort !== null) await this.clearEffort();
+      } else if (effort === null) {
+        if (this.currentEffort !== null) await this.clearEffort();
+      } else if (effort && effort !== this.currentEffort && (!activeOpt || activeOpt.efforts.some((entry) => entry.value === effort))) {
+        await this.setEffort(effort);
       }
       await this.applyPolicy(policy);
       return this.claudeSessionId;
@@ -368,23 +371,31 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     if (!this.alive || !this.claudeSessionId || this.active) {
       return { status: 'not_accepted', reason: 'Claude Code 会话已关闭或正忙' };
     }
+    const switchingModel = Boolean(input.model && input.model !== this.currentModel);
     const targetModel = input.model ?? this.currentModel;
-    const targetOpt = this.modelOptions.find((entry) => entry.id === targetModel || entry.model === targetModel);
-    let clearEffort = input.effort === null && this.currentEffort !== null;
-    if (input.effort) {
-      if (targetOpt && targetOpt.efforts.length === 0) {
-        if (input.effort !== this.currentEffort) {
-          return { status: 'not_accepted', reason: `Claude 当前模型不支持推理强度 ${input.effort}` };
-        }
-        clearEffort = this.currentEffort !== null;
-      } else if (targetOpt && !targetOpt.efforts.some((entry) => entry.value === input.effort)) {
-        return { status: 'not_accepted', reason: `Claude 当前模型不支持推理强度 ${input.effort}` };
+    const preOpt = this.modelOptions.find((entry) => entry.id === targetModel || entry.model === targetModel);
+    let desiredEffort = input.effort;
+    if (desiredEffort && preOpt && !preOpt.efforts.some((entry) => entry.value === desiredEffort)) {
+      if (switchingModel && desiredEffort === this.currentEffort) {
+        desiredEffort = preOpt.defaultEffort;
+      } else {
+        return { status: 'not_accepted', reason: `Claude 当前模型不支持推理强度 ${desiredEffort}` };
       }
     }
     try {
-      if (input.model && input.model !== this.currentModel) await this.setModel(input.model);
-      if (clearEffort) await this.clearEffort();
-      else if (input.effort && input.effort !== this.currentEffort) await this.setEffort(input.effort);
+      if (switchingModel) await this.setModel(input.model!);
+      const activeOpt = this.modelOptions.find((entry) => entry.id === this.currentModel || entry.model === this.currentModel);
+      if (
+        switchingModel &&
+        (desiredEffort === undefined || desiredEffort === this.currentEffort) &&
+        activeOpt &&
+        this.currentEffort &&
+        !activeOpt.efforts.some((entry) => entry.value === this.currentEffort)
+      ) {
+        desiredEffort = activeOpt.defaultEffort;
+      }
+      if (desiredEffort === null && this.currentEffort !== null) await this.clearEffort();
+      else if (desiredEffort && desiredEffort !== this.currentEffort) await this.setEffort(desiredEffort);
       if (input.policy && input.policy !== this.policy) await this.applyPolicy(input.policy);
     } catch (error) {
       // Pre-dispatch controls failed before the user message was ever written.
@@ -625,7 +636,7 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     const turn = this.active;
     if (subtype === 'init') {
       const sid = asNonEmptyText(record.session_id);
-      if (sid && !this.claudeSessionId) this.claudeSessionId = sid;
+      if (sid) this.claudeSessionId = sid;
       const model = asNonEmptyText(record.model);
       if (model) this.currentModel = model;
       const permMode = asNonEmptyText(record.permissionMode);

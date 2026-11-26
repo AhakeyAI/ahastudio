@@ -1191,3 +1191,77 @@ test('open clears stale effortLevel when active model does not support effort, a
   assert.equal(driver.effectiveEffort, null);
   await driver.close();
 });
+
+test('resume preserves saved effort, model-switch adapts inherited effort, conversation_reset syncs sessionId, and Windows job silences CLIXML', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aha-claude-resume-sync-'));
+  const storageFile = join(dir, 'agent-sessions.json');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const seenControls = [];
+  let resetNextTurn = false;
+  const launch = (_sessionId, _cwd, events, options) => {
+    const child = fakeChild();
+    const calls = [];
+    seenControls.push(calls);
+    const io = standardClaudeAgent(child, {
+      onControl: (msg) => {
+        calls.push(msg.request);
+        return false;
+      },
+      onUser: async () => {
+        await tick();
+        if (resetNextTurn) {
+          resetNextTurn = false;
+          io.send({ type: 'conversation_reset', new_conversation_id: 'claude-reset-sid-2' });
+        }
+        io.send({ type: 'result', subtype: 'success', is_error: false, result: 'OK' });
+      },
+    });
+    return new ClaudeSessionDriver(child, events, {
+      sessionId: options.resumeSessionId ?? 'claude-sid-initial',
+      policy: options.policy,
+    });
+  };
+
+  // 1. Set effort: 'max' on Opus, dispose (persisting to disk), reload in new manager, and send without explicit effort.
+  const manager1 = new AgentSessionManager({ launch, storageFile: () => storageFile });
+  const created = await manager1.create({ cwd: dir, policy: 'workspace-write', provider: 'claude' });
+  assert.equal((await manager1.send(created.id, { text: 'turn 1', effort: 'max' })).status, 'accepted');
+  await until(() => manager1.list()[0].status === 'idle');
+  assert.equal(manager1.list()[0].effort, 'max');
+  await manager1.dispose();
+
+  const manager2 = new AgentSessionManager({ launch, storageFile: () => storageFile });
+  assert.equal(manager2.list()[0].effort, 'max');
+  assert.equal((await manager2.send(created.id, { text: 'turn 2 after restart' })).status, 'accepted');
+  await until(() => manager2.list()[0].status === 'idle');
+  assert.equal(manager2.list()[0].effort, 'max', 'resume must restore saved effort rather than clobbering to default medium');
+  assert.ok(seenControls.at(-1).some((req) => req.subtype === 'apply_flag_settings' && req.settings?.effortLevel === 'max'));
+
+  // 2. Switching from Opus ('max') to Sonnet (only low/medium/high) without explicit effort adapts to Sonnet's default ('medium').
+  resetNextTurn = true;
+  assert.equal((await manager2.send(created.id, { text: 'switch model only', model: 'claude-sonnet-4-6' })).status, 'accepted');
+  await until(() => manager2.list()[0].status === 'idle');
+  assert.equal(manager2.list()[0].model, 'claude-sonnet-4-6');
+  assert.equal(manager2.list()[0].effort, 'medium', 'inherited incompatible effort converges to target model defaultEffort');
+
+  // 3. conversation_reset updates providerSessionId on AgentSessionManager and terminal handoff args.
+  assert.equal(manager2.list()[0].providerSessionId, 'claude-reset-sid-2');
+  const handoff = await manager2.handoffToTerminal(created.id);
+  assert.equal(handoff.ok, true);
+  assert.deepEqual(handoff.args, ['--resume', 'claude-reset-sid-2']);
+  await manager2.dispose();
+
+  // 4. On Windows, spawnWindowsCodexJob silences #< CLIXML PowerShell progress output on stderr.
+  if (process.platform === 'win32') {
+    const { spawnWindowsCodexJob } = await import('../dist-electron/orchestration/windows-codex-job.js');
+    const job = spawnWindowsCodexJob(process.execPath, ['-e', 'process.stderr.write("real-err"); process.exit(2)'], dir, process.env);
+    let stderr = '';
+    job.stderr.setEncoding('utf8');
+    job.stderr.on('data', (chunk) => { stderr += chunk; });
+    const code = await new Promise((resolve) => job.once('close', resolve));
+    assert.equal(code, 2);
+    assert.equal(stderr.includes('#< CLIXML'), false);
+    assert.equal(stderr.trim(), 'real-err');
+  }
+});
