@@ -123,11 +123,12 @@ function createSettingsWindow(focus?: SettingsSection | null): BrowserWindow {
       console.error('[settings-window] loadURL error:', err);
     });
   } else {
-    const htmlPath = join(__dirname, '..', '..', 'dist', 'index.html');
-    const query: Record<string, string> = { view: 'settings' };
-    if (focus) query.focus = focus;
-    win.loadFile(htmlPath, { query }).catch((err) => {
-      console.error('[settings-window] loadFile error:', htmlPath, err);
+    // Share the main renderer's origin: localStorage and its storage events
+    // synchronize appearance preferences between the two windows.
+    const query = new URLSearchParams({ view: 'settings' });
+    if (focus) query.set('focus', focus);
+    win.loadURL(`app://bundle/index.html?${query}`).catch((err) => {
+      console.error('[settings-window] loadURL error:', err);
     });
   }
 
