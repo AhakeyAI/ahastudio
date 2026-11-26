@@ -23,7 +23,7 @@ Certain ported, adapted, or bundled components retain their original upstream co
   - `electron/agent/agent-prompt-delivery.ts`, `electron/agent/program-status-osc.ts` (adapted portions)
   - `electron/orchestration/orchestration-task-display.ts` (plus orchestration patterns adapted from Orca's orchestration subsystem)
   - `src/lib/terminal-appearance.ts` (Builtin Tango Light palette)
-  - `src/components/TerminalBrandIcons.tsx` (adapted SVG brand icon components)
+  - `src/components/TerminalBrandIcons.tsx` (adapted SVG brand icon components; Kimi striped moon silhouette vector-traced from Orca’s bundled AgentIcon bitmap)
   - `src/assets/cli-icons/antigravity.png`, `src/assets/cli-icons/grok.png`, `src/assets/cli-icons/qoder.png`
   - `electron/agent-drivers/jsonl-rpc.ts` (JSON-lines framing and call correlation adapted from `src/main/jsonl-rpc/peer.ts`, `peer-reply.ts`, and `src/main/acp/transport/acp-json-rpc-peer.ts`)
   - `electron/agent-drivers/acp/acp-session-driver.ts`, `acp-dialects.ts`, `acp-form-elicitation.ts` (ACP session setup, permission answering, timeline translation, the Antigravity / Grok / OpenCode dialects and launch specs, and form elicitation adapted from `src/main/acp/**`, `src/main/antigravity/antigravity-acp-launch-spec.ts`)
