@@ -32,7 +32,7 @@ export function agentEnvironment(
   const drop = new Set(envToDelete.map((key) => key.toUpperCase()));
   for (const key of Object.keys(env)) {
     const upper = key.toUpperCase();
-    if (upper.startsWith('AHA_') || upper === 'ELECTRON_RUN_AS_NODE' || drop.has(upper)) delete env[key];
+    if (upper.startsWith('AHA_') || upper === 'ELECTRON_RUN_AS_NODE' || upper === 'ELECTRON_NO_ASAR' || drop.has(upper)) delete env[key];
   }
   return { ...env, ...extra };
 }

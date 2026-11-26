@@ -229,6 +229,11 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
       this.claudeSessionId ??= randomUUID();
 
       if (model && model !== this.currentModel) await this.setModel(model);
+      const activeOpt = this.modelOptions.find((entry) => entry.id === this.currentModel || entry.model === this.currentModel);
+      if (activeOpt && activeOpt.efforts.length === 0 && this.currentEffort !== null) {
+        this.currentEffort = null;
+        this.refreshModelOptions();
+      }
       await this.applyPolicy(policy);
       return this.claudeSessionId;
     } catch (error) {

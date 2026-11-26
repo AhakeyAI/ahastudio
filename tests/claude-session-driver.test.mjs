@@ -1167,3 +1167,27 @@ test('AgentSessionManager propagates explicit effort: null when switching Claude
   assert.equal(manager.list()[0].effort, null);
   await manager.dispose();
 });
+
+test('open clears stale effortLevel when active model does not support effort, and agentEnvironment strips ELECTRON_NO_ASAR', async () => {
+  const prevNoAsar = process.env.ELECTRON_NO_ASAR;
+  process.env.ELECTRON_NO_ASAR = '1';
+  try {
+    const scrubbed = agentEnvironment({}, CLAUDE_PARENT_SESSION_ENV_KEYS);
+    assert.equal(scrubbed.ELECTRON_NO_ASAR, undefined);
+  } finally {
+    if (prevNoAsar === undefined) delete process.env.ELECTRON_NO_ASAR;
+    else process.env.ELECTRON_NO_ASAR = prevNoAsar;
+  }
+
+  const child = fakeChild();
+  standardClaudeAgent(child, {
+    settingsResponse: { applied: { model: 'claude-haiku-4-5-20251001', effort: 'high' } },
+  });
+  const driver = new ClaudeSessionDriver(child, {
+    onTurnStarted() {}, onTurnCompleted() {}, onRequest: async () => ({ decision: 'decline' }), onExit() {},
+  }, { sessionId: 'sid-haiku-init' });
+  await driver.open({ cwd: tmpdir(), model: null, policy: 'workspace-write' });
+  assert.equal(driver.effectiveModel, 'claude-haiku-4-5-20251001');
+  assert.equal(driver.effectiveEffort, null);
+  await driver.close();
+});
