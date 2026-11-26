@@ -286,8 +286,9 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   }, [sessionId, info, canToggleOrchestration, busy, onNotify]);
 
   // The terminal pane writes the conversation from here on; this view sends nothing until it is taken back.
+  const hasThreadTurns = currentThreadHasTurns(timeline?.turns ?? []);
   const canHandoff = Boolean(
-    direct && info && caps.terminalResume && !handoff && info.providerSessionId && !info.orchestration &&
+    direct && info && caps.terminalResume && !handoff && info.providerSessionId && hasThreadTurns && !info.orchestration &&
       !running && approvals.length === 0 && !info.pendingQuestions.length && (info.status === 'idle' || resumable),
   );
   const continueInTerminal = () => {
@@ -489,7 +490,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     return {
       currentTitle: title,
       // A waiting `/clear` means the next message starts a new thread, so there is nothing to compact.
-      hasTurns: !freshSessionArmed && currentThreadHasTurns(timeline?.turns ?? []),
+      hasTurns: !freshSessionArmed && hasThreadTurns,
       hasUsageLimits: caps.usageLimits && Boolean(window.vibeMeet?.agentSessions?.rateLimits),
       canHistory,
       // A title is kept here for every driver; only some also store it with the provider.
@@ -564,7 +565,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               title={canHandoff
                 ? `暂停这里，在终端里用 ${DRIVER_LABELS[info.provider]} 自己的界面继续同一个会话`
                 : info.orchestration ? '先关闭编排模式，再在终端中继续'
-                  : !info.providerSessionId ? '发送第一条消息后才能在终端中继续' : '本轮结束后才能在终端中继续'}
+                  : !info.providerSessionId || !hasThreadTurns ? '发送第一条消息后才能在终端中继续' : '本轮结束后才能在终端中继续'}
               onClick={continueInTerminal}
             >
               <SquareTerminal size={13} /> {busy === 'handoff' ? '打开终端…' : '在终端中继续'}

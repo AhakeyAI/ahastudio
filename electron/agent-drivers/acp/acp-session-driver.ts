@@ -41,6 +41,8 @@ interface AcpTurn {
   lastMessage: string | null;
   textSeg: number;
   thinkSeg: number;
+  activeMessageId: string | null;
+  activeThoughtId: string | null;
   last: 'text' | 'thought' | 'tool' | null;
   tools: Map<string, ToolMemory>;
   retries: number;
@@ -183,8 +185,9 @@ export class AcpSessionDriver implements AgentSessionDriver {
       const capabilities = object(initialized.agentCapabilities);
       let method = 'session/new';
       if (resumeSessionId) {
-        if (capabilities.loadSession === true) method = 'session/load';
-        else if (object(capabilities.sessionCapabilities).resume) method = 'session/resume';
+        // Prefer session/resume over session/load so agents that advertise both (agy, grok) do not replay full history.
+        if (object(capabilities.sessionCapabilities).resume) method = 'session/resume';
+        else if (capabilities.loadSession === true) method = 'session/load';
         else throw new Error(`${this.spec.label} 不支持恢复会话`);
       }
       const response = object(await this.withSignIn(initialized, () => this.rpc.request(
@@ -225,7 +228,8 @@ export class AcpSessionDriver implements AgentSessionDriver {
     let finish!: () => void;
     const idle = new Promise<void>((resolve) => { finish = resolve; });
     const turn: AcpTurn = {
-      turnKey, turnId: `prompt-${++this.prompts}`, messages: new Map(), lastMessage: null, textSeg: 0, thinkSeg: 0, last: null,
+      turnKey, turnId: `prompt-${++this.prompts}`, messages: new Map(), lastMessage: null, textSeg: 0, thinkSeg: 0,
+      activeMessageId: null, activeThoughtId: null, last: null,
       tools: new Map(), retries: 0, evidence: false, onEvidence: null, cancelRequested: false, idle, finish,
     };
     this.active = turn;
@@ -510,15 +514,21 @@ export class AcpSessionDriver implements AgentSessionDriver {
         }
         const messageId = text(update.messageId);
         if (thought) {
+          this.closeStreamSegment(turn, 'text');
           if (turn.last === 'text' || turn.last === 'tool') turn.thinkSeg++;
           turn.last = 'thought';
           const id = messageId ? `think:${messageId}` : `think:${turn.turnId}:${turn.thinkSeg}`;
+          if (turn.activeThoughtId && turn.activeThoughtId !== id) this.closeStreamSegment(turn, 'thought');
+          turn.activeThoughtId = id;
           this.timeline(turn, { type: 'delta', id, kind: 'reasoning', field: 'text', delta: chunk });
           return;
         }
+        this.closeStreamSegment(turn, 'thought');
         if (turn.last === 'thought' || turn.last === 'tool') turn.textSeg++;
         turn.last = 'text';
         const id = messageId ? `msg:${messageId}` : `msg:${turn.turnId}:${turn.textSeg}`;
+        if (turn.activeMessageId && turn.activeMessageId !== id) this.closeStreamSegment(turn, 'text');
+        turn.activeMessageId = id;
         turn.messages.set(id, (turn.messages.get(id) ?? '') + chunk);
         turn.lastMessage = id;
         this.append(chunk);
@@ -555,6 +565,7 @@ export class AcpSessionDriver implements AgentSessionDriver {
   }
 
   private applyTool(turn: AcpTurn, raw: AcpToolUpdate): void {
+    this.closeStreamSegment(turn, 'both');
     const update = this.spec.dialect.normalizeToolUpdate?.(raw) ?? raw;
     const known = turn.tools.get(update.toolCallId);
     const input = update.rawInput === undefined ? known?.input : update.rawInput;
@@ -690,11 +701,24 @@ export class AcpSessionDriver implements AgentSessionDriver {
         ? reason === 'max_tokens' ? '已达到模型输出上限' : reason === 'refusal' ? '模型拒绝回答' : `本轮结束：${reason}`
         : null;
     const usage = numericFields(result.usage);
+    this.closeStreamSegment(turn, 'both');
     this.finishTurn(turn);
     this.events.onTurnCompleted(turn.turnKey, {
       turnId: turn.turnId, stopReason, finalText: turn.lastMessage ? turn.messages.get(turn.lastMessage) ?? '' : '',
       diff: null, usage: Object.keys(usage).length ? usage : null, error: failure,
     });
+  }
+
+  /** Marks active streamed thought/message items completed as soon as the agent switches phases. */
+  private closeStreamSegment(turn: AcpTurn, which: 'thought' | 'text' | 'both'): void {
+    if ((which === 'thought' || which === 'both') && turn.activeThoughtId) {
+      this.timeline(turn, { type: 'item', item: { id: turn.activeThoughtId, kind: 'reasoning', status: 'completed', completedAt: Date.now() } });
+      turn.activeThoughtId = null;
+    }
+    if ((which === 'text' || which === 'both') && turn.activeMessageId) {
+      this.timeline(turn, { type: 'item', item: { id: turn.activeMessageId, kind: 'message', status: 'completed', completedAt: Date.now() } });
+      turn.activeMessageId = null;
+    }
   }
 
   private finishTurn(turn: AcpTurn): void {

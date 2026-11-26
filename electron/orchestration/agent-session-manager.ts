@@ -328,6 +328,7 @@ export class AgentSessionManager {
     const text = input.text.trim();
     if (!text && !input.attachments?.length) return { ok: false, error: '消息是空的' };
     const { info } = session;
+    if (info.handoff) return { ok: false, error: '这个会话正在终端中继续；退出终端后点「回到这里」再发送' };
     const busy = info.status === 'running' || info.status === 'starting' || Boolean(session.driver?.busy);
     if (!busy && (!info.queued.length || info.queuePaused)) {
       const delivery = await this.send(id, input);
@@ -497,6 +498,7 @@ export class AgentSessionManager {
     if (!session) return { ok: false, error: '会话不存在' };
     const { info } = session;
     if (info.status === 'closed') return { ok: false, error: '会话已结束' };
+    if (info.handoff) return { ok: false, error: '这个会话正在终端中继续；退出终端后点「回到这里」再操作目标' };
     if (action.type === 'set') {
       const objective = action.objective.trim();
       if (!objective) return { ok: false, error: '请输入目标内容' };

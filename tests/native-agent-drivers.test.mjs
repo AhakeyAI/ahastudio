@@ -625,6 +625,8 @@ test('manager: terminal handoff keeps a single writer until the terminal has exi
   assert.deepEqual(handoff, { ok: true, cliId: 'grok', args: ['--resume', 'prov-1'], cwd: tmpdir() });
   assert.equal(manager.list()[0].status, 'suspended');
   assert.equal((await manager.send(grok.id, { text: 'from here' })).status, 'not_accepted', 'the native side sends nothing meanwhile');
+  assert.equal((await manager.enqueue(grok.id, { text: 'queued from here' })).ok, false, 'enqueue is also blocked while handed off');
+  assert.equal((await manager.runGoal(grok.id, { type: 'show' })).ok, false, 'goal actions are blocked while handed off');
   assert.equal(manager.bindHandoff(grok.id, 'local-handoff-1'), true);
   assert.equal(manager.reclaim(grok.id, () => true).ok, false, 'a running terminal keeps the conversation');
   assert.deepEqual(manager.reclaim(grok.id, () => false), { ok: true });
@@ -663,4 +665,43 @@ test('slash menu hides commands the driver lacks and never runs them locally', a
   assert.equal(slash.runsSlashCommandLocally(local), true);
   assert.equal(slash.runsSlashCommandLocally({ ...local, canGoal: false }), false, 'a driver without /goal gets it as a prompt');
   assert.equal(slash.runsSlashCommandLocally({ ...local, text: '/model', canModel: false }), false);
+});
+
+test('ACP: prefers session/resume over session/load when both are advertised, and settles streamed segments on phase switch', async () => {
+  const child = fakeChild();
+  const rec = recorder();
+  const methods = [];
+  const io = wire(child, (message) => {
+    if (message.method) methods.push(message.method);
+    if (message.method === 'initialize') {
+      io.send({
+        jsonrpc: '2.0', id: message.id,
+        result: { protocolVersion: 1, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } }, authMethods: [] },
+      });
+    } else if (message.method === 'session/resume') {
+      io.send({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'sess-prev' } });
+    } else if (message.method === 'session/prompt') {
+      io.send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-prev', update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking...' } } } });
+      io.send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-prev', update: { sessionUpdate: 'tool_call', toolCallId: 'c1', kind: 'execute', title: 'npm test', status: 'in_progress', rawInput: { command: 'npm test' } } } });
+      io.send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-prev', update: { sessionUpdate: 'tool_call_update', toolCallId: 'c1', status: 'completed', rawOutput: { stdout: 'ok', exitCode: 0 } } } });
+      io.send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-prev', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done!' } } } });
+      io.send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } });
+    }
+  });
+  const driver = new AcpSessionDriver(child, ACP_LAUNCH_SPECS.antigravity, rec.events);
+  const id = await driver.open({ cwd: tmpdir(), model: null, policy: 'workspace-write', resumeSessionId: 'sess-prev' });
+  assert.equal(id, 'sess-prev');
+  assert.equal(methods.includes('session/resume'), true, 'should prefer session/resume to avoid replaying full history');
+  assert.equal(methods.includes('session/load'), false);
+
+  const delivery = await driver.startTurn({ turnKey: 't1', prompt: 'run tests' });
+  assert.equal(delivery.status, 'accepted');
+  await rec.finished;
+
+  const thoughtClosedIndex = rec.timeline.findIndex((e) => e.type === 'item' && e.item.kind === 'reasoning' && e.item.status === 'completed');
+  const firstToolIndex = rec.timeline.findIndex((e) => e.type === 'item' && e.item.kind === 'command');
+  const messageClosedIndex = rec.timeline.findIndex((e) => e.type === 'item' && e.item.kind === 'message' && e.item.status === 'completed');
+  assert.ok(thoughtClosedIndex >= 0 && firstToolIndex > thoughtClosedIndex, 'reasoning item must settle before tool starts');
+  assert.ok(messageClosedIndex > firstToolIndex, 'streamed message item must settle on turn end');
+  await driver.close();
 });
