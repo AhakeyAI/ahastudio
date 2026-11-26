@@ -9,6 +9,7 @@ import { mergeTerminalProcessEnv, resolveLocalTerminal, type OrchestrationCliId 
 import { mergedSubprocessEnv } from './settings-loader.js';
 import { applyShellIntegration } from './shell-integration/index.js';
 import { clampTerminalDim } from './terminal-size.js';
+import { PtyInputQueue } from './pty-input-queue.js';
 import {
   mergeCliLaunchArgs,
   type LocalTerminalData,
@@ -17,7 +18,6 @@ import {
 } from './local-terminal-sessions.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const MAX_INPUT_CHUNK = 8192;
 
 export function toDaemonUuid(rawId: string): string {
   if (UUID_RE.test(rawId)) return rawId.toLowerCase();
@@ -83,6 +83,7 @@ export interface DaemonSessionConfig {
 }
 
 export class DaemonTerminalSessions {
+  private readonly inputQueue = new PtyInputQueue();
   private clientPromise: Promise<TerminalClient> | null = null;
   private activeClient: TerminalClient | null = null;
   private unsubEvents: (() => void) | null = null;
@@ -172,6 +173,7 @@ export class DaemonTerminalSessions {
     if (event.event === 'output') {
       this.events.data({ ptyId, data: event.data, sequence: event.sequence });
     } else {
+      this.inputQueue.release(event.terminalId);
       this.attachedDaemonIds.delete(event.terminalId);
       this.daemonToPtyId.delete(event.terminalId);
       this.events.exit({ ptyId, exitCode: event.exitCode });
@@ -305,10 +307,15 @@ export class DaemonTerminalSessions {
   async input(ptyId: string, data: string): Promise<{ ok: boolean; error?: string }> {
     const daemonId = this.ptyToDaemonId.get(ptyId) ?? toDaemonUuid(ptyId);
     try {
-      for (let offset = 0; offset < data.length; offset += MAX_INPUT_CHUNK) {
-        const chunk = data.slice(offset, offset + MAX_INPUT_CHUNK);
-        await this.withClient(client => client.input(daemonId, chunk), daemonId);
-      }
+      await this.inputQueue.enqueue(daemonId, data, async (chunk, signal) => {
+        // Unlike resize/attach, input must never retry a transport operation.
+        const client = await this.getClient();
+        if (signal.aborted) throw new Error('Terminal input cancelled');
+        const result = await client.input(daemonId, chunk);
+        if (!result || typeof result !== 'object' || !('ok' in result) || result.ok !== true) {
+          throw new Error('Terminal rejected input');
+        }
+      });
       return { ok: true };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : 'Terminal input failed' };
@@ -329,6 +336,7 @@ export class DaemonTerminalSessions {
 
   async close(ptyId: string): Promise<{ ok: boolean; error?: string }> {
     const daemonId = this.ptyToDaemonId.get(ptyId) ?? toDaemonUuid(ptyId);
+    this.inputQueue.cancel(daemonId);
     // daemonToPtyId stays until the exit event, so the renderer still receives it under the original ptyId.
     try {
       await this.withClient((client) => client.terminate(daemonId), daemonId);
@@ -338,11 +346,13 @@ export class DaemonTerminalSessions {
     }
     this.ptyToDaemonId.delete(ptyId);
     this.attachedDaemonIds.delete(daemonId);
+    this.inputQueue.release(daemonId);
     return { ok: true };
   }
 
   /** Disconnect client socket on window close without terminating daemon-hosted PTYs. */
   detachAll(): void {
+    this.inputQueue.cancelAll();
     this.connectionGeneration += 1;
     this.attachedDaemonIds.clear();
     this.resetClientConnection();
