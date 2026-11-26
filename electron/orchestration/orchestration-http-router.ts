@@ -452,7 +452,10 @@ export function isLongPollOrchestrationAction(action: string): boolean {
     action === 'ask' ||
     action === 'ask-self' ||
     action === 'delegate-task' ||
-    action === 'board-wait'
+    action === 'board-wait' ||
+    action === 'role-manage' ||
+    action === 'worker-integrate' ||
+    action === 'run-finalize'
   );
 }
 

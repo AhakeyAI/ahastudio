@@ -5678,7 +5678,7 @@ export class OrchestrationService {
         this.failCodexDispatch(dispatch.id, outcome.status, outcome.reason);
         await session.close();
       }
-    }).catch((error) => console.warn('[orchestration] Codex mailbox delivery failed:', error));
+    }).catch((error) => console.warn(`[orchestration] ${this.headlessLabel(workerId)} mailbox delivery failed:`, error));
   }
 
   private async followUpSettledWorker(
@@ -5733,7 +5733,7 @@ export class OrchestrationService {
     const session = isHeadless ? this.codexWorkers.get(existingPaneId) : undefined;
     if (isHeadless && (!session?.alive || !await session.waitForIdle(15_000) || !session.alive ||
         this.store.getActiveDispatchForIdentity(existingPaneId, null))) {
-      throw new OrchestrationError('dispatch_inactive', 'Codex Worker is unavailable or still finishing its previous turn.');
+      throw new OrchestrationError('dispatch_inactive', `${this.headlessLabel(existingPaneId)} Worker is unavailable or still finishing its previous turn.`);
     }
     const canReuseLivePane =
       Boolean(existingPaneId) &&
@@ -5919,7 +5919,7 @@ export class OrchestrationService {
       if (outcome.status !== 'accepted') {
         this.failCodexDispatch(nextCtx.id, outcome.status, outcome.reason);
         await session.close();
-        throw new OrchestrationError('prompt_delivery_failed', 'Codex follow-up delivery failed.', {
+        throw new OrchestrationError('prompt_delivery_failed', `${this.headlessLabel(targetPtyId)} follow-up delivery failed.`, {
           dispatchId: nextCtx.id, acceptance: outcome.status,
         });
       }

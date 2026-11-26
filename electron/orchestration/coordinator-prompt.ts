@@ -7,6 +7,10 @@ import type { AgentSessionPolicy } from './agent-session-driver.js';
 export const SESSION_WAKE_HEADER =
   '[AhaStation system wake-up — not a message from the user. The user has not replied; do not treat this as their confirmation.]';
 
+/** Sent once when an ACP session turns orchestration off after an orchestrated turn, since ACP keeps prior rules in message history. */
+export const ORCHESTRATION_ENDED_INSTRUCTIONS =
+  '[AhaStation Orchestration Mode Ended — Aha MCP tools are disconnected; handle requests directly in this session.]';
+
 /** What the Coordinator prompt needs from the caller's MCP context. */
 export interface CoordinatorPromptContext {
   confirmMode: string;

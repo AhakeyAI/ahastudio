@@ -75,3 +75,11 @@ export function parseAhaMcpToolName(name: unknown): string | null {
   const match = /^\s*(?:mcp__)?aha(?:__|\/|\.|\s*:\s*)([a-z][a-z0-9_]*)\s*$/iu.exec(name);
   return match ? match[1]!.toLowerCase() : null;
 }
+
+/** Extracts the human-facing tool or capability name from a driver's approval request method. */
+export function approvalToolName(method: string): string {
+  if (method.startsWith('session/request_permission/')) {
+    return method.slice('session/request_permission/'.length) || method;
+  }
+  return method.split('/')[1] || method;
+}

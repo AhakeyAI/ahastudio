@@ -6,6 +6,8 @@ import {
 } from '../agent-drivers/driver-capabilities.js';
 import { AtomicSnapshotWriter } from '../persistence/atomic-snapshot-writer.js';
 import type { CodexModelOption } from './codex-catalog.js';
+import { ORCHESTRATION_ENDED_INSTRUCTIONS } from './coordinator-prompt.js';
+import { approvalToolName } from './headless-workers.js';
 import type {
   AgentGoalAction, AgentProvider, AgentQuestion, AgentRuntimeRequest, AgentRuntimeResponse, AgentSessionDriver,
   AgentSessionEvents, AgentSessionGoal, AgentSessionPolicy, AgentTurnAttachment, TurnDelivery,
@@ -95,6 +97,8 @@ interface Session {
   generation: number;
   /** The provider accepted a turn; Codex saves a thread only then, so before it there is nothing to resume. */
   hasTurns: boolean;
+  /** The provider accepted an orchestrated turn on this conversation (ACP keeps those rules in history). */
+  hadOrchestrationTurn?: boolean;
   /** The person interrupted while a `/goal` turn was being started; its goal must not stay active. */
   goalTurnInterrupted?: boolean;
   /** Policy the live process was launched with; Aha MCP approvals are baked in at that point. */
@@ -257,6 +261,7 @@ export class AgentSessionManager {
       if (info.orchestration || info.capabilities.policyNeedsRelaunch) info.policy = wanted;
       info.goal = null;
       session.hasTurns = false;
+      session.hadOrchestrationTurn = false;
       if (info.title) session.unsyncedName = info.title;
       if (session.driver?.alive) {
         const driver = session.driver;
@@ -423,6 +428,8 @@ export class AgentSessionManager {
     const driver = session.driver!;
     const turnKey = `${info.id}:${++session.turns}`;
     const attachments = input.attachments ?? [];
+    const previousPolicy = info.policy;
+    if (input.policy) info.policy = input.policy;
     info.status = 'running';
     timeline.beginTurn({
       dispatchId: turnKey, prompt: display?.prompt ?? text, ...(origin ? { origin } : {}),
@@ -437,11 +444,12 @@ export class AgentSessionManager {
       turnKey, prompt: text, ...(attachments.length ? { attachments } : {}),
       effort: input.effort !== undefined ? input.effort : info.effort,
       ...(input.model && input.model !== info.model ? { model: input.model } : {}),
-      ...(input.policy && input.policy !== info.policy ? { policy: input.policy } : {}),
+      ...(input.policy && input.policy !== previousPolicy ? { policy: input.policy } : {}),
       ...(input.network !== undefined && input.network !== info.network ? { network: input.network } : {}),
     });
     if (delivery.status === 'accepted') {
       session.hasTurns = true;
+      session.hadOrchestrationTurn = info.orchestration;
       if (driver.sessionId) info.providerSessionId = driver.sessionId;
       if (driver.provider !== 'codex') {
         if (input.model) info.model = driver.effectiveModel ?? input.model;
@@ -451,13 +459,13 @@ export class AgentSessionManager {
         if (input.model) info.model = input.model;
         if (input.effort !== undefined) info.effort = input.effort;
       }
-      if (input.policy) info.policy = input.policy;
       if (input.network !== undefined) info.network = input.network;
       timeline.setMeta({
         model: info.model, readOnly: info.policy === 'read-only',
         ...(info.providerSessionId ? { providerSessionId: info.providerSessionId } : {}),
       });
     } else {
+      info.policy = previousPolicy;
       timeline.endActiveTurn('failed', delivery.reason);
       // Unknown acceptance leaves the provider thread in an unknown state; do not send into it again.
       if (delivery.status === 'unknown_acceptance') {
@@ -642,9 +650,11 @@ export class AgentSessionManager {
     const live = info.status === 'starting' || info.status === 'idle' || info.status === 'running';
     const active = info.orchestration && live;
     const idle = active && info.status === 'idle' && Boolean(driver?.alive) && !driver?.busy && session.requests.size === 0;
+    const policy = session.launchedPolicy === 'full-auto' || info.policy === 'full-auto'
+      ? (session.launchedPolicy ?? info.policy)
+      : info.policy;
     return {
-      cwd: info.cwd, provider: info.provider, active, idle, network: info.network,
-      policy: session.launchedPolicy ?? info.policy,
+      cwd: info.cwd, provider: info.provider, active, idle, network: info.network, policy,
     };
   }
 
@@ -806,6 +816,7 @@ export class AgentSessionManager {
     const session: Session = {
       info, driver: null, requests: new Map(), generation: 0, launchedPolicy: null, unsyncedName: null,
       turns: initial?.turns.length ?? 0,
+      hadOrchestrationTurn: Boolean(info.orchestration && initial?.turns.length),
       // A turn that never reached the provider ends failed with no turn id and no output.
       hasTurns: initial?.turns.some((turn) => turn.status !== 'failed' || turn.turnId !== null || turn.items.length > 0) ?? false,
       timeline: new WorkerTimeline({
@@ -905,7 +916,9 @@ export class AgentSessionManager {
       const orchestration = info.orchestration;
       const developerInstructions = orchestration
         ? this.deps.coordinatorInstructions?.(info.id, { policy: info.policy })
-        : undefined;
+        : rejoin && session.hadOrchestrationTurn && info.provider === 'grok'
+          ? ORCHESTRATION_ENDED_INSTRUCTIONS
+          : undefined;
       const events = this.eventsFor(session, generation);
       session.events = events;
       session.driver = this.deps.launch(info.id, info.cwd, events, {
@@ -997,7 +1010,7 @@ export class AgentSessionManager {
           }
           timeline.upsertApproval({
             approvalId: requestId, dispatchId: turnKey, method: request.method,
-            tool: request.method.split('/')[1] ?? request.method,
+            tool: approvalToolName(request.method),
             input: request.toolInput, reason: request.message ?? null, status: 'pending',
           });
         });

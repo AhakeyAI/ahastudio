@@ -51,6 +51,7 @@ interface AcpTurn {
   evidence: boolean;
   onEvidence: (() => void) | null;
   cancelRequested: boolean;
+  abort: AbortController;
   idle: Promise<void>;
   finish: () => void;
 }
@@ -274,7 +275,8 @@ export class AcpSessionDriver implements AgentSessionDriver {
     const turn: AcpTurn = {
       turnKey, turnId: `prompt-${++this.prompts}`, messages: new Map(), lastMessage: null, textSeg: 0, thinkSeg: 0,
       activeMessageId: null, activeThoughtId: null, last: null,
-      tools: new Map(), retries: 0, evidence: false, onEvidence: null, cancelRequested: false, idle, finish,
+      tools: new Map(), retries: 0, evidence: false, onEvidence: null, cancelRequested: false,
+      abort: new AbortController(), idle, finish,
     };
     this.active = turn;
     if (this.outputTurnKey !== turnKey) {
@@ -333,6 +335,7 @@ export class AcpSessionDriver implements AgentSessionDriver {
     const turn = this.active;
     if (!this.alive || !turn || !this.acpSessionId) return false;
     turn.cancelRequested = true;
+    turn.abort.abort();
     try {
       await this.rpc.write({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: this.acpSessionId } });
       return true;
@@ -390,6 +393,7 @@ export class AcpSessionDriver implements AgentSessionDriver {
     this.stopPromise = (async () => {
       if (interrupt && this.active && !this.disconnected && this.acpSessionId) {
         this.active.cancelRequested = true;
+        this.active.abort.abort();
         await this.rpc.write({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: this.acpSessionId } }).catch(() => {});
         await this.waitForIdle(2_000);
       }
@@ -722,6 +726,7 @@ export class AcpSessionDriver implements AgentSessionDriver {
     const toolCall = object(request.toolCall);
     const command = text(object(toolCall.rawInput).command);
     const title = text(toolCall.title) ?? text(toolCall.kind) ?? 'tool';
+    const signal = AbortSignal.any([this.disconnect.signal, turn.abort.signal]);
     let response: AgentRuntimeResponse;
     try {
       response = await this.events.onRequest(turn.turnKey, {
@@ -730,12 +735,12 @@ export class AcpSessionDriver implements AgentSessionDriver {
         toolInput: this.redact(command ?? title),
         ...(claimed?.kind === 'approval' ? { message: this.redact(claimed.warning) }
           : command && title !== command ? { message: this.redact(title) } : {}),
-        signal: this.disconnect.signal,
+        signal,
       });
     } catch {
       return cancelled;
     }
-    if (this.disconnected) return cancelled;
+    if (this.disconnected || this.active !== turn || turn.cancelRequested || signal.aborted) return cancelled;
     return 'decision' in response && response.decision === 'accept' ? select(allow) : select(reject);
   }
 
@@ -744,15 +749,17 @@ export class AcpSessionDriver implements AgentSessionDriver {
     const turn = this.active;
     if (!turn || this.stopping) return claimed.reply(null);
     this.sawEvidence(turn);
+    const signal = AbortSignal.any([this.disconnect.signal, turn.abort.signal]);
     let answers: Record<string, string[]> | null = null;
     try {
       const response = await this.events.onRequest(turn.turnKey, {
-        kind: 'question', method, toolInput: '', questions: claimed.questions, signal: this.disconnect.signal,
+        kind: 'question', method, toolInput: '', questions: claimed.questions, signal,
       });
       answers = 'answers' in response ? response.answers : null;
     } catch {
       answers = null;
     }
+    if (this.disconnected || this.active !== turn || turn.cancelRequested || signal.aborted) return claimed.reply(null);
     return claimed.reply(answers);
   }
 
@@ -794,6 +801,7 @@ export class AcpSessionDriver implements AgentSessionDriver {
   private finishTurn(turn: AcpTurn): void {
     if (this.active === turn) this.active = null;
     turn.onEvidence = null;
+    turn.abort.abort();
     turn.finish();
   }
 

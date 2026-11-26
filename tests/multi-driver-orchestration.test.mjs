@@ -20,14 +20,19 @@ import {
 import { ClaudeSessionDriver } from '../dist-electron/agent-drivers/claude/claude-session-driver.js';
 import { AGENT_DRIVER_CAPABILITIES } from '../dist-electron/agent-drivers/driver-capabilities.js';
 import { ahaMcpSecrets, redactSecrets, redactTimelineEvent } from '../dist-electron/agent-drivers/secret-redaction.js';
+import { createRequire } from 'node:module';
 import { AgentSessionManager } from '../dist-electron/orchestration/agent-session-manager.js';
+import { ORCHESTRATION_ENDED_INSTRUCTIONS } from '../dist-electron/orchestration/coordinator-prompt.js';
 import {
-  AHA_TOOL_DENIED, HEADLESS_WORKER_ID, ahaToolDecision, headlessWorkerDriver, headlessWorkerSupports,
+  AHA_TOOL_DENIED, HEADLESS_WORKER_ID, ahaToolDecision, approvalToolName, headlessWorkerDriver, headlessWorkerSupports,
   parseAhaMcpToolName, sessionGateDecision,
 } from '../dist-electron/orchestration/headless-workers.js';
 import { OrchestrationService } from '../dist-electron/orchestration/orchestration-service.js';
 import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
-import { dispatchOrchestrationHttpAction } from '../dist-electron/orchestration/orchestration-http-router.js';
+import { dispatchOrchestrationHttpAction, isLongPollOrchestrationAction } from '../dist-electron/orchestration/orchestration-http-router.js';
+
+const require = createRequire(import.meta.url);
+const { runMcpServer } = require('../electron/orchestration/aha-mcp-server.cjs');
 
 const cwd = process.cwd();
 const SESSION_A = 'agent-session-00000000-0000-0000-0000-00000000000a';
@@ -566,13 +571,18 @@ async function serviceSetup(t, { allowPtySpawn = false, available = () => true }
             child.exit(1);
             return;
           }
+          if (scenario === 'permission') {
+            launch.permReply = await acpPermission(agent, 991, {
+              toolCallId: 'c-perm', kind: 'execute', title: 'Run npm test', rawInput: { command: 'npm test' },
+            });
+          }
           chunk(agent, `Worker finished; token ${env.AHA_WORKER_TOKEN}`);
           if (scenario === 'report') {
             launch.report = await workerHttp(workerId, 'worker-done-self', { summary: 'Reported by report_done' });
           }
           agent.send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } });
         });
-        const launch = { cliId, workerId, cwd: workdir, policy, env, io };
+        const launch = { cliId, workerId, cwd: workdir, policy, env, io, child };
         launches.push(launch);
         const driver = new AcpSessionDriver(child, ACP_LAUNCH_SPECS.grok, events, {
           acceptanceWindowMs: 500,
@@ -617,7 +627,7 @@ async function serviceSetup(t, { allowPtySpawn = false, available = () => true }
     });
     return response.json();
   };
-  return Object.assign(app, { dir, service, store, sessions, approvals, launches, spawnCalls, call, workerHttp });
+  return Object.assign(app, { dir, service, store, hook, sessions, approvals, launches, spawnCalls, call, workerHttp });
 }
 
 /** A sparse clone of this repository, so the fallback diff runs against a real HEAD. */
@@ -781,4 +791,177 @@ test('delivery: not_accepted falls back to one PTY; unknown_acceptance fails wit
   assert.equal(app.spawnCalls.length, 1, 'never resent to a PTY');
   const token = app.launches[1].env.AHA_WORKER_TOKEN;
   assert.doesNotMatch(JSON.stringify(lost), new RegExp(token));
+});
+
+test('ACP turn interrupt aborts open permission requests and answers cancelled per ACP spec', async () => {
+  assert.equal(approvalToolName('item/commandExecution/requestApproval'), 'commandExecution');
+  assert.equal(approvalToolName('claude/Bash'), 'Bash');
+  assert.equal(approvalToolName('aha/integrate_worker'), 'integrate_worker');
+  assert.equal(approvalToolName('session/request_permission/execute'), 'execute');
+  assert.equal(isLongPollOrchestrationAction('worker-integrate'), true);
+  assert.equal(isLongPollOrchestrationAction('run-finalize'), true);
+  assert.equal(isLongPollOrchestrationAction('role-manage'), true);
+
+  let permReply = null;
+  const child = fakeChild();
+  grokAgent(child, async (message, io) => {
+    permReply = await acpPermission(io, 950, { toolCallId: 'c-int', kind: 'execute', title: 'Run npm test', rawInput: { command: 'npm test' } });
+    io.send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'cancelled' } });
+  });
+  let requestSignal = null;
+  const rec = recorder((req) => {
+    requestSignal = req.signal;
+    return new Promise((resolve) => {
+      req.signal.addEventListener('abort', () => resolve({ decision: 'decline' }), { once: true });
+    });
+  });
+  const driver = new AcpSessionDriver(child, ACP_LAUNCH_SPECS.grok, rec.events);
+  await driver.open({ cwd: tmpdir(), model: null, policy: 'workspace-write' });
+  assert.equal((await driver.startTurn({ turnKey: 'k-int', prompt: 'run tests' })).status, 'accepted');
+  await until(() => requestSignal !== null);
+  assert.equal(await driver.interrupt(), true);
+  await until(() => permReply !== null && rec.completed.length === 1);
+  assert.equal(requestSignal.aborted, true, 'turn abort cancels the held approval signal');
+  assert.deepEqual(permReply, { outcome: { outcome: 'cancelled' } }, 'interrupted turn answers cancelled, never reject');
+  assert.equal(rec.completed[0].stopReason, 'interrupted');
+  await driver.close();
+});
+
+test('manager policy sync and Grok orchestration-exit instructions stay accurate across non-relaunch switches', async () => {
+  const fake = holdingLaunch();
+  const manager = new AgentSessionManager({
+    launch: fake.launch,
+    coordinatorInstructions: (id, { policy }) => `rules for ${id} (${policy})`,
+  });
+  const info = (id) => manager.list().find((s) => s.id === id);
+
+  // Claude Coordinator switching workspace-write -> read-only without relaunch updates coordinatorState().policy.
+  const claude = await manager.create({ cwd: tmpdir(), policy: 'workspace-write', provider: 'claude' });
+  assert.deepEqual(await manager.setOrchestration(claude.id, true), { ok: true });
+  const launchesBefore = fake.log.length;
+  assert.equal((await manager.send(claude.id, { text: 'HOLD read', policy: 'read-only' })).status, 'accepted');
+  assert.equal(fake.log.length, launchesBefore, 'no relaunch across non-full-auto tiers');
+  assert.equal(manager.coordinatorState(claude.id).policy, 'read-only', 'active turn reflects read-only immediately');
+  fake.held.shift().finish();
+  await until(() => info(claude.id).status === 'idle');
+  assert.equal(manager.coordinatorState(claude.id).policy, 'read-only');
+  assert.deepEqual(await manager.setOrchestration(claude.id, false), { ok: true });
+  assert.equal(fake.log.at(-1).developerInstructions, undefined, 'Claude system prompt needs no exit banner');
+
+  // Grok Coordinator turning orchestration off after an orchestrated turn gets the one-time exit notice.
+  const grok = await manager.create({ cwd: tmpdir(), policy: 'workspace-write', provider: 'grok' });
+  assert.deepEqual(await manager.setOrchestration(grok.id, true), { ok: true });
+  assert.equal((await manager.send(grok.id, { text: 'delegate' })).status, 'accepted');
+  await until(() => info(grok.id).status === 'idle');
+  assert.deepEqual(await manager.setOrchestration(grok.id, false), { ok: true });
+  assert.equal(fake.log.at(-1).developerInstructions, ORCHESTRATION_ENDED_INSTRUCTIONS);
+
+  // Once a normal non-orchestrated turn runs, future resumes do not repeat the exit notice.
+  assert.equal((await manager.send(grok.id, { text: 'direct work' })).status, 'accepted');
+  await until(() => info(grok.id).status === 'idle');
+  await fake.log.length;
+  await manager.handoffToTerminal(grok.id);
+  manager.reclaim(grok.id, () => false);
+  assert.equal((await manager.send(grok.id, { text: 'direct again' })).status, 'accepted');
+  await until(() => info(grok.id).status === 'idle');
+  assert.equal(fake.log.at(-1).developerInstructions, undefined);
+
+  await manager.dispose();
+});
+
+test('headless Worker approvals record real provider/toolName, follow-up errors name the real driver, and MCP cancellation expires Coordinator approvals', async (t) => {
+  const app = await serviceSetup(t);
+  const sessionCwd = mkdtempSync(join(app.dir, 'session-'));
+
+  const fake = holdingLaunch();
+  const manager = new AgentSessionManager({
+    launch: fake.launch,
+    coordinatorInstructions: (id, { policy }) => `rules for ${id} (${policy})`,
+  });
+  t.after(() => manager.dispose());
+  const coord = await manager.create({ cwd: sessionCwd, policy: 'workspace-write', provider: 'claude' });
+  assert.deepEqual(await manager.setOrchestration(coord.id, true), { ok: true });
+  app.service.setSessionCoordinators({
+    get: (id) => manager.coordinatorState(id),
+    requestApproval: (id, req, signal) => manager.requestCoordinatorApproval(id, req, signal),
+  });
+
+  // 1. End-to-end headless Grok Worker permission escalation carries provider="grok" and toolName="execute".
+  app.scenario = 'permission';
+  const permRun = await app.call(coord.id, 'delegate-task', { role: 'runner', task: 'Run command', agent: 'grok', worktree: false });
+  assert.equal(permRun.ok, true, permRun.error);
+  const permDispatch = permRun.result.dispatch;
+  const escalation = await until(() => app.store.listMessages({ runId: permRun.result.run.id })
+    .find((m) => m.kind === 'approval' && m.fromHandle === `dispatch:${permDispatch.id}`));
+  const parsedPayload = JSON.parse(escalation.payload);
+  assert.equal(parsedPayload.provider, 'grok');
+  assert.equal(parsedPayload.toolName, 'execute');
+  assert.equal((await manager.send(coord.id, { text: 'HOLD approve' })).status, 'accepted');
+  const approvePending = app.call(coord.id, 'role-manage', { role: 'runner', action: 'approve' });
+  const manageCard = await until(() => manager.getTimeline(coord.id).turns.at(-1).items
+    .find((item) => item.kind === 'approval' && item.status === 'pending'));
+  assert.equal(manageCard.tool, 'manage_worker');
+  assert.equal(manager.respond(coord.id, manageCard.approvalId, true), true);
+  assert.equal((await approvePending).ok, true);
+  fake.held.shift().finish();
+  await until(() => app.launches[0].permReply);
+  assert.deepEqual(app.launches[0].permReply, { outcome: { outcome: 'selected', optionId: 'allow' } });
+
+  // 2. Exited settled Grok Worker follow-up error names "Grok Worker", not "Codex Worker".
+  app.scenario = 'report';
+  const started = await app.call(coord.id, 'delegate-task', { role: 'fixer', task: 'Fix it', agent: 'grok', worktree: false });
+  assert.equal(started.ok, true, started.error);
+  await until(() => app.store.getDispatchContext(started.result.dispatch.id).status === 'completed');
+  app.launches[1].child.exit(0);
+  await delay(50);
+  const followUp = await app.call(coord.id, 'role-message', { role: 'fixer', message: 'One more change' });
+  assert.equal(followUp.ok, false);
+  assert.match(followUp.error, /Grok Worker is unavailable/);
+
+  // 3. Real aha-mcp-server.cjs notifications/cancelled aborts in-flight HTTP gate and expires the Coordinator approval card.
+  assert.equal((await manager.send(coord.id, { text: 'HOLD integrate' })).status, 'accepted');
+  const mcpIn = new PassThrough();
+  const mcpOut = new PassThrough();
+  const mcpOutLines = [];
+  createInterface({ input: mcpOut }).on('line', (line) => {
+    if (line.trim()) mcpOutLines.push(JSON.parse(line));
+  });
+
+  const savedEnv = {};
+  const realSessionEnv = app.hook.envForSession(coord.id);
+  for (const key of Object.keys(realSessionEnv)) {
+    savedEnv[key] = process.env[key];
+    process.env[key] = realSessionEnv[key];
+  }
+  const serverDone = runMcpServer({ input: mcpIn, output: mcpOut });
+  try {
+    mcpIn.write(JSON.stringify({
+      jsonrpc: '2.0', id: 77, method: 'tools/call',
+      params: { name: 'integrate_worker', arguments: { role: 'fixer' } },
+    }) + '\n');
+
+    const pending = await until(() => manager.getTimeline(coord.id).turns.at(-1).items
+      .find((item) => item.kind === 'approval' && item.status === 'pending'));
+    assert.equal(pending.tool, 'integrate_worker');
+
+    // Simulate MCP client timing out tools/call and sending notifications/cancelled while the turn continues.
+    mcpIn.write(JSON.stringify({
+      jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 77 },
+    }) + '\n');
+
+    await until(() => manager.getTimeline(coord.id).turns.at(-1).items
+      .find((item) => item.kind === 'approval' && item.approvalId === pending.approvalId)?.status === 'expired');
+
+    // Late human click on "Allow" is rejected and cannot trigger integration.
+    assert.equal(manager.respond(coord.id, pending.approvalId, true), false);
+    assert.equal(mcpOutLines.some((msg) => msg.id === 77), false, 'cancelled RPC emits no late response');
+  } finally {
+    mcpIn.end();
+    await serverDone;
+    for (const [key, val] of Object.entries(savedEnv)) {
+      if (val === undefined) delete process.env[key];
+      else process.env[key] = val;
+    }
+    fake.held.shift()?.finish();
+  }
 });
