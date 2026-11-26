@@ -10,8 +10,10 @@ import type {
   AgentTurnAttachment, TurnDelivery,
 } from '../../orchestration/agent-session-driver.js';
 import type { CodexModelOption } from '../../orchestration/codex-catalog.js';
+import { ahaToolDecision, parseAhaMcpToolName } from '../../orchestration/headless-workers.js';
 import type { WorkerTimelineEvent, WorkerTimelineFileChange, WorkerTimelineItemStatus } from '../../orchestration/worker-timeline.js';
 import { AgentProcessHandle, type AgentChild } from '../agent-process.js';
+import { redactSecrets, redactTimelineEvent } from '../secret-redaction.js';
 import { driverCapabilities } from '../driver-capabilities.js';
 import {
   JSON_RPC_2_ENVELOPE, JsonlRpc, JsonlRpcClosedError, JsonlRpcError, JsonlRpcWriteError, type JsonlRecord,
@@ -60,6 +62,29 @@ export interface AcpDriverOptions {
   /** Session setup can wait on the agent's own sign-in refresh. */
   setupTimeoutMs?: number;
   env?: NodeJS.ProcessEnv;
+  /** ACP `mcpServers` for every session/new|load|resume (the Aha server when orchestrating); none by default. */
+  mcpServers?: readonly AcpMcpServer[];
+  /**
+   * The Aha server's role in `mcpServers`. A Coordinator's Aha tools are approved without a prompt
+   * (the orchestration service gates the ones that change Workers or Git history); a Worker's only
+   * for its dispatch contract.
+   */
+  ahaMcp?: { role: 'coordinator' | 'worker' };
+  /** Credentials the process was given, redacted from everything the driver reports. */
+  secrets?: readonly string[];
+}
+
+/** An ACP stdio MCP server entry (`McpServerStdio`). */
+export interface AcpMcpServer {
+  name: string;
+  command: string;
+  args: string[];
+  env: { name: string; value: string }[];
+}
+
+/** ACP has no developer-instructions field, so session rules lead the first prompt of each process. */
+export function acpPromptWithInstructions(instructions: string, prompt: string): string {
+  return `${instructions}\n\n[End of AhaStation session instructions. The message follows.]\n\n${prompt}`;
 }
 
 function toolStatus(status: unknown, previous?: WorkerTimelineItemStatus): WorkerTimelineItemStatus {
@@ -112,6 +137,10 @@ export class AcpSessionDriver implements AgentSessionDriver {
   private readonly acceptanceWindowMs: number;
   private readonly setupTimeoutMs: number;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly mcpServers: readonly AcpMcpServer[];
+  private readonly ahaMcp: AcpDriverOptions['ahaMcp'] | null;
+  private readonly secrets: readonly string[];
+  private pendingInstructions: string | null = null;
   private initialized: Obj | null = null;
   private acpSessionId: string | null = null;
   private policy: AgentSessionPolicy = 'workspace-write';
@@ -144,6 +173,9 @@ export class AcpSessionDriver implements AgentSessionDriver {
     this.acceptanceWindowMs = options.acceptanceWindowMs ?? 1_500;
     this.setupTimeoutMs = options.setupTimeoutMs ?? 60_000;
     this.env = options.env ?? process.env;
+    this.mcpServers = options.mcpServers ?? [];
+    this.ahaMcp = options.ahaMcp ?? null;
+    this.secrets = options.secrets ?? [];
     this.proc = new AgentProcessHandle(child);
     this.rpc = new JsonlRpc(child.stdout, child.stdin, JSON_RPC_2_ENVELOPE, {
       onRecord: (record) => this.receive(record),
@@ -175,13 +207,13 @@ export class AcpSessionDriver implements AgentSessionDriver {
     }));
   }
 
-  async open({ cwd, model, effort, policy, resumeSessionId }: {
+  async open({ cwd, model, effort, policy, resumeSessionId, developerInstructions }: {
     cwd: string; model: string | null; effort?: string | null; policy: AgentSessionPolicy; resumeSessionId?: string;
     network?: boolean; developerInstructions?: string;
   }): Promise<string> {
     try {
       const initialized = await this.initialize();
-      const params = { cwd, mcpServers: [] };
+      const params = { cwd, mcpServers: this.mcpServers.map((server) => ({ ...server, args: [...server.args], env: [...server.env] })) };
       const capabilities = object(initialized.agentCapabilities);
       let method = 'session/new';
       if (resumeSessionId) {
@@ -202,16 +234,24 @@ export class AcpSessionDriver implements AgentSessionDriver {
         await this.setEffort(effort);
       }
       await this.applyPolicy(policy);
+      this.pendingInstructions = developerInstructions?.trim() ? developerInstructions : null;
       return id;
     } catch (error) {
-      throw new Error(this.proc.withStderr(this.describe(error)));
+      throw new Error(this.proc.withStderr(this.redact(this.describe(error)), (value) => this.redact(value)));
     }
   }
 
-  async startTurn({ turnKey, prompt, effort, model, policy, attachments = [] }: {
+  startTurn(input: {
     turnKey: string; prompt: string; effort?: string | null; model?: string | null; policy?: AgentSessionPolicy;
     network?: boolean; attachments?: readonly AgentTurnAttachment[];
   }): Promise<TurnDelivery> {
+    return this.runPrompt(input, true);
+  }
+
+  private async runPrompt({ turnKey, prompt, effort, model, policy, attachments = [] }: {
+    turnKey: string; prompt: string; effort?: string | null; model?: string | null; policy?: AgentSessionPolicy;
+    network?: boolean; attachments?: readonly AgentTurnAttachment[];
+  }, withInstructions: boolean): Promise<TurnDelivery> {
     if (!this.alive || !this.acpSessionId || this.active) {
       return { status: 'not_accepted', reason: `${this.spec.label} 会话已关闭或正忙` };
     }
@@ -222,9 +262,10 @@ export class AcpSessionDriver implements AgentSessionDriver {
     } catch (error) {
       return { status: this.alive ? 'not_accepted' : 'unknown_acceptance', reason: this.describe(error) };
     }
+    const instructions = withInstructions ? this.pendingInstructions : null;
     let blocks: Obj[];
     try {
-      blocks = this.promptBlocks(prompt, attachments);
+      blocks = this.promptBlocks(instructions ? acpPromptWithInstructions(instructions, prompt) : prompt, attachments);
     } catch (error) {
       return { status: 'not_accepted', reason: this.describe(error) };
     }
@@ -267,8 +308,9 @@ export class AcpSessionDriver implements AgentSessionDriver {
     });
     if (delivery.status !== 'accepted') {
       this.finishTurn(turn);
-      return delivery;
+      return { ...delivery, reason: this.redact(delivery.reason) };
     }
+    if (instructions && this.pendingInstructions === instructions) this.pendingInstructions = null;
     turn.evidence = true;
     this.timeline(turn, { type: 'turn_started', turnId: turn.turnId });
     this.events.onTurnStarted(turnKey);
@@ -284,7 +326,7 @@ export class AcpSessionDriver implements AgentSessionDriver {
   /** Runs the agent's own `/compact` command as a turn. */
   async compactThread(turnKey: string): Promise<TurnDelivery> {
     if (!this.spec.dialect.compactCommand) return { status: 'not_accepted', reason: `${this.spec.label} 不支持压缩上下文` };
-    return this.startTurn({ turnKey, prompt: this.spec.dialect.compactCommand });
+    return this.runPrompt({ turnKey, prompt: this.spec.dialect.compactCommand }, false);
   }
 
   async interrupt(): Promise<boolean> {
@@ -317,13 +359,29 @@ export class AcpSessionDriver implements AgentSessionDriver {
     const size = Math.max(1, Math.min(256_000, Math.floor(limit)));
     const slice = this.output.slice(start - this.offset, screen ? undefined : start - this.offset + size);
     return {
-      screen, text: slice, cursor: start, nextCursor: start + slice.length, truncated: cursor < this.offset,
+      screen, text: this.redact(slice), cursor: start, nextCursor: start + slice.length, truncated: cursor < this.offset,
       hasMore: start + slice.length < this.offset + this.output.length, alive: this.alive, exitCode: this.proc.exitCode,
     };
   }
 
   redactText(value: string): string {
-    return value;
+    return this.redact(value);
+  }
+
+  private redact(value: string): string {
+    return redactSecrets(value, this.secrets);
+  }
+
+  /** How this session's role answers an Aha tool call, recognized by the names the agent reports; null otherwise. */
+  private ahaDecision(toolCall: Obj): 'allow' | 'ask' | 'deny' | null {
+    if (!this.ahaMcp) return null;
+    const meta = object(object(toolCall._meta)['x.ai/tool']);
+    const names = [
+      this.spec.dialect.toolName?.(toolCall as AcpToolUpdate), text(toolCall.title), text(meta.name),
+      text(meta.server) === 'aha' ? `aha__${text(meta.name) ?? ''}` : undefined,
+    ];
+    const tool = names.map(parseAhaMcpToolName).find(Boolean);
+    return tool ? ahaToolDecision(this.ahaMcp.role, tool, this.policy) : null;
   }
 
   close(interrupt = false): Promise<void> {
@@ -648,11 +706,19 @@ export class AcpSessionDriver implements AgentSessionDriver {
     const allow = pick(['allow_once', 'allow_always']);
     const reject = pick(['reject_once', 'reject_always']);
     const select = (option: Obj | undefined) => (option ? { outcome: { outcome: 'selected', optionId: option.optionId } } : cancelled);
-    if (this.policy === 'read-only') {
+    // The role's Aha tools never wait on a prompt, read-only included: report_done must always work.
+    // Other Aha tools go to the person in every tier but full-auto, which refuses them.
+    const aha = claimed ? null : this.ahaDecision(object(request.toolCall));
+    if (aha === 'allow' && allow) return select(allow);
+    if (aha === 'deny') {
+      this.timeline(turn, { type: 'notice', level: 'warning', text: '完全自动模式：已拒绝一次需要人工确认的 Aha 编排操作' });
+      return select(reject);
+    }
+    if (this.policy === 'read-only' && aha !== 'ask') {
       this.timeline(turn, { type: 'notice', level: 'warning', text: '只读模式：已拒绝一次需要授权的操作' });
       return select(reject);
     }
-    if (this.policy === 'full-auto' && !claimed && allow) return select(allow);
+    if (this.policy === 'full-auto' && !claimed && aha === null && allow) return select(allow);
     const toolCall = object(request.toolCall);
     const command = text(object(toolCall.rawInput).command);
     const title = text(toolCall.title) ?? text(toolCall.kind) ?? 'tool';
@@ -661,8 +727,9 @@ export class AcpSessionDriver implements AgentSessionDriver {
       response = await this.events.onRequest(turn.turnKey, {
         kind: 'approval',
         method: `session/request_permission/${text(toolCall.kind) ?? 'tool'}`,
-        toolInput: command ?? title,
-        ...(claimed?.kind === 'approval' ? { message: claimed.warning } : command && title !== command ? { message: title } : {}),
+        toolInput: this.redact(command ?? title),
+        ...(claimed?.kind === 'approval' ? { message: this.redact(claimed.warning) }
+          : command && title !== command ? { message: this.redact(title) } : {}),
         signal: this.disconnect.signal,
       });
     } catch {
@@ -707,8 +774,8 @@ export class AcpSessionDriver implements AgentSessionDriver {
     this.closeStreamSegment(turn, 'both');
     this.finishTurn(turn);
     this.events.onTurnCompleted(turn.turnKey, {
-      turnId: turn.turnId, stopReason, finalText: turn.lastMessage ? turn.messages.get(turn.lastMessage) ?? '' : '',
-      diff: null, usage: Object.keys(usage).length ? usage : null, error: failure,
+      turnId: turn.turnId, stopReason, finalText: this.redact(turn.lastMessage ? turn.messages.get(turn.lastMessage) ?? '' : ''),
+      diff: null, usage: Object.keys(usage).length ? usage : null, error: failure === null ? null : this.redact(failure),
     });
   }
 
@@ -737,7 +804,7 @@ export class AcpSessionDriver implements AgentSessionDriver {
     this.rpc.close(new JsonlRpcClosedError(reason));
     if (this.active) this.finishTurn(this.active);
     try {
-      this.events.onExit(this.proc.withStderr(reason), exitCode);
+      this.events.onExit(this.proc.withStderr(this.redact(reason), (value) => this.redact(value)), exitCode);
     } finally {
       void this.close();
     }
@@ -745,7 +812,7 @@ export class AcpSessionDriver implements AgentSessionDriver {
 
   private timeline(turn: AcpTurn, event: WorkerTimelineEvent): void {
     try {
-      this.events.onTimeline?.(turn.turnKey, event);
+      this.events.onTimeline?.(turn.turnKey, redactTimelineEvent(event, this.secrets));
     } catch (error) {
       console.warn(`[agent-drivers] ${this.spec.label} timeline listener failed:`, error);
     }

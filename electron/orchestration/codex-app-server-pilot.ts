@@ -246,7 +246,7 @@ export function enabledCodexPilot(platform: NodeJS.Platform, setting: boolean, o
 }
 
 // These calls are part of the Worker dispatch contract and still use Worker-scoped auth.
-const WORKER_APPROVED_MCP_TOOLS = ['report_done', 'read_board', 'ask_coordinator', 'post_message'] as const;
+export const WORKER_APPROVED_MCP_TOOLS = ['report_done', 'read_board', 'ask_coordinator', 'post_message'] as const;
 
 /**
  * Coordinator tools a session runs without a Codex prompt: reads, plus calls the orchestration

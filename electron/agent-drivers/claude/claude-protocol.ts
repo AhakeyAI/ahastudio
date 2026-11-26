@@ -80,6 +80,15 @@ export const CLAUDE_SESSION_ENV: Readonly<Record<string, string>> = {
 export const CLAUDE_READ_ONLY_HOOK_ID = 'aha_readonly_guard';
 export const CLAUDE_READ_ONLY_HOOK_MATCHER = 'Edit|MultiEdit|Write|NotebookEdit|ExitPlanMode';
 
+/** SDK PreToolUse hook that answers Aha MCP tool calls by orchestration role, whatever the permission mode. */
+export const CLAUDE_AHA_MCP_HOOK_ID = 'aha_mcp_gate';
+export const CLAUDE_AHA_MCP_HOOK_MATCHER = '^mcp__aha__';
+
+/** A per-process `--mcp-config` with only the Aha server; the person's own config files are never touched. */
+export function claudeAhaMcpConfig(server: { command: string; args: readonly string[]; env: Readonly<Record<string, string>> }): string {
+  return JSON.stringify({ mcpServers: { aha: { type: 'stdio', command: server.command, args: [...server.args], env: { ...server.env } } } });
+}
+
 export type ClaudePermissionMode = 'plan' | 'default' | 'acceptEdits' | 'auto' | 'bypassPermissions' | 'dontAsk';
 
 /** Maps AhaStudio's three permission tiers to Claude Code's native `--permission-mode`. */
@@ -106,6 +115,10 @@ export function claudeLaunchArgs(options: {
   resumeSessionId?: string;
   model?: string | null;
   effort?: string | null;
+  /** Inline `--mcp-config` JSON (see `claudeAhaMcpConfig`). */
+  mcpConfig?: string;
+  /** Appended to Claude's system prompt for this process, e.g. the Coordinator rules. */
+  appendSystemPrompt?: string;
 }): string[] {
   const mode = claudePermissionModeForPolicy(options.policy);
   return [
@@ -123,6 +136,8 @@ export function claudeLaunchArgs(options: {
       : options.sessionId ? ['--session-id', options.sessionId] : []),
     ...(options.model ? ['--model', options.model] : []),
     ...(options.effort ? ['--effort', options.effort] : []),
+    ...(options.mcpConfig ? ['--mcp-config', options.mcpConfig] : []),
+    ...(options.appendSystemPrompt ? ['--append-system-prompt', options.appendSystemPrompt] : []),
   ];
 }
 

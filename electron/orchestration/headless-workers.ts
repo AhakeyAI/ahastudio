@@ -1,0 +1,77 @@
+import { driverCapabilities, type AgentDriverId } from '../agent-drivers/driver-capabilities.js';
+import type { AgentSessionPolicy } from './agent-session-driver.js';
+import { WORKER_APPROVED_MCP_TOOLS, coordinatorApprovedMcpTools } from './codex-app-server-pilot.js';
+
+/**
+ * Drivers that run session-coordinated Workers headless, over their native protocol, with the Aha
+ * MCP server injected per process. Antigravity accepts ACP `mcpServers` but never starts them, and
+ * OpenCode and Pi are not verified, so their Workers keep the terminal path.
+ */
+export const HEADLESS_WORKER_DRIVERS = ['codex', 'claude', 'grok'] as const satisfies readonly AgentDriverId[];
+export type HeadlessWorkerDriver = (typeof HEADLESS_WORKER_DRIVERS)[number];
+
+/** A headless Worker's identity: `<driver>-worker-<uuid>`. Codex Workers keep their original prefix. */
+export const HEADLESS_WORKER_ID = /^(?:codex|claude|grok)-worker-[a-f0-9-]{36}$/;
+
+export function isHeadlessWorkerDriver(cliId: string | null | undefined): cliId is HeadlessWorkerDriver {
+  return typeof cliId === 'string' && (HEADLESS_WORKER_DRIVERS as readonly string[]).includes(cliId);
+}
+
+/** Whether `cliId` can run a headless Worker that enforces `policy` itself; otherwise the task keeps a terminal. */
+export function headlessWorkerSupports(cliId: string | null | undefined, policy: AgentSessionPolicy): boolean {
+  return isHeadlessWorkerDriver(cliId) && driverCapabilities(cliId).policies.includes(policy);
+}
+
+export function headlessWorkerDriver(workerId: string): HeadlessWorkerDriver | null {
+  if (!HEADLESS_WORKER_ID.test(workerId)) return null;
+  return workerId.slice(0, workerId.indexOf('-worker-')) as HeadlessWorkerDriver;
+}
+
+export const HEADLESS_DRIVER_LABELS: Readonly<Record<HeadlessWorkerDriver, string>> = {
+  codex: 'Codex', claude: 'Claude Code', grok: 'Grok',
+};
+
+/**
+ * How a non-Codex session answers its own Aha tool call. A Worker runs its dispatch contract without
+ * a prompt; any other Aha tool asks the person, except under `full-auto`, which refuses it. A
+ * Coordinator runs every Aha tool without a driver prompt, because agents differ in whether they
+ * ask at all; the orchestration service gates the ones that change Workers or Git history instead
+ * (`sessionGateDecision`), so every driver gets the same rules.
+ */
+export const AHA_TOOL_DENIED = 'Full-auto cannot ask the person, and this AhaStation tool needs their approval. Ask them to run it, or to switch the session to another permission tier.';
+
+export function ahaToolDecision(
+  role: 'coordinator' | 'worker', tool: string, policy: AgentSessionPolicy,
+): 'allow' | 'ask' | 'deny' {
+  if (role === 'coordinator' || (WORKER_APPROVED_MCP_TOOLS as readonly string[]).includes(tool)) return 'allow';
+  return policy === 'full-auto' ? 'deny' : 'ask';
+}
+
+/** Coordinator actions that change Workers or Git history, by the Aha tool that calls them. */
+export const SESSION_GATED_COORDINATOR_ACTIONS: Readonly<Record<string, string>> = {
+  'role-manage': 'manage_worker',
+  'worker-integrate': 'integrate_worker',
+  'run-finalize': 'finalize_run_integration',
+};
+
+/**
+ * What a non-Codex session Coordinator's policy allows for an action, matching the Codex approval
+ * rules (`coordinatorApprovedMcpTools`): `full-auto` pre-approves manage_worker and never the
+ * Git-history tools (Codex's `never` approval policy fails them outright); the other tiers ask
+ * the person each time.
+ */
+export function sessionGateDecision(action: string, policy: AgentSessionPolicy): 'allow' | 'ask' | 'deny' {
+  const tool = SESSION_GATED_COORDINATOR_ACTIONS[action];
+  if (!tool || coordinatorApprovedMcpTools(policy).includes(tool)) return 'allow';
+  return policy === 'full-auto' ? 'deny' : 'ask';
+}
+
+/**
+ * The Aha tool a provider names, if any: Claude says `mcp__aha__<tool>`, other agents may use
+ * `aha__<tool>`, `aha/<tool>`, `aha.<tool>`, or `aha: <tool>`.
+ */
+export function parseAhaMcpToolName(name: unknown): string | null {
+  if (typeof name !== 'string') return null;
+  const match = /^\s*(?:mcp__)?aha(?:__|\/|\.|\s*:\s*)([a-z][a-z0-9_]*)\s*$/iu.exec(name);
+  return match ? match[1]!.toLowerCase() : null;
+}

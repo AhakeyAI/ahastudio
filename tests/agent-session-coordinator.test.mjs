@@ -452,7 +452,7 @@ test('orchestration mode switches only between turns and resumes the same thread
   assert.match(resumed[0].developerInstructions, /Orchestration Mode Active/);
   assert.equal(app.sent('thread/start')[0].developerInstructions, undefined);
   assert.equal(app.sent('mcpServerStatus/list').length, 1, 'an orchestrating thread must expose delegate_task');
-  assert.deepEqual(app.manager.coordinatorState(session.id), { cwd, provider: 'codex', active: true, idle: true, network: false });
+  assert.deepEqual(app.manager.coordinatorState(session.id), { cwd, provider: 'codex', active: true, idle: true, network: false, policy: 'workspace-write' });
   // The replaced process must not close the session or leave a failed turn behind.
   assert.equal(app.manager.getTimeline(session.id).turns.at(-1).status, 'interrupted');
   assert.equal((await app.manager.send(session.id, { text: 'Plan the work' })).status, 'accepted');

@@ -101,12 +101,18 @@ interface Session {
   launchedPolicy: AgentSessionPolicy | null;
   /** A title the person chose that the provider has not stored yet; sent when a process is next up. */
   unsyncedName: string | null;
+  /** Events of the live process, so orchestration can ask the person inside the running turn. */
+  events?: AgentSessionEvents;
 }
 
 export interface AgentSessionManagerDependencies {
   launch: (
     sessionId: string, cwd: string, events: AgentSessionEvents,
-    options: { orchestration: boolean; policy: AgentSessionPolicy; provider: AgentProvider; resumeSessionId?: string },
+    options: {
+      orchestration: boolean; policy: AgentSessionPolicy; provider: AgentProvider; resumeSessionId?: string;
+      /** Coordinator rules, for drivers that take them at launch (Claude Code) rather than in `open`. */
+      developerInstructions?: string;
+    },
   ) => AgentSessionDriver;
   /** Coordinator rules for an orchestrating session's conversation; without it orchestration mode is unavailable. */
   coordinatorInstructions?: (sessionId: string, options: { policy: AgentSessionPolicy }) => string;
@@ -627,14 +633,33 @@ export class AgentSessionManager {
   }
 
   /** Coordinator state the orchestration service checks before trusting the session's MCP calls. */
-  coordinatorState(id: string): { cwd: string; provider: string; active: boolean; idle: boolean; network: boolean } | null {
+  coordinatorState(id: string): {
+    cwd: string; provider: string; active: boolean; idle: boolean; network: boolean; policy: AgentSessionPolicy;
+  } | null {
     const session = this.sessions.get(id);
     if (!session) return null;
     const { info, driver } = session;
     const live = info.status === 'starting' || info.status === 'idle' || info.status === 'running';
     const active = info.orchestration && live;
     const idle = active && info.status === 'idle' && Boolean(driver?.alive) && !driver?.busy && session.requests.size === 0;
-    return { cwd: info.cwd, provider: info.provider, active, idle, network: info.network };
+    return {
+      cwd: info.cwd, provider: info.provider, active, idle, network: info.network,
+      policy: session.launchedPolicy ?? info.policy,
+    };
+  }
+
+  /**
+   * Puts an orchestration action the Coordinator called to the person, as an approval in its running
+   * turn. Resolves false when declined, or when there is no turn to ask in.
+   */
+  async requestCoordinatorApproval(
+    id: string, request: { method: string; toolInput: string; message?: string }, signal: AbortSignal,
+  ): Promise<boolean> {
+    const session = this.sessions.get(id);
+    const turnKey = session?.timeline.activeTurn?.dispatchId;
+    if (!session?.info.orchestration || !session.events || !session.driver?.alive || !turnKey) return false;
+    const response = await session.events.onRequest(turnKey, { kind: 'approval', ...request, signal });
+    return 'decision' in response && response.decision === 'accept';
   }
 
   /** Requests an in-place tool config reload on the active Codex thread between turns. */
@@ -881,8 +906,11 @@ export class AgentSessionManager {
       const developerInstructions = orchestration
         ? this.deps.coordinatorInstructions?.(info.id, { policy: info.policy })
         : undefined;
-      session.driver = this.deps.launch(info.id, info.cwd, this.eventsFor(session, generation), {
+      const events = this.eventsFor(session, generation);
+      session.events = events;
+      session.driver = this.deps.launch(info.id, info.cwd, events, {
         orchestration, policy: info.policy, provider: info.provider,
+        ...(developerInstructions ? { developerInstructions } : {}),
         ...(rejoin && info.providerSessionId ? { resumeSessionId: info.providerSessionId } : {}),
       });
       session.launchedPolicy = info.policy;

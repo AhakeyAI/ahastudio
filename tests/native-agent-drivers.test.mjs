@@ -537,7 +537,8 @@ test('capability table: legacy providers fall back to Codex, policies never wide
     'Codex keeps every capability it had');
   for (const id of ['claude', 'antigravity', 'grok', 'opencode', 'pi']) {
     const caps = AGENT_DRIVER_CAPABILITIES[id];
-    assert.equal(caps.goal || caps.feedback || caps.usageLimits || caps.skills || caps.plugins || caps.history || caps.orchestration || caps.network, false, id);
+    assert.equal(caps.goal || caps.feedback || caps.usageLimits || caps.skills || caps.plugins || caps.history || caps.network, false, id);
+    assert.equal(caps.orchestration, id === 'claude' || id === 'grok', `${id} orchestration`);
   }
   const claude = AGENT_DRIVER_CAPABILITIES.claude;
   assert.deepEqual(claude.policies, ['workspace-write', 'read-only', 'full-auto']);
@@ -601,9 +602,10 @@ test('manager: legacy saved sessions load as Codex with its capabilities; other 
   assert.equal(grok.provider, 'grok');
   assert.equal(grok.policy, 'workspace-write');
   assert.equal(grok.network, false, 'no network switch for a driver without one');
-  assert.deepEqual(await manager.setOrchestration(grok.id, true), { ok: false, error: '当前会话驱动不支持编排模式' });
   assert.equal((await manager.send(grok.id, { text: 'x', network: true })).status, 'not_accepted');
   assert.equal(log.at(-1).provider, 'grok');
+  const agy = await manager.create({ cwd: dir, policy: 'workspace-write', provider: 'antigravity' });
+  assert.deepEqual(await manager.setOrchestration(agy.id, true), { ok: false, error: '当前会话驱动不支持编排模式' });
   await manager.dispose();
 });
 
