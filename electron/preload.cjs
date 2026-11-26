@@ -249,6 +249,9 @@ const api = {
     },
   },
   agentSessions: {
+    runtime: (opts) => ipcRenderer.invoke('agent-sessions:runtime', opts),
+    revealRuntimeConfig: () => ipcRenderer.invoke('agent-sessions:runtime-config', {}),
+    reloadTools: (opts) => ipcRenderer.invoke('agent-sessions:reload-tools', opts),
     list: () => ipcRenderer.invoke('agent-sessions:list', {}),
     create: (opts) => ipcRenderer.invoke('agent-sessions:create', opts),
     send: (opts) => ipcRenderer.invoke('agent-sessions:send', opts),

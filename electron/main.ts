@@ -1,4 +1,4 @@
-import { app, BrowserWindow, nativeTheme, protocol, screen, session } from 'electron';
+import { app, BrowserWindow, nativeTheme, protocol, screen, session, shell } from 'electron';
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -561,6 +561,14 @@ app.whenReady().then(async () => {
   const codexCatalog = new CodexCatalog(() => launchCodexPilot({ cwd: app.getPath('home'), events: noSessionEvents }));
   const agentSessionsIpc = registerAgentSessionsIpc(ipcCtx, agentSessions, {
     catalog: codexCatalog,
+    inspectRuntime: async (cwd, probe) => {
+      const { inspectCodexRuntime } = await import('./orchestration/codex-runtime-diagnostics.js');
+      return inspectCodexRuntime(cwd, probe, () => launchCodexPilot({ cwd, events: noSessionEvents, diagnostics: true }));
+    },
+    revealRuntimeConfig: () => {
+      const file = join(process.env.CODEX_HOME || join(app.getPath('home'), '.codex'), 'config.toml');
+      shell.showItemInFolder(file);
+    },
     attachmentsDir: () => join(app.getPath('userData'), 'agent-session-attachments'),
   });
   const offPtyExit = shellPtyCtrl.onPtyExit((ptyId) => {

@@ -41,6 +41,7 @@ import {
   useSessionReplyReveals,
 } from './agent-session/session-disclosure-store';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
+import { CodexRuntimePanel } from './CodexRuntimePanel';
 import './agent-session-view.css';
 
 const STAGE_LABELS: Record<OrchestrationDispatchStage, string> = {
@@ -496,6 +497,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       <SessionDisclosureContext.Provider value={disclosures}>
         <SessionReplyRevealsContext.Provider value={replyReveals}>
       <div className="agent-session-view" data-running={running || undefined}>
+        {direct && info?.provider === 'codex' && <CodexRuntimePanel sessionId={sessionId} running={running || info.status === 'starting'} />}
         <header className="asv-header">
           <TerminalProfileIcon id={timeline?.cliId ?? win.localCliId ?? 'codex'} size={16} />
           <SessionTitle title={title} {...(direct && info && info.status !== 'closed' ? { onRename: rename } : {})} />
