@@ -429,7 +429,7 @@ export class AgentSessionManager {
     this.sessionsChanged();
     const delivery = await driver.startTurn({
       turnKey, prompt: text, ...(attachments.length ? { attachments } : {}),
-      effort: input.effort ?? info.effort,
+      effort: input.effort !== undefined ? input.effort : info.effort,
       ...(input.model && input.model !== info.model ? { model: input.model } : {}),
       ...(input.policy && input.policy !== info.policy ? { policy: input.policy } : {}),
       ...(input.network !== undefined && input.network !== info.network ? { network: input.network } : {}),

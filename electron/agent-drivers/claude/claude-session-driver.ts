@@ -33,6 +33,8 @@ import {
   asText,
   buildClaudeUserContent,
   CLAUDE_CONTROL_ENVELOPE,
+  CLAUDE_READ_ONLY_HOOK_ID,
+  CLAUDE_READ_ONLY_HOOK_MATCHER,
   claudePermissionModeForPolicy,
   claudeRequestRequiresPerson,
   describeClaudeResultError,
@@ -41,6 +43,10 @@ import {
   formatClaudeCompactNotice,
   isClaudeAutoRefusal,
   isClaudeBypassRefusal,
+  isClaudeFileEditTool,
+  isClaudeSyntheticNoResponse,
+  isClaudeToolResultBlock,
+  isClaudeToolResultError,
   normalizeClaudeUsage,
   parseClaudeAskUserQuestion,
   parseClaudeModels,
@@ -64,6 +70,7 @@ interface StreamBlockState {
   toolName?: string;
   toolId?: string;
   jsonBuf?: string;
+  jsonTruncated?: boolean;
 }
 
 interface StreamedMessageQueues {
@@ -90,6 +97,7 @@ interface ClaudeTurn {
   usage: Record<string, number> | null;
   lastError: string | null;
   compactBoundarySeen: boolean;
+  compactNoticeSeen: boolean;
   started: boolean;
   evidence: boolean;
   onEvidence: (() => void) | null;
@@ -158,6 +166,7 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
         if (this.stopping || this.disconnected) return;
         // Prefer process exit, which carries the exit code and lets stderr drain.
         const timer = setTimeout(() => this.transportLost('Claude Code 的输出已关闭'), 100);
+        timer.unref?.();
         void this.proc.closed.then(() => clearTimeout(timer));
       },
     }, { requestTimeoutMs: options.requestTimeoutMs ?? 30_000 });
@@ -184,7 +193,12 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     try {
       const init = asObject(await this.rpc.request(
         'initialize',
-        { supportedDialogKinds: [] },
+        {
+          supportedDialogKinds: [],
+          hooks: {
+            PreToolUse: [{ matcher: CLAUDE_READ_ONLY_HOOK_MATCHER, hookCallbackIds: [CLAUDE_READ_ONLY_HOOK_ID] }],
+          },
+        },
         { timeoutMs: this.setupTimeoutMs },
       ));
       this.readCapabilities(init.capabilities);
@@ -350,18 +364,26 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
       return { status: 'not_accepted', reason: 'Claude Code 会话已关闭或正忙' };
     }
     const targetModel = input.model ?? this.currentModel;
-    if (input.effort && input.effort !== this.currentEffort) {
-      const targetOpt = this.modelOptions.find((entry) => entry.id === targetModel || entry.model === targetModel);
-      if (targetOpt && targetOpt.efforts.length > 0 && !targetOpt.efforts.some((entry) => entry.value === input.effort)) {
+    const targetOpt = this.modelOptions.find((entry) => entry.id === targetModel || entry.model === targetModel);
+    let clearEffort = input.effort === null && this.currentEffort !== null;
+    if (input.effort) {
+      if (targetOpt && targetOpt.efforts.length === 0) {
+        if (input.effort !== this.currentEffort) {
+          return { status: 'not_accepted', reason: `Claude 当前模型不支持推理强度 ${input.effort}` };
+        }
+        clearEffort = this.currentEffort !== null;
+      } else if (targetOpt && !targetOpt.efforts.some((entry) => entry.value === input.effort)) {
         return { status: 'not_accepted', reason: `Claude 当前模型不支持推理强度 ${input.effort}` };
       }
     }
     try {
       if (input.model && input.model !== this.currentModel) await this.setModel(input.model);
-      if (input.effort && input.effort !== this.currentEffort) await this.setEffort(input.effort);
+      if (clearEffort) await this.clearEffort();
+      else if (input.effort && input.effort !== this.currentEffort) await this.setEffort(input.effort);
       if (input.policy && input.policy !== this.policy) await this.applyPolicy(input.policy);
     } catch (error) {
-      return { status: this.alive ? 'not_accepted' : 'unknown_acceptance', reason: describe(error) };
+      // Pre-dispatch controls failed before the user message was ever written.
+      return { status: 'not_accepted', reason: describe(error) };
     }
 
     let content: Obj[];
@@ -393,6 +415,7 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
       usage: null,
       lastError: null,
       compactBoundarySeen: false,
+      compactNoticeSeen: false,
       started: false,
       evidence: false,
       onEvidence: null,
@@ -456,17 +479,23 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
   }
 
   private async setModel(model: string): Promise<void> {
-    await this.rpc.request('set_model', { model });
-    this.currentModel = model;
+    const res = asObject(await this.rpc.request('set_model', { model }));
+    this.currentModel = asNonEmptyText(res.model) ?? model;
   }
 
   private async setEffort(effort: string): Promise<void> {
     const currentOpt = this.modelOptions.find((entry) => entry.id === this.currentModel || entry.model === this.currentModel);
-    if (currentOpt && currentOpt.efforts.length > 0 && !currentOpt.efforts.some((entry) => entry.value === effort)) {
+    if (currentOpt && !currentOpt.efforts.some((entry) => entry.value === effort)) {
       throw new Error(`Claude 当前模型不支持推理强度 ${effort}`);
     }
     await this.rpc.request('apply_flag_settings', { settings: { effortLevel: effort } });
     this.currentEffort = effort;
+    this.refreshModelOptions();
+  }
+
+  private async clearEffort(): Promise<void> {
+    await this.rpc.request('apply_flag_settings', { settings: { effortLevel: null } }).catch(() => {});
+    this.currentEffort = null;
     this.refreshModelOptions();
   }
 
@@ -611,8 +640,10 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
       if (record.status === 'compacting') {
         this.timeline(turn, { type: 'notice', id: `compact:${turn.turnId}`, level: 'info', text: '正在压缩上下文…' });
       } else if (record.compact_result === 'success' && !turn.compactBoundarySeen) {
+        turn.compactNoticeSeen = true;
         this.timeline(turn, { type: 'notice', id: `compact:${turn.turnId}`, level: 'info', text: '上下文已压缩' });
       } else if (record.compact_result === 'failed' && !turn.cancelRequested) {
+        turn.compactNoticeSeen = true;
         const detail = asNonEmptyText(record.compact_error);
         this.timeline(turn, {
           type: 'notice',
@@ -625,6 +656,7 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     }
     if (subtype === 'compact_boundary') {
       turn.compactBoundarySeen = true;
+      turn.compactNoticeSeen = true;
       this.timeline(turn, {
         type: 'notice',
         id: `compact:${turn.turnId}`,
@@ -756,8 +788,10 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
       if (deltaType === 'input_json_delta') {
         const partial = asText(delta.partial_json);
         const entry = turn.streamBlocks.get(index);
-        if (entry?.kind === 'tool' && partial && (entry.jsonBuf?.length ?? 0) < MAX_TOOL_JSON_BUF) {
-          entry.jsonBuf = (entry.jsonBuf ?? '') + partial;
+        if (entry?.kind === 'tool' && partial && !entry.jsonTruncated) {
+          const nextLen = (entry.jsonBuf?.length ?? 0) + partial.length;
+          if (nextLen > MAX_TOOL_JSON_BUF) entry.jsonTruncated = true;
+          else entry.jsonBuf = (entry.jsonBuf ?? '') + partial;
         }
       }
       return;
@@ -772,19 +806,31 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
         this.timeline(turn, { type: 'item', item: { id: entry.id, kind: 'reasoning', status: 'completed', completedAt: Date.now() } });
         if (turn.activeThoughtId === entry.id) turn.activeThoughtId = null;
       } else if (entry.kind === 'message') {
-        this.timeline(turn, { type: 'item', item: { id: entry.id, kind: 'message', status: 'completed', completedAt: Date.now() } });
+        if (turn.messages.has(entry.id)) {
+          this.timeline(turn, { type: 'item', item: { id: entry.id, kind: 'message', status: 'completed', completedAt: Date.now() } });
+        }
         if (turn.activeMessageId === entry.id) turn.activeMessageId = null;
-      } else if (entry.kind === 'tool' && entry.toolId && entry.toolName && !turn.tools.has(entry.toolId)) {
+      } else if (entry.kind === 'tool' && entry.toolId && entry.toolName && !turn.tools.has(entry.toolId) && !entry.jsonTruncated) {
         // Fallback when a stream omits the companion `assistant` frame after tool input finishes.
+        // Never emit truncated/unparseable JSON or a pathless edit tool here: WorkerTimeline locks
+        // item.kind on first upsert, so the companion `assistant` frame must supply the real input.
         let parsedInput: unknown = {};
+        let valid = true;
         if (entry.jsonBuf) {
           try {
             parsedInput = JSON.parse(entry.jsonBuf);
           } catch {
-            parsedInput = {};
+            valid = false;
           }
         }
-        this.emitToolUse(turn, entry.toolId, entry.toolName, parsedInput);
+        if (valid) {
+          const parsedObj = asObject(parsedInput);
+          const editMissingPath = isClaudeFileEditTool(entry.toolName) &&
+            !(asNonEmptyText(parsedObj.file_path) ?? asNonEmptyText(parsedObj.notebook_path) ?? asNonEmptyText(parsedObj.path));
+          if (!editMissingPath) {
+            this.emitToolUse(turn, entry.toolId, entry.toolName, parsedInput);
+          }
+        }
       }
       return;
     }
@@ -851,9 +897,11 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
       return;
     }
 
+    if (isClaudeSyntheticNoResponse(record)) return;
+
     const msgId = asNonEmptyText(message.id) ?? null;
     const apiError = asNonEmptyText(record.error) ?? asNonEmptyText(record.api_error);
-    if (record.is_api_error_message === true) {
+    if (record.is_api_error_message === true || record.isApiErrorMessage === true) {
       const errorText = content
         .filter((block) => block.type === 'text' && typeof block.text === 'string')
         .map((block) => (block.text as string).trim())
@@ -898,14 +946,18 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
         const claimed = this.claimStreamedBlock(turn, msgId, 'text');
         if (claimed) {
           this.markStreamBlockClosed(turn, claimed);
+          const hadStreamed = turn.messages.has(claimed);
           if (value) {
+            if (!hadStreamed) this.append(value);
             turn.messages.set(claimed, value);
             turn.lastMessage = claimed;
           }
-          this.timeline(turn, {
-            type: 'item',
-            item: { id: claimed, kind: 'message', role: 'assistant', status: 'completed', ...(value ? { text: value } : {}), completedAt: Date.now() },
-          });
+          if (value || hadStreamed) {
+            this.timeline(turn, {
+              type: 'item',
+              item: { id: claimed, kind: 'message', role: 'assistant', status: 'completed', ...(value ? { text: value } : {}), completedAt: Date.now() },
+            });
+          }
         } else if (value) {
           const id = `msg:${turn.turnId}:${++turn.textSeg}`;
           turn.messages.set(id, value);
@@ -926,6 +978,11 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
           this.closeOpenStreams(turn);
           this.emitToolUse(turn, toolId, toolName, block.input ?? {});
         }
+        continue;
+      }
+
+      if (isClaudeToolResultBlock(block)) {
+        this.applyToolResultBlock(turn, block, record.tool_use_result);
       }
     }
   }
@@ -936,35 +993,39 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     if (event) this.timeline(turn, event);
   }
 
+  private applyToolResultBlock(turn: ClaudeTurn, block: Obj, toolUseResult: unknown): void {
+    const toolUseId = asNonEmptyText(block.tool_use_id);
+    if (!toolUseId) return;
+    this.sawEvidence(turn);
+    const tracked = turn.tools.get(toolUseId) ?? {
+      id: toolUseId,
+      name: 'tool',
+      input: {},
+      itemKind: 'tool_call' as const,
+    };
+    const event = translateClaudeToolResult(
+      turn.turnId,
+      tracked,
+      block.content,
+      isClaudeToolResultError(block),
+      toolUseResult,
+      turn.declinedTools.has(toolUseId),
+      Date.now(),
+    );
+    if (event) this.timeline(turn, event);
+    turn.tools.delete(toolUseId);
+  }
+
   private handleUser(turn: ClaudeTurn, record: JsonlRecord): void {
     if (record.uuid === turn.userMessageUuid) this.sawEvidence(turn);
-    // Skip replayed/synthetic user messages; only tool_result blocks update timeline items.
-    if (record.isReplay === true || record.isSynthetic === true) return;
+    // Skip replayed user prompts; inspect remaining frames (including synthetic tool_results) for tool outputs only.
+    if (record.isReplay === true) return;
     if (asNonEmptyText(record.parent_tool_use_id)) return;
     const message = asObject(record.message);
     const content = asArray(message.content).map(asObject);
     for (const block of content) {
-      if (block.type !== 'tool_result') continue;
-      const toolUseId = asNonEmptyText(block.tool_use_id);
-      if (!toolUseId) continue;
-      this.sawEvidence(turn);
-      const tracked = turn.tools.get(toolUseId) ?? {
-        id: toolUseId,
-        name: 'tool',
-        input: {},
-        itemKind: 'tool_call' as const,
-      };
-      const event = translateClaudeToolResult(
-        turn.turnId,
-        tracked,
-        block.content,
-        block.is_error === true,
-        record.tool_use_result,
-        turn.declinedTools.has(toolUseId),
-        Date.now(),
-      );
-      if (event) this.timeline(turn, event);
-      turn.tools.delete(toolUseId);
+      if (!isClaudeToolResultBlock(block)) continue;
+      this.applyToolResultBlock(turn, block, record.tool_use_result);
     }
   }
 
@@ -994,7 +1055,15 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
 
     const resultText = asText(record.result) ?? '';
     let finalText = turn.lastMessage ? (turn.messages.get(turn.lastMessage) ?? '') : '';
-    if (!finalText && resultText) {
+    if (turn.command === 'compact' && stopReason === 'completed' && !turn.compactNoticeSeen) {
+      turn.compactNoticeSeen = true;
+      this.timeline(turn, {
+        type: 'notice',
+        id: `compact:${turn.turnId}`,
+        level: 'info',
+        text: resultText.trim() || '上下文已压缩',
+      });
+    } else if (!finalText && resultText) {
       finalText = resultText;
       // Show a final result string when Claude produced no assistant text block (e.g. a local command).
       if (stopReason === 'completed' && turn.command !== 'compact') {
@@ -1009,6 +1078,9 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
       }
     }
 
+    // Abort any still-pending control requests so they cannot write stale replies after the turn settles.
+    for (const controller of this.pendingControls.values()) controller.abort();
+    this.pendingControls.clear();
     this.dropTurn(turn);
     this.events.onTurnCompleted(turn.turnKey, {
       turnId: turn.turnId,
@@ -1041,7 +1113,7 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
       } else if (subtype === 'elicitation') {
         response = { action: 'decline' };
       } else if (subtype === 'hook_callback') {
-        response = {};
+        response = this.handleHookCallback(req);
       } else {
         await this.writeControlError(requestId, `Unsupported Claude control request subtype: ${subtype}`);
         return;
@@ -1057,6 +1129,25 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     } finally {
       if (this.pendingControls.get(requestId) === cancel) this.pendingControls.delete(requestId);
     }
+  }
+
+  private handleHookCallback(req: Obj): Obj {
+    if (req.callback_id === CLAUDE_READ_ONLY_HOOK_ID && this.policy === 'read-only') {
+      const turn = this.active;
+      const toolUseId = asNonEmptyText(req.tool_use_id);
+      if (turn) {
+        if (toolUseId) turn.declinedTools.add(toolUseId);
+        this.timeline(turn, { type: 'notice', level: 'warning', text: '只读模式：已拒绝一次文件写入或退出规划操作' });
+      }
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: 'Read-only mode: file modifications are not allowed.',
+        },
+      };
+    }
+    return {};
   }
 
   private async writeControlError(requestId: string, error: string): Promise<void> {
@@ -1181,7 +1272,9 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     if (!turn.activeMessageId) return;
     const id = turn.activeMessageId;
     this.markStreamBlockClosed(turn, id);
-    this.timeline(turn, { type: 'item', item: { id, kind: 'message', status: 'completed', completedAt: Date.now() } });
+    if (turn.messages.has(id)) {
+      this.timeline(turn, { type: 'item', item: { id, kind: 'message', status: 'completed', completedAt: Date.now() } });
+    }
   }
 
   private closeOpenStreams(turn: ClaudeTurn): void {

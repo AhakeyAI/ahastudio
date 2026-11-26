@@ -76,6 +76,10 @@ export const CLAUDE_SESSION_ENV: Readonly<Record<string, string>> = {
   CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
 };
 
+/** SDK PreToolUse hook that enforces `read-only` even when user settings auto-allow write tools. */
+export const CLAUDE_READ_ONLY_HOOK_ID = 'aha_readonly_guard';
+export const CLAUDE_READ_ONLY_HOOK_MATCHER = 'Edit|MultiEdit|Write|NotebookEdit|ExitPlanMode';
+
 export type ClaudePermissionMode = 'plan' | 'default' | 'acceptEdits' | 'auto' | 'bypassPermissions' | 'dontAsk';
 
 /** Maps AhaStudio's three permission tiers to Claude Code's native `--permission-mode`. */
@@ -184,26 +188,31 @@ export function parseClaudeModels(
   if (rows.length === 0) return [];
   const defaultRow = rows.find((row) => asNonEmptyText(row.value) === 'default');
   const defaultResolved = asNonEmptyText(defaultRow?.resolvedModel);
+  // Look up non-default rows by resolved id so their picker display names win over "Default (recommended)"
+  // without pushing the default model to the bottom of the list.
+  const namedById = new Map<string, Obj>();
+  for (const row of rows) {
+    const value = asNonEmptyText(row.value)!;
+    if (value === 'default') continue;
+    const id = asNonEmptyText(row.resolvedModel) ?? value;
+    if (!namedById.has(id)) namedById.set(id, row);
+  }
   const seen = new Set<string>();
   const models: CodexModelOption[] = [];
-  // Prefer non-default rows first so their picker display names win over "Default (recommended)".
-  const ordered = [
-    ...rows.filter((row) => asNonEmptyText(row.value) !== 'default'),
-    ...rows.filter((row) => asNonEmptyText(row.value) === 'default'),
-  ];
-  for (const row of ordered) {
+  for (const row of rows) {
     const value = asNonEmptyText(row.value)!;
     const resolved = asNonEmptyText(row.resolvedModel);
     const id = resolved ?? value;
     if (id === 'default' && rows.length > 1) continue;
     if (seen.has(id)) continue;
     seen.add(id);
+    const named = value === 'default' ? namedById.get(id) : undefined;
     const isDefault = defaultResolved ? id === defaultResolved : value === 'default';
-    const rawDisplay = asNonEmptyText(row.displayName);
-    const displayName = value === 'default'
+    const rawDisplay = asNonEmptyText(named?.displayName) ?? asNonEmptyText(row.displayName);
+    const displayName = value === 'default' && !named
       ? (resolved ? formatClaudeModelLabel(resolved) : (rawDisplay ?? id))
       : (rawDisplay ?? formatClaudeModelLabel(id));
-    const description = asNonEmptyText(row.description) ?? '';
+    const description = asNonEmptyText(named?.description) ?? asNonEmptyText(row.description) ?? '';
     const efforts = row.supportsEffort === true && Array.isArray(row.supportedEffortLevels)
       ? row.supportedEffortLevels
         .map(asNonEmptyText)
@@ -548,6 +557,55 @@ function buildInitialFileChange(name: string, input: Obj): WorkerTimelineFileCha
   return [];
 }
 
+const FILE_EDIT_TOOLS = new Set(['edit', 'multiedit', 'write', 'notebookedit']);
+const WEB_SEARCH_TOOLS = new Set(['websearch', 'webfetch', 'web_search', 'web_fetch']);
+
+export function isClaudeFileEditTool(name: string): boolean {
+  return FILE_EDIT_TOOLS.has(name.toLowerCase());
+}
+
+/** True for client `tool_result` blocks and server-side tool result blocks (`web_search_tool_result`, etc.). */
+export function isClaudeToolResultBlock(block: Obj): boolean {
+  if (block.type === 'tool_result') return true;
+  if (block.type === 'tool_use' || block.type === 'server_tool_use') return false;
+  return asNonEmptyText(block.tool_use_id) !== undefined;
+}
+
+/** True when a tool result reports an error, including server-tool `*_error` payloads. */
+export function isClaudeToolResultError(block: Obj): boolean {
+  if (block.is_error === true) return true;
+  const content = asObject(block.content);
+  return typeof content.type === 'string' && content.type.endsWith('_error');
+}
+
+/** True for Claude Code's `<synthetic>` `"No response requested."` resume-repair assistant frames. */
+export function isClaudeSyntheticNoResponse(record: Obj): boolean {
+  if (record.type !== 'assistant') return false;
+  if (
+    record.error !== undefined ||
+    record.api_error !== undefined ||
+    record.is_api_error_message === true ||
+    record.isApiErrorMessage === true ||
+    record.apiErrorStatus !== undefined
+  ) {
+    return false;
+  }
+  const message = asObject(record.message);
+  if (message.role !== 'assistant' || message.model !== '<synthetic>') return false;
+  if (message.stop_reason !== 'stop_sequence' || message.stop_sequence !== '') return false;
+  const usage = asObject(message.usage);
+  const zeroUsage = ['input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'output_tokens']
+    .every((key) => usage[key] === 0);
+  if (!zeroUsage) return false;
+  const content = asArray(message.content).map(asObject);
+  if (content.length === 0 || content.some((part) => part.type !== 'text')) return false;
+  const text = content
+    .map((part) => (typeof part.text === 'string' ? part.text : ''))
+    .join('\n')
+    .trim();
+  return text === 'No response requested.';
+}
+
 /** Classifies a Claude tool_use and produces the initial timeline event (or null for AskUserQuestion). */
 export function translateClaudeToolStart(
   turnId: string,
@@ -593,7 +651,7 @@ export function translateClaudeToolStart(
     };
   }
 
-  if (lower === 'edit' || lower === 'multiedit' || lower === 'write' || lower === 'notebookedit') {
+  if (FILE_EDIT_TOOLS.has(lower)) {
     const files = buildInitialFileChange(name, input);
     if (files.length > 0) {
       return {
@@ -607,7 +665,7 @@ export function translateClaudeToolStart(
   }
 
   const mcp = parseMcpToolName(name);
-  const toolType = mcp ? 'mcp' as const : (lower === 'websearch' || lower === 'webfetch') ? 'search' as const : 'tool' as const;
+  const toolType = mcp ? 'mcp' as const : WEB_SEARCH_TOOLS.has(lower) ? 'search' as const : 'tool' as const;
   const args = Object.keys(input).length > 0 ? JSON.stringify(input) : '';
   return {
     tracked: { id: toolUseId, name, input, itemKind: 'tool_call' },
@@ -632,7 +690,10 @@ export function extractClaudeToolResultText(content: unknown, toolUseResult?: un
     const texts = content.flatMap((entry) => {
       if (typeof entry === 'string') return [entry];
       const block = asObject(entry);
-      return block.type === 'text' && typeof block.text === 'string' ? [block.text] : [];
+      if (typeof block.text === 'string') return [block.text];
+      if (typeof block.content === 'string') return [block.content];
+      if (typeof block.title === 'string' && typeof block.url === 'string') return [`${block.title} (${block.url})`];
+      return [];
     });
     if (texts.length > 0) return texts.join('\n');
   }
@@ -702,7 +763,13 @@ export function translateClaudeToolResult(
         status,
         completedAt,
         output: finalOutput,
-        ...(typeof extra.exitCode === 'number' ? { exitCode: extra.exitCode } : isError && !declined ? { exitCode: 1 } : { exitCode: 0 }),
+        ...(typeof extra.exitCode === 'number'
+          ? { exitCode: extra.exitCode }
+          : declined
+            ? {}
+            : isError
+              ? { exitCode: 1 }
+              : { exitCode: 0 }),
       },
     };
   }
@@ -741,7 +808,7 @@ export function translateClaudeToolResult(
     item: {
       id: timelineId,
       kind: 'tool_call',
-      toolType: mcp ? 'mcp' : (tracked.name.toLowerCase() === 'websearch' || tracked.name.toLowerCase() === 'webfetch') ? 'search' : 'tool',
+      toolType: mcp ? 'mcp' : WEB_SEARCH_TOOLS.has(tracked.name.toLowerCase()) ? 'search' : 'tool',
       server: mcp ? mcp.server : null,
       tool: mcp ? mcp.tool : tracked.name,
       status,

@@ -16,6 +16,7 @@ import {
   buildClaudeUserContent,
   CLAUDE_CONTROL_ENVELOPE,
   CLAUDE_PARENT_SESSION_ENV_KEYS,
+  CLAUDE_READ_ONLY_HOOK_ID,
   claudeLaunchArgs,
   formatClaudeModelLabel,
   normalizeClaudeUsage,
@@ -25,6 +26,7 @@ import {
 import { ClaudeSessionDriver } from '../dist-electron/agent-drivers/claude/claude-session-driver.js';
 import { JsonlRpc, JsonlRpcError } from '../dist-electron/agent-drivers/jsonl-rpc.js';
 import { AgentSessionManager } from '../dist-electron/orchestration/agent-session-manager.js';
+import { WorkerTimeline } from '../dist-electron/orchestration/worker-timeline.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = (...parts) => join(here, 'fixtures', ...parts);
@@ -251,18 +253,30 @@ test('Claude launch args, parent env scrubbing, control envelope, and model pars
 
   const models = parseClaudeModels(SAMPLE_MODELS, 'high');
   assert.deepEqual(models.map((m) => [m.id, m.displayName, m.isDefault, m.efforts.map((e) => e.value), m.defaultEffort, m.images]), [
+    ['claude-opus-4-6[1m]', 'Opus 4.6 (1M)', true, ['low', 'medium', 'high', 'xhigh', 'max'], 'high', true],
     ['claude-sonnet-4-6', 'Sonnet', false, ['low', 'medium', 'high'], 'high', true],
     ['claude-haiku-4-5-20251001', 'Haiku', false, [], null, true],
-    ['claude-opus-4-6[1m]', 'Opus 4.6 (1M)', true, ['low', 'medium', 'high', 'xhigh', 'max'], 'high', true],
   ]);
 
-  // Proxy aliases resolving to the same model deduplicate cleanly.
+  // Proxy aliases resolving to the same model deduplicate cleanly while keeping default first.
   const proxyModels = parseClaudeModels([
     { value: 'default', resolvedModel: 'Custom-1[1m]', displayName: 'Default', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
     { value: 'opus', resolvedModel: 'Custom-1', displayName: 'Custom-1', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
     { value: 'sonnet', resolvedModel: 'Custom-1', displayName: 'Custom-1', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
   ]);
-  assert.deepEqual(proxyModels.map((m) => m.id), ['Custom-1', 'Custom-1[1m]']);
+  assert.deepEqual(proxyModels.map((m) => m.id), ['Custom-1[1m]', 'Custom-1']);
+  assert.equal(proxyModels[0].isDefault, true);
+
+  // When a non-default row shares the default row's resolvedModel, its displayName still wins at index 0.
+  const sharedDefault = parseClaudeModels([
+    { value: 'default', resolvedModel: 'claude-opus-4-6', displayName: 'Default (recommended)', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+    { value: 'opus', resolvedModel: 'claude-opus-4-6', displayName: 'Opus', description: 'Flagship', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+    { value: 'sonnet', resolvedModel: 'claude-sonnet-4-6', displayName: 'Sonnet', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+  ]);
+  assert.deepEqual(sharedDefault.map((m) => [m.id, m.displayName, m.isDefault]), [
+    ['claude-opus-4-6', 'Opus', true],
+    ['claude-sonnet-4-6', 'Sonnet', false],
+  ]);
 
   // Usage normalization includes Anthropic cache tokens in inputTokens.
   assert.deepEqual(normalizeClaudeUsage({
@@ -900,4 +914,256 @@ test('SessionComposer renders Claude Code provider label, multi-select hint, and
   assert.match(html, /可写 · 需确认/);
   assert.match(html, /自动/);
   assert.doesNotMatch(html, /不联网/);
+});
+
+test('regressions: truncated Write input_json_delta, empty text blocks, server_tool_use results, synthetic no-response, and declined Bash exitCode', async () => {
+  const child = fakeChild();
+  const hugeContent = 'x'.repeat(300_000);
+  const io = standardClaudeAgent(child, {
+    onUser: async (msg) => {
+      const sid = msg.session_id;
+      const send = (frame) => io.send({ session_id: sid, parent_tool_use_id: null, ...frame });
+      await tick();
+      send({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg_1' } } });
+      // Empty text block before a tool call must never produce a ghost assistant message.
+      send({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } });
+      send({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 } });
+      // Large Write (>256KB) whose input_json_delta truncates before content_block_stop must wait for assistant frame.
+      send({ type: 'stream_event', event: { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'tu_big', name: 'Write', input: {} } } });
+      send({ type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: `{"file_path":"/repo/big.ts","content":"${hugeContent}` } } });
+      send({ type: 'stream_event', event: { type: 'content_block_stop', index: 1 } });
+      // Companion assistant frame delivers the real complete Write input + a server_tool_use web_search + a Bash tool.
+      send({
+        type: 'assistant',
+        message: {
+          id: 'msg_1', role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tu_big', name: 'Write', input: { file_path: '/repo/big.ts', content: 'export const a = 1;\nexport const b = 2;\n' } },
+            { type: 'server_tool_use', id: 'srv_ok', name: 'web_search', input: { query: 'orca' } },
+            { type: 'server_tool_use', id: 'srv_err', name: 'web_search', input: { query: 'fail' } },
+            { type: 'tool_use', id: 'tu_declined_bash', name: 'Bash', input: { command: 'rm -rf /' } },
+          ],
+        },
+      });
+      // Server tool results arrive on assistant frame (including *_error payload).
+      send({
+        type: 'assistant',
+        message: {
+          id: 'msg_1b', role: 'assistant',
+          content: [
+            { type: 'web_search_tool_result', tool_use_id: 'srv_ok', content: [{ type: 'web_search_result', title: 'Orca', url: 'https://example.com' }] },
+            { type: 'web_search_tool_result', tool_use_id: 'srv_err', content: { type: 'web_search_tool_result_error', error_code: 'unavailable' } },
+          ],
+        },
+      });
+      // Declined Bash permission followed by synthetic tool_result.
+      io.send({
+        type: 'control_request', request_id: 'perm-rm',
+        request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 'tu_declined_bash', input: { command: 'rm -rf /' } },
+      });
+      await io.waitFor((sent) => sent.type === 'control_response' && sent.response?.request_id === 'perm-rm');
+      send({
+        type: 'user', isSynthetic: true,
+        message: {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tu_big', content: 'Wrote file', is_error: false },
+            { type: 'tool_result', tool_use_id: 'tu_declined_bash', content: 'Denied', is_error: true },
+          ],
+        },
+        tool_use_result: { type: 'create', filePath: '/repo/big.ts' },
+      });
+      // Synthetic resume-repair assistant message must be ignored.
+      send({
+        type: 'assistant',
+        message: {
+          id: 'syn_1', model: '<synthetic>', role: 'assistant', stop_reason: 'stop_sequence', stop_sequence: '',
+          usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+          content: [{ type: 'text', text: 'No response requested.' }],
+        },
+      });
+      send({ type: 'assistant', message: { id: 'msg_2', role: 'assistant', content: [{ type: 'text', text: 'Finished.' }] } });
+      send({ type: 'result', subtype: 'success', is_error: false, result: 'Finished.' });
+    },
+  });
+
+  const timeline = new WorkerTimeline({ workerHandle: 'w1', cliId: 'claude', model: null, readOnly: false });
+  timeline.beginTurn({ dispatchId: 'k1', prompt: 'run edge cases' });
+  let resolveDone;
+  const done = new Promise((r) => { resolveDone = r; });
+  const driver = new ClaudeSessionDriver(child, {
+    onTurnStarted() {},
+    onTimeline: (_k, event) => timeline.apply(event),
+    onRequest: async () => ({ decision: 'decline' }),
+    onTurnCompleted: (_k, res) => {
+      timeline.completeTurn({ turnId: res.turnId, status: 'completed', stopReason: res.stopReason, usage: res.usage, error: res.error });
+      resolveDone(res);
+    },
+    onExit() {},
+  }, { sessionId: 'sid-reg' });
+
+  await driver.open({ cwd: tmpdir(), model: null, policy: 'workspace-write' });
+  await driver.startTurn({ turnKey: 'k1', prompt: 'run edge cases' });
+  await done;
+
+  const turn = timeline.snapshot().turns[0];
+  // 1. No ghost empty assistant message and no synthetic "No response requested." message.
+  const messages = turn.items.filter((i) => i.kind === 'message');
+  assert.deepEqual(messages.map((m) => m.text), ['Finished.']);
+  // 2. Large Write survived as a completed file_change with computed added line count (not locked to tool_call).
+  const bigWrite = turn.items.find((i) => i.id === 'tool:tu_big');
+  assert.equal(bigWrite.kind, 'file_change');
+  assert.equal(bigWrite.status, 'completed');
+  assert.equal(bigWrite.files[0].added, 2);
+  // 3. Server tool results settled both succeeded and *_error failed searches.
+  const srvOk = turn.items.find((i) => i.id === 'tool:srv_ok');
+  assert.equal(srvOk.toolType, 'search');
+  assert.equal(srvOk.status, 'completed');
+  assert.match(srvOk.output, /Orca/);
+  const srvErr = turn.items.find((i) => i.id === 'tool:srv_err');
+  assert.equal(srvErr.status, 'failed');
+  // 4. Declined Bash command settled via synthetic tool_result with exitCode: null (NOT 0).
+  const declinedBash = turn.items.find((i) => i.id === 'tool:tu_declined_bash');
+  assert.equal(declinedBash.status, 'declined');
+  assert.equal(declinedBash.exitCode, null);
+  await driver.close();
+});
+
+test('regressions: read-only PreToolUse hook, Haiku effort clearing/rejection, stale control abort on result, pre-send delivery safety, and /compact fallback notice', async () => {
+  const child = fakeChild();
+  let initPayload;
+  let hookReplies = [];
+  let staleSignal;
+  let turnIndex = 0;
+  const io = standardClaudeAgent(child, {
+    onControl: (msg, ctl) => {
+      if (msg.request?.subtype === 'initialize') {
+        initPayload = msg.request;
+        return false;
+      }
+      if (msg.request?.subtype === 'set_model' && msg.request.model === 'opus') {
+        ctl.send(controlSuccess(msg.request_id, { model: 'claude-opus-4-6[1m]' }));
+        return true;
+      }
+      return false;
+    },
+    onUser: async (msg) => {
+      turnIndex += 1;
+      await tick();
+      if (turnIndex === 1) {
+        // PreToolUse hook callback in read-only mode denies Edit even if user settings auto-allowed it.
+        io.send({
+          type: 'control_request', request_id: 'hook-ro',
+          request: { subtype: 'hook_callback', callback_id: CLAUDE_READ_ONLY_HOOK_ID, tool_use_id: 'tu_ro_edit', input: { tool_name: 'Edit' } },
+        });
+        hookReplies.push(await io.waitFor((sent) => sent.type === 'control_response' && sent.response?.request_id === 'hook-ro'));
+        io.send({ type: 'result', subtype: 'success', is_error: false, result: 'Done' });
+      } else if (turnIndex === 2) {
+        // PreToolUse hook passes through {} in workspace-write mode.
+        io.send({
+          type: 'control_request', request_id: 'hook-ww',
+          request: { subtype: 'hook_callback', callback_id: CLAUDE_READ_ONLY_HOOK_ID, tool_use_id: 'tu_ww_edit', input: { tool_name: 'Edit' } },
+        });
+        hookReplies.push(await io.waitFor((sent) => sent.type === 'control_response' && sent.response?.request_id === 'hook-ww'));
+        // Pending can_use_tool that is still open when result arrives must be aborted without writing a stale reply.
+        io.send({
+          type: 'control_request', request_id: 'stale-perm',
+          request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 'tu_stale', input: { command: 'echo 1' } },
+        });
+        await until(() => staleSignal !== undefined);
+        io.send({ type: 'result', subtype: 'success', is_error: false, result: 'Ended early' });
+      } else if (turnIndex === 3) {
+        // /compact without compact_boundary or status still produces a notice.
+        io.send({ type: 'result', subtype: 'success', is_error: false, result: 'Compacted summary' });
+      }
+    },
+  });
+
+  const timeline = [];
+  let resolveDone;
+  const nextDone = () => new Promise((r) => { resolveDone = r; });
+  const driver = new ClaudeSessionDriver(child, {
+    onTurnStarted() {},
+    onTimeline: (_k, e) => timeline.push(e),
+    onRequest: (_k, req) => new Promise((resolve) => {
+      staleSignal = req.signal;
+      req.signal.addEventListener('abort', () => resolve({ decision: 'decline' }), { once: true });
+    }),
+    onTurnCompleted: (_k, res) => resolveDone?.(res),
+    onExit() {},
+  }, { sessionId: 'sid-reg2', policy: 'read-only' });
+
+  await driver.open({ cwd: tmpdir(), model: null, policy: 'read-only' });
+  assert.equal(initPayload.hooks.PreToolUse[0].hookCallbackIds[0], CLAUDE_READ_ONLY_HOOK_ID);
+
+  // Explicitly requesting a new effort on Haiku (supportsEffort: false) is rejected pre-send.
+  const haikuBadEffort = await driver.startTurn({ turnKey: 'bad', prompt: 'hi', model: 'claude-haiku-4-5-20251001', effort: 'high' });
+  assert.equal(haikuBadEffort.status, 'not_accepted');
+  assert.equal(driver.effectiveModel, 'claude-opus-4-6[1m]');
+
+  // Turn 1: switching to Haiku with effort: null clears effectiveEffort to null and PreToolUse denies in read-only.
+  const p1 = nextDone();
+  assert.equal((await driver.startTurn({ turnKey: 'k1', prompt: 'try edit', model: 'claude-haiku-4-5-20251001', effort: null })).status, 'accepted');
+  await p1;
+  assert.equal(driver.effectiveModel, 'claude-haiku-4-5-20251001');
+  assert.equal(driver.effectiveEffort, null);
+  assert.equal(hookReplies[0].response.response.hookSpecificOutput.permissionDecision, 'deny');
+
+  // Turn 2: workspace-write passes PreToolUse through {}, resolves alias 'opus' -> 'claude-opus-4-6[1m]', and aborts stale prompt on result.
+  const p2 = nextDone();
+  assert.equal((await driver.startTurn({ turnKey: 'k2', prompt: 'edit', model: 'opus', policy: 'workspace-write' })).status, 'accepted');
+  await p2;
+  assert.equal(driver.effectiveModel, 'claude-opus-4-6[1m]');
+  assert.deepEqual(hookReplies[1].response.response, {});
+  assert.equal(staleSignal.aborted, true);
+  await tick();
+  assert.equal(io.seen.some((m) => m.type === 'control_response' && m.response?.request_id === 'stale-perm'), false);
+
+  // Turn 3: /compact without compact_boundary emits fallback notice.
+  const p3 = nextDone();
+  assert.equal((await driver.compactThread('k3')).status, 'accepted');
+  await p3;
+  assert.ok(timeline.some((e) => e.type === 'notice' && e.text === 'Compacted summary'));
+  await driver.close();
+
+  // Pre-dispatch option failure when child dies before user message is written must return not_accepted (not unknown_acceptance).
+  const dyingChild = fakeChild();
+  standardClaudeAgent(dyingChild, {
+    onControl: (msg) => {
+      if (msg.request?.subtype === 'set_model') {
+        dyingChild.exit(1);
+        return true;
+      }
+      return false;
+    },
+  });
+  const dDead = new ClaudeSessionDriver(dyingChild, {
+    onTurnStarted() {}, onTurnCompleted() {}, onRequest: async () => ({ decision: 'decline' }), onExit() {},
+  }, { sessionId: 'sid-presend' });
+  await dDead.open({ cwd: tmpdir(), model: null, policy: 'workspace-write' });
+  const preSendFail = await dDead.startTurn({ turnKey: 'k-dead', prompt: 'never written', model: 'claude-sonnet-4-6' });
+  assert.equal(preSendFail.status, 'not_accepted');
+});
+
+test('AgentSessionManager propagates explicit effort: null when switching Claude to an effort-less model (Haiku)', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aha-claude-effort-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const launch = (_sessionId, _cwd, events, options) => {
+    const child = fakeChild();
+    const io = standardClaudeAgent(child, {
+      onUser: async () => {
+        await tick();
+        io.send({ type: 'result', subtype: 'success', is_error: false, result: 'OK' });
+      },
+    });
+    return new ClaudeSessionDriver(child, events, { sessionId: 'claude-effort-1', policy: options.policy });
+  };
+  const manager = new AgentSessionManager({ launch });
+  const created = await manager.create({ cwd: dir, policy: 'workspace-write', provider: 'claude' });
+  assert.equal(created.effort, 'medium');
+  assert.equal((await manager.send(created.id, { text: 'switch to haiku', model: 'claude-haiku-4-5-20251001', effort: null })).status, 'accepted');
+  await until(() => manager.list()[0].status === 'idle');
+  assert.equal(manager.list()[0].model, 'claude-haiku-4-5-20251001');
+  assert.equal(manager.list()[0].effort, null);
+  await manager.dispose();
 });

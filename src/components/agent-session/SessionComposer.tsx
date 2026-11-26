@@ -153,7 +153,7 @@ function DirectQuestionBanner({ entry, onAnswer, providerLabel = 'Codex' }: {
   const answerFor = (id: string) => {
     const selected = picked[id] ?? [];
     const custom = other[id]?.trim();
-    return custom ? [...selected, custom] : selected;
+    return custom && !selected.includes(custom) ? [...selected, custom] : selected;
   };
   const complete = entry.questions.every((question) => answerFor(question.id).length > 0);
   const submit = async (answers: Record<string, string[]> | null) => {
@@ -192,10 +192,10 @@ function DirectQuestionBanner({ entry, onAnswer, providerLabel = 'Codex' }: {
             </div>
             {question.options.length > 0 && (
               <div className="asv-banner-options">
-                {question.options.map((option) => {
+                {question.options.map((option, optionIndex) => {
                   const isSelected = selected.includes(option.label);
                   return (
-                    <button key={option.label} type="button" title={option.description || undefined}
+                    <button key={`${optionIndex}:${option.label}`} type="button" title={option.description || undefined}
                       className={`asv-btn${isSelected ? ' is-primary' : ''}`}
                       aria-pressed={isSelected} disabled={busy}
                       onClick={() => toggle(option.label)}>
@@ -212,7 +212,7 @@ function DirectQuestionBanner({ entry, onAnswer, providerLabel = 'Codex' }: {
                 onChange={(event) => {
                   const value = event.target.value;
                   setOther((prev) => ({ ...prev, [question.id]: value }));
-                  if (!question.multiSelect && value) {
+                  if (!question.multiSelect && value.trim()) {
                     setPicked((prev) => (prev[question.id]?.length ? { ...prev, [question.id]: [] } : prev));
                   }
                 }} />
@@ -330,6 +330,8 @@ export interface ComposerToolbar {
   sessionId: string;
   /** The session's driver; models come from its catalog, and only its capabilities show controls. */
   provider?: AgentDriverId;
+  /** Live session status so drivers whose models load after process startup refresh automatically. */
+  sessionStatus?: AgentSessionInfo['status'];
   capabilities?: AgentDriverCapabilities;
   /** The model and effort the next message uses; null means Codex's default. */
   modelId: string | null;
@@ -356,27 +358,45 @@ const readBase64 = (file: Blob) => new Promise<string>((resolve, reject) => {
 const formatSize = (bytes: number) => (bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)}MB` : `${Math.ceil(bytes / 1024)}KB`);
 
 /** The driver's models and (Codex only) the session's skills, loaded once the composer can use them. */
-function useComposerCatalog(sessionId: string | undefined, provider: AgentDriverId | undefined, capabilities: AgentDriverCapabilities) {
+function useComposerCatalog(
+  sessionId: string | undefined,
+  provider: AgentDriverId | undefined,
+  capabilities: AgentDriverCapabilities,
+  sessionStatus: AgentSessionInfo['status'] | undefined,
+) {
   const [models, setModels] = useState<CodexModelOption[]>([]);
   const [skills, setSkills] = useState<CodexSkillOption[] | null>(capabilities.skills ? null : []);
   const { models: listsModels, skills: hasSkills } = capabilities;
   useEffect(() => {
+    setModels([]);
+  }, [sessionId, provider]);
+  useEffect(() => {
     if (!sessionId || !listsModels) return;
     let live = true;
-    void codexCatalogClient.sessionModels(sessionId, provider).then((list) => live && setModels(list), () => {});
+    void codexCatalogClient.sessionModels(sessionId, provider).then((list) => {
+      if (live && (list.length > 0 || sessionStatus === 'idle' || !provider || provider === 'codex')) {
+        setModels(list);
+      }
+    }, () => {});
     return () => {
       live = false;
     };
-  }, [sessionId, provider, listsModels]);
+  }, [sessionId, provider, listsModels, sessionStatus]);
   const loadSkills = useMemo(() => () => {
     if (!sessionId) return;
     if (!hasSkills) return setSkills([]);
     void codexCatalogClient.skills(sessionId).then(setSkills, () => setSkills([]));
   }, [sessionId, hasSkills]);
   // A driver that started its process after the composer mounted lists its models only then.
-  const reloadModels = useCallback(() => {
-    if (!sessionId || !listsModels) return;
-    void codexCatalogClient.sessionModels(sessionId, provider).then(setModels, () => {});
+  const reloadModels = useCallback(async (): Promise<CodexModelOption[]> => {
+    if (!sessionId || !listsModels) return [];
+    try {
+      const list = await codexCatalogClient.sessionModels(sessionId, provider);
+      setModels(list);
+      return list;
+    } catch {
+      return [];
+    }
   }, [sessionId, provider, listsModels]);
   return { models, skills, loadSkills, reloadModels };
 }
@@ -401,7 +421,7 @@ export function SessionComposer(props: SessionComposerProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const searchSeq = useRef(0);
   const capabilities = toolbar?.capabilities ?? CODEX_CAPABILITIES;
-  const catalog = useComposerCatalog(toolbar?.sessionId, toolbar?.provider, capabilities);
+  const catalog = useComposerCatalog(toolbar?.sessionId, toolbar?.provider, capabilities, toolbar?.sessionStatus);
   const choice = useMemo(
     () => resolveModelChoice(catalog.models, toolbar?.modelId ?? null, toolbar?.effort ?? null),
     [catalog.models, toolbar?.modelId, toolbar?.effort],
@@ -583,12 +603,15 @@ export function SessionComposer(props: SessionComposerProps) {
       toolbar?.onNotify?.('本轮结束后可以切换模型');
       return;
     }
-    if (catalog.models.length === 0) {
-      toolbar?.onNotify?.('正在读取模型列表，请稍后再试');
+    if (catalog.models.length > 0) {
+      setModelPickerOpen(true);
       return;
     }
-    setModelPickerOpen(true);
-  }, [props.running, catalog.models.length, toolbar]);
+    void catalog.reloadModels().then((list) => {
+      if (list.length > 0) setModelPickerOpen(true);
+      else toolbar?.onNotify?.('正在读取模型列表，请稍后再试');
+    });
+  }, [props.running, catalog.models.length, catalog.reloadModels, toolbar]);
 
   const replaceTrigger = (insertion: string) => {
     if (!trigger) return;
@@ -1067,7 +1090,7 @@ export function SessionComposer(props: SessionComposerProps) {
                     disabled={props.running}
                     open={modelPickerOpen}
                     onOpenChange={(open) => {
-                      if (open) catalog.reloadModels();
+                      if (open) void catalog.reloadModels();
                       setModelPickerOpen(open);
                     }}
                     onModelChange={toolbar.onModelChange}
