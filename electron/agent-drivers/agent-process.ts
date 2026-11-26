@@ -24,10 +24,15 @@ export function resolveAgentCommand(command: string): string | null {
 }
 
 /** Environment for an agent process: the person's own, minus AhaStation's terminal and token plumbing. */
-export function agentEnvironment(extra: Readonly<Record<string, string>> = {}): NodeJS.ProcessEnv {
+export function agentEnvironment(
+  extra: Readonly<Record<string, string>> = {},
+  envToDelete: readonly string[] = [],
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath() };
+  const drop = new Set(envToDelete.map((key) => key.toUpperCase()));
   for (const key of Object.keys(env)) {
-    if (key.toUpperCase().startsWith('AHA_') || key.toUpperCase() === 'ELECTRON_RUN_AS_NODE') delete env[key];
+    const upper = key.toUpperCase();
+    if (upper.startsWith('AHA_') || upper === 'ELECTRON_RUN_AS_NODE' || drop.has(upper)) delete env[key];
   }
   return { ...env, ...extra };
 }
@@ -38,6 +43,7 @@ export function agentEnvironment(extra: Readonly<Record<string, string>> = {}): 
  */
 export function spawnAgentProcess(input: {
   command: string; args: readonly string[]; cwd: string; env?: Readonly<Record<string, string>>;
+  envToDelete?: readonly string[];
 }): AgentChild {
   const resolved = resolveAgentCommand(input.command);
   if (!resolved) throw new Error(`没有找到 ${input.command} 命令，请先安装并登录对应 CLI`);
@@ -50,7 +56,7 @@ export function spawnAgentProcess(input: {
     file = node;
     args = [entry, ...args];
   }
-  const env = agentEnvironment(input.env);
+  const env = agentEnvironment(input.env, input.envToDelete);
   return process.platform === 'win32'
     ? spawnWindowsCodexJob(file, args, input.cwd, env)
     : spawn(file, args, { cwd: input.cwd, env, windowsHide: true, stdio: 'pipe' });

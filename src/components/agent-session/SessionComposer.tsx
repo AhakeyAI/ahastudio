@@ -9,7 +9,7 @@ import type { UsageSummary } from '../../lib/usage-limits';
 import { resolveTitleEdit } from '../../lib/session-title';
 import { UsageLimitChip } from './UsageLimitChip';
 import { POLICY_LABELS, codexCatalogClient } from '../../lib/agent-session-client';
-import { CODEX_CAPABILITIES } from '../../lib/session-capabilities';
+import { CODEX_CAPABILITIES, DRIVER_LABELS } from '../../lib/session-capabilities';
 import {
   buildSlashCommandItems,
   isClearCommand,
@@ -142,13 +142,20 @@ function QuestionBanner({ question }: { question: OrchestrationQuestionRecord })
 type DirectQuestion = AgentSessionInfo['pendingQuestions'][number];
 
 /** Questions the agent asked through its own protocol; every question needs an answer before sending. */
-function DirectQuestionBanner({ entry, onAnswer }: {
+function DirectQuestionBanner({ entry, onAnswer, providerLabel = 'Codex' }: {
   entry: DirectQuestion;
   onAnswer: (requestId: string, answers: Record<string, string[]> | null) => Promise<boolean>;
+  providerLabel?: string;
 }) {
-  const [picked, setPicked] = useState<Record<string, string>>({});
+  const [picked, setPicked] = useState<Record<string, string[]>>({});
+  const [other, setOther] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
-  const complete = entry.questions.every((question) => picked[question.id]?.trim());
+  const answerFor = (id: string) => {
+    const selected = picked[id] ?? [];
+    const custom = other[id]?.trim();
+    return custom ? [...selected, custom] : selected;
+  };
+  const complete = entry.questions.every((question) => answerFor(question.id).length > 0);
   const submit = async (answers: Record<string, string[]> | null) => {
     setBusy(true);
     try {
@@ -158,41 +165,66 @@ function DirectQuestionBanner({ entry, onAnswer }: {
     }
   };
   return (
-    <div className="asv-banner is-question" role="group" aria-label="Codex 提问">
+    <div className="asv-banner is-question" role="group" aria-label={`${providerLabel} 提问`}>
       <div className="asv-banner-head">
         <MessageCircleQuestion size={14} />
-        <span className="asv-banner-title">Codex 在等你的答复</span>
+        <span className="asv-banner-title">{providerLabel} 在等你的答复</span>
       </div>
-      {entry.questions.map((question) => (
-        <div key={question.id} className="asv-banner-qa">
-          <div className="asv-banner-question">
-            {question.header && <strong>{question.header}</strong>} {question.prompt}
-          </div>
-          {question.options.length > 0 && (
-            <div className="asv-banner-options">
-              {question.options.map((option) => (
-                <button key={option.label} type="button" title={option.description || undefined}
-                  className={`asv-btn${picked[question.id] === option.label ? ' is-primary' : ''}`}
-                  aria-pressed={picked[question.id] === option.label} disabled={busy}
-                  onClick={() => setPicked((prev) => ({ ...prev, [question.id]: option.label }))}>
-                  {option.label}
-                </button>
-              ))}
+      {entry.questions.map((question) => {
+        const selected = picked[question.id] ?? [];
+        const toggle = (label: string) => {
+          if (question.multiSelect) {
+            setPicked((prev) => {
+              const current = prev[question.id] ?? [];
+              const next = current.includes(label) ? current.filter((item) => item !== label) : [...current, label];
+              return { ...prev, [question.id]: next };
+            });
+            return;
+          }
+          setPicked((prev) => ({ ...prev, [question.id]: [label] }));
+          setOther((prev) => (prev[question.id] ? { ...prev, [question.id]: '' } : prev));
+        };
+        return (
+          <div key={question.id} className="asv-banner-qa">
+            <div className="asv-banner-question">
+              {question.header && <strong>{question.header}</strong>} {question.prompt}
+              {question.multiSelect && <span className="asv-banner-note">（可多选）</span>}
             </div>
-          )}
-          {question.allowOther && (
-            <input className="asv-banner-input" placeholder={question.options.length ? '或输入其他答复' : '输入答复'}
-              aria-label={`${question.header || question.prompt} 的答复`} disabled={busy}
-              value={question.options.some((option) => option.label === picked[question.id]) ? '' : picked[question.id] ?? ''}
-              onChange={(event) => setPicked((prev) => ({ ...prev, [question.id]: event.target.value }))} />
-          )}
-        </div>
-      ))}
+            {question.options.length > 0 && (
+              <div className="asv-banner-options">
+                {question.options.map((option) => {
+                  const isSelected = selected.includes(option.label);
+                  return (
+                    <button key={option.label} type="button" title={option.description || undefined}
+                      className={`asv-btn${isSelected ? ' is-primary' : ''}`}
+                      aria-pressed={isSelected} disabled={busy}
+                      onClick={() => toggle(option.label)}>
+                      {option.label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {question.allowOther && (
+              <input className="asv-banner-input" placeholder={question.options.length ? '或输入其他答复' : '输入答复'}
+                aria-label={`${question.header || question.prompt} 的答复`} disabled={busy}
+                value={other[question.id] ?? ''}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setOther((prev) => ({ ...prev, [question.id]: value }));
+                  if (!question.multiSelect && value) {
+                    setPicked((prev) => (prev[question.id]?.length ? { ...prev, [question.id]: [] } : prev));
+                  }
+                }} />
+            )}
+          </div>
+        );
+      })}
       <div className="asv-banner-actions">
         <span className="asv-strip-spacer" />
         <button type="button" className="asv-btn" disabled={busy} onClick={() => void submit(null)}>跳过</button>
         <button type="button" className="asv-btn is-primary" disabled={busy || !complete}
-          onClick={() => void submit(Object.fromEntries(entry.questions.map((question) => [question.id, [picked[question.id]!.trim()]])))}>
+          onClick={() => void submit(Object.fromEntries(entry.questions.map((question) => [question.id, answerFor(question.id)])))}>
           答复
         </button>
       </div>
@@ -850,7 +882,12 @@ export function SessionComposer(props: SessionComposerProps) {
           {props.approvals.map((item) => <ApprovalBanner key={item.id} item={item} />)}
           {props.questions.map((question) => <QuestionBanner key={question.messageId} question={question} />)}
           {props.onAnswer && props.directQuestions?.map((entry) => (
-            <DirectQuestionBanner key={entry.requestId} entry={entry} onAnswer={props.onAnswer!} />
+            <DirectQuestionBanner
+              key={entry.requestId}
+              entry={entry}
+              onAnswer={props.onAnswer!}
+              providerLabel={toolbar?.provider ? DRIVER_LABELS[toolbar.provider] : 'Codex'}
+            />
           ))}
           {slash?.goal && (
             <GoalBanner

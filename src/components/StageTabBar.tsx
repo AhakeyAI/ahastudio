@@ -1,6 +1,5 @@
 import { agentSessionClient } from '../lib/agent-session-client';
-import { DRIVER_LABELS } from '../lib/session-capabilities';
-import type { AgentDriverId } from '../types';
+import { DRIVER_LABELS, SESSION_DRIVER_IDS } from '../lib/session-capabilities';
 import { useState, useRef, useEffect, useSyncExternalStore, type ReactNode } from 'react';
 import { Activity, Globe, Terminal, FileText, X, Plus, SquareArrowOutUpRight, MessagesSquare, History } from 'lucide-react';
 import type { StageWindow, StageWindowType, StageWindowOptions } from '../lib/stage-window-store';
@@ -24,7 +23,6 @@ interface StageTabBarProps {
 }
 
 const ACTIVITY_TAB_ID = 'activity-default';
-const SESSION_DRIVERS: readonly AgentDriverId[] = ['codex', 'antigravity', 'grok', 'opencode', 'pi'];
 const PHASE_LABELS = { starting: '启动中', running: '运行中', exited: '已退出', error: '错误', closing: '关闭中' };
 
 const ICON_MAP: Record<StageWindowType, typeof Globe> = {
@@ -118,7 +116,7 @@ export function StageTabBar({
   const filteredClis = clis.filter(matches);
   // Desktop sessions run the same installed CLIs natively; the driver ids are the CLI ids.
   const sessionQuery = query.trim().toLowerCase();
-  const sessionDrivers = SESSION_DRIVERS.filter((driver) =>
+  const sessionDrivers = SESSION_DRIVER_IDS.filter((driver) =>
     clis.some((cli) => cli.id === driver) &&
     `${DRIVER_LABELS[driver]} ${driver} 会话 session 历史 history`.toLowerCase().includes(sessionQuery));
 

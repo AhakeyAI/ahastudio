@@ -1,6 +1,6 @@
 import type { AgentSessionPolicy } from '../orchestration/agent-session-driver.js';
 
-export const AGENT_DRIVER_IDS = ['codex', 'antigravity', 'grok', 'opencode', 'pi'] as const;
+export const AGENT_DRIVER_IDS = ['codex', 'claude', 'antigravity', 'grok', 'opencode', 'pi'] as const;
 export type AgentDriverId = (typeof AGENT_DRIVER_IDS)[number];
 
 /**
@@ -48,6 +48,11 @@ export const AGENT_DRIVER_CAPABILITIES: Readonly<Record<AgentDriverId, AgentDriv
     efforts: true, images: true, compact: true, goal: true, feedback: true, usageLimits: true, skills: true,
     plugins: true, history: true, orchestration: true, rename: true, resume: true, terminalResume: true,
   },
+  // Claude Code runs over bidirectional stream-json stdio with live permission modes and can_use_tool prompts.
+  claude: {
+    ...NONE, policies: ['workspace-write', 'read-only', 'full-auto'], models: true, efforts: true, images: true,
+    compact: true, rename: true, resume: true, terminalResume: true,
+  },
   // ACP agents ask through session/request_permission; AhaStation answers by policy or asks the person.
   antigravity: {
     ...NONE, policies: ['workspace-write', 'full-auto'], models: true, efforts: true, images: true, resume: true,
@@ -70,7 +75,7 @@ export const AGENT_DRIVER_CAPABILITIES: Readonly<Record<AgentDriverId, AgentDriv
   },
 };
 
-/** Stored sessions from before multiple drivers had no provider (or `acp`/`claude` placeholders): they are Codex. */
+/** Stored sessions from before multiple drivers had no provider (or the `acp` placeholder): they are Codex. */
 export function normalizeDriverId(value: unknown): AgentDriverId {
   return typeof value === 'string' && (AGENT_DRIVER_IDS as readonly string[]).includes(value)
     ? value as AgentDriverId
@@ -95,6 +100,7 @@ export function terminalResumeArgs(id: AgentDriverId, providerSessionId: string)
   if (!providerSessionId.trim() || providerSessionId.startsWith('-')) return null;
   switch (id) {
     case 'codex': return ['resume', providerSessionId];
+    case 'claude': return ['--resume', providerSessionId];
     case 'antigravity': return ['--conversation', providerSessionId];
     case 'grok': return ['--resume', providerSessionId];
     case 'opencode': return ['--session', providerSessionId];

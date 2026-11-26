@@ -53,6 +53,8 @@ export interface AgentQuestion {
   prompt: string;
   /** The answer may be free text instead of one of the options. */
   allowOther: boolean;
+  /** Multiple options may be selected together (Claude AskUserQuestion). */
+  multiSelect?: boolean;
   options: { label: string; description: string }[];
 }
 

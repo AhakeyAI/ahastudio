@@ -81,6 +81,7 @@ interface PendingRequest {
   turnKey: string;
   request: AgentRuntimeRequest;
   resolve: (response: AgentRuntimeResponse) => void;
+  onAbort?: () => void;
 }
 
 interface Session {
@@ -933,7 +934,13 @@ export class AgentSessionManager {
         if (!current() || request.signal.aborted) return Promise.resolve(DECLINE);
         const requestId = `req_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
         return new Promise<AgentRuntimeResponse>((resolve) => {
-          session.requests.set(requestId, { turnKey, request, resolve });
+          const onAbort = () => {
+            if (!session.requests.has(requestId)) return;
+            this.settleRequest(session, requestId, 'expired', 'Request cancelled');
+            resolve(DECLINE);
+          };
+          session.requests.set(requestId, { turnKey, request, resolve, onAbort });
+          request.signal.addEventListener('abort', onAbort, { once: true });
           if (request.kind === 'question') {
             info.pendingQuestions.push({ requestId, questions: request.questions ?? [] });
             this.sessionsChanged();
@@ -966,6 +973,7 @@ export class AgentSessionManager {
     const pending = session.requests.get(requestId);
     if (!pending) return;
     session.requests.delete(requestId);
+    if (pending.onAbort) pending.request.signal.removeEventListener('abort', pending.onAbort);
     if (pending.request.kind === 'question') {
       session.info.pendingQuestions = session.info.pendingQuestions.filter((entry) => entry.requestId !== requestId);
       this.sessionsChanged();

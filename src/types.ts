@@ -112,7 +112,7 @@ export type AgentGoalAction =
   | { type: 'set'; objective: string };
 
 // Mirrors electron/agent-drivers/driver-capabilities.ts.
-export type AgentDriverId = 'codex' | 'antigravity' | 'grok' | 'opencode' | 'pi';
+export type AgentDriverId = 'codex' | 'claude' | 'antigravity' | 'grok' | 'opencode' | 'pi';
 
 export interface AgentDriverCapabilities {
   policies: AgentSessionPolicy[];
@@ -190,6 +190,7 @@ export interface AgentSessionQuestion {
   header: string;
   prompt: string;
   allowOther: boolean;
+  multiSelect?: boolean;
   options: { label: string; description: string }[];
 }
 
