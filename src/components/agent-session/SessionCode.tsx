@@ -1,14 +1,20 @@
+// Code block language labels, line-wrap toggle, and plain muted mode adapted from Orca
+// (https://github.com/stablyai/orca, NativeChatCodeBlock.tsx). Copyright (c) 2026 Lovecast Inc. — MIT License.
+// See THIRD_PARTY_NOTICES.md.
+
 import { Fragment, memo, useEffect, useId, useMemo, useRef, useState } from 'react';
-import { Check, Copy } from 'lucide-react';
+import { Check, Copy, WrapText } from 'lucide-react';
 import type { BundledLanguage } from 'shiki/langs';
 import { useCodeHighlight } from '../../hooks/useCodeHighlight';
 import { detectCodeLanguage } from '../../lib/code-language';
 import type { CodeHighlightAppearance, DiffHighlightRow, SyntaxToken } from '../../lib/code-syntax-highlight';
 import { requestCodeHighlight } from '../../lib/code-syntax-highlight-client';
 import { parseUnifiedDiff, type DiffLine } from '../../lib/git-panel-model';
+import { codeFenceLanguageLabel } from '../../lib/session-work-log-model';
 import { fenceLanguage } from '../../lib/worker-timeline-model';
 import { renderLineTokens } from '../SyntaxTokens';
 import { useAgentSession } from './session-context';
+import { useSessionDisclosure } from './session-disclosure-store';
 
 const MAX_DIFF_ROWS = 2000;
 const HIGHLIGHT_DEBOUNCE_MS = 120;
@@ -33,7 +39,14 @@ export function CopyButton({ text, label = '复制', className = 'asv-copy' }: {
     }, () => onNotify?.('复制失败'));
   };
   return (
-    <button type="button" className={className} data-copied={copied || undefined} onClick={copy} aria-label={copied ? '已复制' : label} title={copied ? '已复制' : label}>
+    <button
+      type="button"
+      className={className}
+      data-copied={copied || undefined}
+      onClick={copy}
+      aria-label={copied ? '已复制' : label}
+      title={copied ? '已复制' : label}
+    >
       {copied ? <Check size={13} /> : <Copy size={13} />}
     </button>
   );
@@ -70,17 +83,44 @@ function useStreamingLineTokens(lines: readonly string[], lang: string | null, a
   return result;
 }
 
-export const CodeBlock = memo(function CodeBlock({ info, code }: { info: string; code: string }) {
+export const CodeBlock = memo(function CodeBlock({
+  info,
+  code,
+  disclosureKey,
+  plain = false,
+}: {
+  info: string;
+  code: string;
+  disclosureKey?: string;
+  /** Suppress syntax tokenization for muted reasoning blocks so code inherits faint tone. */
+  plain?: boolean;
+}) {
   const appearance = useAppearance();
   const lines = useMemo(() => code.split('\n'), [code]);
-  const lang = fenceLanguage(info);
+  const lang = plain ? null : fenceLanguage(info);
   const highlighted = useStreamingLineTokens(lines, lang, appearance);
-  const label = info.trim().split(/\s+/)[0] ?? '';
+  const rawTag = info.trim().split(/\s+/)[0] ?? '';
+  const displayLabel = codeFenceLanguageLabel(rawTag);
+  const { open: wrapped, setOpen: setWrapped } = useSessionDisclosure(disclosureKey, false);
+  const wrapLabel = wrapped ? '取消自动换行' : '自动换行';
+
   return (
-    <div className="asv-code" data-lang={label || undefined}>
+    <div className="asv-code" data-lang={rawTag || undefined} data-wrapped={wrapped || undefined}>
       <div className="asv-code-head">
-        <span className="asv-code-lang">{label || 'text'}</span>
-        <CopyButton text={code} label="复制代码" />
+        <span className="asv-code-lang" title={rawTag || undefined}>{displayLabel}</span>
+        <span className="asv-code-actions">
+          <button
+            type="button"
+            className="asv-code-btn"
+            aria-pressed={wrapped}
+            aria-label={wrapLabel}
+            title={wrapLabel}
+            onClick={() => setWrapped(!wrapped)}
+          >
+            <WrapText size={13} />
+          </button>
+          <CopyButton text={code} label="复制代码" />
+        </span>
       </div>
       <pre>
         <code>

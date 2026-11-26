@@ -9,9 +9,9 @@ const EXAMPLES = [
 ];
 
 const POLICY_NOTES: Record<AgentSessionPolicy, string> = {
-  'read-only': '当前为只读：Codex 只阅读代码、运行不改文件的命令。',
-  'workspace-write': 'Codex 可以在这个文件夹里读代码、跑命令、改文件；要越出文件夹时会先问你。',
-  'full-auto': '自动模式：Codex 不会停下来询问，但仍只能在这个文件夹的沙盒里动手。',
+  'read-only': '当前为只读：助手只阅读代码、运行不改文件的命令。',
+  'workspace-write': '助手可以在这个文件夹里读代码、跑命令、改文件；要越出文件夹时会先问你。',
+  'full-auto': '自动模式：助手不会停下来询问，但仍只能在这个文件夹的沙盒里动手。',
 };
 
 /** First screen of a new direct session; an example only fills the composer, it never sends. */
