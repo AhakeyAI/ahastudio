@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { basename } from 'node:path';
+import {
+  driverCapabilities, normalizeDriverId, supportedPolicy, terminalResumeArgs, type AgentDriverCapabilities,
+} from '../agent-drivers/driver-capabilities.js';
 import { AtomicSnapshotWriter } from '../persistence/atomic-snapshot-writer.js';
+import type { CodexModelOption } from './codex-catalog.js';
 import type {
   AgentGoalAction, AgentProvider, AgentQuestion, AgentRuntimeRequest, AgentRuntimeResponse, AgentSessionDriver,
   AgentSessionEvents, AgentSessionGoal, AgentSessionPolicy, AgentTurnAttachment, TurnDelivery,
@@ -16,6 +20,13 @@ export type AgentSessionStatus = 'starting' | 'idle' | 'running' | 'suspended' |
 export interface AgentSessionInfo {
   id: string;
   provider: AgentProvider;
+  /** What this session's driver supports; the renderer shows only these controls. */
+  capabilities: AgentDriverCapabilities;
+  /**
+   * The conversation continues in a terminal pane; the session sends nothing until it is taken back,
+   * which needs that terminal to have exited (one writer at a time).
+   */
+  handoff: SessionHandoff | null;
   title: string;
   cwd: string;
   model: string | null;
@@ -38,6 +49,12 @@ export interface AgentSessionInfo {
   createdAt: number;
 }
 
+export interface SessionHandoff {
+  /** The terminal now writing the conversation, once it was opened. */
+  ptyId: string | null;
+  at: number;
+}
+
 export interface QueuedMessage {
   id: string;
   text: string;
@@ -56,7 +73,9 @@ type MessageInput = {
 };
 
 // The queue lives only as long as the process: after a restart nothing is sent on its own.
-type SavedSession = Omit<AgentSessionInfo, 'status' | 'error' | 'pendingQuestions' | 'queued' | 'queuePaused' | 'goal'> & { timeline: WorkerTimelineSnapshot };
+// Capabilities are recomputed from the driver on load; older files have no provider or handoff.
+type SavedSession = Omit<AgentSessionInfo, 'status' | 'error' | 'pendingQuestions' | 'queued' | 'queuePaused' | 'goal' | 'capabilities' | 'provider' | 'handoff'>
+  & { provider?: unknown; handoff?: { ptyId?: unknown; at?: unknown } | null; timeline: WorkerTimelineSnapshot };
 
 interface PendingRequest {
   turnKey: string;
@@ -86,7 +105,7 @@ interface Session {
 export interface AgentSessionManagerDependencies {
   launch: (
     sessionId: string, cwd: string, events: AgentSessionEvents,
-    options: { orchestration: boolean; policy: AgentSessionPolicy },
+    options: { orchestration: boolean; policy: AgentSessionPolicy; provider: AgentProvider; resumeSessionId?: string },
   ) => AgentSessionDriver;
   /** Coordinator rules for an orchestrating session's conversation; without it orchestration mode is unavailable. */
   coordinatorInstructions?: (sessionId: string, options: { policy: AgentSessionPolicy }) => string;
@@ -158,11 +177,14 @@ export class AgentSessionManager {
 
   async create(input: {
     cwd: string; policy: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
-    title?: string;
+    title?: string; provider?: AgentProvider;
   }): Promise<AgentSessionInfo> {
+    const provider = normalizeDriverId(input.provider);
+    const capabilities = driverCapabilities(provider);
     const info: AgentSessionInfo = {
-      id: `agent-session-${randomUUID()}`, provider: 'codex', title: input.title?.trim() || '', cwd: input.cwd,
-      model: input.model ?? null, effort: input.effort ?? null, policy: input.policy, network: input.network ?? false,
+      id: `agent-session-${randomUUID()}`, provider, capabilities, handoff: null, title: input.title?.trim() || '', cwd: input.cwd,
+      model: input.model ?? null, effort: capabilities.efforts ? input.effort ?? null : null,
+      policy: supportedPolicy(provider, input.policy), network: capabilities.network && (input.network ?? false),
       orchestration: false, providerSessionId: null, status: 'starting', error: null, pendingQuestions: [],
       queued: [], queuePaused: false, goal: null, createdAt: this.now(),
     };
@@ -186,7 +208,7 @@ export class AgentSessionManager {
     if (open) return structuredClone(open.info);
     const id = `agent-session-${randomUUID()}`;
     const info: AgentSessionInfo = {
-      id, provider: 'codex', title: input.title.trim(), cwd: input.cwd,
+      id, provider: 'codex', capabilities: driverCapabilities('codex'), handoff: null, title: input.title.trim(), cwd: input.cwd,
       model: input.model ?? null, effort: input.effort ?? null, policy: input.policy, network: false,
       orchestration: false, providerSessionId: input.providerSessionId, status: 'suspended', error: null,
       pendingQuestions: [], queued: [], queuePaused: false, goal: null, createdAt: this.now(),
@@ -209,10 +231,15 @@ export class AgentSessionManager {
     if (!session) return { status: 'not_accepted', reason: 'Session not found' };
     if (!text && !input.attachments?.length) return { status: 'not_accepted', reason: 'Message is empty' };
     const { info } = session;
+    if (info.handoff) return { status: 'not_accepted', reason: '这个会话正在终端中继续；退出终端后点「回到这里」再发送' };
     const compact = !input.attachments?.length && /^\/compact\s*$/iu.test(text);
     if (compact && (input.freshContext || !session.hasTurns)) {
       return { status: 'not_accepted', reason: '还没有可压缩的对话记录' };
     }
+    if (input.policy && !info.capabilities.policies.includes(input.policy)) {
+      return { status: 'not_accepted', reason: '当前会话驱动不支持这个权限档位' };
+    }
+    if (input.network && !info.capabilities.network) return { status: 'not_accepted', reason: '当前会话驱动不支持联网开关' };
     const wanted = input.policy ?? info.policy;
     if (input.freshContext) {
       if (info.status === 'running' || info.status === 'starting' || session.driver?.busy) {
@@ -220,7 +247,7 @@ export class AgentSessionManager {
       }
       if (info.status === 'closed') return { status: 'not_accepted', reason: 'Session is closed' };
       const previous = info.policy;
-      if (info.orchestration) info.policy = wanted;
+      if (info.orchestration || info.capabilities.policyNeedsRelaunch) info.policy = wanted;
       info.goal = null;
       session.hasTurns = false;
       if (info.title) session.unsyncedName = info.title;
@@ -240,7 +267,7 @@ export class AgentSessionManager {
       }
     } else if (this.resumable(session)) {
       const previous = info.policy;
-      if (info.orchestration) info.policy = wanted;
+      if (info.orchestration || info.capabilities.policyNeedsRelaunch) info.policy = wanted;
       await this.connect(session, true);
       if (session.info.status !== 'idle') {
         info.policy = previous;
@@ -254,7 +281,11 @@ export class AgentSessionManager {
     // An orchestrating session whose approval tier changed must be relaunched: the Aha MCP tool
     // approvals are baked into the process arguments, so a per-turn policy delta cannot grant
     // manage_worker under `full-auto`. The other tiers differ only per turn and need no relaunch.
-    if (info.orchestration && (wanted === 'full-auto') !== (session.launchedPolicy === 'full-auto')) {
+    // A driver that fixes its tools at launch (Pi) is restarted onto the same conversation as well.
+    const relaunch = info.capabilities.policyNeedsRelaunch
+      ? wanted !== session.launchedPolicy
+      : info.orchestration && (wanted === 'full-auto') !== (session.launchedPolicy === 'full-auto');
+    if (relaunch) {
       const previous = info.policy;
       info.policy = wanted;
       const driver = session.driver;
@@ -299,6 +330,7 @@ export class AgentSessionManager {
     const text = input.text.trim();
     if (!text && !input.attachments?.length) return { ok: false, error: '消息是空的' };
     const { info } = session;
+    if (info.handoff) return { ok: false, error: '这个会话正在终端中继续；退出终端后点「回到这里」再发送' };
     const busy = info.status === 'running' || info.status === 'starting' || Boolean(session.driver?.busy);
     if (!busy && (!info.queued.length || info.queuePaused)) {
       const delivery = await this.send(id, input);
@@ -468,6 +500,7 @@ export class AgentSessionManager {
     if (!session) return { ok: false, error: '会话不存在' };
     const { info } = session;
     if (info.status === 'closed') return { ok: false, error: '会话已结束' };
+    if (info.handoff) return { ok: false, error: '这个会话正在终端中继续；退出终端后点「回到这里」再操作目标' };
     if (action.type === 'set') {
       const objective = action.objective.trim();
       if (!objective) return { ok: false, error: '请输入目标内容' };
@@ -593,14 +626,13 @@ export class AgentSessionManager {
     return { cwd: info.cwd, provider: info.provider, active, idle, network: info.network };
   }
 
-  /**
-   * Switches orchestration mode between turns. A running provider process is replaced and the same
-   * conversation resumed with (or without) Aha MCP; a suspended session takes the mode on its next resume.
-   */
+  /** Requests an in-place tool config reload on the active Codex thread between turns. */
   async reloadTools(id: string): Promise<{ ok: true } | { ok: false; error: string }> {
     const session = this.sessions.get(id);
     if (!session) return { ok: false, error: '会话不存在' };
     const { info, driver } = session;
+    if (info.provider !== 'codex') return { ok: false, error: '当前宿主不支持工具热重载，请正常退出后从历史恢复同一会话' };
+    if (info.handoff) return { ok: false, error: '会话正在终端中继续，回到这里后再重载工具' };
     if (!driver?.alive) return { ok: true }; // The next ordinary resume reads the configuration.
     if (info.status !== 'idle' || driver.busy || session.requests.size || info.queued.length > 0) {
       return { ok: false, error: '请等当前回合、批准请求和消息队列结束后再重载' };
@@ -621,12 +653,18 @@ export class AgentSessionManager {
     }
   }
 
+  /**
+   * Switches orchestration mode between turns. A running provider process is replaced and the same
+   * conversation resumed with (or without) Aha MCP; a suspended session takes the mode on its next resume.
+   */
   async setOrchestration(id: string, enabled: boolean): Promise<{ ok: true } | { ok: false; error: string }> {
     const session = this.sessions.get(id);
     if (!session) return { ok: false, error: '会话不存在' };
     const { info } = session;
     if (info.orchestration === enabled) return { ok: true };
+    if (enabled && !info.capabilities.orchestration) return { ok: false, error: '当前会话驱动不支持编排模式' };
     if (enabled && !this.deps.coordinatorInstructions) return { ok: false, error: '编排模式当前不可用' };
+    if (info.handoff) return { ok: false, error: '会话正在终端中继续，回到这里后才能切换编排模式' };
     if (info.status === 'starting' || info.status === 'running' || session.driver?.busy || session.requests.size > 0) {
       return { ok: false, error: '请等本轮结束后再切换编排模式' };
     }
@@ -749,8 +787,71 @@ export class AgentSessionManager {
   }
 
   private resumable(session: Session): boolean {
-    const { status, providerSessionId } = session.info;
-    return Boolean(providerSessionId) && !session.driver?.alive && (status === 'suspended' || status === 'failed');
+    const { status, providerSessionId, handoff } = session.info;
+    return !handoff && Boolean(providerSessionId) && !session.driver?.alive && (status === 'suspended' || status === 'failed');
+  }
+
+  /** Models the session's live process offered; Codex sessions list theirs from `CodexCatalog` instead. */
+  models(id: string): CodexModelOption[] {
+    return this.sessions.get(id)?.driver?.models?.() ?? [];
+  }
+
+  /**
+   * Suspends the native process so a terminal pane can continue the same conversation with the
+   * CLI's own resume flags. Only one writer at a time: nothing is sent from here until `reclaim`.
+   */
+  async handoffToTerminal(id: string): Promise<
+    { ok: true; cliId: AgentProvider; args: string[]; cwd: string } | { ok: false; error: string }
+  > {
+    const session = this.sessions.get(id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    const { info } = session;
+    if (!info.capabilities.terminalResume) return { ok: false, error: '当前会话驱动不支持在终端中继续' };
+    if (info.handoff) return { ok: false, error: '这个会话已经在终端中继续' };
+    if (info.orchestration) return { ok: false, error: '请先关闭编排模式，再在终端中继续' };
+    if (!info.providerSessionId || !session.hasTurns) return { ok: false, error: '请先发送至少一条消息，终端才能接着这个会话' };
+    if (info.status === 'starting' || info.status === 'running' || session.driver?.busy || session.requests.size > 0) {
+      return { ok: false, error: '请等本轮结束后再在终端中继续' };
+    }
+    if (info.status === 'closed') return { ok: false, error: '会话已结束' };
+    const args = terminalResumeArgs(info.provider, info.providerSessionId);
+    if (!args) return { ok: false, error: '无法生成终端恢复命令' };
+    const driver = session.driver;
+    session.generation++;
+    session.driver = null;
+    info.handoff = { ptyId: null, at: this.now() };
+    info.status = 'suspended';
+    info.error = null;
+    if (info.queued.length) info.queuePaused = true;
+    session.timeline.setMeta({ alive: false });
+    this.sessionsChanged();
+    // Wait for the process to be gone before the terminal opens the same conversation.
+    await driver?.close();
+    return { ok: true, cliId: info.provider, args, cwd: info.cwd };
+  }
+
+  /** Records the terminal pane that took the conversation, so reclaiming can check it exited. */
+  bindHandoff(id: string, ptyId: string): boolean {
+    const handoff = this.sessions.get(id)?.info.handoff;
+    if (!handoff || handoff.ptyId) return false;
+    handoff.ptyId = ptyId;
+    this.sessionsChanged();
+    return true;
+  }
+
+  /** Takes the conversation back once the terminal stopped writing to it; the next message resumes it here. */
+  reclaim(id: string, isPtyAlive: (ptyId: string) => boolean): { ok: true } | { ok: false; error: string } {
+    const session = this.sessions.get(id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    const { handoff } = session.info;
+    if (!handoff) return { ok: true };
+    if (handoff.ptyId && isPtyAlive(handoff.ptyId)) {
+      return { ok: false, error: '终端里的会话还在运行：请先退出该 CLI 或关闭终端，再回到这里' };
+    }
+    session.info.handoff = null;
+    session.info.status = 'suspended';
+    this.sessionsChanged();
+    return { ok: true };
   }
 
   /**
@@ -770,7 +871,8 @@ export class AgentSessionManager {
         ? this.deps.coordinatorInstructions?.(info.id, { policy: info.policy })
         : undefined;
       session.driver = this.deps.launch(info.id, info.cwd, this.eventsFor(session, generation), {
-        orchestration, policy: info.policy,
+        orchestration, policy: info.policy, provider: info.provider,
+        ...(rejoin && info.providerSessionId ? { resumeSessionId: info.providerSessionId } : {}),
       });
       session.launchedPolicy = info.policy;
       info.provider = session.driver.provider;
@@ -896,7 +998,18 @@ export class AgentSessionManager {
     for (const entry of saved) {
       if (!entry?.id || !AGENT_SESSION_ID.test(entry.id) || !entry.providerSessionId || !entry.timeline) continue;
       const { timeline, ...rest } = entry;
-      const session = this.track({ ...rest, network: rest.network === true, orchestration: rest.orchestration === true, status: 'suspended', error: null, pendingQuestions: [], queued: [], queuePaused: false, goal: null }, timeline);
+      // Sessions saved before multiple drivers carry no provider (or a placeholder): they are Codex.
+      const provider = normalizeDriverId(rest.provider);
+      const capabilities = driverCapabilities(provider);
+      const handoff = rest.handoff && typeof rest.handoff.at === 'number'
+        ? { ptyId: typeof rest.handoff.ptyId === 'string' ? rest.handoff.ptyId : null, at: rest.handoff.at }
+        : null;
+      const session = this.track({
+        ...rest, provider, capabilities, handoff, policy: supportedPolicy(provider, rest.policy),
+        network: capabilities.network && rest.network === true,
+        orchestration: capabilities.orchestration && rest.orchestration === true,
+        status: 'suspended', error: null, pendingQuestions: [], queued: [], queuePaused: false, goal: null,
+      }, timeline);
       session.timeline.setMeta({ alive: false });
     }
   }
@@ -907,7 +1020,10 @@ export class AgentSessionManager {
       .sort((a, b) => b.info.createdAt - a.info.createdAt)
       .slice(0, MAX_SAVED_SESSIONS)
       .map(({ info, timeline }) => {
-        const { status: _status, error: _error, pendingQuestions: _questions, queued: _queued, queuePaused: _paused, goal: _goal, ...rest } = info;
+        const {
+          status: _status, error: _error, pendingQuestions: _questions, queued: _queued, queuePaused: _paused, goal: _goal,
+          capabilities: _capabilities, ...rest
+        } = info;
         return { ...rest, timeline: timeline.archive() };
       });
     return JSON.stringify({ version: 1, sessions });

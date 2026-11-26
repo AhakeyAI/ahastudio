@@ -9,6 +9,7 @@ import type { UsageSummary } from '../../lib/usage-limits';
 import { resolveTitleEdit } from '../../lib/session-title';
 import { UsageLimitChip } from './UsageLimitChip';
 import { POLICY_LABELS, codexCatalogClient } from '../../lib/agent-session-client';
+import { CODEX_CAPABILITIES } from '../../lib/session-capabilities';
 import {
   buildSlashCommandItems,
   isClearCommand,
@@ -32,7 +33,7 @@ import {
   skillsInText, type ComposerTrigger,
 } from '../../lib/composer-tokens';
 import type {
-  AgentQueuedMessage, AgentSessionGoal, AgentSessionInfo, AgentSessionPolicy, AgentTurnAttachment, CodexFileMatch,
+  AgentDriverCapabilities, AgentDriverId, AgentQueuedMessage, AgentSessionGoal, AgentSessionInfo, AgentSessionPolicy, AgentTurnAttachment, CodexFileMatch,
   CodexModelOption, CodexSkillOption, OrchestrationQuestionRecord, WorkerTimelineItem,
 } from '../../types';
 import {
@@ -227,6 +228,8 @@ export interface SessionComposerProps {
   onAnswer?: (requestId: string, answers: Record<string, string[]> | null) => Promise<boolean>;
   /** The session is not running but sending a message resumes it. */
   resumable?: boolean;
+  /** Replaces the ended-session line, e.g. while a terminal pane continues the conversation. */
+  endedText?: string;
   /** Direct sessions take one turn at a time, so sending waits for the running turn. */
   direct?: boolean;
   /** Direct sessions: a message sent while a turn runs is queued for after it, listed above the input. */
@@ -254,6 +257,11 @@ export interface ComposerSlashControl {
   canRename: boolean;
   canOrchestration: boolean;
   orchestrationOn: boolean;
+  /** Driver capability flags; each defaults to on (Codex). */
+  canCompact?: boolean;
+  canGoal?: boolean;
+  canFeedback?: boolean;
+  canModel?: boolean;
   freshSessionArmed: boolean;
   goal: AgentSessionGoal | null;
   goalBusy: boolean;
@@ -288,6 +296,9 @@ export interface ComposerQueue {
 
 export interface ComposerToolbar {
   sessionId: string;
+  /** The session's driver; models come from its catalog, and only its capabilities show controls. */
+  provider?: AgentDriverId;
+  capabilities?: AgentDriverCapabilities;
   /** The model and effort the next message uses; null means Codex's default. */
   modelId: string | null;
   effort: string | null;
@@ -312,23 +323,30 @@ const readBase64 = (file: Blob) => new Promise<string>((resolve, reject) => {
 });
 const formatSize = (bytes: number) => (bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)}MB` : `${Math.ceil(bytes / 1024)}KB`);
 
-/** Codex's models and the session's skills, loaded once the composer can use them. */
-function useComposerCatalog(sessionId: string | undefined) {
+/** The driver's models and (Codex only) the session's skills, loaded once the composer can use them. */
+function useComposerCatalog(sessionId: string | undefined, provider: AgentDriverId | undefined, capabilities: AgentDriverCapabilities) {
   const [models, setModels] = useState<CodexModelOption[]>([]);
-  const [skills, setSkills] = useState<CodexSkillOption[] | null>(null);
+  const [skills, setSkills] = useState<CodexSkillOption[] | null>(capabilities.skills ? null : []);
+  const { models: listsModels, skills: hasSkills } = capabilities;
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId || !listsModels) return;
     let live = true;
-    void codexCatalogClient.models().then((list) => live && setModels(list), () => {});
+    void codexCatalogClient.sessionModels(sessionId, provider).then((list) => live && setModels(list), () => {});
     return () => {
       live = false;
     };
-  }, [sessionId]);
+  }, [sessionId, provider, listsModels]);
   const loadSkills = useMemo(() => () => {
     if (!sessionId) return;
+    if (!hasSkills) return setSkills([]);
     void codexCatalogClient.skills(sessionId).then(setSkills, () => setSkills([]));
-  }, [sessionId]);
-  return { models, skills, loadSkills };
+  }, [sessionId, hasSkills]);
+  // A driver that started its process after the composer mounted lists its models only then.
+  const reloadModels = useCallback(() => {
+    if (!sessionId || !listsModels) return;
+    void codexCatalogClient.sessionModels(sessionId, provider).then(setModels, () => {});
+  }, [sessionId, provider, listsModels]);
+  return { models, skills, loadSkills, reloadModels };
 }
 
 /** Floating input card with the approvals and questions that block the Worker stacked above it. */
@@ -350,7 +368,8 @@ export function SessionComposer(props: SessionComposerProps) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const searchSeq = useRef(0);
-  const catalog = useComposerCatalog(toolbar?.sessionId);
+  const capabilities = toolbar?.capabilities ?? CODEX_CAPABILITIES;
+  const catalog = useComposerCatalog(toolbar?.sessionId, toolbar?.provider, capabilities);
   const choice = useMemo(
     () => resolveModelChoice(catalog.models, toolbar?.modelId ?? null, toolbar?.effort ?? null),
     [catalog.models, toolbar?.modelId, toolbar?.effort],
@@ -429,6 +448,7 @@ export function SessionComposer(props: SessionComposerProps) {
         !hasTrailingText &&
         attached.length === 0 &&
         slash.hasTurns &&
+        slash.canCompact !== false &&
         !props.running &&
         props.approvals.length === 0 &&
         !(props.directQuestions?.length);
@@ -442,6 +462,9 @@ export function SessionComposer(props: SessionComposerProps) {
         canOrchestration: slash.canOrchestration,
         orchestrationOn: slash.orchestrationOn,
         skills: catalog.skills ?? [],
+        ...(slash.canGoal === false ? { canGoal: false } : {}),
+        ...(slash.canFeedback === false ? { canFeedback: false } : {}),
+        ...(slash.canModel === false ? { canModel: false } : {}),
       });
       return searchSlashCommandItems(items, trigger.query).map((item) => ({
         kind: 'slash' as const,
@@ -488,19 +511,22 @@ export function SessionComposer(props: SessionComposerProps) {
     canHistory: Boolean(slash?.canHistory),
     canRename: Boolean(slash?.canRename),
     canOrchestration: Boolean(slash?.canOrchestration),
+    canGoal: slash?.canGoal !== false,
+    canFeedback: slash?.canFeedback !== false,
+    canModel: slash?.canModel !== false,
   });
 
   const { queue } = props;
   const queueing = Boolean(queue && props.running && !localSlashCommand);
   const blocked = Boolean(props.direct && props.running && !queue && !localSlashCommand);
   const placeholder = props.direct
-    ? (queueing ? '正在工作，现在发送会排队，本轮结束后自动发出' : props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : toolbar ? '给助手发消息，/ 斜杠命令，$ 选技能，@ 引用文件' : '给助手发消息')
+    ? (queueing ? '正在工作，现在发送会排队，本轮结束后自动发出' : props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : toolbar ? `给助手发消息，/ 斜杠命令，${capabilities.skills ? '$ 选技能，' : ''}@ 引用文件` : '给助手发消息')
     : (props.running ? '补充指令，本轮结束后送达' : '给 Worker 发送追加指令');
 
   const handleEditTrigger = (text: string, caret: number) => {
     if (!toolbar) return;
     const candidate = detectTrigger(text, caret);
-    const allowed = candidate?.kind === 'slash' && !slash ? null : candidate;
+    const allowed = (candidate?.kind === 'slash' && !slash) || (candidate?.kind === 'skill' && !capabilities.skills) ? null : candidate;
     if (isSameTrigger(dismissedTriggerRef.current, allowed)) {
       activateTrigger(null);
       return;
@@ -513,7 +539,7 @@ export function SessionComposer(props: SessionComposerProps) {
   const handleSelectTrigger = (text: string, caret: number) => {
     if (!toolbar) return;
     const candidate = detectTrigger(text, caret);
-    const allowed = candidate?.kind === 'slash' && !slash ? null : candidate;
+    const allowed = (candidate?.kind === 'slash' && !slash) || (candidate?.kind === 'skill' && !capabilities.skills) ? null : candidate;
     if (!isSameTrigger(dismissedTriggerRef.current, allowed)) {
       dismissedTriggerRef.current = null;
     }
@@ -992,18 +1018,25 @@ export function SessionComposer(props: SessionComposerProps) {
                     event.target.value = '';
                   }}
                 />
-                <ComposerCatalogPanel sessionId={toolbar.sessionId} onNotify={toolbar.onNotify} onUseSkill={useSkill} />
-                <ComposerModelPicker
-                  models={catalog.models}
-                  model={choice.model}
-                  fallbackLabel={toolbar.modelId}
-                  effort={choice.effort}
-                  disabled={props.running}
-                  open={modelPickerOpen}
-                  onOpenChange={setModelPickerOpen}
-                  onModelChange={toolbar.onModelChange}
-                  onEffortChange={toolbar.onEffortChange}
-                />
+                {capabilities.plugins && (
+                  <ComposerCatalogPanel sessionId={toolbar.sessionId} onNotify={toolbar.onNotify} onUseSkill={useSkill} />
+                )}
+                {capabilities.models && (
+                  <ComposerModelPicker
+                    models={catalog.models}
+                    model={choice.model}
+                    fallbackLabel={toolbar.modelId}
+                    effort={capabilities.efforts ? choice.effort : null}
+                    disabled={props.running}
+                    open={modelPickerOpen}
+                    onOpenChange={(open) => {
+                      if (open) catalog.reloadModels();
+                      setModelPickerOpen(open);
+                    }}
+                    onModelChange={toolbar.onModelChange}
+                    onEffortChange={toolbar.onEffortChange}
+                  />
+                )}
               </div>
             ) : (
               <span className="asv-composer-hint">Enter 发送 · Shift+Enter 换行</span>
@@ -1019,7 +1052,7 @@ export function SessionComposer(props: SessionComposerProps) {
                     aria-label="权限"
                     onChange={(event) => props.onPolicyChange!(event.target.value as AgentSessionPolicy)}
                   >
-                    {(Object.keys(POLICY_LABELS) as AgentSessionPolicy[]).map((value) => (
+                    {(toolbar ? capabilities.policies : Object.keys(POLICY_LABELS) as AgentSessionPolicy[]).map((value) => (
                       <option key={value} value={value}>{POLICY_LABELS[value]}</option>
                     ))}
                   </select>
@@ -1068,7 +1101,7 @@ export function SessionComposer(props: SessionComposerProps) {
           </div>
         </div>
       ) : (
-        <div className="asv-composer is-ended">会话已结束，当前为只读回放</div>
+        <div className="asv-composer is-ended">{props.endedText ?? '会话已结束，当前为只读回放'}</div>
       )}
       {hasEndedStrip && (
         <div className="asv-context-strip">

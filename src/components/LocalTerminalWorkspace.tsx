@@ -1081,7 +1081,8 @@ export function LocalTerminalWorkspace({
           onCreate={(type, opts) => {
             const cwd = selectedCwd ?? opts?.cwd;
             if (type !== 'agent-session') return stage.createWindow(type, { ...opts, cwd });
-            void agentSessionClient.create({ ...(cwd ? { cwd } : {}), policy: 'workspace-write' }).then((res) => {
+            const provider = (['codex', 'antigravity', 'grok', 'opencode', 'pi'] as const).find((id) => id === opts?.localCliId) ?? 'codex';
+            void agentSessionClient.create({ ...(cwd ? { cwd } : {}), provider, policy: 'workspace-write' }).then((res) => {
               if (!res.ok) return handleNotify(res.error);
               void stageWindowStore.createWindow('agent-session', { ...opts, cwd: res.session.cwd, workerId: res.session.id });
             });

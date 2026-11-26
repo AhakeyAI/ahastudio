@@ -1,4 +1,6 @@
-import type { AgentSessionInfo, AgentSessionPolicy, CodexModelOption, CodexRateLimits, CodexSkillOption } from '../types';
+import type {
+  AgentDriverId, AgentDriverSummary, AgentSessionInfo, AgentSessionPolicy, CodexModelOption, CodexRateLimits, CodexSkillOption,
+} from '../types';
 
 const STANDALONE_ID = /^agent-session-[a-f0-9-]{36}$/;
 
@@ -40,7 +42,7 @@ export const agentSessionClient = {
     };
   },
   getSnapshot: () => sessions,
-  async create(opts: { cwd?: string; policy: AgentSessionPolicy }): Promise<
+  async create(opts: { cwd?: string; policy: AgentSessionPolicy; provider?: AgentDriverId }): Promise<
     { ok: true; session: AgentSessionInfo } | { ok: false; error: string }
   > {
     const api = window.vibeMeet?.agentSessions;
@@ -86,6 +88,21 @@ export const usageLimitsClient = {
   },
 };
 
+const DRIVERS_CACHE_MS = 30_000;
+let driversRequest: { at: number; request: Promise<AgentDriverSummary[]> } | null = null;
+
+/** Native session drivers and whether each CLI is installed, read at most every 30 seconds. */
+export const agentDriversClient = {
+  list(force = false): Promise<AgentDriverSummary[]> {
+    const api = typeof window !== 'undefined' ? window.vibeMeet?.agentSessions : undefined;
+    if (!api?.drivers) return Promise.resolve([]);
+    if (!force && driversRequest && Date.now() - driversRequest.at < DRIVERS_CACHE_MS) return driversRequest.request;
+    const request = api.drivers().then((res) => (res.ok ? res.drivers : []), () => []);
+    driversRequest = { at: Date.now(), request };
+    return request;
+  },
+};
+
 let modelsRequest: Promise<CodexModelOption[]> | null = null;
 const skillRequests = new Map<string, { at: number; request: Promise<CodexSkillOption[]> }>();
 const SKILL_CACHE_MS = 60_000;
@@ -104,6 +121,13 @@ export const codexCatalogClient = {
       throw error;
     });
     return modelsRequest;
+  },
+  /** The models a session's own driver offers: Codex's catalog, or what the live process listed. */
+  sessionModels(sessionId: string, provider: AgentDriverId | undefined): Promise<CodexModelOption[]> {
+    if (!provider || provider === 'codex') return this.models();
+    const api = window.vibeMeet?.agentSessions;
+    if (!api?.models) return Promise.resolve([]);
+    return api.models({ id: sessionId }).then((res) => (res.ok ? res.models : []), () => []);
   },
   skills(sessionId: string): Promise<CodexSkillOption[]> {
     const api = window.vibeMeet?.agentSessions;
