@@ -70,3 +70,22 @@ test('the native settings background follows theme updates and removes the liste
   f.api.closeSettingsWindow();
   assert.equal(f.nativeTheme.listenerCount('updated'), 0);
 });
+
+test('native theme resolution is broadcast to every renderer without changing its saved preference', () => {
+  const source = ts.transpileModule(readFileSync(new URL('../electron/ipc/desktop.ts', import.meta.url), 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  }).outputText.replace(/^import .*;$/gm, '').replaceAll('export function ', 'function ');
+  const nativeTheme = Object.assign(new EventEmitter(), { shouldUseDarkColors: false });
+  const messages = [];
+  const renderers = [1, 2].map(id => ({ send: (channel, state) => messages.push({ id, channel, state }) }));
+  const register = new Function('app', 'clipboard', 'ipcMain', 'nativeTheme', 'webContents',
+    'requestMicrophoneAccess', 'getSettings', 'updateSettings', source + '\nreturn registerDesktopIpc;')(
+    {}, {}, { handle() {} }, nativeTheme, { getAllWebContents: () => renderers }, () => {}, () => ({}), () => {},
+  );
+  register();
+  nativeTheme.shouldUseDarkColors = true;
+  nativeTheme.emit('updated');
+  assert.deepEqual(messages, renderers.map((_, index) => ({
+    id: index + 1, channel: 'theme:changed', state: { shouldUseDarkColors: true },
+  })));
+});

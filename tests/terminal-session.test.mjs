@@ -413,6 +413,40 @@ test('terminal appearance defaults to system, tracks OS color-scheme changes, an
   }
 });
 
+test('system appearance accepts native theme events even when the renderer media event is delayed', async () => {
+  const originalStorage = globalThis.localStorage;
+  const originalWindow = globalThis.window;
+  const saved = new Map([['aha.terminal.appearance', 'system']]);
+  let onThemeChanged;
+  globalThis.localStorage = { getItem: key => saved.get(key) ?? null, setItem: (key, value) => saved.set(key, value) };
+  globalThis.window = {
+    matchMedia: () => ({ matches: false, addEventListener() {} }),
+    addEventListener() {},
+    vibeMeet: {
+      setThemeSource: async () => ({ shouldUseDarkColors: false }),
+      onThemeChanged: cb => { onThemeChanged = cb; return () => {}; },
+    },
+  };
+  try {
+    const { terminalSessionStore: store } = await import(`${storeUrl}#native-theme-event`);
+    const f = fixture(); const session = store.acquire('native-theme-event', f.transport);
+    await tick();
+    assert.equal(typeof onThemeChanged, 'function');
+    onThemeChanged({ shouldUseDarkColors: true });
+    assert.equal(store.getAppearancePreference(), 'system');
+    assert.equal(store.getAppearance(), 'dark');
+    assert.equal(session.terminal.options.theme.background, '#1e1e1e');
+    onThemeChanged({ shouldUseDarkColors: false });
+    assert.equal(store.getAppearance(), 'light');
+    store.setAppearance('dark');
+    onThemeChanged({ shouldUseDarkColors: false });
+    assert.equal(store.getAppearance(), 'dark', 'explicit preference ignores system-only notifications');
+  } finally {
+    globalThis.localStorage = originalStorage;
+    globalThis.window = originalWindow;
+  }
+});
+
 test('terminal responds to OSC 10/11/12 and CSI ?996n, suppresses snapshot replay queries, and pushes Mode 2031 updates on theme switch', async () => {
   const f = fixture();
   const lightTheme = { background: '#ffffff', foreground: '#1f2328', cursor: '#0969da' };
