@@ -8,6 +8,32 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { AGENT_SESSION_ID, AgentSessionManager, MAX_QUEUED_MESSAGES } from '../dist-electron/orchestration/agent-session-manager.js';
 import { CodexAppServerPilot, coordinatorApprovedMcpTools } from '../dist-electron/orchestration/codex-app-server-pilot.js';
 
+test('tool reload stays in one thread and rejects concurrent reload/send without stopping the driver', async t => {
+  const { manager, sent } = setup(t);
+  const session = await manager.create({ cwd, policy: 'read-only' });
+  const original = manager.list()[0].providerSessionId;
+  const refresh = manager.reloadTools(session.id);
+  assert.equal((await manager.reloadTools(session.id)).ok, false);
+  assert.equal((await manager.send(session.id, { text: 'must not be delivered' })).status, 'not_accepted');
+  assert.equal((await manager.enqueue(session.id, { text: 'must not be stranded in a queue' })).ok, false);
+  assert.equal((await refresh).ok, true);
+  assert.equal(manager.list()[0].providerSessionId, original);
+  assert.equal(sent('thread/start').length, 1);
+  assert.equal(sent('thread/resume').length, 0);
+  assert.equal(sent('turn/start').length, 0);
+  assert.equal(sent('config/mcpServer/reload').length, 1);
+});
+
+test('tool reload refuses active turns and pending approvals without interrupting them', async t => {
+  const { manager, status, sent } = setup(t);
+  const session = await manager.create({ cwd, policy: 'read-only' });
+  await manager.send(session.id, { text: 'ASK_FOR_APPROVAL' });
+  await until(() => status(session.id) === 'running');
+  assert.equal((await manager.reloadTools(session.id)).ok, false);
+  assert.equal(sent('config/mcpServer/reload').length, 0);
+  assert.equal(sent('turn/interrupt').length, 0);
+});
+
 const cwd = process.cwd();
 
 async function until(read, timeout = 4_000) {

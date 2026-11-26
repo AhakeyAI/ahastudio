@@ -84,6 +84,7 @@ interface PendingRequest {
 }
 
 interface Session {
+  toolReloading?: boolean;
   info: AgentSessionInfo;
   driver: AgentSessionDriver | null;
   timeline: WorkerTimeline;
@@ -325,6 +326,7 @@ export class AgentSessionManager {
   async enqueue(id: string, input: MessageInput): Promise<{ ok: true; queued: boolean } | { ok: false; error: string }> {
     const session = this.sessions.get(id);
     if (!session) return { ok: false, error: '会话不存在' };
+    if (session.toolReloading) return { ok: false, error: '正在重读工具配置，请稍后发送；消息尚未加入队列' };
     const text = input.text.trim();
     if (!text && !input.attachments?.length) return { ok: false, error: '消息是空的' };
     const { info } = session;
@@ -622,6 +624,33 @@ export class AgentSessionManager {
     const active = info.orchestration && live;
     const idle = active && info.status === 'idle' && Boolean(driver?.alive) && !driver?.busy && session.requests.size === 0;
     return { cwd: info.cwd, provider: info.provider, active, idle, network: info.network };
+  }
+
+  /** Requests an in-place tool config reload on the active Codex thread between turns. */
+  async reloadTools(id: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    const session = this.sessions.get(id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    const { info, driver } = session;
+    if (info.provider !== 'codex') return { ok: false, error: '当前宿主不支持工具热重载，请正常退出后从历史恢复同一会话' };
+    if (info.handoff) return { ok: false, error: '会话正在终端中继续，回到这里后再重载工具' };
+    if (!driver?.alive) return { ok: true }; // The next ordinary resume reads the configuration.
+    if (info.status !== 'idle' || driver.busy || session.requests.size || info.queued.length > 0) {
+      return { ok: false, error: '请等当前回合、批准请求和消息队列结束后再重载' };
+    }
+    if (!driver.reloadTools) return { ok: false, error: '当前宿主不支持工具热重载，请正常退出后从历史恢复同一会话' };
+    session.toolReloading = true;
+    info.status = 'starting'; // Blocks concurrent sends, reloads, and coordinator wakes.
+    this.sessionsChanged();
+    try {
+      await driver.reloadTools();
+      return { ok: true };
+    } catch {
+      return { ok: false, error: '工具未能重载；原会话保留，请正常退出后从历史恢复，勿同时打开两个入口' };
+    } finally {
+      session.toolReloading = false;
+      if (session.driver === driver && info.status === 'starting' && driver.alive) info.status = 'idle';
+      this.sessionsChanged();
+    }
   }
 
   /**

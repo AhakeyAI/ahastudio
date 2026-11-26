@@ -62,6 +62,9 @@ for await (const line of history) {
     send(scenario === 'initialize-error'
       ? { id, error: { code: -32602, message: 'mock initialization rejected' } }
       : { id, result: { userAgent: 'mock-codex' } });
+  } else if (method === 'config/mcpServer/reload') {
+    await delay(80);
+    send({ id, result: {} });
   } else if (method === 'thread/start' || method === 'thread/resume') {
     if (method === 'thread/resume') assert.equal(params.threadId, threadId);
     if (typeof params.cwd === 'string' && params.cwd) threadCwd = params.cwd;

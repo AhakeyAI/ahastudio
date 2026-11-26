@@ -10,6 +10,7 @@ import type {
 } from '../types';
 import { AgentHooksPanel } from './AgentHooksPanel';
 import { AgentMcpPanel } from './AgentMcpPanel';
+import { CodexRuntimePanel } from './CodexRuntimePanel';
 
 const DEFAULT_ORCHESTRATION_SETTINGS: OrchestrationSettings = {
   confirmBeforeDispatch: 'chat-and-guard',
@@ -168,6 +169,7 @@ export function CliAgentSettingsPanel() {
 
   return (
     <div className="settings-panel">
+      <CodexRuntimePanel />
       <div className="settings-panel-heading settings-heading-with-action">
         <div>
           <h2>CLI 与 Agent</h2>

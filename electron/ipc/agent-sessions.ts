@@ -8,10 +8,12 @@ import { WorkspaceFileSearch } from '../agent-drivers/workspace-file-search.js';
 import type { AgentTurnAttachment } from '../orchestration/agent-session-driver.js';
 import { AGENT_SESSION_ID, type AgentSessionManager } from '../orchestration/agent-session-manager.js';
 import type { CodexCatalog } from '../orchestration/codex-catalog.js';
+import type { CodexRuntimeReport } from '../orchestration/codex-runtime-diagnostics.js';
 import { codexThreadTimeline } from '../orchestration/codex-thread-history.js';
 import { WorkerTimelinePatchCoalescer } from '../orchestration/worker-timeline.js';
 import type { IpcContext } from './context.js';
 import { handleSecure, mainWindowSenderPolicy } from './validators.js';
+import { settingsWindowSenderId } from './settings-window.js';
 
 const id = z.string().regex(AGENT_SESSION_ID);
 const policy = z.enum(['read-only', 'workspace-write', 'full-auto']);
@@ -104,6 +106,9 @@ export function registerAgentSessionsIpc(
   options: {
     /** Models, skills, plugins, and file search; without it the composer offers none of them. */
     catalog?: CodexCatalog;
+    inspectRuntime?: (cwd: string, probe: boolean) => Promise<CodexRuntimeReport>;
+    runtimeCwd?: () => string;
+    revealRuntimeConfig?: () => void;
     /** Where pasted images are kept, one folder per session; without it images cannot be attached. */
     attachmentsDir?: () => string;
     /** Native drivers the person can start sessions with. */
@@ -166,9 +171,10 @@ export function registerAgentSessionsIpc(
     }
   }
   const secure = <T extends z.ZodTypeAny>(
-    channel: string, schema: T, handler: (input: z.infer<T>) => Promise<Record<string, unknown>> | Record<string, unknown>,
+    channel: string, schema: T, handler: (input: z.infer<T>) => Promise<Record<string, unknown>> | Record<string, unknown>, settings = false,
   ) => handleSecure(`agent-sessions:${channel}`, {
-    schema, authorize, authorizeError: 'Sender is not the main window',
+    schema, authorize: settings ? (event) => authorize(event) === true || event.sender.id === settingsWindowSenderId() : authorize,
+    authorizeError: 'Sender is not an authorized application window',
     handler: async (input) => {
       try {
         return { ok: true, ...(await handler(input)) };
@@ -180,6 +186,25 @@ export function registerAgentSessionsIpc(
 
   secure('list', z.object({}).strict(), () => ({ sessions: manager.list() }));
   secure('drivers', z.object({}).strict(), () => ({ drivers: options.drivers?.list() ?? [] }));
+  let inspecting = false;
+  secure('runtime', z.object({ id: id.optional(), probe: z.boolean().optional() }).strict(), async (input) => {
+    if (!options.inspectRuntime) throw new Error('当前客户端不支持运行环境检查');
+    if (inspecting) throw new Error('诊断正在进行，请稍候');
+    const cwd = input.id ? sessionCwd(input.id) : ctx.getCurrentCwd() ?? options.runtimeCwd?.();
+    if (!cwd || !isAbsolute(cwd)) throw new Error('请先选择项目文件夹');
+    inspecting = true;
+    try { return { report: await options.inspectRuntime(cwd, input.probe === true) }; }
+    finally { inspecting = false; }
+  }, true);
+  secure('runtime-config', z.object({}).strict(), () => {
+    options.revealRuntimeConfig?.();
+    return {};
+  }, true);
+  secure('reload-tools', targetSchema, async (input) => {
+    const result = await manager.reloadTools(input.id);
+    if (!result.ok) throw new Error(result.error);
+    return {};
+  });
   secure('create', createSchema, async (input) => {
     const cwd = input.cwd ?? ctx.getCurrentCwd();
     if (!cwd || !isAbsolute(cwd) || !existsSync(cwd) || !statSync(cwd).isDirectory()) {

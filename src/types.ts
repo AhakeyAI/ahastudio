@@ -269,6 +269,9 @@ export type AgentTurnAttachment =
   | { type: 'file'; path: string; name?: string };
 
 export interface AgentSessionsApi {
+  runtime?: (opts: { id?: string; probe?: boolean }) => AgentSessionResult<{ report: import('../electron/orchestration/codex-runtime-types').CodexRuntimeReport }>;
+  revealRuntimeConfig?: () => AgentSessionResult;
+  reloadTools?: (opts: { id: string }) => AgentSessionResult;
   list: () => AgentSessionResult<{ sessions: AgentSessionInfo[] }>;
   create: (opts: {
     cwd?: string; provider?: AgentDriverId; policy: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;

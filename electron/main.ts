@@ -1,4 +1,4 @@
-import { app, BrowserWindow, nativeTheme, protocol, screen, session } from 'electron';
+import { app, BrowserWindow, nativeTheme, protocol, screen, session, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
@@ -573,6 +573,20 @@ app.whenReady().then(async () => {
   const agentSessionsIpc = registerAgentSessionsIpc(ipcCtx, agentSessions, {
     catalog: codexCatalog,
     drivers: driverRegistry,
+    runtimeCwd: () => {
+      const state = getDefaultWorkspaceStateStore(() => app.getPath('userData')).read();
+      const windows = Array.isArray(state?.windows) ? state.windows : [];
+      const active = windows.find((value) => value && typeof value === 'object' && value.id === state?.activeWindowId);
+      return typeof active?.cwd === 'string' && existsSync(active.cwd) ? active.cwd : app.getPath('home');
+    },
+    inspectRuntime: async (cwd, probe) => {
+      const { inspectCodexRuntime } = await import('./orchestration/codex-runtime-diagnostics.js');
+      return inspectCodexRuntime(cwd, probe, () => launchCodexPilot({ cwd, events: noSessionEvents, diagnostics: true }));
+    },
+    revealRuntimeConfig: () => {
+      const file = join(process.env.CODEX_HOME || join(app.getPath('home'), '.codex'), 'config.toml');
+      shell.showItemInFolder(file);
+    },
     attachmentsDir: () => join(app.getPath('userData'), 'agent-session-attachments'),
     terminal: {
       // Main opens the pane with the resume arguments it built, so the renderer never supplies argv.

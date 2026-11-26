@@ -105,6 +105,8 @@ export interface AgentOutputSlice {
 
 /** One provider conversation, driven over its native protocol instead of a terminal. */
 export interface AgentSessionDriver {
+  /** Optional native in-place tool refresh; never restarts or duplicates a conversation. */
+  reloadTools?(): Promise<void>;
   readonly provider: AgentProvider;
   readonly capabilities: { resume: boolean; steer: boolean; policies: readonly AgentSessionPolicy[] };
   readonly alive: boolean;

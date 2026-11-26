@@ -26,7 +26,7 @@ const POLICIES: Record<AgentSessionPolicy, { sandbox: string; sandboxType: strin
  */
 export const CODEX_QUERY_METHODS = new Set([
   'model/list', 'skills/list', 'skills/config/write', 'plugin/installed', 'fuzzyFileSearch', 'account/rateLimits/read',
-  'thread/list', 'thread/read', 'thread/archive', 'thread/unarchive', 'feedback/upload',
+  'thread/list', 'thread/read', 'thread/archive', 'thread/unarchive', 'feedback/upload', 'config/read', 'mcpServerStatus/list',
 ]);
 const OUTPUT_LIMIT = 512 * 1024;
 const STDERR_LIMIT = 4 * 1024;
@@ -307,6 +307,7 @@ export function codexMcpConfigArgs(
 
 export function launchCodexPilot(options: {
   cwd: string;
+  diagnostics?: boolean;
   /**
    * Aha MCP wiring for an orchestration Worker or an orchestrating session; a plain session runs
    * without it. `requiredTool` must be listed before the thread is usable (default report_done) and
@@ -316,25 +317,28 @@ export function launchCodexPilot(options: {
   events: AgentSessionEvents;
 }): CodexAppServerPilot {
   const codex = resolveBinaryFromPath('codex');
-  const node = resolveBinaryFromPath('node');
-  if (!codex || !node) throw new Error('Codex or Node executable was not found');
+  if (!codex) throw new Error('未找到本机 Codex，请先安装 CLI 或检查启动路径');
   const wrapper = /\.(cmd|bat)$/i.test(codex);
+  const node = wrapper || options.mcp ? resolveBinaryFromPath('node') : null;
+  if ((wrapper || options.mcp) && !node) throw new Error('当前 Codex 启动方式需要 Node，请检查依赖安装');
   const entry = join(dirname(codex), 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
   if (wrapper && !existsSync(entry)) throw new Error('Codex npm entry point was not found');
 
-  const args = ['app-server', '--stdio', ...(options.mcp ? codexMcpConfigArgs(node, options.mcp) : [])];
+  const args = ['app-server', '--stdio', ...(options.mcp ? codexMcpConfigArgs(node!, options.mcp) : [])];
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath() };
   for (const key of Object.keys(env)) {
     if (key.toUpperCase().startsWith('AHA_')) delete env[key];
   }
-  const executable = wrapper ? node : codex;
+  delete env.ELECTRON_RUN_AS_NODE;
+  delete env.ELECTRON_NO_ASAR;
+  const executable = wrapper ? node! : codex;
   const argv = wrapper ? [entry, ...args] : args;
   const child = process.platform === 'win32'
     ? spawnWindowsCodexJob(executable, argv, options.cwd, env)
     : spawn(executable, argv, { cwd: options.cwd, env, windowsHide: true, stdio: 'pipe' });
   return new CodexAppServerPilot(child, options.events, 30_000, [
     options.mcp?.env.AHA_WORKER_TOKEN, options.mcp?.env.AHA_SESSION_TOKEN, options.mcp?.env.AHA_AGENT_HOOK_TOKEN,
-  ].filter((value): value is string => Boolean(value)), options.mcp ? options.mcp.requiredTool ?? 'report_done' : null);
+  ].filter((value): value is string => Boolean(value)), options.mcp ? options.mcp.requiredTool ?? 'report_done' : null, options.diagnostics === true);
 }
 
 export class CodexAppServerPilot implements AgentSessionDriver {
@@ -370,6 +374,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     private readonly secrets: readonly string[] = [],
     /** Aha MCP tool the thread must expose before it is usable; null for sessions without Aha MCP. */
     private readonly requiredMcpTool: string | null = 'report_done',
+    private readonly diagnostics = false,
   ) {
     this.childClosed = new Promise((resolve) => {
       child.once('close', (code, signal) => {
@@ -465,6 +470,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   private initialize(): Promise<void> {
     this.initialized ??= this.request('initialize', {
       clientInfo: { name: 'ahastation', title: 'AhaStation', version: '0.1.0' },
+      ...(this.diagnostics ? { capabilities: { experimentalApi: true } } : {}),
     }).then(
       () => this.write({ method: 'initialized' }),
       (error: unknown) => {
@@ -484,6 +490,23 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     } catch (error) {
       throw new Error(this.withStderr(error instanceof Error ? error.message : String(error)));
     }
+  }
+
+  /** Refresh the existing thread in place; never spawn or resume another writer. */
+  async reloadTools(): Promise<void> {
+    if (this.busy || this.stopping) throw new Error('请等本轮结束后再重载工具');
+    await this.initialize();
+    await this.request('config/mcpServer/reload', {});
+  }
+
+  /** Only a dedicated diagnostic connection may create this nonpersistent, model-free thread. */
+  async probeComputerUse(cwd: string): Promise<unknown> {
+    if (!this.diagnostics || this.threadId || this.active) throw new Error('不能在用户会话上运行诊断线程');
+    await this.initialize();
+    const result = object(await this.request('thread/start', { cwd, ephemeral: true }));
+    const id = string(object(result.thread).id);
+    if (!id) throw new Error('当前 Codex 不支持临时诊断线程');
+    return this.request('mcpServer/tool/call', { threadId: id, server: 'computer-use', tool: 'list_apps', arguments: {} });
   }
 
   async waitForIdle(timeoutMs: number): Promise<boolean> {
