@@ -835,6 +835,8 @@
   pointer-events: none;
 }
 .asv-dock-inner { display: flex; flex-direction: column; gap: 6px; width: 100%; max-width: var(--asv-width); margin: 0 auto; pointer-events: auto; container-type: inline-size; }
+.asv-handoff { display: flex; align-items: center; gap: 8px; width: 100%; max-width: var(--asv-width); margin: 0 auto 6px; padding: 8px 12px; border: 1px solid color-mix(in srgb, var(--aha-info) 30%, var(--asv-line)); border-radius: 14px; background: color-mix(in srgb, var(--aha-info) 6%, var(--asv-surface)); box-shadow: var(--asv-shadow); font-size: 13px; pointer-events: auto; color: var(--aha-info); }
+.asv-handoff > span { flex: 1; min-width: 0; color: inherit; }
 .asv-banner-lane { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
 .asv-banner { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--asv-warn) 35%, var(--asv-line)); border-radius: 14px; background: color-mix(in srgb, var(--asv-warn) 6%, var(--asv-surface)); box-shadow: var(--asv-shadow); font-size: 13px; }
 .asv-banner.is-question { border-color: color-mix(in srgb, var(--workspace-accent) 35%, var(--asv-line)); background: color-mix(in srgb, var(--workspace-accent) 5%, var(--asv-surface)); }

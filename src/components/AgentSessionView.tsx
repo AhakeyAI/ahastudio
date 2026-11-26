@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { ArrowDown, Cpu, Folder, History, Square, Workflow } from 'lucide-react';
+import { ArrowDown, Cpu, Folder, History, Square, SquareTerminal, Workflow } from 'lucide-react';
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
 import { agentSessionClient, codexCatalogClient, isStandaloneSession, usageLimitsClient } from '../lib/agent-session-client';
+import { DRIVER_LABELS, sessionCapabilities } from '../lib/session-capabilities';
 import { summarizeUsage, type UsageSummary } from '../lib/usage-limits';
 import type { GoalCommandAction } from '../lib/composer-slash-commands';
 import { effortLabel } from '../lib/composer-tokens';
@@ -86,7 +87,9 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const [nextEffort, setNextEffort] = useState<string | null>(null);
   const policy = nextPolicy ?? info?.policy;
   const network = nextNetwork ?? info?.network ?? false;
-  const resumable = Boolean(info?.providerSessionId) && (info?.status === 'suspended' || info?.status === 'failed');
+  const caps = sessionCapabilities(info);
+  const handoff = info?.handoff ?? null;
+  const resumable = !handoff && Boolean(info?.providerSessionId) && (info?.status === 'suspended' || info?.status === 'failed');
   const dispatch = direct ? null : latestDispatchFor(snapshot.dispatches, win.workerId ?? timeline?.workerHandle, win.dispatchId);
   const task = dispatch ? snapshot.tasks.find((t) => t.id === dispatch.taskId) : undefined;
   const role = task?.displayName?.trim().replace(/^@+/, '');
@@ -282,6 +285,40 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       });
   }, [sessionId, info, canToggleOrchestration, busy, onNotify]);
 
+  // The terminal pane writes the conversation from here on; this view sends nothing until it is taken back.
+  const hasThreadTurns = currentThreadHasTurns(timeline?.turns ?? []);
+  const canHandoff = Boolean(
+    direct && info && caps.terminalResume && !handoff && info.providerSessionId && hasThreadTurns && !info.orchestration &&
+      !running && approvals.length === 0 && !info.pendingQuestions.length && (info.status === 'idle' || resumable),
+  );
+  const continueInTerminal = () => {
+    if (!sessionId || !info) return;
+    void run('handoff', async () => {
+      const res = await window.vibeMeet?.agentSessions?.handoff?.({ id: sessionId });
+      if (!res) return { ok: false, error: '当前环境无法打开终端' };
+      if (!res.ok) return res;
+      const terminalId = res.ptyId.replace(/^local-/u, '');
+      await stageWindowStore.createWindow('terminal', {
+        windowId: terminalId, localCliId: res.cliId, cwd: res.cwd, title: `${DRIVER_LABELS[res.cliId]}（续）`,
+      });
+      onNotify?.('已在终端中继续这个会话；退出终端后可以回到这里');
+      return { ok: true };
+    });
+  };
+  const handoffTerminalOpen = useSyncExternalStore(stageWindowStore.subscribe, () => {
+    const ptyId = handoff?.ptyId;
+    if (!ptyId) return false;
+    const terminalId = ptyId.replace(/^local-/u, '');
+    return stageWindowStore.getSnapshot().windows.some((w) => w.id === terminalId || Boolean(w.panes?.[terminalId]));
+  });
+  const reclaim = () => {
+    if (!sessionId) return;
+    void run('reclaim', async () => window.vibeMeet?.agentSessions?.reclaim?.({ id: sessionId }))
+      .then((ok) => {
+        if (ok) onNotify?.('已回到这里；发送消息会接着同一个会话');
+      });
+  };
+
   const rename = useCallback(async (next: string) => {
     if (!sessionId) return false;
     const res = await window.vibeMeet?.agentSessions?.rename?.({ id: sessionId, title: next });
@@ -344,14 +381,14 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const [modelName, setModelName] = useState<string | null>(null);
   useEffect(() => {
     setModelName(null);
-    if (!direct || !headerModelId) return;
+    if (!direct || !headerModelId || !sessionId) return;
     let live = true;
-    codexCatalogClient.models().then((models) => {
+    codexCatalogClient.sessionModels(sessionId, info?.provider).then((models) => {
       const match = models.find((entry) => entry.id === headerModelId || entry.model === headerModelId);
       if (live && match) setModelName(match.displayName);
     }, () => {});
     return () => { live = false; };
-  }, [direct, headerModelId]);
+  }, [direct, headerModelId, sessionId, info?.provider]);
   const modelText = headerModelId
     ? `${modelName ?? headerModelId}${direct && info?.effort ? ` · ${effortLabel(info.effort)}` : ''}`
     : null;
@@ -359,8 +396,9 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   // Account usage is the person's own Codex quota, so only direct sessions show it.
   const [usageLimits, setUsageLimits] = useState<UsageSummary | null>(null);
   const loadUsage = useRef<(force: boolean) => Promise<UsageSummary | null>>(async () => null);
+  const showsUsageLimits = direct && caps.usageLimits;
   useEffect(() => {
-    if (!direct) return;
+    if (!showsUsageLimits) return;
     let live = true;
     loadUsage.current = async (force) => {
       const limits = await usageLimitsClient.read(force);
@@ -376,7 +414,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       clearInterval(timer);
       loadUsage.current = async () => null;
     };
-  }, [direct]);
+  }, [showsUsageLimits]);
   const wasRunning = useRef(running);
   useEffect(() => {
     if (wasRunning.current && !running) void loadUsage.current(true);
@@ -401,9 +439,10 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     void loadUsage.current(true).finally(() => setUsageLimitsRefreshing(false));
   }, []);
 
+  const canHistory = Boolean(direct && cwd && caps.history && window.vibeMeet?.agentSessions?.history);
   const openHistory = useCallback(() => {
-    if (direct && cwd && window.vibeMeet?.agentSessions?.history) setHistoryOpen(true);
-  }, [direct, cwd]);
+    if (canHistory) setHistoryOpen(true);
+  }, [canHistory]);
 
   const runGoalCommand = useCallback(async (action: GoalCommandAction): Promise<boolean> => {
     if (!sessionId) return false;
@@ -451,12 +490,17 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     return {
       currentTitle: title,
       // A waiting `/clear` means the next message starts a new thread, so there is nothing to compact.
-      hasTurns: !freshSessionArmed && currentThreadHasTurns(timeline?.turns ?? []),
-      hasUsageLimits: Boolean(window.vibeMeet?.agentSessions?.rateLimits),
-      canHistory: Boolean(cwd && window.vibeMeet?.agentSessions?.history),
+      hasTurns: !freshSessionArmed && hasThreadTurns,
+      hasUsageLimits: caps.usageLimits && Boolean(window.vibeMeet?.agentSessions?.rateLimits),
+      canHistory,
+      // A title is kept here for every driver; only some also store it with the provider.
       canRename: Boolean(window.vibeMeet?.agentSessions?.rename),
-      canOrchestration: Boolean(window.vibeMeet?.agentSessions?.setOrchestration),
+      canOrchestration: caps.orchestration && Boolean(window.vibeMeet?.agentSessions?.setOrchestration),
       orchestrationOn: info.orchestration,
+      canCompact: caps.compact,
+      canGoal: caps.goal,
+      canFeedback: caps.feedback,
+      canModel: caps.models,
       freshSessionArmed,
       goal: info.goal ?? null,
       goalBusy,
@@ -476,7 +520,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
       onDismissFeedback: dismissFeedback,
     };
   }, [
-    direct, sessionId, info, title, timeline?.turns, cwd, freshSessionArmed, goalBusy,
+    direct, sessionId, info, caps, canHistory, title, timeline?.turns, freshSessionArmed, goalBusy,
     usageLimitsOpen, usageLimitsRefreshing, feedbackState, armFreshSession, disarmFreshSession,
     openUsageLimits, refreshUsageLimits, closeUsageLimits, openHistory, rename, setOrchestrationMode,
     runGoalCommand, runFeedbackCommand, dismissFeedback,
@@ -513,7 +557,21 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               {stageLabel}
             </span>
           )}
-          {direct && cwd && window.vibeMeet?.agentSessions?.history && (
+          {direct && info && caps.terminalResume && !handoff && info.status !== 'closed' && window.vibeMeet?.agentSessions?.handoff && (
+            <button
+              type="button"
+              className="asv-btn is-ghost"
+              disabled={!canHandoff || busy === 'handoff'}
+              title={canHandoff
+                ? `暂停这里，在终端里用 ${DRIVER_LABELS[info.provider]} 自己的界面继续同一个会话`
+                : info.orchestration ? '先关闭编排模式，再在终端中继续'
+                  : !info.providerSessionId || !hasThreadTurns ? '发送第一条消息后才能在终端中继续' : '本轮结束后才能在终端中继续'}
+              onClick={continueInTerminal}
+            >
+              <SquareTerminal size={13} /> {busy === 'handoff' ? '打开终端…' : '在终端中继续'}
+            </button>
+          )}
+          {canHistory && (
             <button
               type="button"
               className={`asv-btn is-ghost${historyOpen ? ' is-pressed' : ''}`}
@@ -524,7 +582,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               <History size={13} /> 历史
             </button>
           )}
-          {direct && info && info.status !== 'closed' && (
+          {direct && info && caps.orchestration && info.status !== 'closed' && (
             <button
               type="button"
               className={`asv-btn is-ghost asv-orchestration${info.orchestration ? ' is-on' : ''}`}
@@ -583,6 +641,19 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
         )}
 
         <div className="asv-dock" ref={dockRef}>
+          {direct && handoff && (
+            <div className="asv-handoff" role="status">
+              <SquareTerminal size={14} aria-hidden="true" />
+              <span>
+                {handoffTerminalOpen
+                  ? '这个会话正在终端里继续。退出终端里的 CLI 或关闭终端后，可以回到这里接着对话。'
+                  : '终端已关闭，可以回到这里接着对话。'}
+              </span>
+              <button type="button" className="asv-btn" disabled={busy === 'reclaim'} onClick={reclaim}>
+                {busy === 'reclaim' ? '收回中…' : '回到这里'}
+              </button>
+            </div>
+          )}
           <SessionComposer
             alive={alive}
             running={running}
@@ -596,12 +667,16 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             {...(queue ? { queue } : {})}
             {...(direct && policy ? { policy, onPolicyChange: setNextPolicy } : {})}
             {...(direct ? {
-              network, onNetworkChange: setNextNetwork, resumable,
+              ...(caps.network ? { network, onNetworkChange: setNextNetwork } : {}),
+              ...(handoff ? { endedText: '会话正在终端中继续，这里暂停发送' } : {}),
+              resumable,
               directQuestions: info?.pendingQuestions ?? [], onAnswer: answer,
             } : {})}
             {...(direct && sessionId && info && info.status !== 'closed' ? {
               toolbar: {
                 sessionId,
+                provider: info.provider,
+                capabilities: caps,
                 modelId: nextModel ?? info.model,
                 effort: nextEffort ?? info.effort,
                 onModelChange: (model: CodexModelOption) => {
@@ -615,7 +690,7 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
             } : {})}
             {...(slashControl ? { slash: slashControl } : {})}
             usage={usage}
-            usageLimits={direct ? usageLimits : null}
+            usageLimits={showsUsageLimits ? usageLimits : null}
             draftKey={draftKey}
             onSend={send}
             onInterrupt={interrupt}

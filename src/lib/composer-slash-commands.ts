@@ -177,6 +177,12 @@ export interface SlashMenuContext {
   readonly canOrchestration: boolean;
   readonly orchestrationOn: boolean;
   readonly skills: readonly CodexSkillOption[];
+  /** The driver runs `/goal` (Codex thread goals); defaults to true. */
+  readonly canGoal?: boolean;
+  /** The driver uploads `/feedback`; defaults to true. */
+  readonly canFeedback?: boolean;
+  /** The driver lists models for `/model`; defaults to true. */
+  readonly canModel?: boolean;
 }
 
 /**
@@ -194,15 +200,17 @@ export function slashCommandItemsForPromptPosition(
 
 export function buildSlashCommandItems(ctx: SlashMenuContext): SlashCommandItem[] {
   const builtIns: SlashCommandItem[] = [
-    {
-      type: 'builtin',
-      id: 'slash:model',
-      command: 'model',
-      label: '/model',
-      description: '切换当前会话的模型与推理强度',
-      keywords: ['model', 'effort', 'reasoning', '模型', '推理'],
-      promptStartOnly: false,
-    },
+    ...(ctx.canModel !== false
+      ? [{
+          type: 'builtin' as const,
+          id: 'slash:model',
+          command: 'model' as const,
+          label: '/model',
+          description: '切换当前会话的模型与推理强度',
+          keywords: ['model', 'effort', 'reasoning', '模型', '推理'],
+          promptStartOnly: false,
+        }]
+      : []),
     ...(ctx.hasTurns
       ? [{
           type: 'builtin' as const,
@@ -279,17 +287,19 @@ export function buildSlashCommandItems(ctx: SlashMenuContext): SlashCommandItem[
           promptStartOnly: true,
         }]
       : []),
-    {
-      type: 'provider' as const,
-      id: 'provider:goal',
-      command: 'goal' as const,
-      label: '/goal',
-      description: '设定持续推进的目标，或输入 pause / resume / clear',
-      hint: '目标，或 pause / resume / clear',
-      keywords: ['goal', 'objective', '目标', '持续'],
-      promptStartOnly: true,
-    },
-    ...(ctx.hasTurns
+    ...(ctx.canGoal !== false
+      ? [{
+          type: 'provider' as const,
+          id: 'provider:goal',
+          command: 'goal' as const,
+          label: '/goal',
+          description: '设定持续推进的目标，或输入 pause / resume / clear',
+          hint: '目标，或 pause / resume / clear',
+          keywords: ['goal', 'objective', '目标', '持续'],
+          promptStartOnly: true,
+        }]
+      : []),
+    ...(ctx.hasTurns && ctx.canFeedback !== false
       ? [{
           type: 'provider' as const,
           id: 'provider:feedback',
@@ -478,14 +488,18 @@ export function runsSlashCommandLocally(input: {
   readonly canHistory: boolean;
   readonly canRename: boolean;
   readonly canOrchestration: boolean;
+  readonly canGoal?: boolean;
+  readonly canFeedback?: boolean;
+  /** `/model` opens the picker only when the driver lists models; defaults to true. */
+  readonly canModel?: boolean;
 }): boolean {
   if (!input.holdsOnlyText) return false;
   const { text } = input;
-  if (isModelCommand(text)) return true;
+  if (input.canModel !== false && isModelCommand(text)) return true;
   if (input.hasTurns && isClearCommand(text)) return true;
   if (input.hasUsageLimits && isUsageLimitsCommand(text)) return true;
-  if (parseFeedbackCommand(text) !== null) return true;
-  if (parseGoalCommand(text) !== null) return true;
+  if (input.canFeedback !== false && parseFeedbackCommand(text) !== null) return true;
+  if (input.canGoal !== false && parseGoalCommand(text) !== null) return true;
   if (input.canHistory && isHistoryCommand(text)) return true;
   if (input.canRename && parseRenameCommand(text) !== null) return true;
   if (input.canOrchestration && parseOrchestrationCommand(text) !== null) return true;
