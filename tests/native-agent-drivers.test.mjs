@@ -637,7 +637,7 @@ test('manager: terminal handoff keeps a single writer until the terminal has exi
 
 test('helpers: npm shims run their JS entry through node; workspace search ranks file names first', () => {
   const shim = '@ECHO off\r\n"%_prog%"  "%dp0%\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*\r\n';
-  assert.equal(npmShimEntry('C:\\npm\\pi.cmd', () => shim), join('C:\\npm', 'node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js'));
+  assert.equal(npmShimEntry('C:\\npm\\pi.cmd', () => shim), 'C:\\npm\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js');
   assert.equal(npmShimEntry('C:\\npm\\x.cmd', () => 'echo hi'), null);
   assert.equal(scoreWorkspacePath('src/lib/session-title.ts', 'session-title.ts'), 0);
   assert.equal(scoreWorkspacePath('src/lib/session-title.ts', 'session'), 1);

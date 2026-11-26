@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { win32 } from 'node:path';
 import { augmentedPath, resolveBinaryFromPath } from '../bin-resolve.js';
 import { spawnWindowsCodexJob } from '../orchestration/windows-codex-job.js';
 
@@ -15,7 +15,7 @@ export function npmShimEntry(shimPath: string, read: (path: string) => string = 
     return null;
   }
   const match = /"%(?:~?dp0)%\\([^"%]+\.(?:c|m)?js)"/iu.exec(text);
-  return match ? join(dirname(shimPath), match[1]!) : null;
+  return match ? win32.join(win32.dirname(shimPath), match[1]!) : null;
 }
 
 /** Where a CLI resolves on this machine, or null when it is not installed. */
