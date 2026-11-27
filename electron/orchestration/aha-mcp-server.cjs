@@ -274,6 +274,22 @@ function buildDelegateTaskTool(ctx) {
           type: 'string',
           description: 'Optional existing idle pane ptyId to reuse.',
         },
+        policy: {
+          type: 'string',
+          enum: ['read-only', 'workspace-write', 'full-auto'],
+          description:
+            'Headless Worker permission tier (default: read-only for review/research, else workspace-write). full-auto is refused unless the user approves it in the AhaStation UI. Reviews are always read-only.',
+        },
+        network: {
+          type: 'boolean',
+          description:
+            'Let the headless Worker\'s sandboxed commands reach the network (Codex only; default follows your session). Never for reviews.',
+        },
+        allowSubWorkers: {
+          type: 'boolean',
+          description:
+            'Let the headless Worker start its own sub-Workers with delegate_task (still limited by max depth and dispatch confirmation). Never for reviews.',
+        },
         confirmed: {
           type: 'boolean',
           description: 'Set to true only after the user has explicitly confirmed dispatch in chat.',
@@ -405,6 +421,10 @@ function buildTeamWaitTool() {
   };
 }
 
+const SUB_WORKER_TOOLS = new Set([
+  'list_coding_agents', 'delegate_task', 'team_status', 'team_wait', 'message_worker', 'inspect_worker_diff',
+]);
+
 function buildToolsForContext(ctx) {
   if (ctx && ctx.role === 'worker') {
     const tools = [
@@ -482,7 +502,10 @@ function buildToolsForContext(ctx) {
       buildBoardWaitTool(),
     ];
     if (ctx.canDelegate) {
-      tools.push(buildDelegateTaskTool(ctx), buildTeamWaitTool());
+      // A Worker that may start sub-Workers gets the non-destructive Coordinator tools to run them;
+      // stopping, releasing, and integrating stay with the Coordinator and the person.
+      const coordinatorTools = buildToolsForContext({ ...ctx, role: 'coordinator' });
+      tools.push(...coordinatorTools.filter((tool) => SUB_WORKER_TOOLS.has(tool.name)));
     }
     return tools;
   }
@@ -946,6 +969,8 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       const context = nonEmptyStr(args.context) || nonEmptyStr(args.background);
       const proposalId = nonEmptyStr(args.proposalId);
       const taskContext = args.taskContext;
+      const policy = nonEmptyStr(args.policy);
+      const rawAllowSubWorkers = args.allowSubWorkers !== undefined ? args.allowSubWorkers : args.allow_sub_workers;
 
       const payload = {
         ...(role ? { role } : {}),
@@ -968,6 +993,9 @@ async function handleToolCall(name, rawArgs, activeRequests) {
         ...(model ? { model } : {}),
         ...(effort ? { effort } : {}),
         ...(terminal ? { terminal } : {}),
+        ...(policy ? { policy } : {}),
+        ...(typeof args.network === 'boolean' ? { network: args.network } : {}),
+        ...(typeof rawAllowSubWorkers === 'boolean' ? { allowSubWorkers: rawAllowSubWorkers } : {}),
         ...(typeof args.confirmed === 'boolean' ? { confirmed: args.confirmed } : {}),
         ...(typeof (args.authorizeReviews ?? args.authorize_reviews) === 'boolean'
           ? { authorizeReviews: Boolean(args.authorizeReviews ?? args.authorize_reviews) }
@@ -1368,6 +1396,7 @@ function runMcpServer(options = {}) {
   const input = options.input || process.stdin;
   const output = options.output || process.stdout;
   const activeRequests = new Set();
+  const requestsById = new Map();
   let buffer = Buffer.alloc(0);
   let inFlight = 0;
   let stdinEnded = false;
@@ -1390,6 +1419,21 @@ function runMcpServer(options = {}) {
     }
   };
 
+  const cancelRequestById = (requestId) => {
+    if (requestId === undefined || requestId === null) return;
+    const tracker = requestsById.get(requestId);
+    if (!tracker) return;
+    tracker.aborted = true;
+    for (const req of tracker.requests) {
+      try {
+        req.destroy();
+      } catch {
+        // ignore
+      }
+    }
+    tracker.requests.clear();
+  };
+
   const dispatchMessage = async (msg, framing) => {
     if (!msg || typeof msg !== 'object') return;
     const hasId = Object.prototype.hasOwnProperty.call(msg, 'id') && msg.id !== undefined;
@@ -1397,10 +1441,33 @@ function runMcpServer(options = {}) {
     const method = typeof msg.method === 'string' ? msg.method : '';
     const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
 
-    // Notifications (no id) require no response.
+    // Notifications (no id) require no response; cancellation aborts any in-flight HTTP call for that requestId.
     if (!hasId) {
+      if (method === 'notifications/cancelled' || method === '$/cancelRequest') {
+        cancelRequestById(params.requestId !== undefined ? params.requestId : params.id);
+      }
       return;
     }
+
+    const tracker = { aborted: false, requests: new Set() };
+    const scopedRequests = {
+      add(req) {
+        activeRequests.add(req);
+        tracker.requests.add(req);
+        if (tracker.aborted) {
+          try {
+            req.destroy();
+          } catch {
+            // ignore
+          }
+        }
+      },
+      delete(req) {
+        activeRequests.delete(req);
+        tracker.requests.delete(req);
+      },
+    };
+    requestsById.set(id, tracker);
 
     try {
       if (method === 'initialize') {
@@ -1408,43 +1475,46 @@ function runMcpServer(options = {}) {
           typeof params.protocolVersion === 'string' && params.protocolVersion.trim()
             ? params.protocolVersion.trim()
             : DEFAULT_PROTOCOL_VERSION;
-        writeResponse(
-          {
-            jsonrpc: '2.0',
-            id,
-            result: {
-              protocolVersion,
-              capabilities: {
-                tools: { listChanged: false },
+        if (!tracker.aborted) {
+          writeResponse(
+            {
+              jsonrpc: '2.0',
+              id,
+              result: {
+                protocolVersion,
+                capabilities: {
+                  tools: { listChanged: false },
+                },
+                serverInfo: SERVER_INFO,
               },
-              serverInfo: SERVER_INFO,
             },
-          },
-          framing
-        );
+            framing
+          );
+        }
         return;
       }
 
       if (method === 'ping') {
-        writeResponse({ jsonrpc: '2.0', id, result: {} }, framing);
+        if (!tracker.aborted) writeResponse({ jsonrpc: '2.0', id, result: {} }, framing);
         return;
       }
 
       if (method === 'tools/list') {
         if (!callerIdentity()) {
-          writeResponse({ jsonrpc: '2.0', id, result: { tools: [] } }, framing);
+          if (!tracker.aborted) writeResponse({ jsonrpc: '2.0', id, result: { tools: [] } }, framing);
           return;
         }
         let ctx = null;
         try {
-          const res = await postOrchestrationAction('mcp-context', {}, activeRequests);
+          const res = await postOrchestrationAction('mcp-context', {}, scopedRequests);
           if (res.body && res.body.ok === true && res.body.result) {
             ctx = res.body.result;
           }
         } catch {
-          writeResponse({ jsonrpc: '2.0', id, result: { tools: [] } }, framing);
+          if (!tracker.aborted) writeResponse({ jsonrpc: '2.0', id, result: { tools: [] } }, framing);
           return;
         }
+        if (tracker.aborted) return;
         if (!ctx) {
           writeResponse({ jsonrpc: '2.0', id, result: { tools: [] } }, framing);
           return;
@@ -1458,34 +1528,40 @@ function runMcpServer(options = {}) {
 
       if (method === 'tools/call') {
         const toolName = typeof params.name === 'string' ? params.name : '';
-        const result = await handleToolCall(toolName, params.arguments, activeRequests);
-        writeResponse({ jsonrpc: '2.0', id, result }, framing);
+        const result = await handleToolCall(toolName, params.arguments, scopedRequests);
+        if (!tracker.aborted) writeResponse({ jsonrpc: '2.0', id, result }, framing);
         return;
       }
 
-      writeResponse(
-        {
-          jsonrpc: '2.0',
-          id,
-          error: {
-            code: -32601,
-            message: `Method not found: ${method}`,
+      if (!tracker.aborted) {
+        writeResponse(
+          {
+            jsonrpc: '2.0',
+            id,
+            error: {
+              code: -32601,
+              message: `Method not found: ${method}`,
+            },
           },
-        },
-        framing
-      );
+          framing
+        );
+      }
     } catch (err) {
-      writeResponse(
-        {
-          jsonrpc: '2.0',
-          id,
-          error: {
-            code: -32603,
-            message: err instanceof Error ? err.message : String(err),
+      if (!tracker.aborted) {
+        writeResponse(
+          {
+            jsonrpc: '2.0',
+            id,
+            error: {
+              code: -32603,
+              message: err instanceof Error ? err.message : String(err),
+            },
           },
-        },
-        framing
-      );
+          framing
+        );
+      }
+    } finally {
+      requestsById.delete(id);
     }
   };
 

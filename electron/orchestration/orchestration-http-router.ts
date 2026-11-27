@@ -1,5 +1,5 @@
 import { AGENT_SESSION_ID } from './agent-session-manager.js';
-import { CODEX_WORKER_ID } from './codex-app-server-pilot.js';
+import { HEADLESS_SUB_WORKER_ACTIONS, HEADLESS_WORKER_ID } from './headless-workers.js';
 import { z } from 'zod';
 import { OrchestrationService } from './orchestration-service.js';
 import { taskContextFields } from './task-context-schema.js';
@@ -165,6 +165,9 @@ const workerStartSchema = z.object({
   effort: z.string().trim().min(1).optional(),
   terminal: z.string().trim().min(1).optional(),
   readOnly: z.boolean().optional(),
+  policy: z.enum(['read-only', 'workspace-write', 'full-auto']).optional(),
+  network: z.boolean().optional(),
+  allowSubWorkers: z.boolean().optional(),
   worktree: z.union([z.string().trim(), z.boolean()]).optional(),
   noWorktree: z.boolean().optional(),
   branch: z.string().trim().min(1).optional(),
@@ -361,6 +364,9 @@ const delegateTaskSchema = z.object({
   model: z.string().trim().min(1).optional(),
   effort: z.string().trim().min(1).optional(),
   terminal: z.string().trim().min(1).optional(),
+  policy: z.enum(['read-only', 'workspace-write', 'full-auto']).optional(),
+  network: z.boolean().optional(),
+  allowSubWorkers: z.boolean().optional(),
   confirmed: z.boolean().optional(),
   proposalId: z.string().trim().min(1).max(128).optional(),
   planSummary: z.string().trim().max(1_000).optional(),
@@ -392,6 +398,10 @@ const proposalApproveSchema = z.object({
   worktree: z.boolean().optional(),
   model: z.union([z.string().trim().min(1), z.null()]).optional(),
   effort: z.union([z.string().trim().min(1), z.null()]).optional(),
+  policy: z.union([z.enum(['read-only', 'workspace-write', 'full-auto']), z.null()]).optional(),
+  network: z.union([z.boolean(), z.null()]).optional(),
+  allowSubWorkers: z.boolean().optional(),
+  authorizeReviews: z.boolean().optional(),
 });
 
 const proposalRejectSchema = z.object({
@@ -457,7 +467,10 @@ export function isLongPollOrchestrationAction(action: string): boolean {
     action === 'ask' ||
     action === 'ask-self' ||
     action === 'delegate-task' ||
-    action === 'board-wait'
+    action === 'board-wait' ||
+    action === 'role-manage' ||
+    action === 'worker-integrate' ||
+    action === 'run-finalize'
   );
 }
 
@@ -545,7 +558,7 @@ export async function dispatchOrchestrationHttpAction(
       : {};
   const formatReceipt = payload.receiptText === true;
   const full = payload.full === true;
-  const codexCaller = context.callerPaneId && CODEX_WORKER_ID.test(context.callerPaneId)
+  const codexCaller = context.callerPaneId && HEADLESS_WORKER_ID.test(context.callerPaneId)
     ? context.callerPaneId : null;
   const sessionCaller = context.callerPaneId && AGENT_SESSION_ID.test(context.callerPaneId)
     ? context.callerPaneId : null;
@@ -574,7 +587,9 @@ export async function dispatchOrchestrationHttpAction(
   try {
     if (codexCaller) {
       requireCallerPane();
-      if (!CODEX_WORKER_ACTIONS.has(action)) {
+      // Sub-Worker actions open only while the Worker's own dispatch allows them.
+      if (!CODEX_WORKER_ACTIONS.has(action) &&
+          !(HEADLESS_SUB_WORKER_ACTIONS.has(action) && service.canHeadlessWorkerDelegate(codexCaller))) {
         throw new OrchestrationError('operation_rejected', 'This action is unavailable to headless Workers.');
       }
     }
@@ -583,6 +598,7 @@ export async function dispatchOrchestrationHttpAction(
       if (!AGENT_SESSION_COORDINATOR_ACTIONS.has(action)) {
         throw new OrchestrationError('operation_rejected', 'This action is unavailable to an Agent session Coordinator.');
       }
+      await service.gateSessionCoordinatorAction(sessionCaller, action, payload, context.signal);
     }
     let result: unknown;
     switch (action) {
@@ -939,6 +955,10 @@ export async function dispatchOrchestrationHttpAction(
           worktree: parsed.worktree,
           model: parsed.model,
           effort: parsed.effort,
+          ...(parsed.policy !== undefined ? { policy: parsed.policy } : {}),
+          ...(parsed.network !== undefined ? { network: parsed.network } : {}),
+          ...(parsed.allowSubWorkers !== undefined ? { allowSubWorkers: parsed.allowSubWorkers } : {}),
+          ...(parsed.authorizeReviews !== undefined ? { authorizeReviews: parsed.authorizeReviews } : {}),
         });
         break;
       }

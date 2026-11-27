@@ -1,4 +1,5 @@
 import { agentSessionClient } from '../lib/agent-session-client';
+import { DRIVER_LABELS, SESSION_DRIVER_IDS } from '../lib/session-capabilities';
 import { useState, useRef, useEffect, useSyncExternalStore, type ReactNode } from 'react';
 import { Activity, Globe, Terminal, FileText, X, Plus, SquareArrowOutUpRight, MessagesSquare, History } from 'lucide-react';
 import type { StageWindow, StageWindowType, StageWindowOptions } from '../lib/stage-window-store';
@@ -113,6 +114,11 @@ export function StageTabBar({
   const matches = (entry: LocalCliInfo) => `${entry.label} ${entry.command} ${entry.id}`.toLowerCase().includes(query.trim().toLowerCase());
   const filteredShells = shells.filter(matches);
   const filteredClis = clis.filter(matches);
+  // Desktop sessions run the same installed CLIs natively; the driver ids are the CLI ids.
+  const sessionQuery = query.trim().toLowerCase();
+  const sessionDrivers = SESSION_DRIVER_IDS.filter((driver) =>
+    clis.some((cli) => cli.id === driver) &&
+    `${DRIVER_LABELS[driver]} ${driver} 会话 session 历史 history`.toLowerCase().includes(sessionQuery));
 
   return (
     <div className="stage-tab-bar">
@@ -212,15 +218,17 @@ export function StageTabBar({
                 <span>新建浏览器</span>
               </button>
             )}
-            {agentSessionClient.available() && clis.some((cli) => cli.id === 'codex') && 'codex 会话 session 历史 history'.includes(query.trim().toLowerCase()) && (
+            {agentSessionClient.available() && sessionDrivers.length > 0 && (
               <>
                 <div className="stage-tab-menu-section">桌面会话</div>
-                <button type="button" role="menuitem" className="stage-tab-menu-item"
-                  title="不经终端，直接与 Codex 对话"
-                  onClick={() => handleCreate('agent-session', { localCliId: 'codex', title: 'Codex 会话' })}>
-                  <TerminalProfileIcon id="codex" /><span>Codex 会话</span>
-                </button>
-                {onOpenHistory && (
+                {sessionDrivers.map((driver) => (
+                  <button type="button" role="menuitem" className="stage-tab-menu-item" key={`session:${driver}`}
+                    title={`不经终端，直接与 ${DRIVER_LABELS[driver]} 对话`}
+                    onClick={() => handleCreate('agent-session', { localCliId: driver, title: `${DRIVER_LABELS[driver]} 会话` })}>
+                    <TerminalProfileIcon id={driver} /><span>{DRIVER_LABELS[driver]} 会话</span>
+                  </button>
+                ))}
+                {onOpenHistory && sessionDrivers.includes('codex') && 'codex 历史 history'.includes(query.trim().toLowerCase()) && (
                   <button type="button" role="menuitem" className="stage-tab-menu-item"
                     title="打开这个文件夹里以前的 Codex 会话"
                     onClick={() => { setMenuOpen(false); onOpenHistory(); }}>

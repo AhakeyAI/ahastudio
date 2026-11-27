@@ -127,7 +127,7 @@ test('session MCP launch carries session credentials and keeps destructive Coord
     assert.ok(!approved.includes(tool), tool);
   }
   const worker = codexMcpConfigArgs('node', { serverPath: 'x', env: {} }).filter((arg) => arg.endsWith('"approve"'));
-  assert.deepEqual(worker.map((arg) => arg.split('.')[3]), ['report_done', 'read_board', 'ask_coordinator', 'post_message']);
+  assert.deepEqual(worker.map((arg) => arg.split('.')[3]), ['report_done', 'read_board', 'board_wait', 'ask_coordinator', 'post_message']);
 });
 
 test('session credentials authenticate only as that session and only on orchestration routes', async (t) => {
@@ -453,7 +453,7 @@ test('orchestration mode switches only between turns and resumes the same thread
   assert.match(resumed[0].developerInstructions, /Orchestration Mode Active/);
   assert.equal(app.sent('thread/start')[0].developerInstructions, undefined);
   assert.equal(app.sent('mcpServerStatus/list').length, 1, 'an orchestrating thread must expose delegate_task');
-  assert.deepEqual(app.manager.coordinatorState(session.id), { cwd, provider: 'codex', active: true, idle: true, network: false });
+  assert.deepEqual(app.manager.coordinatorState(session.id), { cwd, provider: 'codex', active: true, idle: true, network: false, policy: 'workspace-write' });
   // The replaced process must not close the session or leave a failed turn behind.
   assert.equal(app.manager.getTimeline(session.id).turns.at(-1).status, 'interrupted');
   assert.equal((await app.manager.send(session.id, { text: 'Plan the work' })).status, 'accepted');

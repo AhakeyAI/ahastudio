@@ -8,6 +8,32 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { AGENT_SESSION_ID, AgentSessionManager, MAX_QUEUED_MESSAGES } from '../dist-electron/orchestration/agent-session-manager.js';
 import { CodexAppServerPilot, coordinatorApprovedMcpTools } from '../dist-electron/orchestration/codex-app-server-pilot.js';
 
+test('tool reload stays in one thread and rejects concurrent reload/send without stopping the driver', async t => {
+  const { manager, sent } = setup(t);
+  const session = await manager.create({ cwd, policy: 'read-only' });
+  const original = manager.list()[0].providerSessionId;
+  const refresh = manager.reloadTools(session.id);
+  assert.equal((await manager.reloadTools(session.id)).ok, false);
+  assert.equal((await manager.send(session.id, { text: 'must not be delivered' })).status, 'not_accepted');
+  assert.equal((await manager.enqueue(session.id, { text: 'must not be stranded in a queue' })).ok, false);
+  assert.equal((await refresh).ok, true);
+  assert.equal(manager.list()[0].providerSessionId, original);
+  assert.equal(sent('thread/start').length, 1);
+  assert.equal(sent('thread/resume').length, 0);
+  assert.equal(sent('turn/start').length, 0);
+  assert.equal(sent('config/mcpServer/reload').length, 1);
+});
+
+test('tool reload refuses active turns and pending approvals without interrupting them', async t => {
+  const { manager, status, sent } = setup(t);
+  const session = await manager.create({ cwd, policy: 'read-only' });
+  await manager.send(session.id, { text: 'ASK_FOR_APPROVAL' });
+  await until(() => status(session.id) === 'running');
+  assert.equal((await manager.reloadTools(session.id)).ok, false);
+  assert.equal(sent('config/mcpServer/reload').length, 0);
+  assert.equal(sent('turn/interrupt').length, 0);
+});
+
 const cwd = process.cwd();
 
 async function until(read, timeout = 4_000) {
@@ -199,7 +225,10 @@ test('a rename keeps the title here and names the Codex thread, now or once it r
   assert.equal(manager.list()[0].title, '拆分 登录 重构', 'the first message does not replace a chosen title');
   assert.deepEqual(await manager.rename(session.id, '   '), { ok: false, error: '标题不能为空' });
   assert.deepEqual(await manager.rename('agent-session-00000000-0000-0000-0000-000000000000', 'x'), { ok: false, error: '会话不存在' });
-  assert.match(readFileSync(join(dir, 'agent-sessions.json'), 'utf8'), /拆分 登录 重构/);
+  await until(() => {
+    try { return /拆分 登录 重构/.test(readFileSync(join(dir, 'agent-sessions.json'), 'utf8')); }
+    catch { return false; }
+  });
 });
 
 test('an approval waits in the timeline for the person and is delivered once', async (t) => {
@@ -335,7 +364,7 @@ test('a question waits for an answer to every part, is recorded, and can be skip
   assert.equal(manager.respond(session.id, second.requestId, true), false, 'a question is not an approval');
   assert.equal(manager.answer(session.id, second.requestId, null), true);
   await until(() => status(session.id) === 'idle');
-  assert.equal(turns(session.id)[1].items.find((item) => item.kind === 'message').text, 'request refused');
+  assert.equal(turns(session.id)[1].items.find((item) => item.kind === 'message').text, 'answer: {}');
 });
 
 test('enqueue sends immediately when the session is idle and rejects an empty message', async (t) => {

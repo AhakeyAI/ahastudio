@@ -1,4 +1,5 @@
-import { app, BrowserWindow, nativeTheme, protocol, screen, session } from 'electron';
+import { app, BrowserWindow, nativeTheme, protocol, screen, session, shell } from 'electron';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -352,8 +353,19 @@ app.whenReady().then(async () => {
 
   const hookInstaller = new AgentHookInstaller();
   const mcpCliIdSet = new Set<string>(AGENT_MCP_CLI_IDS);
-  const { coordinatorApprovedMcpTools, enabledCodexPilot, launchCodexPilot } =
+  const { coordinatorApprovedMcpTools, enabledCodexPilot, launchCodexPilot, workerApprovedMcpTools } =
     await import('./orchestration/codex-app-server-pilot.js');
+  const { DriverRegistry, nativeDriverEntries, launchHeadlessWorkerDriver, headlessWorkerCommand } =
+    await import('./agent-drivers/driver-registry.js');
+  const { resolveAgentCommand } = await import('./agent-drivers/agent-process.js');
+  const { resolveBinaryFromPath } = await import('./bin-resolve.js');
+  // The Aha MCP server over stdio for one caller's credentials, the way the Codex pilot starts it.
+  const ahaMcpServer = (env: Record<string, string>) => {
+    const serverPath = resolveActiveMcpServerPath();
+    const node = resolveBinaryFromPath('node');
+    if (!serverPath || !node) throw new Error('Aha MCP Server is unavailable');
+    return { command: node, args: [serverPath], env };
+  };
   const orchestrationStore = OrchestrationStore.forUserDataDir(() => app.getPath('userData'));
   const orchestrationService = new OrchestrationService({
     store: orchestrationStore,
@@ -378,10 +390,25 @@ app.whenReady().then(async () => {
         normalizeOrchestrationSettings(getSettings().orchestration).codexAppServerPilot ?? false,
         process.env.AHA_CODEX_APP_SERVER_PILOT,
       ),
-      launch: (workerId, cwd, events) => {
+      launch: (workerId, cwd, events, options) => {
         const mcpServerPath = resolveActiveMcpServerPath();
         if (!agentHookServer || !mcpServerPath) throw new Error('Aha MCP Server is unavailable');
-        return launchCodexPilot({ cwd, events, mcp: { serverPath: mcpServerPath, env: agentHookServer.envForWorker(workerId) } });
+        return launchCodexPilot({
+          cwd, events,
+          mcp: {
+            serverPath: mcpServerPath, env: agentHookServer.envForWorker(workerId),
+            approvedTools: workerApprovedMcpTools(options),
+          },
+        });
+      },
+    },
+    headlessWorkers: {
+      available: (cliId) => resolveAgentCommand(headlessWorkerCommand(cliId)) !== null,
+      launch: (cliId, workerId, cwd, events, { policy, allowSubWorkers }) => {
+        if (!agentHookServer) throw new Error('Aha MCP Server is unavailable');
+        return launchHeadlessWorkerDriver(cliId, cwd, events, {
+          policy, allowSubWorkers, mcp: ahaMcpServer(agentHookServer.envForWorker(workerId)),
+        });
       },
     },
     closeWorkerPty: (ptyId) => shellPtyCtrl.closePty(ptyId),
@@ -525,19 +552,33 @@ app.whenReady().then(async () => {
   const orchestrationIpc = registerOrchestrationIpc(ipcCtx);
   const { AgentSessionManager } = await import('./orchestration/agent-session-manager.js');
   const { registerAgentSessionsIpc } = await import('./ipc/agent-sessions.js');
-  const agentSessions = new AgentSessionManager({
-    launch: (sessionId, cwd, events, { orchestration, policy }) => {
-      if (!orchestration) return launchCodexPilot({ cwd, events });
-      const mcpServerPath = resolveActiveMcpServerPath();
-      if (!agentHookServer || !mcpServerPath) throw new Error('Aha MCP Server is unavailable');
-      return launchCodexPilot({
-        cwd, events,
-        mcp: {
-          serverPath: mcpServerPath, env: agentHookServer.envForSession(sessionId),
-          requiredTool: 'delegate_task', approvedTools: coordinatorApprovedMcpTools(policy),
-        },
-      });
+  const { driverCapabilities } = await import('./agent-drivers/driver-capabilities.js');
+  // Codex keeps its own app-server pilot (catalog, history, orchestration); the rest are ACP or Pi.
+  const driverRegistry = new DriverRegistry([
+    {
+      id: 'codex', label: 'Codex', command: 'codex', capabilities: driverCapabilities('codex'),
+      launch: (sessionId, cwd, events, { orchestration, policy }) => {
+        if (!orchestration) return launchCodexPilot({ cwd, events });
+        const mcpServerPath = resolveActiveMcpServerPath();
+        if (!agentHookServer || !mcpServerPath) throw new Error('Aha MCP Server is unavailable');
+        return launchCodexPilot({
+          cwd, events,
+          mcp: {
+            serverPath: mcpServerPath, env: agentHookServer.envForSession(sessionId),
+            requiredTool: 'delegate_task', approvedTools: coordinatorApprovedMcpTools(policy),
+          },
+        });
+      },
     },
+    ...nativeDriverEntries({
+      coordinatorMcp: (sessionId) => {
+        if (!agentHookServer) throw new Error('Aha MCP Server is unavailable');
+        return ahaMcpServer(agentHookServer.envForSession(sessionId));
+      },
+    }),
+  ]);
+  const agentSessions = new AgentSessionManager({
+    launch: (sessionId, cwd, events, options) => driverRegistry.launch(sessionId, cwd, events, options),
     coordinatorInstructions: (sessionId, { policy }) =>
       coordinatorInstructions({
         ...orchestrationService.getMcpContextForPane(sessionId),
@@ -551,6 +592,7 @@ app.whenReady().then(async () => {
   orchestrationService.setSessionCoordinators({
     get: (id) => agentSessions.coordinatorState(id),
     wake: (id, prompt) => agentSessions.wake(id, prompt),
+    requestApproval: (id, request, signal) => agentSessions.requestCoordinatorApproval(id, request, signal),
   });
   const { CodexCatalog } = await import('./orchestration/codex-catalog.js');
   const noSessionEvents = {
@@ -561,7 +603,30 @@ app.whenReady().then(async () => {
   const codexCatalog = new CodexCatalog(() => launchCodexPilot({ cwd: app.getPath('home'), events: noSessionEvents }));
   const agentSessionsIpc = registerAgentSessionsIpc(ipcCtx, agentSessions, {
     catalog: codexCatalog,
+    drivers: driverRegistry,
+    runtimeCwd: () => {
+      const state = getDefaultWorkspaceStateStore(() => app.getPath('userData')).read();
+      const windows = Array.isArray(state?.windows) ? state.windows : [];
+      const active = windows.find((value) => value && typeof value === 'object' && value.id === state?.activeWindowId);
+      return typeof active?.cwd === 'string' && existsSync(active.cwd) ? active.cwd : app.getPath('home');
+    },
+    inspectRuntime: async (cwd, probe) => {
+      const { inspectCodexRuntime } = await import('./orchestration/codex-runtime-diagnostics.js');
+      return inspectCodexRuntime(cwd, probe, () => launchCodexPilot({ cwd, events: noSessionEvents, diagnostics: true }));
+    },
+    revealRuntimeConfig: () => {
+      const file = join(process.env.CODEX_HOME || join(app.getPath('home'), '.codex'), 'config.toml');
+      shell.showItemInFolder(file);
+    },
     attachmentsDir: () => join(app.getPath('userData'), 'agent-session-attachments'),
+    terminal: {
+      // Main opens the pane with the resume arguments it built, so the renderer never supplies argv.
+      open: ({ cliId, args, cwd }) => shellPtyCtrl.createPty({
+        terminalId: `handoff-${randomUUID().replace(/-/g, '').slice(0, 12)}`, cliId, cwd, extraArgs: args,
+        appearance: nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
+      }),
+      isAlive: shellPtyCtrl.isPtyAlive,
+    },
   });
   const offPtyExit = shellPtyCtrl.onPtyExit((ptyId) => {
     orchestrationService.markPtyExited(ptyId);

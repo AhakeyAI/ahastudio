@@ -41,7 +41,9 @@ export function ComposerModelPicker({
           disabled={disabled || models.length === 0}
           aria-haspopup="dialog"
           aria-expanded={open}
-          title={disabled ? '本轮结束后可以切换模型' : '模型与推理强度：下一条消息起生效'}
+          title={disabled
+            ? '本轮结束后可以切换模型'
+            : models.length === 0 ? '发送消息恢复会话后将载入可用模型列表' : '模型与推理强度：下一条消息起生效'}
           onClick={() => setOpen((value) => !value)}
         >
           <span className="asv-tool-label">{label}</span>

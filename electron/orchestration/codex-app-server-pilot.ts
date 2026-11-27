@@ -26,7 +26,7 @@ const POLICIES: Record<AgentSessionPolicy, { sandbox: string; sandboxType: strin
  */
 export const CODEX_QUERY_METHODS = new Set([
   'model/list', 'skills/list', 'skills/config/write', 'plugin/installed', 'fuzzyFileSearch', 'account/rateLimits/read',
-  'thread/list', 'thread/read', 'thread/archive', 'thread/unarchive', 'feedback/upload',
+  'thread/list', 'thread/read', 'thread/archive', 'thread/unarchive', 'feedback/upload', 'config/read', 'mcpServerStatus/list',
 ]);
 const OUTPUT_LIMIT = 512 * 1024;
 const STDERR_LIMIT = 4 * 1024;
@@ -45,6 +45,8 @@ interface ActiveTurn {
   usage: Record<string, number> | null;
   idle: Promise<void>;
   finish: () => void;
+  /** Aborted when the turn ends, so requests held for the person expire with it. */
+  ended: AbortController;
 }
 
 class RpcRejection extends Error {}
@@ -246,7 +248,27 @@ export function enabledCodexPilot(platform: NodeJS.Platform, setting: boolean, o
 }
 
 // These calls are part of the Worker dispatch contract and still use Worker-scoped auth.
-const WORKER_APPROVED_MCP_TOOLS = ['report_done', 'read_board', 'ask_coordinator', 'post_message'] as const;
+export const WORKER_APPROVED_MCP_TOOLS = ['report_done', 'read_board', 'board_wait', 'ask_coordinator', 'post_message'] as const;
+
+/** Coordinator tools a Worker allowed to start sub-Workers runs to manage them; none is destructive. */
+export const SUB_WORKER_APPROVED_MCP_TOOLS = [
+  'list_coding_agents', 'delegate_task', 'team_status', 'team_wait', 'message_worker', 'inspect_worker_diff',
+] as const;
+
+/**
+ * Aha tools a headless Worker runs without a driver prompt: the dispatch contract (the same for
+ * every tier, so a Worker switched to full-auto between turns keeps them), plus the sub-Worker
+ * tools when the person let this Worker start sub-Workers. Sub-Worker starts stay gated by the
+ * orchestration service (depth limit and dispatch confirmation), not by the driver.
+ */
+export function workerApprovedMcpTools(options?: {
+  policy?: AgentSessionPolicy;
+  allowSubWorkers?: boolean;
+}): readonly string[] {
+  return options?.allowSubWorkers
+    ? [...WORKER_APPROVED_MCP_TOOLS, ...SUB_WORKER_APPROVED_MCP_TOOLS]
+    : [...WORKER_APPROVED_MCP_TOOLS];
+}
 
 /**
  * Coordinator tools a session runs without a Codex prompt: reads, plus calls the orchestration
@@ -307,6 +329,7 @@ export function codexMcpConfigArgs(
 
 export function launchCodexPilot(options: {
   cwd: string;
+  diagnostics?: boolean;
   /**
    * Aha MCP wiring for an orchestration Worker or an orchestrating session; a plain session runs
    * without it. `requiredTool` must be listed before the thread is usable (default report_done) and
@@ -316,25 +339,28 @@ export function launchCodexPilot(options: {
   events: AgentSessionEvents;
 }): CodexAppServerPilot {
   const codex = resolveBinaryFromPath('codex');
-  const node = resolveBinaryFromPath('node');
-  if (!codex || !node) throw new Error('Codex or Node executable was not found');
+  if (!codex) throw new Error('未找到本机 Codex，请先安装 CLI 或检查启动路径');
   const wrapper = /\.(cmd|bat)$/i.test(codex);
+  const node = wrapper || options.mcp ? resolveBinaryFromPath('node') : null;
+  if ((wrapper || options.mcp) && !node) throw new Error('当前 Codex 启动方式需要 Node，请检查依赖安装');
   const entry = join(dirname(codex), 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
   if (wrapper && !existsSync(entry)) throw new Error('Codex npm entry point was not found');
 
-  const args = ['app-server', '--stdio', ...(options.mcp ? codexMcpConfigArgs(node, options.mcp) : [])];
+  const args = ['app-server', '--stdio', ...(options.mcp ? codexMcpConfigArgs(node!, options.mcp) : [])];
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath() };
   for (const key of Object.keys(env)) {
     if (key.toUpperCase().startsWith('AHA_')) delete env[key];
   }
-  const executable = wrapper ? node : codex;
+  delete env.ELECTRON_RUN_AS_NODE;
+  delete env.ELECTRON_NO_ASAR;
+  const executable = wrapper ? node! : codex;
   const argv = wrapper ? [entry, ...args] : args;
   const child = process.platform === 'win32'
     ? spawnWindowsCodexJob(executable, argv, options.cwd, env)
     : spawn(executable, argv, { cwd: options.cwd, env, windowsHide: true, stdio: 'pipe' });
   return new CodexAppServerPilot(child, options.events, 30_000, [
     options.mcp?.env.AHA_WORKER_TOKEN, options.mcp?.env.AHA_SESSION_TOKEN, options.mcp?.env.AHA_AGENT_HOOK_TOKEN,
-  ].filter((value): value is string => Boolean(value)), options.mcp ? options.mcp.requiredTool ?? 'report_done' : null);
+  ].filter((value): value is string => Boolean(value)), options.mcp ? options.mcp.requiredTool ?? 'report_done' : null, options.diagnostics === true);
 }
 
 export class CodexAppServerPilot implements AgentSessionDriver {
@@ -370,6 +396,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     private readonly secrets: readonly string[] = [],
     /** Aha MCP tool the thread must expose before it is usable; null for sessions without Aha MCP. */
     private readonly requiredMcpTool: string | null = 'report_done',
+    private readonly diagnostics = false,
   ) {
     this.childClosed = new Promise((resolve) => {
       child.once('close', (code, signal) => {
@@ -465,6 +492,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   private initialize(): Promise<void> {
     this.initialized ??= this.request('initialize', {
       clientInfo: { name: 'ahastation', title: 'AhaStation', version: '0.1.0' },
+      ...(this.diagnostics ? { capabilities: { experimentalApi: true } } : {}),
     }).then(
       () => this.write({ method: 'initialized' }),
       (error: unknown) => {
@@ -484,6 +512,23 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     } catch (error) {
       throw new Error(this.withStderr(error instanceof Error ? error.message : String(error)));
     }
+  }
+
+  /** Refresh the existing thread in place; never spawn or resume another writer. */
+  async reloadTools(): Promise<void> {
+    if (this.busy || this.stopping) throw new Error('请等本轮结束后再重载工具');
+    await this.initialize();
+    await this.request('config/mcpServer/reload', {});
+  }
+
+  /** Only a dedicated diagnostic connection may create this nonpersistent, model-free thread. */
+  async probeComputerUse(cwd: string): Promise<unknown> {
+    if (!this.diagnostics || this.threadId || this.active) throw new Error('不能在用户会话上运行诊断线程');
+    await this.initialize();
+    const result = object(await this.request('thread/start', { cwd, ephemeral: true }));
+    const id = string(object(result.thread).id);
+    if (!id) throw new Error('当前 Codex 不支持临时诊断线程');
+    return this.request('mcpServer/tool/call', { threadId: id, server: 'computer-use', tool: 'list_apps', arguments: {} });
   }
 
   async waitForIdle(timeoutMs: number): Promise<boolean> {
@@ -511,6 +556,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     const idle = new Promise<void>((resolve) => { finish = resolve; });
     const turn: ActiveTurn = {
       turnKey, id: null, messages: new Map(), diff: null, usage: null, usageBaseline: this.tokenTotal, idle, finish,
+      ended: new AbortController(),
     };
     this.active = turn;
     if (this.outputTurnKey !== turnKey) {
@@ -591,6 +637,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     const idle = new Promise<void>((resolve) => { finish = resolve; });
     const turn: ActiveTurn = {
       turnKey, id: null, messages: new Map(), diff: null, usage: null, usageBaseline: this.tokenTotal, idle, finish,
+      ended: new AbortController(),
     };
     this.active = turn;
     if (this.outputTurnKey !== turnKey) {
@@ -846,6 +893,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
 
   private finishTurn(turn: ActiveTurn): void {
     if (this.active === turn) this.active = null;
+    turn.ended.abort();
     turn.finish();
   }
 
@@ -883,13 +931,15 @@ export class CodexAppServerPilot implements AgentSessionDriver {
       id: string(question.id) ?? '', header: this.redact(string(question.header) ?? ''),
       prompt: this.redact(string(question.question) ?? ''),
       allowOther: question.isOther === true || !Array.isArray(question.options) || question.options.length === 0,
+      ...(question.multiSelect === true ? { multiSelect: true } : {}),
       options: (Array.isArray(question.options) ? question.options : []).map(object).map((option) => ({
         label: string(option.label) ?? '', description: string(option.description) ?? '',
       })),
     }));
     try {
       const response = await this.events.onRequest(turn.turnKey, {
-        kind: 'question', method, toolInput: '', questions, signal: this.disconnect.signal,
+        kind: 'question', method, toolInput: '', questions,
+        signal: AbortSignal.any([turn.ended.signal, this.disconnect.signal]),
       });
       return 'answers' in response ? response.answers : null;
     } catch {
@@ -903,12 +953,11 @@ export class CodexAppServerPilot implements AgentSessionDriver {
       params.threadId === this.threadId && (!turn.id || params.turnId === turn.id)) {
       const answers = await this.askUser(turn, method, params);
       if (this.disconnected) return;
-      if (answers) {
-        this.write({ id, result: {
-          answers: Object.fromEntries(Object.entries(answers).map(([key, value]) => [key, { answers: value }])),
-        } });
-        return;
-      }
+      // A skipped or expired question is answered empty, not refused as an unknown request.
+      this.write({ id, result: {
+        answers: Object.fromEntries(Object.entries(answers ?? {}).map(([key, value]) => [key, { answers: value }])),
+      } });
+      return;
     }
     const mcpConfirmation = method === 'mcpServer/elicitation/request';
     const approval = method === 'item/commandExecution/requestApproval' ||

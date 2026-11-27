@@ -27,6 +27,8 @@ export const EMPTY_SNAPSHOT: OrchestrationSnapshot = {
   gates: [],
   messages: [],
   questions: [],
+  openApprovals: [],
+  openNativeQuestions: [],
   pendingProposals: [],
   orchestrationModePanes: [],
   memberCursorsByRun: {},
@@ -443,6 +445,18 @@ export function mergeRunSnapshot(
             runId,
             validRunIds,
             (a) => a.approvalId,
+            byCreatedAt,
+          ),
+        }
+      : {}),
+    ...(incoming.openNativeQuestions !== undefined || prev.openNativeQuestions !== undefined
+      ? {
+          openNativeQuestions: mergeScopedRecords(
+            prev.openNativeQuestions ?? [],
+            incoming.openNativeQuestions ?? [],
+            runId,
+            validRunIds,
+            (q) => q.requestId,
             byCreatedAt,
           ),
         }

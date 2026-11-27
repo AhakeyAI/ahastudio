@@ -445,9 +445,21 @@ test('SessionComposer shows non-switchable read-only and writable labels for Wor
   assert.doesNotMatch(writableHtml, /<select\b/);
 
   const directHtml = render({
-    ...baseProps, direct: true, readOnly: false, policy: 'workspace-write', onPolicyChange: () => {},
+    ...baseProps,
+    direct: true,
+    readOnly: false,
+    policy: 'full-auto',
+    onPolicyChange: () => {},
+    network: false,
+    onNetworkChange: () => {},
+    usageLimits: { text: '额度 35%', level: 'ok', planType: 'plus', windows: [] },
   });
-  assert.match(directHtml, /<select\b/);
+  assert.match(directHtml, /class="asv-composer-actions"[\s\S]*<select\b[\s\S]*不联网[\s\S]*asv-usage[\s\S]*class="asv-composer-submit"/);
+  assert.doesNotMatch(directHtml, /class="asv-context-strip"/);
+  assert.doesNotMatch(readOnlyHtml, /class="asv-context-strip"|不联网|asv-usage/);
+
+  const endedHtml = render({ ...baseProps, alive: false, direct: false, readOnly: true });
+  assert.match(endedHtml, /class="asv-context-strip"[\s\S]*<span>只读<\/span>/);
 });
 
 test('SessionComposer renders the direct-session queue and its paused state, but none for Workers', async () => {

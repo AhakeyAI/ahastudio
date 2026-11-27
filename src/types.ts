@@ -111,10 +111,46 @@ export type AgentGoalAction =
   | { type: 'resume' }
   | { type: 'set'; objective: string };
 
+// Mirrors electron/agent-drivers/driver-capabilities.ts.
+export type AgentDriverId = 'codex' | 'claude' | 'antigravity' | 'grok' | 'opencode' | 'pi';
+
+export interface AgentDriverCapabilities {
+  policies: AgentSessionPolicy[];
+  policyNeedsRelaunch: boolean;
+  network: boolean;
+  models: boolean;
+  efforts: boolean;
+  images: boolean;
+  compact: boolean;
+  goal: boolean;
+  feedback: boolean;
+  usageLimits: boolean;
+  skills: boolean;
+  plugins: boolean;
+  history: boolean;
+  orchestration: boolean;
+  rename: boolean;
+  resume: boolean;
+  terminalResume: boolean;
+}
+
+// Mirrors AgentDriverSummary in electron/agent-drivers/driver-registry.ts.
+export interface AgentDriverSummary {
+  id: AgentDriverId;
+  label: string;
+  command: string;
+  installed: boolean;
+  capabilities: AgentDriverCapabilities;
+}
+
 // Mirrors electron/orchestration/agent-session-manager.ts.
 export interface AgentSessionInfo {
   id: string;
-  provider: 'codex' | 'claude' | 'acp';
+  provider: AgentDriverId;
+  /** Older main processes omit it; the renderer then assumes Codex. */
+  capabilities?: AgentDriverCapabilities;
+  /** The conversation continues in a terminal pane until it is taken back. */
+  handoff?: { ptyId: string | null; at: number } | null;
   title: string;
   cwd: string;
   model: string | null;
@@ -154,6 +190,7 @@ export interface AgentSessionQuestion {
   header: string;
   prompt: string;
   allowOther: boolean;
+  multiSelect?: boolean;
   options: { label: string; description: string }[];
 }
 
@@ -233,9 +270,19 @@ export type AgentTurnAttachment =
   | { type: 'file'; path: string; name?: string };
 
 export interface AgentSessionsApi {
+  runtime?: (opts: { id?: string; probe?: boolean }) => AgentSessionResult<{ report: import('../electron/orchestration/codex-runtime-types').CodexRuntimeReport }>;
+  revealRuntimeConfig?: () => AgentSessionResult;
+  reloadTools?: (opts: { id: string }) => AgentSessionResult;
   list: () => AgentSessionResult<{ sessions: AgentSessionInfo[] }>;
-  create: (opts: { cwd?: string; policy: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean }) =>
-    AgentSessionResult<{ session: AgentSessionInfo }>;
+  create: (opts: {
+    cwd?: string; provider?: AgentDriverId; policy: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
+  }) => AgentSessionResult<{ session: AgentSessionInfo }>;
+  /** Native drivers and whether their CLI is installed. */
+  drivers?: () => AgentSessionResult<{ drivers: AgentDriverSummary[] }>;
+  /** Suspends the session and continues it in a new terminal pane with the CLI's resume flags. */
+  handoff?: (opts: { id: string }) => AgentSessionResult<{ ptyId: string; cliId: AgentDriverId; cwd: string }>;
+  /** Takes a handed-off session back once its terminal has exited. */
+  reclaim?: (opts: { id: string }) => AgentSessionResult;
   send: (opts: {
     id: string; text: string; policy?: AgentSessionPolicy; model?: string | null; effort?: string | null; network?: boolean;
     freshContext?: boolean; attachments?: AgentTurnAttachment[];
@@ -247,7 +294,8 @@ export interface AgentSessionsApi {
   }) => AgentSessionResult<{ queued: boolean }>;
   unqueue?: (opts: { id: string; messageId: string }) => AgentSessionResult<{ message: AgentQueuedMessage }>;
   resumeQueue?: (opts: { id: string }) => AgentSessionResult;
-  models: () => AgentSessionResult<{ models: CodexModelOption[] }>;
+  /** Codex's catalog, or with `id` the models that session's driver offered. */
+  models: (opts?: { id?: string }) => AgentSessionResult<{ models: CodexModelOption[] }>;
   rateLimits?: () => AgentSessionResult<{ limits: CodexRateLimits }>;
   skills: (opts: { id: string; reload?: boolean }) => AgentSessionResult<{ skills: CodexSkillOption[] }>;
   setSkillEnabled: (opts: { id: string; path: string; enabled: boolean }) => AgentSessionResult;
@@ -728,6 +776,27 @@ export type OrchestrationDispatchStage =
 
 export type WorkerApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired';
 
+export type WorkerNativeQuestionStatus = 'pending' | 'answered' | 'skipped' | 'expired';
+
+/** A structured question a headless Worker's own agent asked through its native protocol. */
+export interface WorkerNativeQuestionPayload {
+  requestId: string;
+  dispatchId: string;
+  taskId: string;
+  runId: string;
+  workerHandle: string;
+  /** The driver that asked (codex, claude, antigravity, grok). */
+  provider: string;
+  method: string;
+  questions: AgentSessionQuestion[];
+  status: WorkerNativeQuestionStatus;
+  createdAt: string;
+  resolvedAt?: string | null;
+  resolvedBy?: string | null;
+  answers?: Record<string, string[]> | null;
+  reason?: string | null;
+}
+
 export interface WorkerApprovalPayload {
   approvalId: string;
   dispatchId: string;
@@ -827,6 +896,12 @@ interface OrchestrationTaskContextInput {
 export interface OrchestrationDispatchRecord {
   executionMode?: 'codex-app-server';
   providerSessionId?: string;
+  /** Headless Workers only: permission tier, network access, and sub-Worker opt-in. */
+  workerPolicy?: AgentSessionPolicy;
+  workerNetwork?: boolean;
+  allowSubWorkers?: boolean;
+  /** Snapshot only, never stored: whether a headless Worker's process is alive and a turn is running. */
+  headlessLive?: { alive: boolean; busy: boolean };
   codexTurn?: {
     turnId: string;
     stopReason: string;
@@ -915,6 +990,10 @@ export interface QueuedWorkerLaunch {
   model?: string;
   effort?: string;
   taskKind?: OrchestrationTaskKind;
+  policy?: AgentSessionPolicy;
+  network?: boolean;
+  allowSubWorkers?: boolean;
+  userInitiated?: boolean;
   worktree: boolean;
   authorizeReviews: boolean;
   reason?: string;
@@ -1168,6 +1247,9 @@ export interface OrchestrationDispatchProposal {
   model: string | null;
   effort: string | null;
   terminal: string | null;
+  policy?: AgentSessionPolicy | null;
+  network?: boolean | null;
+  allowSubWorkers?: boolean;
   authorizeReviews?: boolean;
   status: 'pending' | 'approved' | 'rejected' | 'expired';
   createdAt: string;
@@ -1183,6 +1265,7 @@ export interface OrchestrationSnapshot {
   messages: OrchestrationMessageRecord[];
   questions: OrchestrationQuestionRecord[];
   openApprovals?: WorkerApprovalPayload[];
+  openNativeQuestions?: WorkerNativeQuestionPayload[];
   pendingProposals?: OrchestrationDispatchProposal[];
   orchestrationModePanes?: string[];
   memberCursorsByRun?: Record<string, Record<string, OrchestrationMemberCursor>>;
@@ -1330,6 +1413,9 @@ export interface WorkerTimelineSnapshot {
   cliId: string;
   model: string | null;
   readOnly: boolean;
+  /** Absent on timelines saved before per-Worker controls: `readOnly` decides, with network off. */
+  policy?: AgentSessionPolicy;
+  network?: boolean;
   alive: boolean;
   seq: number;
   turns: WorkerTimelineTurn[];
@@ -1520,6 +1606,9 @@ export interface OrchestrationApi {
     terminal?: string;
     retryOfDispatchId?: string;
     readOnly?: boolean;
+    policy?: AgentSessionPolicy;
+    network?: boolean;
+    allowSubWorkers?: boolean;
     worktree?: string | boolean;
     noWorktree?: boolean;
     branch?: string;
@@ -1588,6 +1677,16 @@ export interface OrchestrationApi {
     worker?: string;
     taskId?: string;
   }) => Promise<OrchestrationResult<{ dispatch: OrchestrationDispatchRecord; interrupted: boolean }>>;
+  /** Changes a live headless Worker's permission tier or network access; its next turn runs with them. */
+  workerUpdateControls?: (opts: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+    policy?: AgentSessionPolicy;
+    network?: boolean;
+  }) => Promise<
+    OrchestrationResult<{ dispatch: OrchestrationDispatchRecord; policy: AgentSessionPolicy; network: boolean }>
+  >;
   workerKeepOpen?: (opts: {
     dispatchId?: string;
     worker?: string;
@@ -1666,6 +1765,12 @@ export interface OrchestrationApi {
     from?: string;
     reason?: string;
   }) => Promise<OrchestrationResult<{ approval: WorkerApprovalPayload }>>;
+  /** Answers (or, with `answers: null`, skips) a headless Worker's native question. */
+  workerAnswerQuestion?: (opts: {
+    id: string;
+    dispatchId?: string;
+    answers: Record<string, string[]> | null;
+  }) => Promise<OrchestrationResult<{ question: WorkerNativeQuestionPayload }>>;
   check: (opts?: {
     from?: string;
     runId?: string;
@@ -1784,6 +1889,9 @@ export interface OrchestrationApi {
     model?: string;
     effort?: string;
     terminal?: string;
+    policy?: AgentSessionPolicy;
+    network?: boolean;
+    allowSubWorkers?: boolean;
     callerCwd?: string;
     userInitiated?: boolean;
     confirmed?: boolean;
@@ -1812,6 +1920,9 @@ export interface OrchestrationApi {
     worktree?: boolean;
     model?: string | null;
     effort?: string | null;
+    policy?: AgentSessionPolicy | null;
+    network?: boolean | null;
+    allowSubWorkers?: boolean;
     authorizeReviews?: boolean;
   }) => Promise<
     OrchestrationResult<{

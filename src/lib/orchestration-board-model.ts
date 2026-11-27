@@ -13,6 +13,7 @@ import type {
   OrchestrationSnapshot,
   OrchestrationTaskRecord,
   WorkerApprovalPayload,
+  WorkerNativeQuestionPayload,
 } from '../types';
 import {
   collapseFollowUpLineages,
@@ -118,6 +119,7 @@ export interface BoardViewModel {
   members: BoardMemberCard[];
   openApprovals: WorkerApprovalPayload[];
   openQuestions: OrchestrationQuestionRecord[];
+  openNativeQuestions: WorkerNativeQuestionPayload[];
   openGates: OrchestrationGateRecord[];
   pendingProposals: OrchestrationDispatchProposal[];
   attentionCount: number;
@@ -515,6 +517,7 @@ export function buildBoardViewModel(
       members: [],
       openApprovals: [],
       openQuestions: [],
+      openNativeQuestions: [],
       openGates: [],
       pendingProposals: pendingProposalsAll,
       attentionCount: pendingProposalsAll.length,
@@ -711,6 +714,9 @@ export function buildBoardViewModel(
   const openQuestions = snapshot.questions.filter(
     (q) => q.status === 'pending' && q.runId === run.id,
   );
+  const openNativeQuestions = (snapshot.openNativeQuestions ?? []).filter(
+    (q) => q.status === 'pending' && q.runId === run.id,
+  );
   const openGates = snapshot.gates.filter((g) => g.status === 'pending' && g.runId === run.id);
   const pendingProposals = pendingProposalsAll.filter(
     (p) =>
@@ -727,7 +733,9 @@ export function buildBoardViewModel(
         (dispatch.assigneeHandle.startsWith('local-') ? dispatch.assigneeHandle : null);
       const agentStatus = ptyId ? opts.agentStatuses?.get(ptyId) : undefined;
       const hasOpenApproval = openApprovals.some((a) => a.dispatchId === dispatch.id);
-      const hasOpenQuestion = openQuestions.some((q) => q.dispatchId === dispatch.id);
+      const hasOpenQuestion =
+        openQuestions.some((q) => q.dispatchId === dispatch.id) ||
+        openNativeQuestions.some((q) => q.dispatchId === dispatch.id);
       const stage = deriveClientDispatchStage(
         dispatch,
         agentStatus,
@@ -848,6 +856,7 @@ export function buildBoardViewModel(
     pendingProposals.length +
     openApprovals.length +
     openQuestions.length +
+    openNativeQuestions.length +
     openGates.length;
 
   let runIntegrationBadge: { label: string; tone: StatusTone } | null = null;
@@ -910,6 +919,7 @@ export function buildBoardViewModel(
     members,
     openApprovals,
     openQuestions,
+    openNativeQuestions,
     openGates,
     pendingProposals,
     attentionCount,

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref } from 'react';
 import {
-  ArrowUp, FileText, GitBranch, Globe, Loader2, Lock, MessageCircleQuestion, Paperclip, ShieldAlert, Square, X,
+  ArrowUp, ChevronDown, FileText, GitBranch, Globe, Loader2, Lock, MessageCircleQuestion, Paperclip, ShieldAlert, Square, X,
 } from 'lucide-react';
 import { composerDrafts, type ComposerDraftAttachment } from '../../lib/composer-drafts';
 import { prepareImageForAttachment } from '../../lib/image-compression';
@@ -9,6 +9,7 @@ import type { UsageSummary } from '../../lib/usage-limits';
 import { resolveTitleEdit } from '../../lib/session-title';
 import { UsageLimitChip } from './UsageLimitChip';
 import { POLICY_LABELS, codexCatalogClient } from '../../lib/agent-session-client';
+import { CODEX_CAPABILITIES, DRIVER_LABELS } from '../../lib/session-capabilities';
 import {
   buildSlashCommandItems,
   isClearCommand,
@@ -32,7 +33,7 @@ import {
   skillsInText, type ComposerTrigger,
 } from '../../lib/composer-tokens';
 import type {
-  AgentQueuedMessage, AgentSessionGoal, AgentSessionInfo, AgentSessionPolicy, AgentTurnAttachment, CodexFileMatch,
+  AgentDriverCapabilities, AgentDriverId, AgentQueuedMessage, AgentSessionGoal, AgentSessionInfo, AgentSessionPolicy, AgentTurnAttachment, CodexFileMatch,
   CodexModelOption, CodexSkillOption, OrchestrationQuestionRecord, WorkerTimelineItem,
 } from '../../types';
 import {
@@ -141,13 +142,20 @@ function QuestionBanner({ question }: { question: OrchestrationQuestionRecord })
 type DirectQuestion = AgentSessionInfo['pendingQuestions'][number];
 
 /** Questions the agent asked through its own protocol; every question needs an answer before sending. */
-function DirectQuestionBanner({ entry, onAnswer }: {
+function DirectQuestionBanner({ entry, onAnswer, providerLabel = 'Codex' }: {
   entry: DirectQuestion;
   onAnswer: (requestId: string, answers: Record<string, string[]> | null) => Promise<boolean>;
+  providerLabel?: string;
 }) {
-  const [picked, setPicked] = useState<Record<string, string>>({});
+  const [picked, setPicked] = useState<Record<string, string[]>>({});
+  const [other, setOther] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
-  const complete = entry.questions.every((question) => picked[question.id]?.trim());
+  const answerFor = (id: string) => {
+    const selected = picked[id] ?? [];
+    const custom = other[id]?.trim();
+    return custom && !selected.includes(custom) ? [...selected, custom] : selected;
+  };
+  const complete = entry.questions.every((question) => answerFor(question.id).length > 0);
   const submit = async (answers: Record<string, string[]> | null) => {
     setBusy(true);
     try {
@@ -157,41 +165,66 @@ function DirectQuestionBanner({ entry, onAnswer }: {
     }
   };
   return (
-    <div className="asv-banner is-question" role="group" aria-label="Codex 提问">
+    <div className="asv-banner is-question" role="group" aria-label={`${providerLabel} 提问`}>
       <div className="asv-banner-head">
         <MessageCircleQuestion size={14} />
-        <span className="asv-banner-title">Codex 在等你的答复</span>
+        <span className="asv-banner-title">{providerLabel} 在等你的答复</span>
       </div>
-      {entry.questions.map((question) => (
-        <div key={question.id} className="asv-banner-qa">
-          <div className="asv-banner-question">
-            {question.header && <strong>{question.header}</strong>} {question.prompt}
-          </div>
-          {question.options.length > 0 && (
-            <div className="asv-banner-options">
-              {question.options.map((option) => (
-                <button key={option.label} type="button" title={option.description || undefined}
-                  className={`asv-btn${picked[question.id] === option.label ? ' is-primary' : ''}`}
-                  aria-pressed={picked[question.id] === option.label} disabled={busy}
-                  onClick={() => setPicked((prev) => ({ ...prev, [question.id]: option.label }))}>
-                  {option.label}
-                </button>
-              ))}
+      {entry.questions.map((question) => {
+        const selected = picked[question.id] ?? [];
+        const toggle = (label: string) => {
+          if (question.multiSelect) {
+            setPicked((prev) => {
+              const current = prev[question.id] ?? [];
+              const next = current.includes(label) ? current.filter((item) => item !== label) : [...current, label];
+              return { ...prev, [question.id]: next };
+            });
+            return;
+          }
+          setPicked((prev) => ({ ...prev, [question.id]: [label] }));
+          setOther((prev) => (prev[question.id] ? { ...prev, [question.id]: '' } : prev));
+        };
+        return (
+          <div key={question.id} className="asv-banner-qa">
+            <div className="asv-banner-question">
+              {question.header && <strong>{question.header}</strong>} {question.prompt}
+              {question.multiSelect && <span className="asv-banner-note">（可多选）</span>}
             </div>
-          )}
-          {question.allowOther && (
-            <input className="asv-banner-input" placeholder={question.options.length ? '或输入其他答复' : '输入答复'}
-              aria-label={`${question.header || question.prompt} 的答复`} disabled={busy}
-              value={question.options.some((option) => option.label === picked[question.id]) ? '' : picked[question.id] ?? ''}
-              onChange={(event) => setPicked((prev) => ({ ...prev, [question.id]: event.target.value }))} />
-          )}
-        </div>
-      ))}
+            {question.options.length > 0 && (
+              <div className="asv-banner-options">
+                {question.options.map((option, optionIndex) => {
+                  const isSelected = selected.includes(option.label);
+                  return (
+                    <button key={`${optionIndex}:${option.label}`} type="button" title={option.description || undefined}
+                      className={`asv-btn${isSelected ? ' is-primary' : ''}`}
+                      aria-pressed={isSelected} disabled={busy}
+                      onClick={() => toggle(option.label)}>
+                      {option.label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {question.allowOther && (
+              <input className="asv-banner-input" placeholder={question.options.length ? '或输入其他答复' : '输入答复'}
+                aria-label={`${question.header || question.prompt} 的答复`} disabled={busy}
+                value={other[question.id] ?? ''}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setOther((prev) => ({ ...prev, [question.id]: value }));
+                  if (!question.multiSelect && value.trim()) {
+                    setPicked((prev) => (prev[question.id]?.length ? { ...prev, [question.id]: [] } : prev));
+                  }
+                }} />
+            )}
+          </div>
+        );
+      })}
       <div className="asv-banner-actions">
         <span className="asv-strip-spacer" />
         <button type="button" className="asv-btn" disabled={busy} onClick={() => void submit(null)}>跳过</button>
         <button type="button" className="asv-btn is-primary" disabled={busy || !complete}
-          onClick={() => void submit(Object.fromEntries(entry.questions.map((question) => [question.id, [picked[question.id]!.trim()]])))}>
+          onClick={() => void submit(Object.fromEntries(entry.questions.map((question) => [question.id, answerFor(question.id)])))}>
           答复
         </button>
       </div>
@@ -218,15 +251,25 @@ export interface SessionComposerProps {
   questions: readonly OrchestrationQuestionRecord[];
   branch: string | null;
   readOnly?: boolean;
-  /** Direct sessions only: the permission level, switchable between turns. */
+  /** The permission level, switchable between turns for direct sessions and live headless Workers. */
   policy?: AgentSessionPolicy;
   onPolicyChange?: (policy: AgentSessionPolicy) => void;
+  /** Tiers the picker offers when there is no toolbar (headless Workers: their driver's own tiers). */
+  policyChoices?: readonly AgentSessionPolicy[];
+  /** Why the permission level cannot change, shown on the locked chip. */
+  policyLockedReason?: string;
   network?: boolean;
   onNetworkChange?: (network: boolean) => void;
+  /** A control change is being saved. */
+  controlsBusy?: boolean;
   directQuestions?: readonly DirectQuestion[];
+  /** Who asked `directQuestions`; defaults to the toolbar's driver. */
+  questionProviderLabel?: string;
   onAnswer?: (requestId: string, answers: Record<string, string[]> | null) => Promise<boolean>;
   /** The session is not running but sending a message resumes it. */
   resumable?: boolean;
+  /** Replaces the ended-session line, e.g. while a terminal pane continues the conversation. */
+  endedText?: string;
   /** Direct sessions take one turn at a time, so sending waits for the running turn. */
   direct?: boolean;
   /** Direct sessions: a message sent while a turn runs is queued for after it, listed above the input. */
@@ -254,6 +297,11 @@ export interface ComposerSlashControl {
   canRename: boolean;
   canOrchestration: boolean;
   orchestrationOn: boolean;
+  /** Driver capability flags; each defaults to on (Codex). */
+  canCompact?: boolean;
+  canGoal?: boolean;
+  canFeedback?: boolean;
+  canModel?: boolean;
   freshSessionArmed: boolean;
   goal: AgentSessionGoal | null;
   goalBusy: boolean;
@@ -288,6 +336,11 @@ export interface ComposerQueue {
 
 export interface ComposerToolbar {
   sessionId: string;
+  /** The session's driver; models come from its catalog, and only its capabilities show controls. */
+  provider?: AgentDriverId;
+  /** Live session status so drivers whose models load after process startup refresh automatically. */
+  sessionStatus?: AgentSessionInfo['status'];
+  capabilities?: AgentDriverCapabilities;
   /** The model and effort the next message uses; null means Codex's default. */
   modelId: string | null;
   effort: string | null;
@@ -312,23 +365,48 @@ const readBase64 = (file: Blob) => new Promise<string>((resolve, reject) => {
 });
 const formatSize = (bytes: number) => (bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)}MB` : `${Math.ceil(bytes / 1024)}KB`);
 
-/** Codex's models and the session's skills, loaded once the composer can use them. */
-function useComposerCatalog(sessionId: string | undefined) {
+/** The driver's models and (Codex only) the session's skills, loaded once the composer can use them. */
+function useComposerCatalog(
+  sessionId: string | undefined,
+  provider: AgentDriverId | undefined,
+  capabilities: AgentDriverCapabilities,
+  sessionStatus: AgentSessionInfo['status'] | undefined,
+) {
   const [models, setModels] = useState<CodexModelOption[]>([]);
-  const [skills, setSkills] = useState<CodexSkillOption[] | null>(null);
+  const [skills, setSkills] = useState<CodexSkillOption[] | null>(capabilities.skills ? null : []);
+  const { models: listsModels, skills: hasSkills } = capabilities;
   useEffect(() => {
-    if (!sessionId) return;
+    setModels([]);
+  }, [sessionId, provider]);
+  useEffect(() => {
+    if (!sessionId || !listsModels) return;
     let live = true;
-    void codexCatalogClient.models().then((list) => live && setModels(list), () => {});
+    void codexCatalogClient.sessionModels(sessionId, provider).then((list) => {
+      if (live && (list.length > 0 || sessionStatus === 'idle' || !provider || provider === 'codex')) {
+        setModels(list);
+      }
+    }, () => {});
     return () => {
       live = false;
     };
-  }, [sessionId]);
+  }, [sessionId, provider, listsModels, sessionStatus]);
   const loadSkills = useMemo(() => () => {
     if (!sessionId) return;
+    if (!hasSkills) return setSkills([]);
     void codexCatalogClient.skills(sessionId).then(setSkills, () => setSkills([]));
-  }, [sessionId]);
-  return { models, skills, loadSkills };
+  }, [sessionId, hasSkills]);
+  // A driver that started its process after the composer mounted lists its models only then.
+  const reloadModels = useCallback(async (): Promise<CodexModelOption[]> => {
+    if (!sessionId || !listsModels) return [];
+    try {
+      const list = await codexCatalogClient.sessionModels(sessionId, provider);
+      setModels(list);
+      return list;
+    } catch {
+      return [];
+    }
+  }, [sessionId, provider, listsModels]);
+  return { models, skills, loadSkills, reloadModels };
 }
 
 /** Floating input card with the approvals and questions that block the Worker stacked above it. */
@@ -350,7 +428,8 @@ export function SessionComposer(props: SessionComposerProps) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const searchSeq = useRef(0);
-  const catalog = useComposerCatalog(toolbar?.sessionId);
+  const capabilities = toolbar?.capabilities ?? CODEX_CAPABILITIES;
+  const catalog = useComposerCatalog(toolbar?.sessionId, toolbar?.provider, capabilities, toolbar?.sessionStatus);
   const choice = useMemo(
     () => resolveModelChoice(catalog.models, toolbar?.modelId ?? null, toolbar?.effort ?? null),
     [catalog.models, toolbar?.modelId, toolbar?.effort],
@@ -429,6 +508,7 @@ export function SessionComposer(props: SessionComposerProps) {
         !hasTrailingText &&
         attached.length === 0 &&
         slash.hasTurns &&
+        slash.canCompact !== false &&
         !props.running &&
         props.approvals.length === 0 &&
         !(props.directQuestions?.length);
@@ -442,6 +522,9 @@ export function SessionComposer(props: SessionComposerProps) {
         canOrchestration: slash.canOrchestration,
         orchestrationOn: slash.orchestrationOn,
         skills: catalog.skills ?? [],
+        ...(slash.canGoal === false ? { canGoal: false } : {}),
+        ...(slash.canFeedback === false ? { canFeedback: false } : {}),
+        ...(slash.canModel === false ? { canModel: false } : {}),
       });
       return searchSlashCommandItems(items, trigger.query).map((item) => ({
         kind: 'slash' as const,
@@ -488,19 +571,22 @@ export function SessionComposer(props: SessionComposerProps) {
     canHistory: Boolean(slash?.canHistory),
     canRename: Boolean(slash?.canRename),
     canOrchestration: Boolean(slash?.canOrchestration),
+    canGoal: slash?.canGoal !== false,
+    canFeedback: slash?.canFeedback !== false,
+    canModel: slash?.canModel !== false,
   });
 
   const { queue } = props;
   const queueing = Boolean(queue && props.running && !localSlashCommand);
   const blocked = Boolean(props.direct && props.running && !queue && !localSlashCommand);
   const placeholder = props.direct
-    ? (queueing ? '正在工作，现在发送会排队，本轮结束后自动发出' : props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : toolbar ? '给 Codex 发消息，/ 斜杠命令，$ 选技能，@ 引用文件' : '给 Codex 发消息')
+    ? (queueing ? '正在工作，现在发送会排队，本轮结束后自动发出' : props.running ? '正在工作，可以先写好下一条' : props.resumable ? '发送消息会恢复这个会话' : toolbar ? `给助手发消息，/ 斜杠命令，${capabilities.skills ? '$ 选技能，' : ''}@ 引用文件` : '给助手发消息')
     : (props.running ? '补充指令，本轮结束后送达' : '给 Worker 发送追加指令');
 
   const handleEditTrigger = (text: string, caret: number) => {
     if (!toolbar) return;
     const candidate = detectTrigger(text, caret);
-    const allowed = candidate?.kind === 'slash' && !slash ? null : candidate;
+    const allowed = (candidate?.kind === 'slash' && !slash) || (candidate?.kind === 'skill' && !capabilities.skills) ? null : candidate;
     if (isSameTrigger(dismissedTriggerRef.current, allowed)) {
       activateTrigger(null);
       return;
@@ -513,7 +599,7 @@ export function SessionComposer(props: SessionComposerProps) {
   const handleSelectTrigger = (text: string, caret: number) => {
     if (!toolbar) return;
     const candidate = detectTrigger(text, caret);
-    const allowed = candidate?.kind === 'slash' && !slash ? null : candidate;
+    const allowed = (candidate?.kind === 'slash' && !slash) || (candidate?.kind === 'skill' && !capabilities.skills) ? null : candidate;
     if (!isSameTrigger(dismissedTriggerRef.current, allowed)) {
       dismissedTriggerRef.current = null;
     }
@@ -525,12 +611,15 @@ export function SessionComposer(props: SessionComposerProps) {
       toolbar?.onNotify?.('本轮结束后可以切换模型');
       return;
     }
-    if (catalog.models.length === 0) {
-      toolbar?.onNotify?.('正在读取模型列表，请稍后再试');
+    if (catalog.models.length > 0) {
+      setModelPickerOpen(true);
       return;
     }
-    setModelPickerOpen(true);
-  }, [props.running, catalog.models.length, toolbar]);
+    void catalog.reloadModels().then((list) => {
+      if (list.length > 0) setModelPickerOpen(true);
+      else toolbar?.onNotify?.('正在读取模型列表，请稍后再试');
+    });
+  }, [props.running, catalog.models.length, catalog.reloadModels, toolbar]);
 
   const replaceTrigger = (insertion: string) => {
     if (!trigger) return;
@@ -813,6 +902,10 @@ export function SessionComposer(props: SessionComposerProps) {
   );
   const hasBannerLane =
     props.approvals.length > 0 || props.questions.length > 0 || Boolean(props.directQuestions?.length) || hasSlashBanners;
+  const hasEndedStrip = !props.alive && Boolean(
+    props.branch || props.policy || (!props.direct && props.readOnly !== undefined) || props.readOnly ||
+      props.usageLimits || props.usage,
+  );
 
   return (
     <div className="asv-dock-inner">
@@ -821,7 +914,12 @@ export function SessionComposer(props: SessionComposerProps) {
           {props.approvals.map((item) => <ApprovalBanner key={item.id} item={item} />)}
           {props.questions.map((question) => <QuestionBanner key={question.messageId} question={question} />)}
           {props.onAnswer && props.directQuestions?.map((entry) => (
-            <DirectQuestionBanner key={entry.requestId} entry={entry} onAnswer={props.onAnswer!} />
+            <DirectQuestionBanner
+              key={entry.requestId}
+              entry={entry}
+              onAnswer={props.onAnswer!}
+              providerLabel={props.questionProviderLabel ?? (toolbar?.provider ? DRIVER_LABELS[toolbar.provider] : 'Codex')}
+            />
           ))}
           {slash?.goal && (
             <GoalBanner
@@ -989,74 +1087,116 @@ export function SessionComposer(props: SessionComposerProps) {
                     event.target.value = '';
                   }}
                 />
-                <ComposerCatalogPanel sessionId={toolbar.sessionId} onNotify={toolbar.onNotify} onUseSkill={useSkill} />
-                <ComposerModelPicker
-                  models={catalog.models}
-                  model={choice.model}
-                  fallbackLabel={toolbar.modelId}
-                  effort={choice.effort}
-                  disabled={props.running}
-                  open={modelPickerOpen}
-                  onOpenChange={setModelPickerOpen}
-                  onModelChange={toolbar.onModelChange}
-                  onEffortChange={toolbar.onEffortChange}
-                />
+                {capabilities.plugins && (
+                  <ComposerCatalogPanel sessionId={toolbar.sessionId} onNotify={toolbar.onNotify} onUseSkill={useSkill} />
+                )}
+                {capabilities.models && (
+                  <ComposerModelPicker
+                    models={catalog.models}
+                    model={choice.model}
+                    fallbackLabel={toolbar.modelId}
+                    effort={capabilities.efforts ? choice.effort : null}
+                    disabled={props.running}
+                    open={modelPickerOpen}
+                    onOpenChange={(open) => {
+                      if (open) void catalog.reloadModels();
+                      setModelPickerOpen(open);
+                    }}
+                    onModelChange={toolbar.onModelChange}
+                    onEffortChange={toolbar.onEffortChange}
+                  />
+                )}
               </div>
             ) : (
               <span className="asv-composer-hint">Enter 发送 · Shift+Enter 换行</span>
             )}
-            {props.running && (
-              <button type="button" className="asv-round-btn" disabled={props.interrupting} onClick={props.onInterrupt} aria-label="中断本轮" title="中断本轮">
-                <Square size={12} fill="currentColor" />
-              </button>
-            )}
-            <button
-              type="button"
-              className="asv-round-btn is-primary"
-              disabled={(!draft.trim() && attached.length === 0) || props.sending || blocked || preparing > 0}
-              onClick={() => void send()}
-              aria-label={localSlashCommand ? '执行命令' : queueing ? '加入队列' : '发送'}
-              title={localSlashCommand ? '执行斜杠命令（Enter）' : queueing ? '加入队列，本轮结束后发送（Enter）' : '发送（Enter）· Shift+Enter 换行'}
-            >
-              <ArrowUp size={15} strokeWidth={2.25} />
-            </button>
+            <div className="asv-composer-actions">
+              {props.branch && <Chip icon={<GitBranch size={12} />} title={props.branch}>{props.branch}</Chip>}
+              {props.policy && props.onPolicyChange ? (
+                <label className="asv-chip asv-policy asv-composer-ctrl" title="权限：下一条消息起生效">
+                  <Lock size={12} aria-hidden="true" />
+                  <select
+                    value={props.policy}
+                    disabled={props.running || props.controlsBusy}
+                    aria-label="权限"
+                    onChange={(event) => props.onPolicyChange!(event.target.value as AgentSessionPolicy)}
+                  >
+                    {(toolbar ? capabilities.policies : props.policyChoices ?? Object.keys(POLICY_LABELS) as AgentSessionPolicy[]).map((value) => (
+                      <option key={value} value={value}>{POLICY_LABELS[value]}</option>
+                    ))}
+                  </select>
+                  <ChevronDown size={11} className="asv-policy-caret" aria-hidden="true" />
+                </label>
+              ) : props.policy ? (
+                <Chip icon={<Lock size={12} />} {...(props.policyLockedReason ? { title: props.policyLockedReason } : {})}>
+                  {POLICY_LABELS[props.policy]}
+                </Chip>
+              ) : !props.direct && props.readOnly !== undefined ? (
+                <Chip icon={<Lock size={12} />}>{props.readOnly ? POLICY_LABELS['read-only'] : POLICY_LABELS['workspace-write']}</Chip>
+              ) : props.readOnly && <Chip icon={<Lock size={12} />}>{POLICY_LABELS['read-only']}</Chip>}
+              {props.onNetworkChange && (
+                <button
+                  type="button"
+                  className={`asv-chip asv-chip-toggle asv-composer-ctrl${props.network ? ' is-on' : ''}`}
+                  disabled={props.running || props.controlsBusy}
+                  aria-pressed={Boolean(props.network)}
+                  title={props.network ? '命令可以联网：下一条消息起生效' : '命令不能联网（npm install 等会失败）：下一条消息起生效'}
+                  onClick={() => props.onNetworkChange!(!props.network)}
+                >
+                  <Globe size={12} aria-hidden="true" />
+                  <span>{props.network ? '联网' : '不联网'}</span>
+                </button>
+              )}
+              {!props.direct && !props.onNetworkChange && props.network === true && (
+                <Chip icon={<Globe size={12} />}>联网</Chip>
+              )}
+              {props.usageLimits && <UsageLimitChip summary={props.usageLimits} />}
+              {props.usage && (
+                <span className="asv-chip asv-composer-usage" title={`输入 ${props.usage.input} · 输出 ${props.usage.output}`}>
+                  {formatTokenCount(props.usage.total)} tokens
+                </span>
+              )}
+              <div className="asv-composer-submit">
+                {props.running && (
+                  <button type="button" className="asv-round-btn" disabled={props.interrupting} onClick={props.onInterrupt} aria-label="中断本轮" title="中断本轮">
+                    <Square size={12} fill="currentColor" />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="asv-round-btn is-primary"
+                  disabled={(!draft.trim() && attached.length === 0) || props.sending || blocked || preparing > 0}
+                  onClick={() => void send()}
+                  aria-label={localSlashCommand ? '执行命令' : queueing ? '加入队列' : '发送'}
+                  title={localSlashCommand ? '执行斜杠命令（Enter）' : queueing ? '加入队列，本轮结束后发送（Enter）' : '发送（Enter）· Shift+Enter 换行'}
+                >
+                  <ArrowUp size={16} strokeWidth={2.25} />
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       ) : (
-        <div className="asv-composer is-ended">会话已结束，当前为只读回放</div>
+        <div className="asv-composer is-ended">{props.endedText ?? '会话已结束，当前为只读回放'}</div>
       )}
-      <div className="asv-context-strip">
-        {props.branch && <Chip icon={<GitBranch size={12} />} title={props.branch}>{props.branch}</Chip>}
-        {props.policy && props.onPolicyChange ? (
-          <label className="asv-chip asv-policy" title="权限：下一条消息起生效">
-            <Lock size={12} />
-            <select value={props.policy} disabled={props.running} aria-label="权限"
-              onChange={(event) => props.onPolicyChange!(event.target.value as AgentSessionPolicy)}>
-              {(Object.keys(POLICY_LABELS) as AgentSessionPolicy[]).map((value) => (
-                <option key={value} value={value}>{POLICY_LABELS[value]}</option>
-              ))}
-            </select>
-          </label>
-        ) : !props.direct && props.readOnly !== undefined ? (
-          <Chip icon={<Lock size={12} />}>{props.readOnly ? POLICY_LABELS['read-only'] : POLICY_LABELS['workspace-write']}</Chip>
-        ) : props.readOnly && <Chip icon={<Lock size={12} />}>{POLICY_LABELS['read-only']}</Chip>}
-        {props.onNetworkChange && (
-          <button type="button" className={`asv-chip asv-chip-toggle${props.network ? ' is-on' : ''}`}
-            disabled={props.running} aria-pressed={Boolean(props.network)}
-            title={props.network ? '命令可以联网：下一条消息起生效' : '命令不能联网（npm install 等会失败）：下一条消息起生效'}
-            onClick={() => props.onNetworkChange!(!props.network)}>
-            <Globe size={12} />
-            <span>{props.network ? '联网' : '不联网'}</span>
-          </button>
-        )}
-        <span className="asv-strip-spacer" />
-        {props.usageLimits && <UsageLimitChip summary={props.usageLimits} />}
-        {props.usage && (
-          <span className="asv-chip" title={`输入 ${props.usage.input} · 输出 ${props.usage.output}`}>
-            {formatTokenCount(props.usage.total)} tokens
-          </span>
-        )}
-      </div>
+      {hasEndedStrip && (
+        <div className="asv-context-strip">
+          {props.branch && <Chip icon={<GitBranch size={12} />} title={props.branch}>{props.branch}</Chip>}
+          {props.policy ? (
+            <Chip icon={<Lock size={12} />}>{POLICY_LABELS[props.policy]}</Chip>
+          ) : !props.direct && props.readOnly !== undefined ? (
+            <Chip icon={<Lock size={12} />}>{props.readOnly ? POLICY_LABELS['read-only'] : POLICY_LABELS['workspace-write']}</Chip>
+          ) : props.readOnly && <Chip icon={<Lock size={12} />}>{POLICY_LABELS['read-only']}</Chip>}
+          {!props.direct && props.network === true && <Chip icon={<Globe size={12} />}>联网</Chip>}
+          <span className="asv-strip-spacer" />
+          {props.usageLimits && <UsageLimitChip summary={props.usageLimits} />}
+          {props.usage && (
+            <span className="asv-chip" title={`输入 ${props.usage.input} · 输出 ${props.usage.output}`}>
+              {formatTokenCount(props.usage.total)} tokens
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

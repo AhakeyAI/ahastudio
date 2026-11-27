@@ -2,13 +2,18 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import { z } from 'zod';
+import { AGENT_DRIVER_IDS, type AgentDriverCapabilities } from '../agent-drivers/driver-capabilities.js';
+import type { DriverRegistry } from '../agent-drivers/driver-registry.js';
+import { WorkspaceFileSearch } from '../agent-drivers/workspace-file-search.js';
 import type { AgentTurnAttachment } from '../orchestration/agent-session-driver.js';
 import { AGENT_SESSION_ID, type AgentSessionManager } from '../orchestration/agent-session-manager.js';
 import type { CodexCatalog } from '../orchestration/codex-catalog.js';
+import type { CodexRuntimeReport } from '../orchestration/codex-runtime-diagnostics.js';
 import { codexThreadTimeline } from '../orchestration/codex-thread-history.js';
 import { WorkerTimelinePatchCoalescer } from '../orchestration/worker-timeline.js';
 import type { IpcContext } from './context.js';
 import { handleSecure, mainWindowSenderPolicy } from './validators.js';
+import { settingsWindowSenderId } from './settings-window.js';
 
 const id = z.string().regex(AGENT_SESSION_ID);
 const policy = z.enum(['read-only', 'workspace-write', 'full-auto']);
@@ -32,6 +37,7 @@ const safeFileName = (name: string) =>
 
 const createSchema = z.object({
   cwd: z.string().min(1).max(1024).optional(),
+  provider: z.enum(AGENT_DRIVER_IDS).optional(),
   policy,
   model: optionalName,
   effort: optionalName,
@@ -53,6 +59,7 @@ const goalSchema = z.object({ id, action: goalActionSchema }).strict();
 const feedbackSchema = z.object({ id, reason: z.string().max(4_000).optional() }).strict();
 const unqueueSchema = z.object({ id, messageId: z.string().min(1).max(64) }).strict();
 const catalogSchema = z.object({ id, reload: z.boolean().optional() }).strict();
+const modelsSchema = z.object({ id: id.optional() }).strict();
 const searchSchema = z.object({ id, query: z.string().max(200) }).strict();
 const skillSwitchSchema = z.object({ id, path: absolutePath, enabled: z.boolean() }).strict();
 const imageSchema = z.object({
@@ -99,16 +106,34 @@ export function registerAgentSessionsIpc(
   options: {
     /** Models, skills, plugins, and file search; without it the composer offers none of them. */
     catalog?: CodexCatalog;
+    inspectRuntime?: (cwd: string, probe: boolean) => Promise<CodexRuntimeReport>;
+    runtimeCwd?: () => string;
+    revealRuntimeConfig?: () => void;
     /** Where pasted images are kept, one folder per session; without it images cannot be attached. */
     attachmentsDir?: () => string;
+    /** Native drivers the person can start sessions with. */
+    drivers?: Pick<DriverRegistry, 'list'>;
+    /** Opens the terminal pane that continues a handed-off conversation, and tells whether it still runs. */
+    terminal?: {
+      open: (input: { cliId: string; args: string[]; cwd: string }) => Promise<{ ptyId: string; cwd?: string }>;
+      isAlive: (ptyId: string) => boolean;
+    };
   } = {},
 ): { dispose: () => void } {
   const authorize = mainWindowSenderPolicy(() => ctx.liveWindow()?.webContents.id ?? null);
   const { catalog } = options;
-  const sessionCwd = (sessionId: string) => {
-    const cwd = manager.list().find((session) => session.id === sessionId)?.cwd;
-    if (!cwd) throw new Error('会话不存在');
-    return cwd;
+  const fileSearch = new WorkspaceFileSearch();
+  const sessionInfo = (sessionId: string) => {
+    const info = manager.list().find((session) => session.id === sessionId);
+    if (!info) throw new Error('会话不存在');
+    return info;
+  };
+  const sessionCwd = (sessionId: string) => sessionInfo(sessionId).cwd;
+  // Each provider-specific channel refuses a session whose driver lacks it, so no control works by accident.
+  const requireCapability = (sessionId: string, capability: keyof AgentDriverCapabilities, label: string) => {
+    const info = sessionInfo(sessionId);
+    if (!info.capabilities[capability]) throw new Error(`当前会话驱动不支持${label}`);
+    return info;
   };
   const requireCatalog = () => {
     if (!catalog) throw new Error('当前环境无法读取 Codex 目录');
@@ -123,6 +148,7 @@ export function registerAgentSessionsIpc(
     const cwd = sessionCwd(sessionId);
     for (const attachment of attachments) {
       if (attachment.type === 'skill') {
+        requireCapability(sessionId, 'skills', '技能');
         if (!await requireCatalog().findSkill(cwd, attachment.path)) throw new Error(`技能 ${attachment.name} 不可用`);
       } else {
         const path = resolve(attachment.path);
@@ -145,9 +171,10 @@ export function registerAgentSessionsIpc(
     }
   }
   const secure = <T extends z.ZodTypeAny>(
-    channel: string, schema: T, handler: (input: z.infer<T>) => Promise<Record<string, unknown>> | Record<string, unknown>,
+    channel: string, schema: T, handler: (input: z.infer<T>) => Promise<Record<string, unknown>> | Record<string, unknown>, settings = false,
   ) => handleSecure(`agent-sessions:${channel}`, {
-    schema, authorize, authorizeError: 'Sender is not the main window',
+    schema, authorize: settings ? (event) => authorize(event) === true || event.sender.id === settingsWindowSenderId() : authorize,
+    authorizeError: 'Sender is not an authorized application window',
     handler: async (input) => {
       try {
         return { ok: true, ...(await handler(input)) };
@@ -158,12 +185,40 @@ export function registerAgentSessionsIpc(
   });
 
   secure('list', z.object({}).strict(), () => ({ sessions: manager.list() }));
+  secure('drivers', z.object({}).strict(), () => ({ drivers: options.drivers?.list() ?? [] }));
+  let inspecting = false;
+  secure('runtime', z.object({ id: id.optional(), probe: z.boolean().optional() }).strict(), async (input) => {
+    if (!options.inspectRuntime) throw new Error('当前客户端不支持运行环境检查');
+    if (inspecting) throw new Error('诊断正在进行，请稍候');
+    const cwd = input.id ? sessionCwd(input.id) : ctx.getCurrentCwd() ?? options.runtimeCwd?.();
+    if (!cwd || !isAbsolute(cwd)) throw new Error('请先选择项目文件夹');
+    inspecting = true;
+    try { return { report: await options.inspectRuntime(cwd, input.probe === true) }; }
+    finally { inspecting = false; }
+  }, true);
+  secure('runtime-config', z.object({}).strict(), () => {
+    options.revealRuntimeConfig?.();
+    return {};
+  }, true);
+  secure('reload-tools', targetSchema, async (input) => {
+    const result = await manager.reloadTools(input.id);
+    if (!result.ok) throw new Error(result.error);
+    return {};
+  });
   secure('create', createSchema, async (input) => {
     const cwd = input.cwd ?? ctx.getCurrentCwd();
     if (!cwd || !isAbsolute(cwd) || !existsSync(cwd) || !statSync(cwd).isDirectory()) {
       throw new Error('请选择一个项目文件夹后再新建会话');
     }
-    return { session: await manager.create({ cwd, policy: input.policy, model: input.model, effort: input.effort, network: input.network }) };
+    if (input.provider && options.drivers && !options.drivers.list().some((driver) => driver.id === input.provider && driver.installed)) {
+      throw new Error('这台电脑没有安装对应的 CLI');
+    }
+    return {
+      session: await manager.create({
+        cwd, policy: input.policy, model: input.model, effort: input.effort, network: input.network,
+        ...(input.provider ? { provider: input.provider } : {}),
+      }),
+    };
   });
   secure('send', sendSchema, async ({ id: sessionId, ...message }) => {
     if (message.attachments?.length) await checkAttachments(sessionId, message.attachments);
@@ -186,18 +241,29 @@ export function registerAgentSessionsIpc(
     if (!manager.resumeQueue(input.id)) throw new Error('会话不存在');
     return {};
   });
-  secure('models', z.object({}).strict(), async () => ({ models: await requireCatalog().listModels() }));
+  // Codex lists models from its catalog; other drivers list what their live process offered.
+  secure('models', modelsSchema, async (input) => {
+    const info = input.id ? sessionInfo(input.id) : null;
+    if (info && info.provider !== 'codex') return { models: info.capabilities.models ? manager.models(info.id) : [] };
+    return { models: await requireCatalog().listModels() };
+  });
   secure('rate-limits', z.object({}).strict(), async () => ({ limits: await requireCatalog().readRateLimits() }));
-  secure('skills', catalogSchema, async (input) => ({
-    skills: await requireCatalog().listSkills(sessionCwd(input.id), input.reload),
-  }));
+  secure('skills', catalogSchema, async (input) => {
+    if (!sessionInfo(input.id).capabilities.skills) return { skills: [] };
+    return { skills: await requireCatalog().listSkills(sessionCwd(input.id), input.reload) };
+  });
   secure('set-skill-enabled', skillSwitchSchema, async (input) => {
+    requireCapability(input.id, 'skills', '技能');
     await requireCatalog().setSkillEnabled(sessionCwd(input.id), input.path, input.enabled);
     return {};
   });
-  secure('plugins', catalogSchema, async (input) => ({ plugins: await requireCatalog().listPlugins(sessionCwd(input.id)) }));
+  secure('plugins', catalogSchema, async (input) => {
+    if (!sessionInfo(input.id).capabilities.plugins) return { plugins: [] };
+    return { plugins: await requireCatalog().listPlugins(sessionCwd(input.id)) };
+  });
+  // `@` searches the session's folder itself, so it works the same for every driver.
   secure('search-files', searchSchema, async (input) => ({
-    files: input.query.trim() ? await requireCatalog().searchFiles(sessionCwd(input.id), input.query.trim()) : [],
+    files: input.query.trim() ? await fileSearch.search(sessionCwd(input.id), input.query.trim()) : [],
   }));
   secure('attach-image', imageSchema, (input) => {
     sessionCwd(input.id);
@@ -246,12 +312,35 @@ export function registerAgentSessionsIpc(
     if (!result.ok) throw new Error(result.error);
     return { synced: result.synced };
   });
+  secure('handoff', targetSchema, async (input) => {
+    const terminal = options.terminal;
+    if (!terminal) throw new Error('当前环境无法打开终端');
+    const handoff = await manager.handoffToTerminal(input.id);
+    if (!handoff.ok) throw new Error(handoff.error);
+    let pane: { ptyId: string; cwd?: string };
+    try {
+      pane = await terminal.open({ cliId: handoff.cliId, args: handoff.args, cwd: handoff.cwd });
+    } catch (error) {
+      // Nothing took the conversation, so it stays here.
+      manager.reclaim(input.id, () => false);
+      throw error;
+    }
+    manager.bindHandoff(input.id, pane.ptyId);
+    return { ptyId: pane.ptyId, cliId: handoff.cliId, cwd: pane.cwd ?? handoff.cwd };
+  });
+  secure('reclaim', targetSchema, (input) => {
+    const result = manager.reclaim(input.id, (ptyId) => options.terminal?.isAlive(ptyId) ?? false);
+    if (!result.ok) throw new Error(result.error);
+    return {};
+  });
   secure('goal', goalSchema, async (input) => {
+    requireCapability(input.id, 'goal', ' /goal');
     const result = await manager.runGoal(input.id, input.action);
     if (!result.ok) throw new Error(result.error);
     return { goal: result.goal, message: result.message };
   });
   secure('upload-feedback', feedbackSchema, async (input) => {
+    requireCapability(input.id, 'feedback', ' /feedback');
     const result = await manager.uploadFeedback(
       input.id,
       input.reason,

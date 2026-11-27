@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentStatusStore } from '../agent/agent-status-store.js';
+import { approvalToolName, headlessWorkerDriver } from './headless-workers.js';
 import { ACTIVE_DISPATCH_STATUSES } from './orchestration-lifecycle-graph.js';
 import type { OrchestrationStore } from './orchestration-store.js';
 import {
@@ -211,14 +212,15 @@ export class PermissionApprovalManager {
     input: { method: string; toolInput: string; message?: string; signal: AbortSignal },
   ): Promise<boolean> {
     if (input.signal.aborted || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return false;
+    const provider = headlessWorkerDriver(dispatch.assigneeHandle) ?? dispatch.cliId ?? 'codex';
     const decision = await this.holdRequest(dispatch, {
       ptyId: dispatch.assigneeHandle,
       eventName: input.method,
-      toolName: input.method.split('/')[1],
+      toolName: approvalToolName(input.method),
       toolInput: input.toolInput,
       message: input.message,
       signal: input.signal,
-    }, 'codex');
+    }, provider);
     return decision.allow;
   }
 

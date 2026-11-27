@@ -6,7 +6,7 @@ import { basename, dirname, isAbsolute, join, normalize, resolve } from 'node:pa
 import { getPtyHost } from '../pty-host.js';
 import type { IpcContext } from './context.js';
 import { handleSecure, mainWindowSenderPolicy } from './validators.js';
-import { PTY_INPUT_MAX_BYTES } from '../pty-input-limiter.js';
+import { PTY_INPUT_PENDING_BYTES } from '../pty-input-queue.js';
 import {
   isOrchestrationCliId,
   LOCAL_SHELL_IDS,
@@ -37,7 +37,10 @@ export const shellPtyCreateSchema = z.object({
 
 export const shellPtyIdSchema = z.object({ ptyId: z.string().regex(PTY_ID_RE) }).strict();
 export const shellPtyInputSchema = z.object({
-  ptyId: z.string().regex(PTY_ID_RE), data: z.string().min(1).max(PTY_INPUT_MAX_BYTES),
+  ptyId: z.string().regex(PTY_ID_RE),
+  // A paste is one ordered input; the daemon adapter splits it into bounded UTF-8 writes.
+  data: z.string().min(1).max(PTY_INPUT_PENDING_BYTES)
+    .refine(value => Buffer.byteLength(value, 'utf8') <= PTY_INPUT_PENDING_BYTES),
 }).strict();
 export const shellPtyResizeSchema = z.object({
   ptyId: z.string().regex(PTY_ID_RE),

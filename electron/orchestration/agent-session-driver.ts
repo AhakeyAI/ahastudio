@@ -1,6 +1,9 @@
+import type { AgentDriverId } from '../agent-drivers/driver-capabilities.js';
+import type { CodexModelOption } from './codex-catalog.js';
 import type { WorkerTimelineEvent } from './worker-timeline.js';
 
-export type AgentProvider = 'codex' | 'claude' | 'acp';
+/** The native driver behind a session; stored sessions without one are Codex. */
+export type AgentProvider = AgentDriverId;
 
 /**
  * How much the agent may do on its own. `read-only` cannot change files; `workspace-write` may edit
@@ -50,6 +53,8 @@ export interface AgentQuestion {
   prompt: string;
   /** The answer may be free text instead of one of the options. */
   allowOther: boolean;
+  /** Multiple options may be selected together (Claude AskUserQuestion). */
+  multiSelect?: boolean;
   options: { label: string; description: string }[];
 }
 
@@ -102,6 +107,8 @@ export interface AgentOutputSlice {
 
 /** One provider conversation, driven over its native protocol instead of a terminal. */
 export interface AgentSessionDriver {
+  /** Optional native in-place tool refresh; never restarts or duplicates a conversation. */
+  reloadTools?(): Promise<void>;
   readonly provider: AgentProvider;
   readonly capabilities: { resume: boolean; steer: boolean; policies: readonly AgentSessionPolicy[] };
   readonly alive: boolean;
@@ -118,8 +125,8 @@ export interface AgentSessionDriver {
   /** `network` lets sandboxed commands reach the network; off unless asked for. */
   /** `developerInstructions` are set on the conversation, e.g. the Coordinator rules in orchestration mode. */
   open(input: {
-    cwd: string; model: string | null; policy: AgentSessionPolicy; resumeSessionId?: string; network?: boolean;
-    developerInstructions?: string;
+    cwd: string; model: string | null; effort?: string | null; policy: AgentSessionPolicy; resumeSessionId?: string;
+    network?: boolean; developerInstructions?: string;
   }): Promise<string>;
   /** `model`, `effort`, `policy`, and `network` apply to this turn and stay in effect for later ones. */
   startTurn(input: {
@@ -130,6 +137,8 @@ export interface AgentSessionDriver {
   interrupt(): Promise<boolean>;
   /** Names the provider's conversation, so its own history shows the same title. False if it could not. */
   setName?(name: string): Promise<boolean>;
+  /** Models the live process offered for this conversation; Codex lists its own through `CodexCatalog`. */
+  models?(): CodexModelOption[];
   /** Compacts the provider conversation's context window (Codex `thread/compact/start`). */
   compactThread?(turnKey: string): Promise<TurnDelivery>;
   /** Uploads thread logs and an optional reason to the provider (Codex `feedback/upload`). */

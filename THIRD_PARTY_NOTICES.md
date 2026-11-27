@@ -12,7 +12,10 @@ Certain ported, adapted, or bundled components retain their original upstream co
 - **Full license text:** See [src/assets/cli-icons/THIRD-PARTY-LICENSE.txt](./src/assets/cli-icons/THIRD-PARTY-LICENSE.txt) and the MIT License section below.
 - **Ported / adapted files in this repository:**
   - `electron/shared/**` (terminal escape/protocol/replay/appearance/link helpers, `osc7-path-text.ts`, `powershell-command-encoding.ts`, `windows-retry-file-operations.ts`, `wsl-paths.ts`, `osc-title-extraction.ts`, `node-file-content-equality.ts`)
-  - `src/lib/shared/**` (`cross-platform-path.ts`, `own-retained-string.ts`, `owned-utf16-suffix.ts`, `prose-url-boundary.ts`, `wsl-paths.ts`, `file-links/*`, `native-chat/*`, `terminal/links/*`, `terminal/output/*`)
+  - `src/lib/shared/**` (`cross-platform-path.ts`, `longest-non-overlapping-matches.ts`, `own-retained-string.ts`, `owned-utf16-suffix.ts`, `prose-url-boundary.ts`, `wsl-paths.ts`, `file-links/*`, `native-chat/*`, `terminal/links/*`, `terminal/output/*`)
+  - `src/lib/session-turn-model.ts`, `src/lib/session-work-log-model.ts`, `src/lib/session-file-link-checker.ts` (turn working status, turn folding, live reasoning disclosure, semantic tool-run summaries, and batched file-link existence adapted from `src/shared/native-chat/**`)
+  - `src/hooks/useSharedNow.ts` (visibility-gated shared second clock adapted from `use-native-chat-elapsed-seconds.ts`)
+  - `src/components/agent-session/session-disclosure-store.tsx`, `useSessionPacedText.ts`, `SessionPacedMarkdown.tsx`, `SessionTurnChrome.tsx`, `SessionTurnView.tsx`, `SessionMarkdown.tsx`, `SessionCode.tsx`, `SessionWorkLog.tsx`, `src/components/AgentSessionView.tsx`, `src/components/agent-session-view.css` (paced streaming text reveal, word-fade settling, inline workspace file path references, turn status clock & folding, streaming bounded reasoning disclosure, semantic tool runs, file target pills, notice cards, and restrained assistant controls adapted from `src/renderer/src/components/native-chat/**` and `comment-markdown/**`)
   - `electron/persistence/atomic-file-publication.ts`, `atomic-snapshot-writer.ts`, `durable-file-write.ts`, `permission-errors.ts`
   - `electron/terminal-daemon/emulation/*`, `electron/terminal-daemon/protocol/terminal-modes.ts`, `electron/terminal-daemon/protocol/terminal-snapshot.ts`, `electron/terminal-daemon/windows-conpty-warmup.ts`
   - `electron/shell-integration/bash-prompt-command-composition.ts`, `electron/shell-integration/powershell-bootstrap.ts`
@@ -22,6 +25,12 @@ Certain ported, adapted, or bundled components retain their original upstream co
   - `src/lib/terminal-appearance.ts` (Builtin Tango Light palette)
   - `src/components/TerminalBrandIcons.tsx` (adapted SVG brand icon components)
   - `src/assets/cli-icons/antigravity.png`, `src/assets/cli-icons/grok.png`, `src/assets/cli-icons/qoder.png`
+  - `electron/agent-drivers/jsonl-rpc.ts` (JSON-lines framing and call correlation adapted from `src/main/jsonl-rpc/peer.ts`, `peer-reply.ts`, and `src/main/acp/transport/acp-json-rpc-peer.ts`)
+  - `electron/agent-drivers/acp/acp-session-driver.ts`, `acp-dialects.ts`, `acp-form-elicitation.ts` (ACP session setup, permission answering, timeline translation, the Antigravity / Grok / OpenCode dialects and launch specs, and form elicitation adapted from `src/main/acp/**`, `src/main/antigravity/antigravity-acp-launch-spec.ts`)
+  - `electron/agent-drivers/pi/pi-session-driver.ts` (`pi --mode rpc` protocol, message/tool mapping, extension dialogs, and launch arguments adapted from `src/main/pi/rpc/**`)
+  - `electron/agent-drivers/claude/claude-protocol.ts`, `claude-session-driver.ts` (Claude Code stream-json control protocol, model/settings parsing, permission mode fallback ladder, `can_use_tool` / `AskUserQuestion` handling, streamed thinking/text block reconciliation, image block ordering, and parent-session env scrubbing adapted from `src/main/claude/**`, `src/shared/agent-session/options/model-catalog/claude-model-list-probe.ts`, and `src/shared/agent-launch/startup/parent-agent-session-env.ts`)
+  - `electron/agent-drivers/driver-capabilities.ts` (`terminalResumeArgs`, adapted from `src/shared/agent-launch/startup/agent-resume-argv.ts`)
+  - `tests/fixtures/orca-acp/*.jsonl`, `tests/fixtures/orca-pi/*.jsonl`, `tests/fixtures/orca-claude/*.jsonl` (recorded protocol sessions copied unchanged from `src/main/acp/fixtures/`, `src/main/pi/rpc/__fixtures__/`, and `src/main/claude/__fixtures__/`)
 
 ## 2. Visual Studio Code (`https://github.com/microsoft/vscode`)
 
@@ -55,7 +64,7 @@ Certain ported, adapted, or bundled components retain their original upstream co
   - `src/lib/composer-slash-commands.ts` (slash command search, skill source resolution, highlight tracking, and `/clear`/`/compact`/`/usage-limits`/`/goal`/`/feedback` command parsers, adapted from `apps/web/src/components/chat/composerSlashCommandSearch.ts`, `composerMenuHighlight.ts`, `apps/web/src/providerSkillSearch.ts`, `packages/client-runtime/src/providerSkills.ts`, `packages/client-runtime/src/state/composerDispatch.ts`, `packages/client-runtime/src/state/threadFeedback.ts`, `packages/contracts/src/orchestrationV2.ts`, `packages/shared/src/composerTrigger.ts`, and `packages/shared/src/usageLimits.ts`)
   - `src/components/agent-session/ComposerCommandMenu.tsx` (composer slash/skill/file menu and skill source badges, adapted from `apps/web/src/components/chat/ComposerCommandMenu.tsx`)
   - `src/components/agent-session/ComposerBanners.tsx` (fresh-session, usage-limits, goal, and feedback inline banners, adapted from `apps/web/src/components/chat/ComposerFreshSession.tsx`, `ComposerUsageLimits.tsx`, and `packages/client-runtime/src/state/threadFeedback.ts`)
-  - `src/components/AgentSessionView.tsx` (`FreshSessionDivider`, adapted from `FreshSessionRow` in `apps/web/src/components/chat/V2LifecycleRow.tsx`)
+  - `src/components/agent-session/SessionTurnView.tsx` (`FreshSessionDivider`, adapted from `FreshSessionRow` in `apps/web/src/components/chat/V2LifecycleRow.tsx`)
   - `electron/ipc/agent-sessions.ts` (attachment paths stated in the message text, adapted from `packages/provider-core/src/server/attachmentPrompt.ts`)
   - `src/lib/turn-changes.ts` (changed-file tree and compact diff counts, adapted from `apps/web/src/lib/turnDiffTree.ts` and `apps/web/src/components/chat/DiffStatLabel.tsx`)
   - `src/components/agent-session/TurnChangesCard.tsx` (per-turn changed-files card, adapted from `apps/web/src/components/chat/ChangedFilesTree.tsx`)

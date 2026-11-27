@@ -356,7 +356,7 @@ test('resume continues the given thread and reports per-turn usage without a bas
   assert.deepEqual(turns[0].usage, { inputTokens: 11, outputTokens: 3 });
 });
 
-test('a question from Codex is answered through onRequest; secret or unanswered ones are refused', async (t) => {
+test('a question from Codex is answered through onRequest; secret or unanswered ones get an empty answer', async (t) => {
   const { session, opened, turns, requests } = await openDriver(t, {
     onRequest: (request) => (request.kind === 'question' && requests.length === 1
       ? { answers: { db: ['SQLite'] } } : { decision: 'decline' }),
@@ -370,15 +370,18 @@ test('a question from Codex is answered through onRequest; secret or unanswered 
     options: [{ label: 'SQLite', description: 'Local file' }, { label: 'Postgres', description: 'Server' }],
   }]);
   assert.equal(turns[0].finalText, 'answer: {"db":{"answers":["SQLite"]}}');
+  assert.ok(requests[0].signal.aborted, 'the question signal ends with its turn');
 
-  await session.startTurn({ turnKey: 'two', prompt: 'ASK_A_QUESTION' });
+  // A skipped (or expired) question is answered empty, never as an unsupported request.
+  await session.startTurn({ turnKey: 'two', prompt: 'ASK_A_QUESTION MULTI' });
   await until(() => turns.length === 2);
-  assert.equal(turns[1].finalText, 'request refused');
+  assert.equal(requests[1].questions[0].multiSelect, true);
+  assert.equal(turns[1].finalText, 'answer: {}');
 
   await session.startTurn({ turnKey: 'three', prompt: 'ASK_A_QUESTION SECRET' });
   await until(() => turns.length === 3);
   assert.equal(requests.length, 2, 'a secret question is never forwarded');
-  assert.equal(turns[2].finalText, 'request refused');
+  assert.equal(turns[2].finalText, 'answer: {}');
 });
 
 test('bounded stderr is included and redacted on startup failure and process exit', async () => {

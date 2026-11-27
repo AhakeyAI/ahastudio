@@ -7,7 +7,12 @@ import type {
 } from './agent-session-driver.js';
 import { SESSION_WAKE_HEADER } from './coordinator-prompt.js';
 import { AGENT_SESSION_ID } from './agent-session-manager.js';
-import { CODEX_WORKER_ID } from './codex-app-server-pilot.js';
+import {
+  HEADLESS_DRIVER_LABELS, HEADLESS_WORKER_ID, SESSION_GATED_COORDINATOR_ACTIONS, headlessWorkerControlsError,
+  headlessWorkerDriver, headlessWorkerSupports, isHeadlessWorkerDriver, sessionGateDecision, type HeadlessWorkerDriver,
+} from './headless-workers.js';
+import { driverCapabilities } from '../agent-drivers/driver-capabilities.js';
+import { WorkerNativeQuestionManager } from './worker-native-questions.js';
 import {
   WorkerTimeline, type WorkerTimelineChange, type WorkerTimelineSnapshot, type WorkerTimelineTurnStatus,
 } from './worker-timeline.js';
@@ -69,6 +74,7 @@ import {
   type OrchestrationTaskWithDispatch,
   type OrchestrationWorkerReportOutcome,
   type WorkerApprovalPayload,
+  type WorkerNativeQuestionPayload,
 } from './orchestration-types.js';
 import {
   DEFAULT_PEER_PING_PONG_LIMIT,
@@ -204,6 +210,7 @@ export interface OrchestrationWorkerSummary {
   followUpChildDispatchId: string | null;
   openApprovals: WorkerApprovalPayload[];
   openQuestions: OrchestrationQuestionRecord[];
+  openNativeQuestions: WorkerNativeQuestionPayload[];
   terminal: TerminalSummary | null;
 }
 
@@ -277,10 +284,29 @@ export interface OrchestrationSessionCoordinators {
    * `idle`: active, between turns, and not waiting on the person.
    * `network`: whether sandboxed commands in this session may reach the network.
    */
-  get(sessionId: string): { cwd: string; provider: string; active: boolean; idle?: boolean; network?: boolean } | null;
+  get(sessionId: string): {
+    cwd: string; provider: string; active: boolean; idle?: boolean; network?: boolean;
+    /** The policy the session's provider process was launched with. */
+    policy?: AgentSessionPolicy;
+  } | null;
+  /**
+   * Asks the person, inside the session's running turn, to allow an orchestration action; resolves
+   * false when declined. Omitted means actions that need the person are refused.
+   */
+  requestApproval?(sessionId: string, request: { method: string; toolInput: string; message?: string }, signal: AbortSignal): Promise<boolean>;
   /** Starts a system turn (never counted as the person's message); omitted means sessions are never woken. */
   wake?(sessionId: string, prompt: string): Promise<TurnDelivery>;
 }
+
+/** A headless Worker's permission tier, network access, and whether it may start sub-Workers. */
+export interface HeadlessWorkerControls {
+  policy: AgentSessionPolicy;
+  network: boolean;
+  allowSubWorkers: boolean;
+}
+
+/** How a headless Worker process is launched; sub-Worker tools are fixed for the life of the process. */
+export type HeadlessWorkerLaunchOptions = HeadlessWorkerControls;
 
 export interface OrchestrationServiceDependencies {
   store: OrchestrationStore;
@@ -295,7 +321,19 @@ export interface OrchestrationServiceDependencies {
   }) => Promise<WorkerPaneCandidate | null>;
   codexPilot?: {
     enabled: () => boolean;
-    launch: (workerId: string, cwd: string, events: AgentSessionEvents) => AgentSessionDriver;
+    launch: (workerId: string, cwd: string, events: AgentSessionEvents, options?: HeadlessWorkerLaunchOptions) => AgentSessionDriver;
+  };
+  /**
+   * Headless Workers for the other `HEADLESS_WORKER_DRIVERS` (Codex uses `codexPilot`), launched
+   * with the Worker's own Aha MCP credentials. Only session-coordinated runs use them.
+   */
+  headlessWorkers?: {
+    /** Whether the driver's CLI can be launched here; false keeps its tasks in a terminal. */
+    available?: (cliId: Exclude<HeadlessWorkerDriver, 'codex'>) => boolean;
+    launch: (
+      cliId: Exclude<HeadlessWorkerDriver, 'codex'>, workerId: string, cwd: string, events: AgentSessionEvents,
+      options: HeadlessWorkerLaunchOptions,
+    ) => AgentSessionDriver;
   };
   closeWorkerPty?: (ptyId: string) => Promise<unknown> | unknown;
   isPtyAlive?: (ptyId: string) => boolean;
@@ -340,6 +378,8 @@ export interface OrchestrationServiceDependencies {
   settleDelayMs?: number;
   turnStopSettleMs?: number;
   approvalHoldTimeoutMs?: number;
+  /** Optional safety timeout for native Worker questions; 0 (default) waits for the person. */
+  nativeQuestionHoldTimeoutMs?: number;
   now?: () => number;
 }
 
@@ -348,6 +388,7 @@ export class OrchestrationService {
   readonly waiters: RuntimeMessageWaiters;
   readonly pointerDelivery: MailboxPointerDelivery;
   readonly approvals: PermissionApprovalManager;
+  readonly nativeQuestions: WorkerNativeQuestionManager;
   readonly proposals: DispatchProposalManager;
   readonly peerPingPong = new PeerPingPongTracker();
   readonly stallWatchdog: BoardStallWatchdog;
@@ -357,7 +398,11 @@ export class OrchestrationService {
   private readonly writePty: PtyWriteFn;
   private readonly spawnWorkerPty?: OrchestrationServiceDependencies['spawnWorkerPty'];
   private readonly codexPilot?: OrchestrationServiceDependencies['codexPilot'];
+  private readonly headlessWorkers?: OrchestrationServiceDependencies['headlessWorkers'];
   private readonly codexWorkers = new Map<string, AgentSessionDriver>();
+  /** Live per-Worker controls; the next turn of that Worker runs with them. */
+  private readonly codexWorkerControls = new Map<string, HeadlessWorkerControls>();
+  private readonly pendingCodexTurnDiffs = new Set<Promise<void>>();
   private sessionCoordinators: OrchestrationSessionCoordinators | null = null;
   private readonly codexSubmitting = new Set<string>();
   /** Pending wake-ups per headless Worker; `opaque` means at least one wake carried no message record. */
@@ -422,6 +467,7 @@ export class OrchestrationService {
     this.writePty = deps.writePty;
     this.spawnWorkerPty = deps.spawnWorkerPty;
     this.codexPilot = deps.codexPilot;
+    this.headlessWorkers = deps.headlessWorkers;
     this.closeWorkerPty = deps.closeWorkerPty;
     this.externalIsPtyAlive = deps.isPtyAlive;
     this.isAgentCliId = deps.isAgentCliId;
@@ -492,6 +538,15 @@ export class OrchestrationService {
       resolveRoleName: (dispatch) => this.resolveRoleNameForDispatch(dispatch) || null,
       cliCommand: this.cliCommand,
       holdTimeoutMs: deps.approvalHoldTimeoutMs,
+      now: this.clock,
+    });
+
+    this.nativeQuestions = new WorkerNativeQuestionManager({
+      store: this.store,
+      hasOpenApprovalForDispatch: (dispatchId) => this.approvals.hasOpenApprovalForDispatch(dispatchId),
+      onChanged: (reason, runId) => this.emitChanged(reason, runId),
+      onAnswered: (payload, answers) => this.timelineNativeQuestionAnswered(payload, answers),
+      holdTimeoutMs: deps.nativeQuestionHoldTimeoutMs,
       now: this.clock,
     });
 
@@ -672,6 +727,30 @@ export class OrchestrationService {
     };
   }
 
+  /**
+   * Applies the Codex approval rules to a non-Codex session Coordinator's actions that change
+   * Workers or Git history. A Codex session prompts for these in its own app-server, so it passes.
+   */
+  async gateSessionCoordinatorAction(id: string, action: string, payload: Record<string, unknown>, signal: AbortSignal): Promise<void> {
+    const state = this.sessionCoordinator(id);
+    if (!state || state.provider === 'codex') return;
+    const decision = sessionGateDecision(action, state.policy ?? 'workspace-write');
+    if (decision === 'allow') return;
+    const tool = SESSION_GATED_COORDINATOR_ACTIONS[action]!;
+    if (decision === 'deny') {
+      throw new OrchestrationError('operation_rejected', `${tool} needs the person's approval, which full-auto cannot ask for. Ask the person to run it, or to switch this session to another permission tier.`);
+    }
+    const request = this.sessionCoordinators?.requestApproval;
+    const approved = request
+      ? await request.call(this.sessionCoordinators, id, {
+        method: `aha/${tool}`,
+        toolInput: JSON.stringify(payload, null, 2).slice(0, 4_000),
+        message: `协调者请求执行 ${tool}`,
+      }, signal)
+      : false;
+    if (!approved) throw new OrchestrationError('operation_rejected', `The person declined ${tool}.`);
+  }
+
   private isActiveSessionCoordinator(id: string): boolean {
     return this.sessionCoordinator(id)?.active ?? false;
   }
@@ -682,14 +761,14 @@ export class OrchestrationService {
   }
 
   isAuthenticatedCallerActive(id: string, discoverTools = false, reporting = false): boolean {
-    if (reporting && CODEX_WORKER_ID.test(id) && this.store.getActiveDispatchForIdentity(id, null)?.stage === 'needs_reconciliation') return true;
+    if (reporting && HEADLESS_WORKER_ID.test(id) && this.store.getActiveDispatchForIdentity(id, null)?.stage === 'needs_reconciliation') return true;
     if (AGENT_SESSION_ID.test(id)) return this.isActiveSessionCoordinator(id);
-    return !CODEX_WORKER_ID.test(id) ||
+    return !HEADLESS_WORKER_ID.test(id) ||
       (this.isPaneAlive(id) && (discoverTools || Boolean(this.store.getActiveDispatchForIdentity(id, null))));
   }
 
   isPaneAlive(ptyId: string): boolean {
-    if (CODEX_WORKER_ID.test(ptyId)) return this.codexWorkers.get(ptyId)?.alive ?? false;
+    if (HEADLESS_WORKER_ID.test(ptyId)) return this.codexWorkers.get(ptyId)?.alive ?? false;
     if (AGENT_SESSION_ID.test(ptyId)) return this.isActiveSessionCoordinator(ptyId);
     if (this.exitedPanes.has(ptyId)) {
       return false;
@@ -749,11 +828,105 @@ export class OrchestrationService {
     return { dispatch: this.store.getDispatchContext(dispatch.id) ?? dispatch, interrupted };
   }
 
+  /**
+   * Changes a live headless Worker's permission tier or network access from the next turn on. Only
+   * the person calls this (IPC), so it may choose `full-auto`; the Worker's driver must support the
+   * tier, network access needs a driver that sandboxes it, and review Workers stay locked.
+   */
+  workerUpdateControls(input: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+    policy?: AgentSessionPolicy;
+    network?: boolean;
+  }): { dispatch: OrchestrationDispatchRecord; policy: AgentSessionPolicy; network: boolean } {
+    if (input.policy === undefined && input.network === undefined) {
+      throw new OrchestrationError('invalid_argument', 'Specify policy and/or network to update Worker controls.');
+    }
+    const target = this.resolveTargetDispatch(input);
+    const dispatch = this.store.resolveDispatchLineage(target.id) ?? target;
+    const driver = headlessWorkerDriver(dispatch.assigneeHandle);
+    const session = dispatch.executionMode === 'codex-app-server' ? this.codexWorkers.get(dispatch.assigneeHandle) : undefined;
+    if (!driver || !session?.alive || dispatch.releasedAt) {
+      throw new OrchestrationError('dispatch_inactive', 'Only a live headless Worker can change its permission or network controls.');
+    }
+    if (session.busy || this.codexSubmitting.has(dispatch.id)) {
+      throw new OrchestrationError('worker_busy', 'Wait for the current turn to finish before changing Worker controls.');
+    }
+    if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
+      throw new OrchestrationError('operation_rejected', 'Review Workers stay read-only without network access.');
+    }
+    const unsupported = headlessWorkerControlsError(driver, input);
+    if (unsupported) throw new OrchestrationError('operation_rejected', unsupported);
+    const current = this.headlessControls(dispatch);
+    const next: HeadlessWorkerControls = {
+      ...current,
+      policy: input.policy ?? current.policy,
+      network: driverCapabilities(driver).network ? input.network ?? current.network : false,
+    };
+    this.codexWorkerControls.set(dispatch.assigneeHandle, next);
+    const updated = this.store.updateDispatchWorkerControls(dispatch.id, {
+      workerPolicy: next.policy, workerNetwork: next.network,
+    }) ?? dispatch;
+    this.workerTimelines.get(dispatch.assigneeHandle)?.setMeta({ policy: next.policy, network: next.network });
+    this.emitChanged('worker:controls-updated', updated.runId);
+    return { dispatch: updated, policy: next.policy, network: next.network };
+  }
+
+  /** A headless Worker's controls: live ones, else the dispatch record, else what legacy records imply. */
+  private headlessControls(dispatch: OrchestrationDispatchRecord): HeadlessWorkerControls {
+    const live = this.codexWorkerControls.get(dispatch.assigneeHandle);
+    if (live) return live;
+    const header = this.workerTimelines.get(dispatch.assigneeHandle)?.getHeader();
+    return {
+      policy: dispatch.workerPolicy ?? (header?.readOnly ? 'read-only' : 'workspace-write'),
+      network: dispatch.workerNetwork ?? header?.network ?? false,
+      allowSubWorkers: dispatch.allowSubWorkers === true,
+    };
+  }
+
+  /** How `caller`'s dispatches are confirmed; headless Workers cannot confirm in chat, so they use UI cards. */
+  private effectiveConfirmMode(caller: string): OrchestrationConfirmMode {
+    const mode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
+    return mode === 'chat-and-guard' && HEADLESS_WORKER_ID.test(caller.trim()) ? 'always-ui' : mode;
+  }
+
+  /**
+   * Whether a headless Worker may call Coordinator actions to start and manage sub-Workers: its
+   * active dispatch must have been allowed to, must not be a review, and must leave depth for one.
+   */
+  canHeadlessWorkerDelegate(workerId: string): boolean {
+    if (!HEADLESS_WORKER_ID.test(workerId)) return false;
+    const dispatch = this.store.getActiveDispatchForIdentity(workerId, null);
+    return Boolean(dispatch && dispatch.allowSubWorkers === true && !dispatch.reviewOfDispatchId &&
+      !dispatch.reviewOfRunId && !dispatch.releasedAt && dispatch.depth < this.maxDepth);
+  }
+
+  private timelineNativeQuestionAnswered(payload: WorkerNativeQuestionPayload, answers: Record<string, string[]>): void {
+    const timeline = this.workerTimelines.get(payload.workerHandle);
+    if (!timeline) return;
+    const text = payload.questions
+      .map((question) => `${question.header || question.prompt}：${(answers[question.id] ?? []).join('、')}`)
+      .join('\n');
+    timeline.apply({ type: 'notice', id: `answer:${payload.requestId}`, level: 'info', text: `已回答提问\n${text}` });
+  }
+
+  answerWorkerNativeQuestion(input: {
+    id: string;
+    dispatchId?: string;
+    answers: Record<string, string[]> | null;
+    from?: string;
+  }): { question: WorkerNativeQuestionPayload } {
+    return this.nativeQuestions.answer(input);
+  }
+
   private createWorkerTimeline(
-    workerId: string, model: string | null, readOnly: boolean, redact: (text: string) => string,
+    workerId: string, cliId: HeadlessWorkerDriver, model: string | null,
+    controls: { policy: AgentSessionPolicy; network: boolean }, redact: (text: string) => string,
   ): WorkerTimeline {
     const timeline = new WorkerTimeline({
-      workerHandle: workerId, cliId: 'codex', model, readOnly,
+      workerHandle: workerId, cliId, model, readOnly: controls.policy === 'read-only',
+      policy: controls.policy, network: controls.network,
       redact: (text) => this.store.redactDispatchCredentials(redact(text)),
       now: this.clock,
       onPatch: (change) => {
@@ -880,10 +1053,16 @@ export class OrchestrationService {
           (q.authorizedNetwork !== undefined && q.authorizedNetwork !== Boolean(this.sessionCoordinator(q.from)?.network))) {
         throw new OrchestrationError('operation_rejected', '原协调者的编排或联网权限已改变，请恢复原设置再核对派发。');
       }
-      await this.workerStart({ taskId: task.id, runId: run.id, from: q.from, callerPaneId: q.callerPaneId,
+      await this.workerStart({
+        taskId: task.id, runId: run.id, from: q.from, callerPaneId: q.callerPaneId,
         callerCwd: q.callerCwd, baseBranch: q.baseBranch, agent: q.agent, role: q.role, name: q.role,
         terminal: q.terminal, model: q.model, effort: q.effort, noWorktree: !q.worktree,
-        taskKind: q.taskKind, mcpEnabled: this.isMcpEnabledForCliDep?.(q.agent), readOnly: q.taskKind === 'review' || q.taskKind === 'research',
+        taskKind: q.taskKind, mcpEnabled: this.isMcpEnabledForCliDep?.(q.agent),
+        ...((q.taskKind === 'review' || q.taskKind === 'research') && q.policy === undefined ? { readOnly: true } : {}),
+        ...(q.policy !== undefined ? { policy: q.policy } : {}),
+        ...(q.network !== undefined ? { network: q.network } : {}),
+        ...(q.allowSubWorkers ? { allowSubWorkers: true } : {}),
+        ...(q.userInitiated ? { userInitiated: true } : {}),
       }, this.claimedLaunches.get(task.id));
       if (q.authorizeReviews) this.store.setRunAutoReviewAuthorized(run.id, true);
       this.store.setQueuedLaunch(task.id);
@@ -1830,6 +2009,41 @@ export class OrchestrationService {
     return latest && this.store.getRun(latest.runId)?.status === 'active' ? latest.depth : 0;
   }
 
+  /**
+   * Refuses Worker controls a caller may not ask for: reviews stay read-only with no network or
+   * sub-Workers, only the person starts a full-auto Worker, and a sub-Worker opt-in needs depth left.
+   */
+  private assertWorkerStartControls(
+    input: {
+      reviewOf?: string; reviewRun?: boolean | string; readOnly?: boolean;
+      policy?: AgentSessionPolicy; network?: boolean; allowSubWorkers?: boolean; userInitiated?: boolean;
+    },
+    from: string,
+  ): void {
+    const isReview = Boolean(input.reviewOf?.trim()) || input.reviewRun === true ||
+      (typeof input.reviewRun === 'string' && input.reviewRun.trim().length > 0);
+    if (isReview && ((input.policy !== undefined && input.policy !== 'read-only') ||
+        input.network === true || input.allowSubWorkers === true)) {
+      throw new OrchestrationError('operation_rejected', 'Review Workers stay read-only, without network access or sub-Workers.');
+    }
+    if (input.readOnly === true && input.policy !== undefined && input.policy !== 'read-only') {
+      throw new OrchestrationError('invalid_argument', `A read-only task cannot run with the ${input.policy} policy.`);
+    }
+    if (input.policy === 'full-auto' && input.userInitiated !== true) {
+      throw new OrchestrationError(
+        'operation_rejected',
+        'Only the person can start a full-auto Worker. Start it with workspace-write, or ask them to approve full-auto in AhaStation.',
+      );
+    }
+    if (input.allowSubWorkers === true && this.resolveCallerDepth(from) + 1 >= this.maxDepth) {
+      throw new OrchestrationError(
+        'operation_rejected',
+        `A Worker at depth ${this.resolveCallerDepth(from) + 1} cannot start sub-Workers (max depth ${this.maxDepth}).`,
+        { maxDepth: this.maxDepth },
+      );
+    }
+  }
+
   private assertCanDelegateFrom(callerPaneId: string): void {
     const nextDepth = this.resolveCallerDepth(callerPaneId) + 1;
     if (nextDepth > this.maxDepth) {
@@ -1881,7 +2095,7 @@ export class OrchestrationService {
 
   runCurrent(input: { from?: string } = {}): { run: OrchestrationRunRecord | null } {
     const handle = input.from?.trim() || 'coordinator';
-    const dispatch = CODEX_WORKER_ID.test(handle)
+    const dispatch = HEADLESS_WORKER_ID.test(handle)
       ? this.store.getActiveDispatchForIdentity(handle, null) : undefined;
     const run = (dispatch ? this.store.getRun(dispatch.runId) : this.store.getCurrentRunForConsumer(handle)) ?? null;
     return { run };
@@ -2805,7 +3019,7 @@ export class OrchestrationService {
     this.waiters.notify(toHandle, messageType);
     const codexTarget = toHandle.startsWith('dispatch:')
       ? this.store.getDispatchContext(toHandle.slice('dispatch:'.length))?.assigneeHandle : toHandle;
-    if (codexTarget && CODEX_WORKER_ID.test(codexTarget)) {
+    if (codexTarget && HEADLESS_WORKER_ID.test(codexTarget)) {
       if (this.codexWorkers.has(codexTarget)) {
         this.queueCodexMail(codexTarget, message);
         this.deliverCodexMailbox(codexTarget);
@@ -3279,6 +3493,7 @@ export class OrchestrationService {
         const parsedPayload = JSON.parse(latestMsg.payload) as { dispatchId?: unknown };
         if (typeof parsedPayload?.dispatchId === 'string' && parsedPayload.dispatchId) {
           this.approvals.cancelForDispatch(parsedPayload.dispatchId, 'Dispatch settled');
+          this.nativeQuestions.cancelForDispatch(parsedPayload.dispatchId, 'Dispatch settled');
           this.store.deleteDeferredDispatchPrompt(parsedPayload.dispatchId);
           this.waiters.cancel(`dispatch:${parsedPayload.dispatchId}`);
           this.waiters.notifyPrefix(`question:${parsedPayload.dispatchId}:`, 'status');
@@ -4564,7 +4779,10 @@ export class OrchestrationService {
     if (status?.state === 'waiting') {
       return status.waitKind === 'permission' ? 'waiting_permission' : 'waiting_input';
     }
-    if (this.store.listQuestions({ dispatchId: dispatch.id, status: 'pending' }).length > 0) {
+    if (
+      this.nativeQuestions.hasOpenQuestionForDispatch(dispatch.id) ||
+      this.store.listQuestions({ dispatchId: dispatch.id, status: 'pending' }).length > 0
+    ) {
       return 'waiting_input';
     }
     if (dispatch.executionMode === 'codex-app-server') return dispatch.stage ?? 'starting';
@@ -4639,6 +4857,7 @@ export class OrchestrationService {
       dispatchId: dispatch.id,
       status: 'pending',
     });
+    const openNativeQuestions = this.nativeQuestions.listOpenQuestions({ dispatchId: dispatch.id });
     const terminal = dispatch.executionMode !== 'codex-app-server' && paneId
       ? this.terminalTracker?.getTerminal(paneId) ?? null : null;
     return {
@@ -4650,6 +4869,7 @@ export class OrchestrationService {
       followUpChildDispatchId: followUpChild?.id ?? null,
       openApprovals,
       openQuestions,
+      openNativeQuestions,
       terminal,
     };
   }
@@ -4692,6 +4912,12 @@ export class OrchestrationService {
     keepOpen?: boolean;
     mcpEnabled?: boolean;
     role?: string;
+    /** Headless Worker controls; omitted ones follow the task (read-only tasks) and the Coordinator session. */
+    policy?: AgentSessionPolicy;
+    network?: boolean;
+    allowSubWorkers?: boolean;
+    /** Only the person (UI start, UI proposal approval) may start a full-auto Worker. */
+    userInitiated?: boolean;
   }, queueClaim?: symbol): Promise<{
     dispatch: OrchestrationDispatchRecord;
     task: OrchestrationTaskRecord;
@@ -4708,9 +4934,12 @@ export class OrchestrationService {
     briefBoardSeq?: number;
   }> {
     const from = input.from?.trim() || 'coordinator';
-    if (CODEX_WORKER_ID.test(from)) throw new OrchestrationError('operation_rejected', 'Headless Workers cannot start other Workers.');
+    if (HEADLESS_WORKER_ID.test(from) && !this.canHeadlessWorkerDelegate(from)) {
+      throw new OrchestrationError('operation_rejected', 'Headless Workers cannot start other Workers.');
+    }
     const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
     this.assertCanDelegateFrom(from);
+    this.assertWorkerStartControls(input, from);
     this.store.assertDispatchCapacity();
 
     if (input.taskId && this.store.getTask(input.taskId)?.queuedLaunch && (!queueClaim || this.claimedLaunches.get(input.taskId) !== queueClaim)) throw new OrchestrationError('task_not_ready', '任务由已批准的队列管理。');
@@ -4753,7 +4982,7 @@ export class OrchestrationService {
         `${reusingTerminal} is an Agent session, not a worker terminal.`
       );
     }
-    if (reusingTerminal && (CODEX_WORKER_ID.test(reusingTerminal) || !this.isPaneAlive(reusingTerminal))) {
+    if (reusingTerminal && (HEADLESS_WORKER_ID.test(reusingTerminal) || !this.isPaneAlive(reusingTerminal))) {
       throw new OrchestrationError(
         'terminal_unavailable',
         `Target terminal ${reusingTerminal} is not alive.`
@@ -5310,27 +5539,48 @@ export class OrchestrationService {
       await this.verifyCodeInputs(task, placement.cwd);
     } catch (error) {
       if (placement.ownsWorktree) await this.rollbackWorkerResources(undefined, placement.worktreePath);
+      if (createdTask) this.failTaskIfReady(task.id);
       throw error;
     }
-    // A run a session coordinates runs every non-reused Codex task as a headless Worker, even when
-    // the pilot setting is off; terminal-coordinated runs keep the read-only pilot gate.
+    // A run a session coordinates runs every non-reused task of a headless-capable driver as a
+    // headless Worker, even when the Codex pilot setting is off; terminal-coordinated runs keep the
+    // read-only Codex pilot gate. A driver that cannot enforce the task's policy keeps a terminal.
     const runIsSessionCoordinated =
       AGENT_SESSION_ID.test(run.coordinatorPaneId ?? '') || this.isActiveSessionCoordinator(from);
-    const readOnlyTask = input.readOnly === true || Boolean(reviewTarget || reviewRunTarget);
-    const usePilot = !reusingTerminal && launchConfig.cliId === 'codex' && Boolean(
-      this.codexPilot && (runIsSessionCoordinated || (readOnlyTask && this.codexPilot.enabled())),
-    );
-    const workerPolicy: AgentSessionPolicy = readOnlyTask ? 'read-only' : 'workspace-write';
+    const readOnlyTask = input.readOnly === true || input.policy === 'read-only' || Boolean(reviewTarget || reviewRunTarget);
+    const workerPolicy: AgentSessionPolicy = readOnlyTask ? 'read-only' : input.policy ?? 'workspace-write';
+    if (!reusingTerminal && runIsSessionCoordinated && isHeadlessWorkerDriver(launchConfig.cliId)) {
+      // An explicit control the driver cannot enforce is refused; an implied read-only tier keeps a terminal.
+      const unsupported = headlessWorkerControlsError(launchConfig.cliId, {
+        ...(input.policy !== undefined ? { policy: input.policy } : {}),
+        ...(input.network !== undefined ? { network: input.network } : {}),
+      });
+      if (unsupported) {
+        if (placement.ownsWorktree && placement.worktreePath) await this.rollbackWorkerResources(undefined, placement.worktreePath);
+        if (createdTask) this.failTaskIfReady(task.id);
+        throw new OrchestrationError('operation_rejected', unsupported, { cliId: launchConfig.cliId });
+      }
+    }
+    const headlessCli = !reusingTerminal && headlessWorkerSupports(launchConfig.cliId, workerPolicy)
+      ? launchConfig.cliId as HeadlessWorkerDriver : null;
+    const usePilot = headlessCli === 'codex'
+      ? Boolean(this.codexPilot && (runIsSessionCoordinated || (readOnlyTask && this.codexPilot.enabled())))
+      : Boolean(headlessCli && runIsSessionCoordinated && this.headlessWorkers &&
+        this.headlessWorkers.available?.(headlessCli) !== false);
     const coordinatorSession =
       (run.coordinatorPaneId && this.isActiveSessionCoordinator(run.coordinatorPaneId)
         ? this.sessionCoordinator(run.coordinatorPaneId)
         : null) ??
       (this.isActiveSessionCoordinator(from) ? this.sessionCoordinator(from) : null);
-    const workerNetwork = runIsSessionCoordinated && Boolean(coordinatorSession?.network);
-    const pilot = usePilot
-      ? await this.openCodexWorker(placement.cwd ?? process.cwd(), launchConfig.model, {
+    // Inherited network access is dropped on drivers that cannot sandbox it per turn.
+    const workerNetwork = !reviewTarget && !reviewRunTarget && Boolean(headlessCli && driverCapabilities(headlessCli).network) &&
+      (input.network ?? (runIsSessionCoordinated && Boolean(coordinatorSession?.network)));
+    const allowSubWorkers = input.allowSubWorkers === true;
+    const pilot = usePilot && headlessCli
+      ? await this.openCodexWorker(headlessCli, placement.cwd ?? process.cwd(), launchConfig.model, {
           policy: workerPolicy,
           network: workerNetwork,
+          allowSubWorkers,
         })
       : null;
 
@@ -5341,7 +5591,7 @@ export class OrchestrationService {
           task,
           cliId: launchConfig.cliId,
           cwd: placement.cwd,
-          extraArgs: usePilot && readOnlyTask
+          extraArgs: usePilot && headlessCli === 'codex' && readOnlyTask
             ? [...launchConfig.extraArgs, '--sandbox', 'read-only', '--ask-for-approval', 'on-request']
             : launchConfig.extraArgs,
         });
@@ -5386,7 +5636,9 @@ export class OrchestrationService {
         taskId: task.id,
         assigneeHandle: pilot?.id ?? ptyId!,
         assigneePaneId: ptyId,
-        ...(pilot ? { providerSessionId: pilot.sessionId } : {}),
+        ...(pilot ? {
+          providerSessionId: pilot.sessionId, workerPolicy, workerNetwork, allowSubWorkers,
+        } : {}),
         creator: from,
         creatorRunId: run.id,
         creatorDispatchId: callerDispatch?.id ?? null,
@@ -5490,10 +5742,11 @@ export class OrchestrationService {
       workerHandle: ctx.assigneeHandle,
       worktreePath: placement.worktreePath,
       branch: placement.branch,
-      canDispatchSubWorkers: ctx.executionMode !== 'codex-app-server' && ctx.depth < this.maxDepth,
+      canDispatchSubWorkers: (ctx.executionMode !== 'codex-app-server' || ctx.allowSubWorkers === true) &&
+        ctx.depth < this.maxDepth,
       mcpEnabled: ctx.executionMode === 'codex-app-server' || effectiveMcpEnabled,
       headless: ctx.executionMode === 'codex-app-server',
-      leaveUncommitted: ctx.executionMode === 'codex-app-server' && !readOnlyTask,
+      leaveUncommitted: ctx.executionMode === 'codex-app-server' && workerPolicy !== 'read-only',
       role: preambleRole,
     });
 
@@ -5529,7 +5782,7 @@ export class OrchestrationService {
         announcePane(ptyId);
       } else if (outcome.status === 'unknown_acceptance') {
         await pilot.session.close();
-        throw new OrchestrationError('prompt_delivery_failed', 'Codex turn acceptance is unknown. Check Worker output before retrying.', {
+        throw new OrchestrationError('prompt_delivery_failed', `${HEADLESS_DRIVER_LABELS[headlessCli!]} turn acceptance is unknown. Check Worker output before retrying.`, {
           dispatchId: ctx.id, taskId: task.id, acceptance: outcome.status,
         });
       } else {
@@ -5644,33 +5897,51 @@ export class OrchestrationService {
     };
   }
 
+  /** Starts a headless Worker on `cliId`'s native protocol; null when it could not start, before any turn. */
   private async openCodexWorker(
-    cwd: string, model: string | null, options: { policy: AgentSessionPolicy; network: boolean },
+    cliId: HeadlessWorkerDriver, cwd: string, model: string | null, options: HeadlessWorkerControls,
   ) {
-    if (this.disposed || !this.codexPilot) return null;
-    const id = `codex-worker-${randomUUID()}`;
+    const codexPilot = this.codexPilot;
+    const headlessWorkers = this.headlessWorkers;
+    if (this.disposed || (cliId === 'codex' ? !codexPilot : !headlessWorkers)) return null;
+    const id = `${cliId}-worker-${randomUUID()}`;
     let session: AgentSessionDriver | undefined;
     const timeline = this.createWorkerTimeline(
-      id, model, options.policy === 'read-only', (text) => session?.redactText(text) ?? text,
+      id, cliId, model, { policy: options.policy, network: options.network }, (text) => session?.redactText(text) ?? text,
     );
+    this.codexWorkerControls.set(id, { ...options });
     try {
-      session = this.codexPilot.launch(id, cwd, {
+      const launch = (events: AgentSessionEvents): AgentSessionDriver => cliId === 'codex'
+        ? codexPilot!.launch(id, cwd, events, { ...options })
+        : headlessWorkers!.launch(cliId, id, cwd, events, { ...options });
+      session = launch({
         onTimeline: (dispatchId, event) => {
           if (timeline.activeTurn?.dispatchId === dispatchId) timeline.apply(event);
         },
         onTurnStarted: (dispatchId) => {
           const waiting = this.approvals.hasOpenApprovalForDispatch(dispatchId);
+          const asking = this.nativeQuestions.hasOpenQuestionForDispatch(dispatchId);
           const updated = this.store.updateDispatchObservation(dispatchId, waiting ? 'permission' : 'observed', {
             promptSent: true, refreshHeartbeat: true,
           });
-          if (updated && !waiting) this.store.updateDispatchStage(dispatchId, 'working');
+          if (updated && !waiting && !asking) this.store.updateDispatchStage(dispatchId, 'working');
+          if (updated) this.emitChanged('worker:turn-started', updated.runId);
         },
         onTurnCompleted: (dispatchId, result) => this.completeCodexTurn(id, cwd, dispatchId, result),
         onRequest: async (dispatchId, request) => {
           const dispatch = this.store.getDispatchContext(dispatchId);
-          // Only approvals can be answered from the approval lane; anything else fails closed.
-          const allowed = request.kind === 'approval' && dispatch?.assigneeHandle === id &&
-            await this.approvals.holdCodexRequest(dispatch, request);
+          if (!dispatch || dispatch.assigneeHandle !== id) return { decision: 'decline' };
+          if (request.kind === 'question') {
+            return this.nativeQuestions.holdQuestion(dispatch, {
+              provider: headlessWorkerDriver(id) ?? dispatch.cliId ?? 'codex',
+              method: request.method,
+              questions: request.questions ?? [],
+              signal: request.signal,
+              redact: (text) => session?.redactText(text) ?? text,
+            });
+          }
+          // Anything that is neither a question nor an approval fails closed.
+          const allowed = request.kind === 'approval' && await this.approvals.holdCodexRequest(dispatch, request);
           return { decision: allowed ? 'accept' : 'decline' };
         },
         onExit: (reason, exitCode) => {
@@ -5682,22 +5953,28 @@ export class OrchestrationService {
           this.workerTimelines.delete(id);
           this.codexWorkers.delete(id);
           this.codexMailbox.delete(id);
+          this.codexWorkerControls.delete(id);
           this.approvals.cancelForPane(id, reason);
+          this.nativeQuestions.cancelForWorker(id, reason);
           this.waiters.cancel(id);
           this.waiters.cancelConsumer(id);
-          if (dispatchId && !this.codexSubmitting.has(dispatchId)) {
-            this.handleCodexExit(dispatchId, reason, exitCode);
-          }
+          const announced = Boolean(dispatchId && !this.codexSubmitting.has(dispatchId) &&
+            this.handleCodexExit(dispatchId, reason, exitCode));
+          const exited = !announced && dispatchId ? this.store.getDispatchContext(dispatchId) : undefined;
+          if (exited) this.emitChanged('worker:exited', exited.runId);
         },
       });
       this.codexWorkers.set(id, session);
       const sessionId = await session.open({ cwd, model, policy: options.policy, network: options.network });
-      if (!session.alive || this.disposed) throw new Error('Codex app-server closed during initialization');
+      if (!session.alive || this.disposed) throw new Error(`${HEADLESS_DRIVER_LABELS[cliId]} closed during initialization`);
       timeline.setMeta({ providerSessionId: sessionId });
       return { id, session, sessionId };
     } catch (error) {
       // No turn was sent, so PTY fallback can safely proceed after process teardown.
-      console.warn('[orchestration] Codex pilot startup failed:', error instanceof Error ? error.message : String(error));
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`[orchestration] ${HEADLESS_DRIVER_LABELS[cliId]} headless Worker startup failed:`, session ? session.redactText(reason) : reason);
+      this.codexWorkers.delete(id);
+      this.codexWorkerControls.delete(id);
       await session?.close();
       this.workerTimelines.delete(id);
       return null;
@@ -5726,7 +6003,9 @@ export class OrchestrationService {
   private completeCodexTurn(workerId: string, cwd: string, dispatchId: string, result: AgentTurnResult): void {
     const session = this.codexWorkers.get(workerId);
     if (session) this.archiveCodexOutput(session, dispatchId);
-    this.approvals.cancelForDispatch(dispatchId, 'Codex turn ended');
+    const label = this.headlessLabel(workerId);
+    this.approvals.cancelForDispatch(dispatchId, `${label} turn ended`);
+    this.nativeQuestions.cancelForDispatch(dispatchId, `${label} turn ended`);
     const timeline = this.workerTimelines.get(workerId);
     const status: WorkerTimelineTurnStatus = result.stopReason === 'completed' ? 'completed'
       : result.stopReason === 'interrupted' ? 'interrupted' : 'failed';
@@ -5738,6 +6017,7 @@ export class OrchestrationService {
     const dispatch = this.store.getDispatchContext(dispatchId);
     if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
     const announce = (diff: string | null) => {
+      if (this.disposed) return;
       const current = this.store.getDispatchContext(dispatchId);
       if (!current || !ACTIVE_DISPATCH_STATUSES.has(current.status) || current.codexTurn?.turnId !== result.turnId) return;
       if (diff !== result.diff) this.store.recordCodexTurn(dispatchId, { ...result, diff }, false);
@@ -5748,17 +6028,17 @@ export class OrchestrationService {
         diffSource: diff === null ? null : result.diff !== null ? 'provider' : 'git',
       });
       this.archiveWorkerTimeline(workerId, dispatchId);
-      this.publishCodexStatus(current, 'Codex turn ended; result pending confirmation',
-        `Codex turn ${result.stopReason} without a recorded report_done. Read the Worker output and diff evidence before deciding what to do.\n\n${result.finalText.slice(0, 4_000)}`,
+      this.publishCodexStatus(current, `${label} turn ended; result pending confirmation`,
+        `${label} turn ${result.stopReason} without a recorded report_done. Read the Worker output and diff evidence before deciding what to do.\n\n${result.finalText.slice(0, 4_000)}`,
         { turnId: result.turnId, stopReason: result.stopReason, error: result.error, usage: result.usage, diff });
       this.deliverCodexMailbox(workerId);
     };
     if (result.diff !== null) {
       announce(result.diff);
-    } else {
+    } else if (!this.disposed) {
       // Working-tree files can contain Worker credentials; redact before the diff is stored or published.
       const redactDiff = (diff: string) => this.store.redactDispatchCredentials(session?.redactText(diff) ?? diff);
-      void Promise.all([
+      const task: Promise<void> = Promise.all([
         runGitCommand(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], {
           cwd, readOnly: true, maxBytes: 128 * 1024, timeoutMs: 3_000,
         }),
@@ -5782,7 +6062,10 @@ export class OrchestrationService {
           ? git.stdout
           : `${[git.stdout.trimEnd(), untrackedDiff].filter(Boolean).join('\n')}\n`;
         announce(redactDiff(combined));
-      }, () => announce(null));
+      }, () => announce(null)).finally(() => {
+        this.pendingCodexTurnDiffs.delete(task);
+      });
+      this.pendingCodexTurnDiffs.add(task);
     }
   }
 
@@ -5790,16 +6073,18 @@ export class OrchestrationService {
     const dispatch = this.store.getDispatchContext(dispatchId);
     if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
     if (failure === 'unknown_acceptance') return; // submitCodexTurn has already parked and archived it.
+    const label = this.headlessLabel(dispatch.assigneeHandle);
     this.store.recordCodexDeliveryFailure(dispatchId, failure);
-    this.store.failDispatch(dispatchId, `Codex ${failure}`, {
+    this.store.failDispatch(dispatchId, `${label} ${failure}`, {
       forceFailTask: true, summary: this.store.redactDispatchCredentials(reason),
     });
-    this.cleanupCodexDispatch(dispatch, `Codex delivery ${failure}`);
-    this.publishCodexStatus(dispatch, `Codex delivery: ${failure}`, reason, { acceptance: failure });
+    this.cleanupCodexDispatch(dispatch, `${label} delivery ${failure}`);
+    this.publishCodexStatus(dispatch, `${label} delivery: ${failure}`, reason, { acceptance: failure });
   }
 
   private cleanupCodexDispatch(dispatch: OrchestrationDispatchRecord, reason: string): void {
     this.approvals.cancelForDispatch(dispatch.id, reason);
+    this.nativeQuestions.cancelForDispatch(dispatch.id, reason);
     this.waiters.cancel(`dispatch:${dispatch.id}`);
     this.waiters.notifyPrefix(`question:${dispatch.id}:`, 'status');
     this.store.cleanupDispatchBrief(dispatch.id);
@@ -5809,13 +6094,23 @@ export class OrchestrationService {
     }
   }
 
-  private handleCodexExit(dispatchId: string, reason: string, exitCode: number | null): void {
+  private handleCodexExit(dispatchId: string, reason: string, exitCode: number | null): boolean {
     const dispatch = this.store.getDispatchContext(dispatchId);
-    if (!dispatch?.promptSentAt || dispatch.stage === 'needs_reconciliation' || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
-    if (exitCode === 0 && dispatch.stage === 'awaiting_review') return;
-    this.store.failDispatch(dispatch.id, 'Codex app-server exited', { forceFailTask: true, summary: reason });
+    if (!dispatch?.promptSentAt || dispatch.stage === 'needs_reconciliation' || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return false;
+    if (exitCode === 0 && dispatch.stage === 'awaiting_review') return false;
+    const label = this.headlessLabel(dispatch.assigneeHandle);
+    this.store.failDispatch(dispatch.id, dispatch.assigneeHandle.startsWith('codex-') ? 'Codex app-server exited' : `${label} exited`, {
+      forceFailTask: true, summary: reason,
+    });
     this.cleanupCodexDispatch(dispatch, reason);
-    this.publishCodexStatus(dispatch, 'Codex Worker exited before report_done', reason, { exitCode });
+    this.publishCodexStatus(dispatch, `${label} Worker exited before report_done`, reason, { exitCode });
+    return true;
+  }
+
+  /** The agent a headless Worker runs, for coordinator-facing status text. */
+  private headlessLabel(workerId: string): string {
+    const driver = headlessWorkerDriver(workerId);
+    return driver ? HEADLESS_DRIVER_LABELS[driver] : 'Codex';
   }
 
   private async submitCodexTurn(dispatch: OrchestrationDispatchRecord, session: AgentSessionDriver, prompt: string) {
@@ -5823,7 +6118,10 @@ export class OrchestrationService {
     const timeline = this.workerTimelines.get(dispatch.assigneeHandle);
     timeline?.beginTurn({ dispatchId: dispatch.id, prompt });
     try {
-      const result = await session.startTurn({ turnKey: dispatch.id, prompt, effort: dispatch.effort ?? null });
+      const controls = this.headlessControls(dispatch);
+      const result = await session.startTurn({
+        turnKey: dispatch.id, prompt, effort: dispatch.effort ?? null, policy: controls.policy, network: controls.network,
+      });
       if (result.status !== 'accepted') timeline?.endActiveTurn('failed', result.reason);
       if (result.status === 'unknown_acceptance') {
         this.store.recordCodexDeliveryFailure(dispatch.id, result.status);
@@ -5844,7 +6142,7 @@ export class OrchestrationService {
         this.publishCodexStatus(dispatch, '接单结果需核对', result.reason, { acceptance: result.status });
       }
       if (result.status === 'accepted' && !session.alive) {
-        this.handleCodexExit(dispatch.id, 'Codex disconnected after accepting the turn', null);
+        this.handleCodexExit(dispatch.id, `${this.headlessLabel(dispatch.assigneeHandle)} disconnected after accepting the turn`, null);
       }
       return result;
     } finally {
@@ -5904,7 +6202,7 @@ export class OrchestrationService {
         this.failCodexDispatch(dispatch.id, outcome.status, outcome.reason);
         await session.close();
       }
-    }).catch((error) => console.warn('[orchestration] Codex mailbox delivery failed:', error));
+    }).catch((error) => console.warn(`[orchestration] ${this.headlessLabel(workerId)} mailbox delivery failed:`, error));
   }
 
   private async followUpSettledWorker(
@@ -5959,7 +6257,7 @@ export class OrchestrationService {
     const session = isHeadless ? this.codexWorkers.get(existingPaneId) : undefined;
     if (isHeadless && (!session?.alive || !await session.waitForIdle(15_000) || !session.alive ||
         this.store.getActiveDispatchForIdentity(existingPaneId, null))) {
-      throw new OrchestrationError('dispatch_inactive', 'Codex Worker is unavailable or still finishing its previous turn.');
+      throw new OrchestrationError('dispatch_inactive', `${this.headlessLabel(existingPaneId)} Worker is unavailable or still finishing its previous turn.`);
     }
     const canReuseLivePane =
       Boolean(existingPaneId) &&
@@ -6020,6 +6318,7 @@ export class OrchestrationService {
     }
 
     const nextGeneration = (settledDispatch.processGeneration ?? 1) + 1;
+    const controls = session ? this.headlessControls(settledDispatch) : null;
     let nextCtx: OrchestrationDispatchRecord;
     try {
       nextCtx = this.store.createDispatchContext({
@@ -6028,6 +6327,9 @@ export class OrchestrationService {
         assigneeHandle: targetPtyId,
         assigneePaneId: session ? null : targetPtyId,
         ...(session?.sessionId ? { providerSessionId: session.sessionId } : {}),
+        ...(controls ? {
+          workerPolicy: controls.policy, workerNetwork: controls.network, allowSubWorkers: controls.allowSubWorkers,
+        } : {}),
         creator: from,
         creatorRunId: settledDispatch.runId,
         creatorDispatchId: settledDispatch.creatorDispatchId ?? null,
@@ -6133,12 +6435,12 @@ export class OrchestrationService {
       workerHandle: targetPtyId,
       worktreePath: nextCtx.worktreePath,
       branch: nextCtx.branch,
-      canDispatchSubWorkers: !session && nextCtx.depth < this.maxDepth,
+      canDispatchSubWorkers: (!session || controls?.allowSubWorkers === true) && nextCtx.depth < this.maxDepth,
       isFollowUp: reusedPane || Boolean(session),
       previousDispatchId: settledDispatch.id,
       mcpEnabled: Boolean(session) || followUpMcpEnabled,
       headless: Boolean(session),
-      leaveUncommitted: Boolean(session) && this.workerTimelines.get(targetPtyId)?.getHeader().readOnly === false,
+      leaveUncommitted: controls !== null && controls.policy !== 'read-only',
       role: followUpRole,
     });
 
@@ -6147,7 +6449,7 @@ export class OrchestrationService {
       if (outcome.status !== 'accepted') {
         this.failCodexDispatch(nextCtx.id, outcome.status, outcome.reason);
         await session.close();
-        throw new OrchestrationError('prompt_delivery_failed', 'Codex follow-up delivery failed.', {
+        throw new OrchestrationError('prompt_delivery_failed', `${this.headlessLabel(targetPtyId)} follow-up delivery failed.`, {
           dispatchId: nextCtx.id, acceptance: outcome.status,
         });
       }
@@ -6646,6 +6948,7 @@ export class OrchestrationService {
     if (shouldClosePane) await this.confirmWorkerPaneClosed(paneId);
 
     this.approvals.cancelForDispatch(dispatch.id, input.reason || 'Worker stopped');
+    this.nativeQuestions.cancelForDispatch(dispatch.id, input.reason || 'Worker stopped');
     if (!headless && paneId) {
       this.turnStopMonitor.cancelForPane(paneId);
       if (this.terminalTracker) {
@@ -6743,6 +7046,7 @@ export class OrchestrationService {
     if (codex) this.archiveCodexOutput(codex, dispatch.id);
 
     this.approvals.cancelForDispatch(dispatch.id, input.reason || 'Worker abandoned');
+    this.nativeQuestions.cancelForDispatch(dispatch.id, input.reason || 'Worker abandoned');
     if (codex) this.archiveWorkerTimeline(dispatch.assigneeHandle, dispatch.id);
     if (!headless && paneId) {
       this.turnStopMonitor.cancelForPane(paneId);
@@ -6820,6 +7124,7 @@ export class OrchestrationService {
       }
       for (const d of this.store.listDispatches()) {
         this.approvals.cancelForDispatch(d.id, 'Orchestration state reset');
+        this.nativeQuestions.cancelForDispatch(d.id, 'Orchestration state reset');
         const pty = d.assigneePaneId ?? d.assigneeHandle;
         if (pty) this.turnStopMonitor.cancelForPane(pty);
       }
@@ -7039,7 +7344,7 @@ export class OrchestrationService {
       : this.resolveTargetDispatch(input);
     if (callerPaneId !== undefined) {
       this.authorizeRunAccess(dispatch.runId, callerPaneId);
-      this.assertRunCoordinator(dispatch.runId, callerPaneId);
+      this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
     }
     const worktreePath =
       dispatch.worktreePath ??
@@ -8006,6 +8311,9 @@ export class OrchestrationService {
       model?: string;
       effort?: string;
       terminal?: string;
+      policy?: AgentSessionPolicy;
+      network?: boolean;
+      allowSubWorkers?: boolean;
       userInitiated?: boolean;
       confirmed?: boolean;
       planSummary?: string;
@@ -8090,6 +8398,20 @@ export class OrchestrationService {
     const taskTitle = role ? `@${role}: ${firstLine}` : firstLine;
 
     const effectiveTaskKind = input.taskKind ?? (isAdversarialReview ? 'review' : undefined);
+    let workerPolicy: AgentSessionPolicy | undefined = input.policy;
+    let workerNetwork: boolean | undefined = input.network;
+    let allowSubWorkers = input.allowSubWorkers === true;
+    if (effectiveTaskKind === 'review' && ((workerPolicy !== undefined && workerPolicy !== 'read-only') ||
+        workerNetwork === true || allowSubWorkers)) {
+      throw new OrchestrationError('operation_rejected', 'Review Workers stay read-only, without network access or sub-Workers.');
+    }
+    if (allowSubWorkers && this.resolveCallerDepth(from) + 1 >= this.maxDepth) {
+      throw new OrchestrationError(
+        'operation_rejected',
+        `A Worker at depth ${this.resolveCallerDepth(from) + 1} cannot start sub-Workers (max depth ${this.maxDepth}).`,
+        { maxDepth: this.maxDepth },
+      );
+    }
     let worktree = isAdversarialReview
       ? false
       : (input.worktree ?? this.getDefaultWorktreeDep?.() ?? true);
@@ -8205,11 +8527,23 @@ export class OrchestrationService {
       model: resolvedModel ?? null,
       effort: resolvedEffort ?? null,
       terminal: input.terminal?.trim() || null,
+      ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
+      ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
+      ...(allowSubWorkers ? { allowSubWorkers: true } : {}),
       ...(requestedAuthorizeReviews !== undefined
         ? { authorizeReviews: requestedAuthorizeReviews }
         : {}),
     };
-    const confirmMode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
+    // A headless Worker has no chat turn with the person, so chat confirmation becomes a UI card.
+    const confirmMode = this.effectiveConfirmMode(from);
+    // A Coordinator can ask for full-auto only through a proposal the person approves in the UI.
+    if (workerPolicy === 'full-auto' && input.userInitiated !== true && confirmMode !== 'always-ui') {
+      throw new OrchestrationError(
+        'operation_rejected',
+        'A Coordinator cannot start a full-auto Worker on its own. Use workspace-write, or ask the person to start or approve a full-auto Worker in AhaStation.',
+      );
+    }
+    let approvedByPerson = input.userInitiated === true;
     // Review dispatches bypass repeated confirmation ONLY when the user explicitly pre-authorized
     // review execution for this Run (via a prior confirmed proposal or UI toggle).
     const autoReviewBypass = Boolean(isReviewDispatch && targetRunForAuth?.reviewAutoAuthorized);
@@ -8258,7 +8592,11 @@ export class OrchestrationService {
         } else if (isReviewDispatch || held.proposal.authorizeReviews === true) {
           grantRunAutoReview = true;
         }
+        approvedByPerson = true;
         if (held.overrides) {
+          if (held.overrides.policy !== undefined) workerPolicy = held.overrides.policy ?? undefined;
+          if (held.overrides.network !== undefined) workerNetwork = held.overrides.network ?? undefined;
+          if (typeof held.overrides.allowSubWorkers === 'boolean') allowSubWorkers = held.overrides.allowSubWorkers;
           const prevAgent = resolvedAgent;
           if (held.overrides.agent?.trim()) {
             resolvedAgent = normalizeWorkerCliId(held.overrides.agent);
@@ -8283,6 +8621,18 @@ export class OrchestrationService {
           if (!resolvedModel) {
             resolvedEffort = undefined;
           }
+          if (isHeadlessWorkerDriver(resolvedAgent)) {
+            // Switching to a driver without network access drops the Coordinator's request; an explicit override still fails.
+            if (workerNetwork === true && held.overrides.network === undefined && !driverCapabilities(resolvedAgent).network) {
+              workerNetwork = false;
+            }
+            const unsupported = headlessWorkerControlsError(resolvedAgent, {
+              ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
+              ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
+            });
+            if (unsupported) throw new OrchestrationError('operation_rejected', unsupported, { proposalId: held.proposal.id });
+          }
+          if (allowSubWorkers && this.resolveCallerDepth(from) + 1 >= this.maxDepth) allowSubWorkers = false;
         }
       }
     }
@@ -8299,6 +8649,10 @@ export class OrchestrationService {
           authorizedNetwork: Boolean(this.sessionCoordinator(from)?.network), requiresPaneMode: this.isPaneOrchestrationMode(from),
           coordinatorGeneration: run.consumerGeneration, baseBranch: input.baseBranch, agent: resolvedAgent,
           role, terminal: input.terminal, model: resolvedModel, effort: resolvedEffort, taskKind: effectiveTaskKind,
+          ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
+          ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
+          ...(allowSubWorkers ? { allowSubWorkers: true } : {}),
+          ...(approvedByPerson ? { userInitiated: true } : {}),
           worktree, authorizeReviews: grantRunAutoReview, state: 'waiting',
         },
       });
@@ -8347,7 +8701,12 @@ export class OrchestrationService {
           ...(reviewTargetDispatch ? { reviewOf: reviewTargetDispatch.id } : {}),
           ...(reviewRunTarget ? { reviewRun: reviewRunTarget.id } : {}),
           ...(reviewFocus ? { reviewFocus } : {}),
-          ...(effectiveTaskKind === 'review' || effectiveTaskKind === 'research' ? { readOnly: true } : {}),
+          ...((effectiveTaskKind === 'review' || effectiveTaskKind === 'research') && workerPolicy === undefined
+            ? { readOnly: true } : {}),
+          ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
+          ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
+          ...(allowSubWorkers ? { allowSubWorkers: true } : {}),
+          userInitiated: approvedByPerson,
           ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
           taskTitle,
           displayName,
@@ -8643,10 +9002,12 @@ export class OrchestrationService {
   getMcpContextForPane(callerPaneId: string): OrchestrationMcpContext {
     const cleanCaller = callerPaneId.trim();
     const activeDispatch = this.store.getActiveDispatchForIdentity(cleanCaller, cleanCaller) ?? null;
-    const role: 'worker' | 'coordinator' = activeDispatch || CODEX_WORKER_ID.test(cleanCaller) ? 'worker' : 'coordinator';
+    const role: 'worker' | 'coordinator' = activeDispatch || HEADLESS_WORKER_ID.test(cleanCaller) ? 'worker' : 'coordinator';
     const orchestrationMode = this.isPaneOrchestrationMode(cleanCaller);
-    const confirmMode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
-    const canDelegate = !CODEX_WORKER_ID.test(cleanCaller) && this.resolveCallerDepth(cleanCaller) < this.maxDepth;
+    const confirmMode = this.effectiveConfirmMode(cleanCaller);
+    const canDelegate = HEADLESS_WORKER_ID.test(cleanCaller)
+      ? this.canHeadlessWorkerDelegate(cleanCaller)
+      : this.resolveCallerDepth(cleanCaller) < this.maxDepth;
     const roster = this.listCodingAgents(cleanCaller);
     const managed = this.listManagedDispatchesForCaller(cleanCaller);
     const workers: OrchestrationMcpWorkerBrief[] = managed.map((d) => {
@@ -8667,7 +9028,7 @@ export class OrchestrationService {
         worktreePath: d.worktreePath ?? null,
         branch: d.branch ?? null,
         openApprovalCount: summary.openApprovals.length,
-        openQuestionCount: summary.openQuestions.length,
+        openQuestionCount: summary.openQuestions.length + summary.openNativeQuestions.length,
       };
     });
     const pendingProposals = this.proposals.listPendingProposals({
@@ -8690,7 +9051,7 @@ export class OrchestrationService {
 
   private isMcpEnabledForPane(ptyId: string): boolean {
     const clean = ptyId.trim();
-    if (CODEX_WORKER_ID.test(clean) || AGENT_SESSION_ID.test(clean)) return this.isPaneAlive(clean);
+    if (HEADLESS_WORKER_ID.test(clean) || AGENT_SESSION_ID.test(clean)) return this.isPaneAlive(clean);
     if (!clean || !this.isMcpEnabledForCliDep) return false;
     const cliId =
       this.agentStatusStore.get(clean)?.agentId ??
@@ -8842,7 +9203,7 @@ export class OrchestrationService {
         cliId: d.cliId ?? null,
         stage: summary.stage,
         openApprovalCount: summary.openApprovals.length,
-        openQuestionCount: summary.openQuestions.length,
+        openQuestionCount: summary.openQuestions.length + summary.openNativeQuestions.length,
       };
     });
     const pendingProposalCount = this.proposals.listPendingProposals({ runId }).length;
@@ -8862,7 +9223,7 @@ export class OrchestrationService {
       if (!paneId || paneId === senderPaneId) return;
       this.waiters.notify(paneId, msg.type);
       this.waiters.notify(`board-pane:${paneId}`, msg.type);
-      if (CODEX_WORKER_ID.test(paneId)) {
+      if (HEADLESS_WORKER_ID.test(paneId)) {
         this.queueCodexMail(paneId, msg);
         this.deliverCodexMailbox(paneId);
       } else {
@@ -9675,6 +10036,7 @@ export class OrchestrationService {
 
       const hasPendingAttention =
         this.approvals.listOpenApprovals({ runId: run.id }).length > 0 ||
+        this.nativeQuestions.listOpenQuestions({ runId: run.id }).length > 0 ||
         this.store.listQuestions({ runId: run.id, status: 'pending' }).length > 0 ||
         this.store.listGates({ runId: run.id, status: 'pending' }).length > 0 ||
         this.proposals.listPendingProposals({ runId: run.id }).length > 0;
@@ -9742,11 +10104,20 @@ export class OrchestrationService {
 
   // ==================== Snapshot & Agent Text Views ====================
 
+  private withHeadlessLive(dispatch: OrchestrationDispatchRecord): OrchestrationDispatchRecord {
+    if (dispatch.executionMode !== 'codex-app-server') return dispatch;
+    const session = this.codexWorkers.get(dispatch.assigneeHandle);
+    const alive = Boolean(session?.alive && !dispatch.releasedAt);
+    const busy = alive && (session!.busy || this.codexSubmitting.has(dispatch.id));
+    return { ...dispatch, headlessLive: { alive, busy } };
+  }
+
   getSnapshot(runId?: string, callerPaneId?: string): OrchestrationSnapshot {
     const scope = callerPaneId === undefined
       ? runId
       : this.authorizeRunAccess(runId, callerPaneId);
     const base = this.store.getSnapshot(scope);
+    base.dispatches = base.dispatches.map((dispatch) => this.withHeadlessLive(dispatch));
     if (callerPaneId !== undefined) {
       base.runs = base.runs.filter((run) => run.id === scope);
       base.currentRunByConsumer = Object.fromEntries(
@@ -9774,6 +10145,9 @@ export class OrchestrationService {
             (approval) =>
               !firewall || !approval.dispatchId || !firewall.targetDispatchIds.has(approval.dispatchId),
           ),
+        openNativeQuestions: this.nativeQuestions
+          .listOpenQuestions(scope ? { runId: scope } : undefined)
+          .filter((question) => !firewall || !firewall.targetDispatchIds.has(question.dispatchId)),
         pendingProposals: firewall
           ? []
           : this.proposals.listPendingProposals(scope ? { runId: scope } : undefined),
@@ -9783,6 +10157,7 @@ export class OrchestrationService {
     return {
       ...base,
       openApprovals: this.approvals.listOpenApprovals(scope ? { runId: scope } : undefined),
+      openNativeQuestions: this.nativeQuestions.listOpenQuestions(scope ? { runId: scope } : undefined),
       pendingProposals: this.proposals.listPendingProposals(scope ? { runId: scope } : undefined),
       orchestrationModePanes: [...this.orchestrationModePanes],
     };
@@ -10124,7 +10499,10 @@ export class OrchestrationService {
 
   async stopCodexWorkers(): Promise<void> {
     this.disposed = true;
-    await Promise.all([...this.codexWorkers.values()].map((codex) => codex.close(true)));
+    await Promise.all([
+      ...[...this.codexWorkers.values()].map((codex) => codex.close(true)),
+      ...this.pendingCodexTurnDiffs,
+    ]);
   }
 
   dispose(): void {
@@ -10157,6 +10535,7 @@ export class OrchestrationService {
     this.peerPingPong.clearAll();
     this.turnStopMonitor.dispose();
     this.approvals.dispose();
+    this.nativeQuestions.dispose();
     this.proposals.dispose();
     this.orchestrationModePanes.clear();
     this.pointerDelivery.stop();
@@ -10306,7 +10685,8 @@ export class OrchestrationService {
 
   private isDispatchDeliberatelyWaiting(dispatch: OrchestrationDispatchRecord): boolean {
     if (dispatch.executionMode === 'codex-app-server' && this.isPaneAlive(dispatch.assigneeHandle)) return true;
-    if (this.approvals.hasOpenApprovalForDispatch(dispatch.id)) {
+    if (this.approvals.hasOpenApprovalForDispatch(dispatch.id) ||
+        this.nativeQuestions.hasOpenQuestionForDispatch(dispatch.id)) {
       return true;
     }
     const dispatchMailbox = `dispatch:${dispatch.id}`;

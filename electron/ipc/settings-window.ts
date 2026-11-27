@@ -11,6 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 let settingsWindow: BrowserWindow | null = null;
+export const settingsWindowSenderId = () => settingsWindow && !settingsWindow.isDestroyed() ? settingsWindow.webContents.id : null;
 
 export type SettingsSection = 'appearance' | 'terminal' | 'voice-input' | 'cli-agents';
 

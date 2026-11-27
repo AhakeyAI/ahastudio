@@ -14,6 +14,7 @@ import {
   reportCorrectsUnresponsiveWorker,
 } from './orchestration-lifecycle-graph.js';
 import { buildOrchestrationTaskDisplayMetadata } from './orchestration-task-display.js';
+import type { AgentSessionPolicy } from './agent-session-driver.js';
 import { mapTimelineStrings, trimTimelineSnapshot, TIMELINE_LIMITS, type WorkerTimelineSnapshot } from './worker-timeline.js';
 import {
   AGENT_PROMPT_STALLED_ERROR,
@@ -1412,6 +1413,9 @@ export class OrchestrationStore {
     taskId: string;
     approvedQueueLaunch?: boolean;
     providerSessionId?: string;
+    workerPolicy?: AgentSessionPolicy;
+    workerNetwork?: boolean;
+    allowSubWorkers?: boolean;
     assigneeHandle: string;
     assigneePaneId?: string | null;
     processIncarnation?: string | null;
@@ -1551,6 +1555,9 @@ export class OrchestrationStore {
       ...(input.providerSessionId ? {
         executionMode: 'codex-app-server' as const,
         providerSessionId: input.providerSessionId,
+        ...(input.workerPolicy !== undefined ? { workerPolicy: input.workerPolicy } : {}),
+        ...(typeof input.workerNetwork === 'boolean' ? { workerNetwork: input.workerNetwork } : {}),
+        ...(input.allowSubWorkers ? { allowSubWorkers: true } : {}),
       } : {}),
       assigneePaneId: input.assigneePaneId ?? null,
       processIncarnation: input.processIncarnation ?? null,
@@ -1660,6 +1667,28 @@ export class OrchestrationStore {
     if (!ctx) return null;
     if (ctx.stage === stage) return { ...ctx };
     ctx.stage = stage;
+    ctx.updatedAt = this.now();
+    this.persist();
+    return { ...ctx };
+  }
+
+  /** Records a headless Worker's permission tier and network access for its next turns. */
+  updateDispatchWorkerControls(
+    dispatchId: string,
+    patch: { workerPolicy?: AgentSessionPolicy; workerNetwork?: boolean },
+  ): OrchestrationDispatchRecord | null {
+    const ctx = this.dispatches.get(dispatchId);
+    if (!ctx || ctx.executionMode !== 'codex-app-server') return null;
+    let changed = false;
+    if (patch.workerPolicy !== undefined && ctx.workerPolicy !== patch.workerPolicy) {
+      ctx.workerPolicy = patch.workerPolicy;
+      changed = true;
+    }
+    if (patch.workerNetwork !== undefined && ctx.workerNetwork !== patch.workerNetwork) {
+      ctx.workerNetwork = patch.workerNetwork;
+      changed = true;
+    }
+    if (!changed) return { ...ctx };
     ctx.updatedAt = this.now();
     this.persist();
     return { ...ctx };
@@ -1814,6 +1843,9 @@ export class OrchestrationStore {
     ctx.ownsPane = true;
     delete ctx.executionMode;
     delete ctx.providerSessionId;
+    delete ctx.workerPolicy;
+    delete ctx.workerNetwork;
+    delete ctx.allowSubWorkers;
     ctx.updatedAt = this.now();
     this.persist();
     return { ...ctx };

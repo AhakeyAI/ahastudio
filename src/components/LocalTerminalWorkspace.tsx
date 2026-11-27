@@ -1,4 +1,5 @@
 import { agentSessionClient, isStandaloneSession } from '../lib/agent-session-client';
+import { SESSION_DRIVER_IDS } from '../lib/session-capabilities';
 import { SessionHistoryPanel } from './agent-session/SessionHistoryPanel';
 import {
   useCallback,
@@ -522,6 +523,12 @@ export function LocalTerminalWorkspace({
       const newApprovals = (next.openApprovals ?? []).filter(
         (a) => a.status === 'pending' && !prevApprovalIds.has(a.approvalId),
       );
+      const prevNativeQuestionIds = new Set(
+        (prev?.openNativeQuestions ?? []).map((q) => q.requestId),
+      );
+      const newNativeQuestions = (next.openNativeQuestions ?? []).filter(
+        (q) => q.status === 'pending' && !prevNativeQuestionIds.has(q.requestId),
+      );
       if (freshProposals.length) {
         const proposal = freshProposals[0]!;
         const role = proposal.role?.trim().replace(/^@+/, '') || 'worker';
@@ -529,6 +536,10 @@ export function LocalTerminalWorkspace({
         setToast(`编排：待确认拉起 @${role} (${agent})`);
       } else if (newApprovals.length) {
         setToast(`编排：Worker 请求权限「${newApprovals[0]!.toolName}」`);
+      } else if (newNativeQuestions.length) {
+        const firstQ = newNativeQuestions[0]!.questions[0];
+        const label = (firstQ?.header || firstQ?.prompt || '请答复 Worker 提问').slice(0, 60);
+        setToast(`编排：Worker 提问「${label}」`);
       } else if (fresh.gates.length) {
         setToast(`编排：需要你决策「${fresh.gates[0]!.question.slice(0, 60)}」`);
       } else if (fresh.questions.length) {
@@ -1107,7 +1118,8 @@ export function LocalTerminalWorkspace({
           onCreate={(type, opts) => {
             const cwd = selectedCwd ?? opts?.cwd;
             if (type !== 'agent-session') return stage.createWindow(type, { ...opts, cwd });
-            void agentSessionClient.create({ ...(cwd ? { cwd } : {}), policy: 'workspace-write' }).then((res) => {
+            const provider = SESSION_DRIVER_IDS.find((id) => id === opts?.localCliId) ?? 'codex';
+            void agentSessionClient.create({ ...(cwd ? { cwd } : {}), provider, policy: 'workspace-write' }).then((res) => {
               if (!res.ok) return handleNotify(res.error);
               void stageWindowStore.createWindow('agent-session', { ...opts, cwd: res.session.cwd, workerId: res.session.id });
             });

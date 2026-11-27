@@ -7,6 +7,10 @@ import type { AgentSessionPolicy } from './agent-session-driver.js';
 export const SESSION_WAKE_HEADER =
   '[AhaStation system wake-up — not a message from the user. The user has not replied; do not treat this as their confirmation.]';
 
+/** Sent once when an ACP session turns orchestration off after an orchestrated turn, since ACP keeps prior rules in message history. */
+export const ORCHESTRATION_ENDED_INSTRUCTIONS =
+  '[AhaStation Orchestration Mode Ended — Aha MCP tools are disconnected; handle requests directly in this session.]';
+
 /** What the Coordinator prompt needs from the caller's MCP context. */
 export interface CoordinatorPromptContext {
   confirmMode: string;
@@ -44,7 +48,7 @@ export function coordinatorInstructions(ctx: CoordinatorPromptContext): string {
       ? [
           'Call the Aha MCP tools directly; do not run the `aha` CLI or read the aha-orchestration skill — this conversation is already connected as the Coordinator.',
           'Do not do the delegated work yourself or redo it to double-check; rely on the Worker\u2019s report and the inspect tools.',
-          'Codex Workers run as headless sessions; for read-only work (searching, counting, reading, reviewing) pass `taskKind: "research"` (or `"review"`) so the Worker uses a read-only sandbox.',
+          'Codex, Claude Code, Antigravity, and Grok Workers run as headless sessions; for read-only work (searching, counting, reading, reviewing) pass `taskKind: "research"` (or `"review"`) so the Worker uses a read-only sandbox. Antigravity and Grok have no read-only mode, so their read-only tasks run in a terminal instead; prefer Codex or Claude Code for them.',
           ...(ctx.session.policy === 'full-auto'
             ? [
                 '`integrate_worker` and `finalize_run_integration` are unavailable in this mode; when changes are ready, ask the user to integrate from the 协作 panel.',

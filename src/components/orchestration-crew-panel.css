@@ -474,6 +474,32 @@ html.handheld .aha-crew-split-pill .aha-crew-drawer-btn {
   border-color: var(--workspace-accent);
 }
 
+.aha-crew-chips button.is-selected {
+  border-color: var(--workspace-accent);
+  background: color-mix(in srgb, var(--workspace-accent) 18%, var(--workspace-surface));
+  color: var(--workspace-accent);
+  font-weight: 600;
+}
+
+.aha-crew-native-qa {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.aha-crew-link-btn {
+  border: none;
+  background: transparent;
+  color: var(--workspace-accent);
+  font-size: 10px;
+  padding: 0 2px;
+  cursor: pointer;
+}
+
+.aha-crew-link-btn:hover {
+  text-decoration: underline;
+}
+
 .aha-crew-inline-actions {
   display: flex;
   flex-wrap: wrap;
@@ -678,4 +704,21 @@ html.handheld .aha-crew-split-pill .aha-crew-drawer-btn {
 .aha-crew-quick-send:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+.aha-crew-worker-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0 4px 22px;
+  font-size: 11px;
+}
+
+.aha-crew-badge {
+  border: 1px solid var(--workspace-border);
+  border-radius: 999px;
+  padding: 0 6px;
+  line-height: 16px;
+  color: var(--workspace-muted, inherit);
 }
