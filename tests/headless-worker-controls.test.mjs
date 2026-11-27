@@ -9,6 +9,7 @@ import { createInterface } from 'node:readline';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
@@ -31,14 +32,22 @@ const SESSION_A = 'agent-session-00000000-0000-0000-0000-00000000000a';
 const modDir = mkdtempSync(join(tmpdir(), 'aha-hwc-ui-'));
 test.after(() => rmSync(modDir, { recursive: true, force: true }));
 
-async function loadRenderer(rel, name) {
+async function loadRenderer(rel, name, rewrite = (source) => source) {
   const source = await readFile(new URL(rel, import.meta.url), 'utf8');
   const js = ts.transpileModule(source, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
   }).outputText;
   const out = join(modDir, name);
-  writeFileSync(out, js, 'utf8');
+  writeFileSync(out, rewrite(js), 'utf8');
   return import(pathToFileURL(out).href);
+}
+
+async function loadCrewModel() {
+  await loadRenderer('../src/lib/git-panel-model.ts', 'git-panel-model.mjs');
+  await loadRenderer('../src/lib/orchestration-view.ts', 'orchestration-view.mjs');
+  return loadRenderer('../src/lib/orchestration-crew-model.ts', 'orchestration-crew-model.mjs', (source) => source
+    .replace("'./git-panel-model'", "'./git-panel-model.mjs'")
+    .replace("'./orchestration-view'", "'./orchestration-view.mjs'"));
 }
 
 const until = async (read, ms = 5_000) => {
@@ -239,16 +248,37 @@ test('controls tables: driver tiers and network, sub-Worker Aha tools, and the r
   assert.equal(headlessWorkerControlsError('codex', { policy: 'full-auto', network: true }), null);
 
   assert.ok(!workerApprovedMcpTools({ policy: 'workspace-write' }).includes('delegate_task'));
-  assert.ok(workerApprovedMcpTools({ policy: 'full-auto' }).includes('board_wait'));
-  for (const tool of ['delegate_task', 'team_wait', 'board_wait', 'report_done']) {
+  // The approved set is fixed at launch, so it cannot depend on a tier the person may switch later.
+  assert.deepEqual(workerApprovedMcpTools({ policy: 'workspace-write' }), workerApprovedMcpTools({ policy: 'full-auto' }));
+  assert.ok(workerApprovedMcpTools({ policy: 'workspace-write' }).includes('board_wait'));
+  const subTools = ['list_coding_agents', 'delegate_task', 'team_status', 'team_wait', 'message_worker', 'inspect_worker_diff'];
+  for (const tool of [...subTools, 'board_wait', 'report_done']) {
     assert.ok(workerApprovedMcpTools({ policy: 'workspace-write', allowSubWorkers: true }).includes(tool), tool);
+  }
+  for (const tool of ['integrate_worker', 'manage_worker', 'finalize_run_integration']) {
+    assert.ok(!workerApprovedMcpTools({ policy: 'full-auto', allowSubWorkers: true }).includes(tool), tool);
   }
   assert.equal(ahaToolDecision('worker', 'delegate_task', 'workspace-write'), 'ask');
   assert.equal(ahaToolDecision('worker', 'delegate_task', 'full-auto'), 'deny');
   assert.equal(ahaToolDecision('worker', 'delegate_task', 'workspace-write', { allowSubWorkers: true }), 'allow');
   assert.equal(ahaToolDecision('worker', 'delegate_task', 'full-auto', { allowSubWorkers: true }), 'allow');
   assert.equal(ahaToolDecision('worker', 'integrate_worker', 'workspace-write', { allowSubWorkers: true }), 'ask', 'only sub-Worker tools open up');
-  assert.deepEqual([...HEADLESS_SUB_WORKER_ACTIONS].sort(), ['agents', 'delegate-task', 'role-manage', 'role-message']);
+  assert.deepEqual([...HEADLESS_SUB_WORKER_ACTIONS].sort(), ['agents', 'delegate-task', 'role-message'],
+    'nothing destructive (stop, abandon, integrate) opens up to a Worker');
+
+  // The MCP server lists the same sub-Worker tools, and only to a Worker that may delegate.
+  const require = createRequire(import.meta.url);
+  const { buildToolsForContext } = require('../electron/orchestration/aha-mcp-server.cjs');
+  const names = (ctx) => buildToolsForContext(ctx).map((tool) => tool.name);
+  const plainTools = names({ role: 'worker', canDelegate: false, confirmMode: 'always-ui', roster: [] });
+  for (const tool of subTools) assert.ok(!plainTools.includes(tool), tool);
+  const leadTools = names({ role: 'worker', canDelegate: true, confirmMode: 'always-ui', roster: [] });
+  for (const tool of subTools) assert.ok(leadTools.includes(tool), tool);
+  for (const tool of ['integrate_worker', 'manage_worker', 'finalize_run_integration']) assert.ok(!leadTools.includes(tool), tool);
+  const delegateTool = buildToolsForContext({ role: 'worker', canDelegate: true, confirmMode: 'always-ui', roster: [] })
+    .find((tool) => tool.name === 'delegate_task');
+  assert.match(delegateTool.description, /waits for the user to approve/);
+  assert.doesNotMatch(delegateTool.description, /confirmed=false/);
 
   const caps = await loadRenderer('../src/lib/session-capabilities.ts', 'session-capabilities.mjs');
   for (const driver of HEADLESS_WORKER_DRIVERS) {
@@ -280,6 +310,18 @@ test('controls tables: driver tiers and network, sub-Worker Aha tools, and the r
   assert.deepEqual(caps.proposalControlOverrides({ ...proposal, taskKind: 'review' }, 'codex', { policy: 'full-auto', network: true, allowSubWorkers: true }, []),
     {}, 'review proposals stay locked');
   assert.deepEqual(caps.proposalControlOverrides({ ...proposal, coordinatorPaneId: 'grok-worker-x' }, 'codex', { ...draft, allowSubWorkers: true }, fromWorker), {});
+  assert.deepEqual(caps.proposalControlOptions({ ...proposal, policy: 'read-only' }, 'grok', []).policies,
+    ['workspace-write', 'full-auto'], 'an explicit tier the driver lacks is not offered');
+
+  // Switching the agent on a card clamps what the new driver cannot run.
+  const wide = { policy: 'read-only', network: true, allowSubWorkers: true };
+  assert.deepEqual(caps.proposalDraftForAgent(proposal, 'codex', wide, []), wide);
+  assert.deepEqual(caps.proposalDraftForAgent(proposal, 'grok', wide, []), { policy: 'workspace-write', network: false, allowSubWorkers: true });
+  assert.deepEqual(caps.proposalDraftForAgent(proposal, 'pi', wide, []), wide, 'terminal drivers keep the draft untouched');
+  assert.deepEqual(caps.proposalControlOverrides(proposal, 'grok', wide, []), { allowSubWorkers: true },
+    'a clamped draft sends nothing the driver would refuse');
+  assert.deepEqual(caps.proposalControlOverrides({ ...proposal, network: true }, 'antigravity', { ...wide, policy: 'workspace-write' }, []),
+    { network: false, allowSubWorkers: true });
 });
 
 // --- Native questions ---
@@ -473,10 +515,12 @@ test('full-auto: only the person starts one, directly or by approving a Coordina
 
   const bad = app.delegate({ role: 'bad', agent: 'grok' });
   const third = await until(() => app.service.getSnapshot().pendingProposals[0]);
-  app.service.approveDispatchProposal(third.id, { policy: 'read-only' });
+  assert.match(errorOf(() => app.service.approveDispatchProposal(third.id, { policy: 'read-only' })).message,
+    /do not support the read-only policy/);
+  assert.equal(app.service.getSnapshot().pendingProposals.length, 1, 'an unsupported override leaves the card open');
+  app.service.rejectDispatchProposal(third.id, 'unsupported');
   const badReply = await bad;
-  assert.equal(badReply.ok, false);
-  assert.match(badReply.error, /do not support the read-only policy/);
+  assert.equal(badReply.result.status, 'rejected');
   assert.equal(app.launches.length, 2);
 
   // Review proposals cannot be widened at approval time.
@@ -487,6 +531,21 @@ test('full-auto: only the person starts one, directly or by approving a Coordina
   app.service.rejectDispatchProposal?.(fourth.id, 'done');
   await review.catch(() => {});
 
+  // Switching the agent alone drops network the new driver cannot run; asking for it is refused while the card stays open.
+  const netted = app.delegate({ role: 'net', agent: 'codex', network: true });
+  const fifth = await until(() => app.service.getSnapshot().pendingProposals[0]);
+  assert.match(errorOf(() => app.service.approveDispatchProposal(fifth.id, { agent: 'grok', network: true })).message,
+    /cannot enable network access/);
+  assert.match(errorOf(() => app.service.approveDispatchProposal(fifth.id, { agent: 'grok', policy: 'read-only' })).message,
+    /do not support the read-only policy/);
+  assert.equal(app.service.getSnapshot().pendingProposals.length, 1, 'still open after a refused approval');
+  const launchedBefore = app.launches.length;
+  app.service.approveDispatchProposal(fifth.id, { agent: 'grok' });
+  const nettedReply = await netted;
+  assert.equal(nettedReply.ok, true, nettedReply.error);
+  assert.equal(app.launches.length, launchedBefore + 1);
+  assert.equal(app.launches.at(-1).cliId, 'grok');
+  assert.equal(app.launches.at(-1).options.network, false);
   // A start the person makes directly (IPC sets userInitiated) may choose full-auto.
   app.confirmMode = 'auto';
   const direct = await app.service.workerStart({
@@ -537,16 +596,68 @@ test('sub-Workers: only an opted-in Worker with depth left gets delegate tools a
   const subTry = await app.workerHttp(subId, 'delegate-task', { role: 'subsub', task: 'Help', agent: 'grok', worktree: false });
   assert.equal(subTry.ok, false);
   assert.match(subTry.error, /unavailable to headless Workers/);
+  // A sub-Worker-enabled Worker sees its sub-Workers but cannot stop, abandon, or integrate them.
+  const status = await app.workerHttp(leadId, 'mcp-context', {});
+  assert.equal(status.ok, true, status.error);
+  const diff = await app.workerHttp(leadId, 'worker-diff', { worker: subId });
+  assert.equal(diff.ok, true, diff.error);
+  const siblingDiff = await app.workerHttp(plainId, 'worker-diff', { worker: subId });
+  assert.equal(siblingDiff.ok, false, 'an unrelated Worker cannot inspect the sub-Worker');
+  const told = await app.workerHttp(leadId, 'role-message', { role: 'sub', message: 'Keep going' });
+  assert.equal(told.ok, true, told.error);
+  const manage = await app.workerHttp(leadId, 'role-manage', { role: 'sub', action: 'stop', reason: 'no' });
+  assert.equal(manage.ok, false, 'role-manage stays closed to Workers');
+  assert.match(manage.error, /unavailable to headless Workers/);
 
   // Session Coordinators at depth 0 may grant it; reviews never.
   const reviewSub = await app.delegate({ role: 'rv', agent: 'codex', taskKind: 'review', allowSubWorkers: true });
   assert.equal(reviewSub.code, 'operation_rejected');
 });
 
+test('sub-Workers: under chat-and-guard a Worker\u2019s delegate waits for a UI card instead of a chat turn it cannot have', async (t) => {
+  const app = await serviceSetup(t);
+  const lead = await app.delegate({ role: 'lead', agent: 'grok', allowSubWorkers: true });
+  assert.equal(lead.ok, true, lead.error);
+  const leadId = lead.result.dispatch.assigneeHandle;
+  app.confirmMode = 'chat-and-guard';
+  assert.equal(app.service.getMcpContextForPane(leadId).confirmMode, 'always-ui');
+  assert.equal(app.service.getMcpContextForPane(SESSION_A).confirmMode, 'chat-and-guard', 'Coordinators still confirm in chat');
+
+  const pending = app.workerHttp(leadId, 'delegate-task', { role: 'sub', task: 'Help', agent: 'grok', worktree: false });
+  const proposal = await until(() => app.service.getSnapshot().pendingProposals[0]);
+  assert.equal(app.launches.length, 1, 'held until the person approves');
+  app.service.approveDispatchProposal(proposal.id);
+  const sub = await pending;
+  assert.equal(sub.ok, true, sub.error);
+  assert.equal(sub.result.dispatch.depth, 2);
+  assert.equal(app.launches.length, 2);
+
+  const declined = app.workerHttp(leadId, 'delegate-task', { role: 'sub2', task: 'More', agent: 'grok', worktree: false });
+  const second = await until(() => app.service.getSnapshot().pendingProposals.find((p) => p.id !== proposal.id));
+  app.service.rejectDispatchProposal(second.id, 'not now');
+  const reply = await declined;
+  assert.equal(reply.ok, true, reply.error);
+  assert.equal(reply.result.status, 'rejected');
+  assert.equal(app.launches.length, 2);
+
+  // Even a confirmed=true call cannot skip the card.
+  const sneaky = app.workerHttp(leadId, 'delegate-task', { role: 'sub3', task: 'More', agent: 'grok', worktree: false, confirmed: true });
+  const third = await until(() => app.service.getSnapshot().pendingProposals[0]);
+  app.service.rejectDispatchProposal(third.id, 'no');
+  assert.equal((await sneaky).result.status, 'rejected');
+});
 // --- Live controls ---
 
 test('live controls: a Worker between turns switches tier and network; busy, unsupported, and stopped Workers are refused', async (t) => {
   const app = await serviceSetup(t);
+  const crew = await loadCrewModel();
+  const controlsFor = (dispatchId) => {
+    const snapshot = app.service.getSnapshot();
+    const dispatch = snapshot.dispatches.find((entry) => entry.id === dispatchId);
+    const entry = crew.buildCrewViewForPane(snapshot, SESSION_A).managing
+      .find((member) => member.dispatch.id === dispatchId);
+    return { live: dispatch.headlessLive, controls: entry.workerControls, stage: entry.stage };
+  };
   let release = null;
   app.onPrompt = async ({ message, io }) => {
     if (app.holdTurns) {
@@ -561,11 +672,15 @@ test('live controls: a Worker between turns switches tier and network; busy, uns
   assert.equal(grok.ok, true, grok.error);
   const grokDispatch = grok.result.dispatch;
   await until(() => release);
+  assert.deepEqual(controlsFor(grokDispatch.id).live, { alive: true, busy: true });
+  assert.equal(controlsFor(grokDispatch.id).controls.changeable, false, 'the Crew panel locks controls during a turn');
   assert.equal(errorOf(() => app.service.workerUpdateControls({ dispatchId: grokDispatch.id, policy: 'full-auto' })).code, 'worker_busy');
   app.holdTurns = false;
   release();
   await until(() => app.service.getWorkerTimeline({ dispatchId: grokDispatch.id }).turns[0]?.status !== 'running');
   await delay(50);
+  assert.deepEqual(controlsFor(grokDispatch.id).live, { alive: true, busy: false });
+  assert.equal(controlsFor(grokDispatch.id).controls.changeable, true, 'the Crew panel unlocks controls between turns');
 
   assert.equal(errorOf(() => app.service.workerUpdateControls({ dispatchId: grokDispatch.id })).code, 'invalid_argument');
   assert.match(errorOf(() => app.service.workerUpdateControls({ dispatchId: grokDispatch.id, policy: 'read-only' })).message,
@@ -594,5 +709,7 @@ test('live controls: a Worker between turns switches tier and network; busy, uns
   // A stopped Worker has no live process to change.
   app.launches[0].child.exit(0);
   await until(() => !app.service.getWorkerTimeline({ dispatchId: grokDispatch.id })?.alive);
+  assert.equal(controlsFor(grokDispatch.id).live.alive, false);
+  assert.equal(controlsFor(grokDispatch.id).controls.changeable, false, 'a dead process cannot be changed from the Crew panel');
   assert.equal(errorOf(() => app.service.workerUpdateControls({ dispatchId: grokDispatch.id, policy: 'workspace-write' })).code, 'dispatch_inactive');
 });

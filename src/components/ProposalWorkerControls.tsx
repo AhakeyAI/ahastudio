@@ -1,5 +1,5 @@
 import { POLICY_LABELS } from '../lib/agent-session-client';
-import { proposalControlOptions, type ProposalWorkerControlsDraft } from '../lib/session-capabilities';
+import { proposalControlOptions, proposalDraftForAgent, type ProposalWorkerControlsDraft } from '../lib/session-capabilities';
 import type { AgentSessionPolicy, OrchestrationDispatchProposal, OrchestrationDispatchRecord } from '../types';
 
 export interface ProposalWorkerControlsProps {
@@ -14,10 +14,12 @@ export interface ProposalWorkerControlsProps {
 
 /** A proposal card's headless Worker controls: permission tier, network access, and sub-Workers. */
 export function ProposalWorkerControls({
-  variant, proposal, agent, draft, dispatches, disabled, onChange,
+  variant, proposal, agent, draft: rawDraft, dispatches, disabled, onChange,
 }: ProposalWorkerControlsProps) {
   const options = proposalControlOptions(proposal, agent, dispatches);
   if (!options) return null;
+  // Shows (and approves) what the chosen agent can run, whatever was picked for another agent.
+  const draft = proposalDraftForAgent(proposal, agent, rawDraft, dispatches);
   const roleLabel = proposal.role?.trim().replace(/^@+/, '') || 'worker';
   const selectClass = variant === 'board' ? 'obp-select' : 'aha-crew-select';
   const checkClass = variant === 'board' ? 'wrp-check obp-wt-check' : 'aha-crew-wt-check';

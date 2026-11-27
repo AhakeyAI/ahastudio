@@ -877,6 +877,12 @@ export class OrchestrationService {
     };
   }
 
+  /** How `caller`'s dispatches are confirmed; headless Workers cannot confirm in chat, so they use UI cards. */
+  private effectiveConfirmMode(caller: string): OrchestrationConfirmMode {
+    const mode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
+    return mode === 'chat-and-guard' && HEADLESS_WORKER_ID.test(caller.trim()) ? 'always-ui' : mode;
+  }
+
   /**
    * Whether a headless Worker may call Coordinator actions to start and manage sub-Workers: its
    * active dispatch must have been allowed to, must not be a review, and must leave depth for one.
@@ -7012,7 +7018,7 @@ export class OrchestrationService {
       : this.resolveTargetDispatch(input);
     if (callerPaneId !== undefined) {
       this.authorizeRunAccess(dispatch.runId, callerPaneId);
-      this.assertRunCoordinator(dispatch.runId, callerPaneId);
+      this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
     }
     const worktreePath =
       dispatch.worktreePath ??
@@ -8168,7 +8174,8 @@ export class OrchestrationService {
         ? { authorizeReviews: requestedAuthorizeReviews }
         : {}),
     };
-    const confirmMode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
+    // A headless Worker has no chat turn with the person, so chat confirmation becomes a UI card.
+    const confirmMode = this.effectiveConfirmMode(from);
     // A Coordinator can ask for full-auto only through a proposal the person approves in the UI.
     if (workerPolicy === 'full-auto' && input.userInitiated !== true && confirmMode !== 'always-ui') {
       throw new OrchestrationError(
@@ -8255,6 +8262,10 @@ export class OrchestrationService {
             resolvedEffort = undefined;
           }
           if (isHeadlessWorkerDriver(resolvedAgent)) {
+            // Switching to a driver without network access drops the Coordinator's request; an explicit override still fails.
+            if (workerNetwork === true && held.overrides.network === undefined && !driverCapabilities(resolvedAgent).network) {
+              workerNetwork = false;
+            }
             const unsupported = headlessWorkerControlsError(resolvedAgent, {
               ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
               ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
@@ -8608,7 +8619,7 @@ export class OrchestrationService {
     const activeDispatch = this.store.getActiveDispatchForIdentity(cleanCaller, cleanCaller) ?? null;
     const role: 'worker' | 'coordinator' = activeDispatch || HEADLESS_WORKER_ID.test(cleanCaller) ? 'worker' : 'coordinator';
     const orchestrationMode = this.isPaneOrchestrationMode(cleanCaller);
-    const confirmMode: OrchestrationConfirmMode = this.getConfirmModeDep?.() ?? 'chat-and-guard';
+    const confirmMode = this.effectiveConfirmMode(cleanCaller);
     const canDelegate = HEADLESS_WORKER_ID.test(cleanCaller)
       ? this.canHeadlessWorkerDelegate(cleanCaller)
       : this.resolveCallerDepth(cleanCaller) < this.maxDepth;
@@ -9706,11 +9717,20 @@ export class OrchestrationService {
 
   // ==================== Snapshot & Agent Text Views ====================
 
+  private withHeadlessLive(dispatch: OrchestrationDispatchRecord): OrchestrationDispatchRecord {
+    if (dispatch.executionMode !== 'codex-app-server') return dispatch;
+    const session = this.codexWorkers.get(dispatch.assigneeHandle);
+    const alive = Boolean(session?.alive && !dispatch.releasedAt);
+    const busy = alive && (session!.busy || this.codexSubmitting.has(dispatch.id));
+    return { ...dispatch, headlessLive: { alive, busy } };
+  }
+
   getSnapshot(runId?: string, callerPaneId?: string): OrchestrationSnapshot {
     const scope = callerPaneId === undefined
       ? runId
       : this.authorizeRunAccess(runId, callerPaneId);
     const base = this.store.getSnapshot(scope);
+    base.dispatches = base.dispatches.map((dispatch) => this.withHeadlessLive(dispatch));
     if (callerPaneId !== undefined) {
       base.runs = base.runs.filter((run) => run.id === scope);
       base.currentRunByConsumer = Object.fromEntries(

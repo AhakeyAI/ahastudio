@@ -362,6 +362,8 @@ export interface OrchestrationDispatchRecord {
   workerPolicy?: AgentSessionPolicy;
   workerNetwork?: boolean;
   allowSubWorkers?: boolean;
+  /** Snapshot only, never stored: whether a headless Worker's process is alive and a turn is running. */
+  headlessLive?: { alive: boolean; busy: boolean };
   codexTurn?: CodexPilotTurnRecord;
   codexDeliveryFailure?: 'unknown_acceptance' | 'not_accepted';
   id: string;

@@ -79,18 +79,37 @@ export function proposalControlOptions(
   const fromWorker = dispatches.some((d) =>
     d.assigneeHandle === proposal.coordinatorPaneId || d.assigneePaneId === proposal.coordinatorPaneId);
   const initial = proposalControlsDefault(proposal).policy;
-  // An implied tier the driver lacks (read-only on Antigravity) stays listed: left alone, the task keeps a terminal.
-  const policies = caps.policies.includes(initial) ? caps.policies : [initial, ...caps.policies];
+  // An implied tier the driver lacks (read-only on Antigravity) stays listed: left alone, the task keeps a
+  // terminal. A tier the Coordinator named explicitly is not, since the driver would refuse it.
+  const policies = caps.policies.includes(initial) || proposal.policy != null ? caps.policies : [initial, ...caps.policies];
   return { policies, network: caps.network, subWorkers: !fromWorker, locked: false };
+}
+
+/**
+ * The draft as `agent` can run it: a tier, network access, or sub-Worker opt-in the driver (or this
+ * proposal) cannot take falls back to what it can, so switching the agent never leaves a stale choice.
+ */
+export function proposalDraftForAgent(
+  proposal: ProposalControlsSource, agent: string, draft: ProposalWorkerControlsDraft,
+  dispatches: readonly Pick<OrchestrationDispatchRecord, 'assigneeHandle' | 'assigneePaneId'>[],
+): ProposalWorkerControlsDraft {
+  const options = proposalControlOptions(proposal, agent, dispatches);
+  if (!options) return draft;
+  return {
+    policy: options.policies.includes(draft.policy) ? draft.policy : options.policies[0]!,
+    network: options.network && draft.network,
+    allowSubWorkers: options.subWorkers && draft.allowSubWorkers,
+  };
 }
 
 /** The overrides to approve with: only what the person changed, and only what the driver supports. */
 export function proposalControlOverrides(
-  proposal: ProposalControlsSource, agent: string, draft: ProposalWorkerControlsDraft,
+  proposal: ProposalControlsSource, agent: string, rawDraft: ProposalWorkerControlsDraft,
   dispatches: readonly Pick<OrchestrationDispatchRecord, 'assigneeHandle' | 'assigneePaneId'>[],
 ): { policy?: AgentSessionPolicy; network?: boolean; allowSubWorkers?: boolean } {
   const options = proposalControlOptions(proposal, agent, dispatches);
   if (!options || options.locked) return {};
+  const draft = proposalDraftForAgent(proposal, agent, rawDraft, dispatches);
   const initial = proposalControlsDefault(proposal);
   return {
     ...(draft.policy !== initial.policy && headlessWorkerControls(agent)!.policies.includes(draft.policy)

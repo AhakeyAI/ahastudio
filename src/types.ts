@@ -897,6 +897,8 @@ export interface OrchestrationDispatchRecord {
   workerPolicy?: AgentSessionPolicy;
   workerNetwork?: boolean;
   allowSubWorkers?: boolean;
+  /** Snapshot only, never stored: whether a headless Worker's process is alive and a turn is running. */
+  headlessLive?: { alive: boolean; busy: boolean };
   codexTurn?: {
     turnId: string;
     stopReason: string;

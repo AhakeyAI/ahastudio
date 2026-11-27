@@ -51,10 +51,11 @@ export function ahaToolDecision(
 
 /**
  * Coordinator actions a headless Worker may call over HTTP once the person allowed it to start
- * sub-Workers (`allowSubWorkers`); every other Worker keeps the narrow Worker action set.
+ * sub-Workers (`allowSubWorkers`); every other Worker keeps the narrow Worker action set. Stopping,
+ * releasing, and approving (`role-manage`) stay with the Coordinator, where the person gates them.
  */
 export const HEADLESS_SUB_WORKER_ACTIONS: ReadonlySet<string> = new Set([
-  'agents', 'delegate-task', 'role-message', 'role-manage',
+  'agents', 'delegate-task', 'role-message',
 ]);
 
 /**

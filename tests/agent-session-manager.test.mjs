@@ -364,7 +364,7 @@ test('a question waits for an answer to every part, is recorded, and can be skip
   assert.equal(manager.respond(session.id, second.requestId, true), false, 'a question is not an approval');
   assert.equal(manager.answer(session.id, second.requestId, null), true);
   await until(() => status(session.id) === 'idle');
-  assert.equal(turns(session.id)[1].items.find((item) => item.kind === 'message').text, 'request refused');
+  assert.equal(turns(session.id)[1].items.find((item) => item.kind === 'message').text, 'answer: {}');
 });
 
 test('enqueue sends immediately when the session is idle and rejects an empty message', async (t) => {

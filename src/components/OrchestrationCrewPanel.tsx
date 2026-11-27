@@ -1010,7 +1010,7 @@ export function OrchestrationCrewPanel({
                     {entry.workerControls && (() => {
                       const controls = entry.workerControls;
                       const caps = headlessWorkerControls(entry.cliId);
-                      const editable = Boolean(caps && !controls.locked && !entry.dispatch?.releasedAt &&
+                      const editable = Boolean(caps && controls.changeable &&
                         window.vibeMeet.orchestration?.workerUpdateControls);
                       const busy = busyId === `ctl:${dId}`;
                       return (

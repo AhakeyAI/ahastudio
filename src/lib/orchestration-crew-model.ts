@@ -46,6 +46,8 @@ export interface CrewMemberEntry {
     allowSubWorkers: boolean;
     /** Reviews stay read-only without network access. */
     locked: boolean;
+    /** Only a live Worker between turns can switch; the service refuses anything else. */
+    changeable: boolean;
   };
 }
 
@@ -300,6 +302,9 @@ function toWorkerCrewEntry(
         network: !isReview && dispatch.workerNetwork === true,
         allowSubWorkers: !isReview && dispatch.allowSubWorkers === true,
         locked: isReview,
+        // The service's own process state, not the derived stage: a finished headless turn can still read "working".
+        changeable: !isReview && !isSettled && !dispatch.releasedAt &&
+          dispatch.headlessLive?.alive === true && !dispatch.headlessLive.busy,
       },
     } : {}),
   };

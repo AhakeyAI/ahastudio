@@ -45,6 +45,8 @@ interface ActiveTurn {
   usage: Record<string, number> | null;
   idle: Promise<void>;
   finish: () => void;
+  /** Aborted when the turn ends, so requests held for the person expire with it. */
+  ended: AbortController;
 }
 
 class RpcRejection extends Error {}
@@ -246,22 +248,26 @@ export function enabledCodexPilot(platform: NodeJS.Platform, setting: boolean, o
 }
 
 // These calls are part of the Worker dispatch contract and still use Worker-scoped auth.
-export const WORKER_APPROVED_MCP_TOOLS = ['report_done', 'read_board', 'ask_coordinator', 'post_message'] as const;
+export const WORKER_APPROVED_MCP_TOOLS = ['report_done', 'read_board', 'board_wait', 'ask_coordinator', 'post_message'] as const;
+
+/** Coordinator tools a Worker allowed to start sub-Workers runs to manage them; none is destructive. */
+export const SUB_WORKER_APPROVED_MCP_TOOLS = [
+  'list_coding_agents', 'delegate_task', 'team_status', 'team_wait', 'message_worker', 'inspect_worker_diff',
+] as const;
 
 /**
- * Aha tools a headless Worker runs without a driver prompt: the dispatch contract, plus
- * `board_wait` under `full-auto` (where an unapproved tool fails outright), plus `delegate_task`
- * and `team_wait` when the person let this Worker start sub-Workers. Sub-Worker starts stay gated
- * by the orchestration service (depth limit and dispatch confirmation), not by the driver.
+ * Aha tools a headless Worker runs without a driver prompt: the dispatch contract (the same for
+ * every tier, so a Worker switched to full-auto between turns keeps them), plus the sub-Worker
+ * tools when the person let this Worker start sub-Workers. Sub-Worker starts stay gated by the
+ * orchestration service (depth limit and dispatch confirmation), not by the driver.
  */
 export function workerApprovedMcpTools(options?: {
   policy?: AgentSessionPolicy;
   allowSubWorkers?: boolean;
 }): readonly string[] {
-  const tools: string[] = [...WORKER_APPROVED_MCP_TOOLS];
-  if (options?.allowSubWorkers) tools.push('board_wait', 'delegate_task', 'team_wait');
-  else if (options?.policy === 'full-auto') tools.push('board_wait');
-  return tools;
+  return options?.allowSubWorkers
+    ? [...WORKER_APPROVED_MCP_TOOLS, ...SUB_WORKER_APPROVED_MCP_TOOLS]
+    : [...WORKER_APPROVED_MCP_TOOLS];
 }
 
 /**
@@ -550,6 +556,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     const idle = new Promise<void>((resolve) => { finish = resolve; });
     const turn: ActiveTurn = {
       turnKey, id: null, messages: new Map(), diff: null, usage: null, usageBaseline: this.tokenTotal, idle, finish,
+      ended: new AbortController(),
     };
     this.active = turn;
     if (this.outputTurnKey !== turnKey) {
@@ -630,6 +637,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     const idle = new Promise<void>((resolve) => { finish = resolve; });
     const turn: ActiveTurn = {
       turnKey, id: null, messages: new Map(), diff: null, usage: null, usageBaseline: this.tokenTotal, idle, finish,
+      ended: new AbortController(),
     };
     this.active = turn;
     if (this.outputTurnKey !== turnKey) {
@@ -885,6 +893,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
 
   private finishTurn(turn: ActiveTurn): void {
     if (this.active === turn) this.active = null;
+    turn.ended.abort();
     turn.finish();
   }
 
@@ -922,13 +931,15 @@ export class CodexAppServerPilot implements AgentSessionDriver {
       id: string(question.id) ?? '', header: this.redact(string(question.header) ?? ''),
       prompt: this.redact(string(question.question) ?? ''),
       allowOther: question.isOther === true || !Array.isArray(question.options) || question.options.length === 0,
+      ...(question.multiSelect === true ? { multiSelect: true } : {}),
       options: (Array.isArray(question.options) ? question.options : []).map(object).map((option) => ({
         label: string(option.label) ?? '', description: string(option.description) ?? '',
       })),
     }));
     try {
       const response = await this.events.onRequest(turn.turnKey, {
-        kind: 'question', method, toolInput: '', questions, signal: this.disconnect.signal,
+        kind: 'question', method, toolInput: '', questions,
+        signal: AbortSignal.any([turn.ended.signal, this.disconnect.signal]),
       });
       return 'answers' in response ? response.answers : null;
     } catch {
@@ -942,12 +953,11 @@ export class CodexAppServerPilot implements AgentSessionDriver {
       params.threadId === this.threadId && (!turn.id || params.turnId === turn.id)) {
       const answers = await this.askUser(turn, method, params);
       if (this.disconnected) return;
-      if (answers) {
-        this.write({ id, result: {
-          answers: Object.fromEntries(Object.entries(answers).map(([key, value]) => [key, { answers: value }])),
-        } });
-        return;
-      }
+      // A skipped or expired question is answered empty, not refused as an unknown request.
+      this.write({ id, result: {
+        answers: Object.fromEntries(Object.entries(answers ?? {}).map(([key, value]) => [key, { answers: value }])),
+      } });
+      return;
     }
     const mcpConfirmation = method === 'mcpServer/elicitation/request';
     const approval = method === 'item/commandExecution/requestApproval' ||

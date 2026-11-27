@@ -418,6 +418,10 @@ function buildTeamWaitTool() {
   };
 }
 
+const SUB_WORKER_TOOLS = new Set([
+  'list_coding_agents', 'delegate_task', 'team_status', 'team_wait', 'message_worker', 'inspect_worker_diff',
+]);
+
 function buildToolsForContext(ctx) {
   if (ctx && ctx.role === 'worker') {
     const tools = [
@@ -495,7 +499,10 @@ function buildToolsForContext(ctx) {
       buildBoardWaitTool(),
     ];
     if (ctx.canDelegate) {
-      tools.push(buildDelegateTaskTool(ctx), buildTeamWaitTool());
+      // A Worker that may start sub-Workers gets the non-destructive Coordinator tools to run them;
+      // stopping, releasing, and integrating stay with the Coordinator and the person.
+      const coordinatorTools = buildToolsForContext({ ...ctx, role: 'coordinator' });
+      tools.push(...coordinatorTools.filter((tool) => SUB_WORKER_TOOLS.has(tool.name)));
     }
     return tools;
   }

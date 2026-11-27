@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentSessionPolicy } from './agent-session-driver.js';
+import { headlessWorkerControlsError, isHeadlessWorkerDriver } from './headless-workers.js';
 import {
   OrchestrationError,
   type OrchestrationDispatchProposal,
@@ -315,6 +316,18 @@ export class DispatchProposalManager {
           { proposalId: cleanId },
         );
       }
+    }
+    // Refuse controls the chosen driver cannot run while the card is still open, instead of
+    // approving a dispatch that then fails to start.
+    const agent = overrides?.agent?.trim() ? normalizeWorkerCliId(overrides.agent) : entry.proposal.resolvedAgent;
+    if (isHeadlessWorkerDriver(agent)) {
+      const policy = overrides?.policy !== undefined ? overrides.policy : entry.proposal.policy;
+      const unsupported = headlessWorkerControlsError(agent, {
+        ...(policy != null ? { policy } : {}),
+        // Network the Coordinator asked for is dropped on drivers without it; only the person's own override fails.
+        ...(overrides?.network === true ? { network: true } : {}),
+      });
+      if (unsupported) throw new OrchestrationError('operation_rejected', unsupported, { proposalId: cleanId });
     }
     this.removeOpenEntry(entry);
 
