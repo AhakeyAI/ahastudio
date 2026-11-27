@@ -156,6 +156,7 @@ const describeGoal = (goal: AgentSessionGoal) => `当前目标（${GOAL_STATUS_L
  */
 export class AgentSessionManager {
   private readonly sessions = new Map<string, Session>();
+  private readonly providerModels = new Map<AgentProvider, CodexModelOption[]>();
   private readonly timelineListeners = new Set<(change: WorkerTimelineChange) => void>();
   private readonly sessionListeners = new Set<(sessions: AgentSessionInfo[]) => void>();
   private readonly now: () => number;
@@ -257,8 +258,12 @@ export class AgentSessionManager {
         return { status: 'not_accepted', reason: `Session is ${info.status}` };
       }
       if (info.status === 'closed') return { status: 'not_accepted', reason: 'Session is closed' };
-      const previous = info.policy;
+      const previousPolicy = info.policy;
+      const previousModel = info.model;
+      const previousEffort = info.effort;
       if (info.orchestration || info.capabilities.policyNeedsRelaunch) info.policy = wanted;
+      if (input.model) info.model = input.model;
+      if (input.effort !== undefined) info.effort = input.effort;
       info.goal = null;
       session.hasTurns = false;
       session.hadOrchestrationTurn = false;
@@ -273,16 +278,24 @@ export class AgentSessionManager {
       }
       await this.connect(session, false);
       if ((info.status as AgentSessionStatus) !== 'idle') {
-        info.policy = previous;
+        info.policy = previousPolicy;
+        info.model = previousModel;
+        info.effort = previousEffort;
         this.sessionsChanged();
         return { status: 'not_accepted', reason: info.error ?? '无法开启新上下文' };
       }
     } else if (this.resumable(session)) {
-      const previous = info.policy;
+      const previousPolicy = info.policy;
+      const previousModel = info.model;
+      const previousEffort = info.effort;
       if (info.orchestration || info.capabilities.policyNeedsRelaunch) info.policy = wanted;
+      if (input.model) info.model = input.model;
+      if (input.effort !== undefined) info.effort = input.effort;
       await this.connect(session, true);
       if (session.info.status !== 'idle') {
-        info.policy = previous;
+        info.policy = previousPolicy;
+        info.model = previousModel;
+        info.effort = previousEffort;
         this.sessionsChanged();
         return { status: 'not_accepted', reason: session.info.error ?? 'Session did not resume' };
       }
@@ -838,9 +851,24 @@ export class AgentSessionManager {
     return !handoff && Boolean(providerSessionId) && !session.driver?.alive && (status === 'suspended' || status === 'failed');
   }
 
-  /** Models the session's live process offered; Codex sessions list theirs from `CodexCatalog` instead. */
+  /**
+   * Models the session's driver offers: the live process first, then another live session of the
+   * same provider, then the last persisted catalog for that provider so suspended tabs can pick a
+   * model before resuming. Codex sessions read theirs from `CodexCatalog` instead.
+   */
   models(id: string): CodexModelOption[] {
-    return this.sessions.get(id)?.driver?.models?.() ?? [];
+    const session = this.sessions.get(id);
+    if (!session) return [];
+    const live = session.driver?.models?.();
+    if (live && live.length > 0) return live;
+    const provider = session.info.provider;
+    for (const other of this.sessions.values()) {
+      if (other.info.provider === provider && other.driver?.alive) {
+        const offered = other.driver.models?.();
+        if (offered && offered.length > 0) return offered;
+      }
+    }
+    return structuredClone(this.providerModels.get(provider) ?? []);
   }
 
   /**
@@ -935,6 +963,8 @@ export class AgentSessionManager {
         ...(rejoin && info.providerSessionId ? { resumeSessionId: info.providerSessionId } : {}),
       });
       if (!session.driver.alive) throw new Error(info.error ?? 'The agent closed while starting');
+      const offeredModels = session.driver.models?.() ?? [];
+      if (offeredModels.length > 0) this.providerModels.set(info.provider, structuredClone(offeredModels));
       // What the provider actually uses, e.g. a default from the person's own config.
       info.model = session.driver.effectiveModel ?? info.model;
       info.effort = session.driver.provider !== 'codex' && session.driver.effectiveEffort !== undefined
@@ -1043,7 +1073,7 @@ export class AgentSessionManager {
     }
     session.timeline.upsertApproval({
       approvalId: requestId, dispatchId: pending.turnKey, method: pending.request.method,
-      tool: pending.request.method.split('/')[1] ?? pending.request.method,
+      tool: approvalToolName(pending.request.method),
       input: pending.request.toolInput, reason: pending.request.message ?? null, status, resolution: reason,
     });
   }
@@ -1059,11 +1089,30 @@ export class AgentSessionManager {
     const file = this.deps.storageFile?.();
     if (!file || !existsSync(file)) return;
     let saved: SavedSession[] = [];
+    let savedModels: Record<string, unknown> | null = null;
     try {
-      const parsed = JSON.parse(readFileSync(file, 'utf8')) as { version?: number; sessions?: SavedSession[] };
+      const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
+        version?: number; sessions?: SavedSession[]; providerModels?: Record<string, unknown>;
+      };
       if (parsed.version === 1 && Array.isArray(parsed.sessions)) saved = parsed.sessions;
+      if (parsed.version === 1 && parsed.providerModels && typeof parsed.providerModels === 'object' && !Array.isArray(parsed.providerModels)) {
+        savedModels = parsed.providerModels;
+      }
     } catch (error) {
       console.warn('[agent-sessions] ignoring unreadable saved sessions:', error);
+    }
+    if (savedModels) {
+      for (const [key, list] of Object.entries(savedModels)) {
+        const provider = normalizeDriverId(key);
+        if (provider !== key || !Array.isArray(list)) continue;
+        const valid = list.filter((entry): entry is CodexModelOption => (
+          Boolean(entry) && typeof entry === 'object' && !Array.isArray(entry) &&
+          typeof (entry as CodexModelOption).id === 'string' &&
+          typeof (entry as CodexModelOption).displayName === 'string' &&
+          Array.isArray((entry as CodexModelOption).efforts)
+        ));
+        if (valid.length > 0) this.providerModels.set(provider, valid);
+      }
     }
     for (const entry of saved) {
       if (!entry?.id || !AGENT_SESSION_ID.test(entry.id) || !entry.providerSessionId || !entry.timeline) continue;
@@ -1096,7 +1145,11 @@ export class AgentSessionManager {
         } = info;
         return { ...rest, timeline: timeline.archive() };
       });
-    return JSON.stringify({ version: 1, sessions });
+    return JSON.stringify({
+      version: 1,
+      sessions,
+      ...(this.providerModels.size > 0 ? { providerModels: Object.fromEntries(this.providerModels) } : {}),
+    });
   }
 
   private sessionsChanged(): void {
