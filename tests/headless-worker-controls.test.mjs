@@ -651,8 +651,13 @@ test('sub-Workers: under chat-and-guard a Worker\u2019s delegate waits for a UI 
 test('live controls: a Worker between turns switches tier and network; busy, unsupported, and stopped Workers are refused', async (t) => {
   const app = await serviceSetup(t);
   const crew = await loadCrewModel();
-  const controlsFor = (dispatchId) => {
-    const snapshot = app.service.getSnapshot();
+  let pushedSnapshot = app.service.getSnapshot();
+  const events = [];
+  app.service.onEvent((event) => {
+    events.push(event.reason);
+    pushedSnapshot = event.snapshot;
+  });
+  const controlsFor = (dispatchId, snapshot = pushedSnapshot) => {
     const dispatch = snapshot.dispatches.find((entry) => entry.id === dispatchId);
     const entry = crew.buildCrewViewForPane(snapshot, SESSION_A).managing
       .find((member) => member.dispatch.id === dispatchId);
@@ -701,15 +706,23 @@ test('live controls: a Worker between turns switches tier and network; busy, uns
   await delay(50);
   const codexUpdate = app.service.workerUpdateControls({ worker: codex.result.dispatch.assigneeHandle, network: true, policy: 'read-only' });
   assert.deepEqual([codexUpdate.policy, codexUpdate.network], ['read-only', true]);
+  app.holdTurns = true;
+  release = null;
   const message = await app.call(SESSION_A, 'role-message', { role: 'c', message: 'Next step' });
   assert.equal(message.ok, true, message.error);
+  await until(() => release);
+  await until(() => controlsFor(codex.result.dispatch.id).live?.busy === true);
+  assert.equal(controlsFor(codex.result.dispatch.id).controls.changeable, false, 'pushed snapshot locks controls on mailbox turn');
+  app.holdTurns = false;
+  release();
   await until(() => codexLaunch.turns.length === 2);
   assert.deepEqual(codexLaunch.turns[1], { policy: 'read-only', network: true });
 
-  // A stopped Worker has no live process to change.
+  // A stopped Worker has no live process to change, and its clean exit pushes an updated snapshot.
+  events.length = 0;
   app.launches[0].child.exit(0);
-  await until(() => !app.service.getWorkerTimeline({ dispatchId: grokDispatch.id })?.alive);
-  assert.equal(controlsFor(grokDispatch.id).live.alive, false);
+  await until(() => controlsFor(grokDispatch.id).live?.alive === false);
+  assert.ok(events.includes('worker:exited'));
   assert.equal(controlsFor(grokDispatch.id).controls.changeable, false, 'a dead process cannot be changed from the Crew panel');
   assert.equal(errorOf(() => app.service.workerUpdateControls({ dispatchId: grokDispatch.id, policy: 'workspace-write' })).code, 'dispatch_inactive');
 });

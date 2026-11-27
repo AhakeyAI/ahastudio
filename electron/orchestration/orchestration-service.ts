@@ -5644,6 +5644,7 @@ export class OrchestrationService {
             promptSent: true, refreshHeartbeat: true,
           });
           if (updated && !waiting && !asking) this.store.updateDispatchStage(dispatchId, 'working');
+          if (updated) this.emitChanged('worker:turn-started', updated.runId);
         },
         onTurnCompleted: (dispatchId, result) => this.completeCodexTurn(id, cwd, dispatchId, result),
         onRequest: async (dispatchId, request) => {
@@ -5676,9 +5677,10 @@ export class OrchestrationService {
           this.nativeQuestions.cancelForWorker(id, reason);
           this.waiters.cancel(id);
           this.waiters.cancelConsumer(id);
-          if (dispatchId && !this.codexSubmitting.has(dispatchId)) {
-            this.handleCodexExit(dispatchId, reason, exitCode);
-          }
+          const announced = Boolean(dispatchId && !this.codexSubmitting.has(dispatchId) &&
+            this.handleCodexExit(dispatchId, reason, exitCode));
+          const exited = !announced && dispatchId ? this.store.getDispatchContext(dispatchId) : undefined;
+          if (exited) this.emitChanged('worker:exited', exited.runId);
         },
       });
       this.codexWorkers.set(id, session);
@@ -5810,16 +5812,17 @@ export class OrchestrationService {
     }
   }
 
-  private handleCodexExit(dispatchId: string, reason: string, exitCode: number | null): void {
+  private handleCodexExit(dispatchId: string, reason: string, exitCode: number | null): boolean {
     const dispatch = this.store.getDispatchContext(dispatchId);
-    if (!dispatch?.promptSentAt || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
-    if (exitCode === 0 && dispatch.stage === 'awaiting_review') return;
+    if (!dispatch?.promptSentAt || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return false;
+    if (exitCode === 0 && dispatch.stage === 'awaiting_review') return false;
     const label = this.headlessLabel(dispatch.assigneeHandle);
     this.store.failDispatch(dispatch.id, dispatch.assigneeHandle.startsWith('codex-') ? 'Codex app-server exited' : `${label} exited`, {
       forceFailTask: true, summary: reason,
     });
     this.cleanupCodexDispatch(dispatch, reason);
     this.publishCodexStatus(dispatch, `${label} Worker exited before report_done`, reason, { exitCode });
+    return true;
   }
 
   /** The agent a headless Worker runs, for coordinator-facing status text. */
