@@ -27,7 +27,7 @@ test('a session Coordinator is told to use the MCP tools directly and delegate r
   const text = coordinatorInstructions(ctx({ session: { policy: 'workspace-write' } }));
   assert.match(text, /Call the Aha MCP tools directly; do not run the `aha` CLI or read the aha-orchestration skill/);
   assert.match(text, /Do not do the delegated work yourself or redo it to double-check/);
-  assert.match(text, /Codex, Claude Code, and Grok Workers run as headless sessions; for read-only work \(searching, counting, reading, reviewing\) pass `taskKind: "research"` \(or `"review"`\) so the Worker uses a read-only sandbox/);
+  assert.match(text, /Codex, Claude Code, Antigravity, and Grok Workers run as headless sessions; for read-only work \(searching, counting, reading, reviewing\) pass `taskKind: "research"` \(or `"review"`\) so the Worker uses a read-only sandbox/);
   assert.ok(!text.includes('integrate_worker'), 'no integration note below full-auto');
 });
 

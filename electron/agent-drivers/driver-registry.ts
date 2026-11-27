@@ -37,8 +37,15 @@ export interface NativeDriverOptions {
   coordinatorMcp?: (sessionId: string) => AhaMcpServerSpec;
 }
 
-function acpMcpServers(mcp: AhaMcpServerSpec) {
-  return [{ name: 'aha', command: mcp.command, args: [...mcp.args], env: Object.entries(mcp.env).map(([name, value]) => ({ name, value })) }];
+const AHA_ACP_SERVER_NAME: Readonly<Record<AcpLaunchSpec['driver'], string>> = {
+  // Antigravity lets a global terminal `aha` MCP entry shadow a same-named ACP server; a distinct name avoids the collision.
+  antigravity: 'aha_orchestration',
+  grok: 'aha',
+  opencode: 'aha',
+};
+
+function acpMcpServers(mcp: AhaMcpServerSpec, name: string) {
+  return [{ name, command: mcp.command, args: [...mcp.args], env: Object.entries(mcp.env).map(([k, value]) => ({ name: k, value })) }];
 }
 
 function launchClaude(cwd: string, events: AgentSessionEvents, options: {
@@ -69,22 +76,28 @@ function launchAcp(spec: AcpLaunchSpec, cwd: string, events: AgentSessionEvents,
   mcp?: AhaMcpServerSpec; role?: 'coordinator' | 'worker';
 }): AcpSessionDriver {
   const { mcp, role } = options;
+  const serverName = AHA_ACP_SERVER_NAME[spec.driver];
   return new AcpSessionDriver(
     spawnAgentProcess({ command: spec.command, args: spec.args, cwd, env: spec.env }), spec, events,
-    mcp && role ? { mcpServers: acpMcpServers(mcp), ahaMcp: { role }, secrets: ahaMcpSecrets(mcp.env) } : {},
+    mcp && role ? { mcpServers: acpMcpServers(mcp, serverName), ahaMcp: { role, serverName }, secrets: ahaMcpSecrets(mcp.env) } : {},
   );
 }
 
+/** CLI executable name for a non-Codex headless Worker driver (`antigravity` runs `agy`). */
+export function headlessWorkerCommand(cliId: 'claude' | 'antigravity' | 'grok'): string {
+  return cliId === 'claude' ? 'claude' : ACP_LAUNCH_SPECS[cliId].command;
+}
+
 /**
- * A headless orchestration Worker on Claude Code or Grok, with the Worker's own Aha MCP credentials
- * in `mcp.env`. Codex Workers use the Codex app-server pilot instead.
+ * A headless orchestration Worker on Claude Code, Antigravity, or Grok, with the Worker's own Aha
+ * MCP credentials in `mcp.env`. Codex Workers use the Codex app-server pilot instead.
  */
 export function launchHeadlessWorkerDriver(
-  cliId: 'claude' | 'grok', cwd: string, events: AgentSessionEvents,
+  cliId: 'claude' | 'antigravity' | 'grok', cwd: string, events: AgentSessionEvents,
   options: { policy: AgentSessionPolicy; mcp: AhaMcpServerSpec },
 ): AgentSessionDriver {
   if (cliId === 'claude') return launchClaude(cwd, events, { policy: options.policy, mcp: options.mcp, role: 'worker' });
-  return launchAcp(ACP_LAUNCH_SPECS.grok, cwd, events, { mcp: options.mcp, role: 'worker' });
+  return launchAcp(ACP_LAUNCH_SPECS[cliId], cwd, events, { mcp: options.mcp, role: 'worker' });
 }
 
 export type DriverLaunch = (sessionId: string, cwd: string, events: AgentSessionEvents, options: DriverLaunchOptions) => AgentSessionDriver;

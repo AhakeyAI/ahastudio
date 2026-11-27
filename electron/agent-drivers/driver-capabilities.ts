@@ -55,10 +55,12 @@ export const AGENT_DRIVER_CAPABILITIES: Readonly<Record<AgentDriverId, AgentDriv
     compact: true, orchestration: true, rename: true, resume: true, terminalResume: true,
   },
   // ACP agents ask through session/request_permission; AhaStation answers by policy or asks the person.
-  // No orchestration: Antigravity accepts ACP `mcpServers` but never starts them.
+  // Orchestration: Antigravity starts ACP `mcpServers` under `aha_orchestration` (a global terminal
+  // `aha` entry shadows a same-named ACP server) and takes Coordinator rules via
+  // `_meta.antigravity.systemPrompt.append` (falling back to the first prompt when absent).
   antigravity: {
-    ...NONE, policies: ['workspace-write', 'full-auto'], models: true, efforts: true, images: true, resume: true,
-    terminalResume: true,
+    ...NONE, policies: ['workspace-write', 'full-auto'], models: true, efforts: true, images: true,
+    orchestration: true, resume: true, terminalResume: true,
   },
   // Effort is each agent's `thought_level` session option. Orchestration: Grok starts the ACP
   // `mcpServers` it is given on session/new|load|resume; ACP has no system prompt, so the

@@ -4,14 +4,14 @@ import { WORKER_APPROVED_MCP_TOOLS, coordinatorApprovedMcpTools } from './codex-
 
 /**
  * Drivers that run session-coordinated Workers headless, over their native protocol, with the Aha
- * MCP server injected per process. Antigravity accepts ACP `mcpServers` but never starts them, and
- * OpenCode and Pi are not verified, so their Workers keep the terminal path.
+ * MCP server injected per process. OpenCode and Pi are not verified, so their Workers keep the
+ * terminal path.
  */
-export const HEADLESS_WORKER_DRIVERS = ['codex', 'claude', 'grok'] as const satisfies readonly AgentDriverId[];
+export const HEADLESS_WORKER_DRIVERS = ['codex', 'claude', 'antigravity', 'grok'] as const satisfies readonly AgentDriverId[];
 export type HeadlessWorkerDriver = (typeof HEADLESS_WORKER_DRIVERS)[number];
 
 /** A headless Worker's identity: `<driver>-worker-<uuid>`. Codex Workers keep their original prefix. */
-export const HEADLESS_WORKER_ID = /^(?:codex|claude|grok)-worker-[a-f0-9-]{36}$/;
+export const HEADLESS_WORKER_ID = /^(?:codex|claude|antigravity|grok)-worker-[a-f0-9-]{36}$/;
 
 export function isHeadlessWorkerDriver(cliId: string | null | undefined): cliId is HeadlessWorkerDriver {
   return typeof cliId === 'string' && (HEADLESS_WORKER_DRIVERS as readonly string[]).includes(cliId);
@@ -28,7 +28,7 @@ export function headlessWorkerDriver(workerId: string): HeadlessWorkerDriver | n
 }
 
 export const HEADLESS_DRIVER_LABELS: Readonly<Record<HeadlessWorkerDriver, string>> = {
-  codex: 'Codex', claude: 'Claude Code', grok: 'Grok',
+  codex: 'Codex', claude: 'Claude Code', antigravity: 'Antigravity', grok: 'Grok',
 };
 
 /**
@@ -67,12 +67,13 @@ export function sessionGateDecision(action: string, policy: AgentSessionPolicy):
 }
 
 /**
- * The Aha tool a provider names, if any: Claude says `mcp__aha__<tool>`, other agents may use
- * `aha__<tool>`, `aha/<tool>`, `aha.<tool>`, or `aha: <tool>`.
+ * The Aha tool a provider names, if any: Claude says `mcp__aha__<tool>`, ACP agents may use
+ * `aha__<tool>`, `aha/<tool>`, `aha.<tool>`, `aha: <tool>`, or the `aha_orchestration` server name
+ * (including Antigravity's `mcp_<server>_<tool>` form).
  */
 export function parseAhaMcpToolName(name: unknown): string | null {
   if (typeof name !== 'string') return null;
-  const match = /^\s*(?:mcp__)?aha(?:__|\/|\.|\s*:\s*)([a-z][a-z0-9_]*)\s*$/iu.exec(name);
+  const match = /^\s*(?:mcp__(?:aha_orchestration|aha)__|mcp_(?:aha_orchestration|aha)_|(?:aha_orchestration|aha)(?:__|\/|\.|\s*:\s*))([a-z][a-z0-9_]*)\s*$/iu.exec(name);
   return match ? match[1]!.toLowerCase() : null;
 }
 

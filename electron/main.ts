@@ -355,7 +355,8 @@ app.whenReady().then(async () => {
   const mcpCliIdSet = new Set<string>(AGENT_MCP_CLI_IDS);
   const { coordinatorApprovedMcpTools, enabledCodexPilot, launchCodexPilot } =
     await import('./orchestration/codex-app-server-pilot.js');
-  const { DriverRegistry, nativeDriverEntries, launchHeadlessWorkerDriver } = await import('./agent-drivers/driver-registry.js');
+  const { DriverRegistry, nativeDriverEntries, launchHeadlessWorkerDriver, headlessWorkerCommand } =
+    await import('./agent-drivers/driver-registry.js');
   const { resolveAgentCommand } = await import('./agent-drivers/agent-process.js');
   const { resolveBinaryFromPath } = await import('./bin-resolve.js');
   // The Aha MCP server over stdio for one caller's credentials, the way the Codex pilot starts it.
@@ -396,7 +397,7 @@ app.whenReady().then(async () => {
       },
     },
     headlessWorkers: {
-      available: (cliId) => resolveAgentCommand(cliId) !== null,
+      available: (cliId) => resolveAgentCommand(headlessWorkerCommand(cliId)) !== null,
       launch: (cliId, workerId, cwd, events, { policy }) => {
         if (!agentHookServer) throw new Error('Aha MCP Server is unavailable');
         return launchHeadlessWorkerDriver(cliId, cwd, events, { policy, mcp: ahaMcpServer(agentHookServer.envForWorker(workerId)) });

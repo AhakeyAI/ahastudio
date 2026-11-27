@@ -70,7 +70,7 @@ export interface AcpDriverOptions {
    * (the orchestration service gates the ones that change Workers or Git history); a Worker's only
    * for its dispatch contract.
    */
-  ahaMcp?: { role: 'coordinator' | 'worker' };
+  ahaMcp?: { role: 'coordinator' | 'worker'; serverName?: string };
   /** Credentials the process was given, redacted from everything the driver reports. */
   secrets?: readonly string[];
 }
@@ -214,7 +214,13 @@ export class AcpSessionDriver implements AgentSessionDriver {
   }): Promise<string> {
     try {
       const initialized = await this.initialize();
-      const params = { cwd, mcpServers: this.mcpServers.map((server) => ({ ...server, args: [...server.args], env: [...server.env] })) };
+      const instructions = developerInstructions?.trim() || null;
+      const sessionMeta = instructions ? this.spec.dialect.systemPromptMeta?.(initialized, instructions) : undefined;
+      const params = {
+        cwd,
+        mcpServers: this.mcpServers.map((server) => ({ ...server, args: [...server.args], env: [...server.env] })),
+        ...(sessionMeta ? { _meta: sessionMeta } : {}),
+      };
       const capabilities = object(initialized.agentCapabilities);
       let method = 'session/new';
       if (resumeSessionId) {
@@ -235,7 +241,7 @@ export class AcpSessionDriver implements AgentSessionDriver {
         await this.setEffort(effort);
       }
       await this.applyPolicy(policy);
-      this.pendingInstructions = developerInstructions?.trim() ? developerInstructions : null;
+      this.pendingInstructions = instructions && !sessionMeta ? instructions : null;
       return id;
     } catch (error) {
       throw new Error(this.proc.withStderr(this.redact(this.describe(error)), (value) => this.redact(value)));
@@ -378,10 +384,17 @@ export class AcpSessionDriver implements AgentSessionDriver {
   /** How this session's role answers an Aha tool call, recognized by the names the agent reports; null otherwise. */
   private ahaDecision(toolCall: Obj): 'allow' | 'ask' | 'deny' | null {
     if (!this.ahaMcp) return null;
+    const serverName = this.ahaMcp.serverName ?? 'aha';
+    const isAhaServer = (value: string | undefined) => value === serverName || value === 'aha' || value === 'aha_orchestration';
     const meta = object(object(toolCall._meta)['x.ai/tool']);
+    const metaServer = text(meta.server);
+    const raw = object(toolCall.rawInput);
+    const rawServer = text(raw.ServerName) ?? text(raw.serverName) ?? text(raw.server);
+    const rawTool = text(raw.ToolName) ?? text(raw.toolName) ?? text(raw.tool);
     const names = [
       this.spec.dialect.toolName?.(toolCall as AcpToolUpdate), text(toolCall.title), text(meta.name),
-      text(meta.server) === 'aha' ? `aha__${text(meta.name) ?? ''}` : undefined,
+      isAhaServer(metaServer) && text(meta.name) ? `${metaServer}__${text(meta.name)}` : undefined,
+      isAhaServer(rawServer) && rawTool ? `${rawServer}__${rawTool}` : undefined,
     ];
     const tool = names.map(parseAhaMcpToolName).find(Boolean);
     return tool ? ahaToolDecision(this.ahaMcp.role, tool, this.policy) : null;

@@ -19,6 +19,7 @@ import {
 } from '../dist-electron/agent-drivers/claude/claude-protocol.js';
 import { ClaudeSessionDriver } from '../dist-electron/agent-drivers/claude/claude-session-driver.js';
 import { AGENT_DRIVER_CAPABILITIES } from '../dist-electron/agent-drivers/driver-capabilities.js';
+import { headlessWorkerCommand } from '../dist-electron/agent-drivers/driver-registry.js';
 import { ahaMcpSecrets, redactSecrets, redactTimelineEvent } from '../dist-electron/agent-drivers/secret-redaction.js';
 import { createRequire } from 'node:module';
 import { AgentSessionManager } from '../dist-electron/orchestration/agent-session-manager.js';
@@ -122,20 +123,26 @@ function recorder(onRequest = async () => ({ decision: 'decline' })) {
 // --- Policy tables ---
 
 test('capabilities and policy tables: which drivers coordinate, which run headless Workers, and how Aha tools are gated', () => {
-  for (const [id, on] of Object.entries({ codex: true, claude: true, grok: true, antigravity: false, opencode: false, pi: false })) {
+  for (const [id, on] of Object.entries({ codex: true, claude: true, antigravity: true, grok: true, opencode: false, pi: false })) {
     assert.equal(AGENT_DRIVER_CAPABILITIES[id].orchestration, on, id);
   }
   assert.equal(headlessWorkerSupports('codex', 'read-only'), true);
   assert.equal(headlessWorkerSupports('claude', 'read-only'), true);
   assert.equal(headlessWorkerSupports('claude', 'workspace-write'), true);
+  assert.equal(headlessWorkerSupports('antigravity', 'workspace-write'), true);
+  assert.equal(headlessWorkerSupports('antigravity', 'read-only'), false, 'Antigravity has no read-only tier, so read-only tasks keep a terminal');
   assert.equal(headlessWorkerSupports('grok', 'workspace-write'), true);
   assert.equal(headlessWorkerSupports('grok', 'read-only'), false, 'Grok has no read-only tier, so read-only tasks keep a terminal');
-  for (const id of ['antigravity', 'opencode', 'pi', 'gemini', null]) assert.equal(headlessWorkerSupports(id, 'workspace-write'), false, String(id));
+  for (const id of ['opencode', 'pi', 'gemini', null]) assert.equal(headlessWorkerSupports(id, 'workspace-write'), false, String(id));
+  assert.equal(headlessWorkerCommand('antigravity'), 'agy');
+  assert.equal(headlessWorkerCommand('claude'), 'claude');
+  assert.equal(headlessWorkerCommand('grok'), 'grok');
 
   assert.ok(HEADLESS_WORKER_ID.test(`claude-worker-${UUID}`));
+  assert.ok(HEADLESS_WORKER_ID.test(`antigravity-worker-${UUID}`));
   assert.ok(HEADLESS_WORKER_ID.test(`grok-worker-${UUID}`));
   assert.ok(HEADLESS_WORKER_ID.test(`codex-worker-${UUID}`));
-  assert.ok(!HEADLESS_WORKER_ID.test(`antigravity-worker-${UUID}`));
+  assert.equal(headlessWorkerDriver(`antigravity-worker-${UUID}`), 'antigravity');
   assert.equal(headlessWorkerDriver(`grok-worker-${UUID}`), 'grok');
   assert.equal(headlessWorkerDriver(SESSION_A), null);
 
@@ -159,9 +166,14 @@ test('capabilities and policy tables: which drivers coordinate, which run headle
   }
   assert.equal(sessionGateDecision('delegate-task', 'workspace-write'), 'allow');
 
-  for (const name of ['mcp__aha__report_done', 'aha__report_done', 'aha/report_done', 'aha.report_done', 'aha: report_done']) {
+  for (const name of [
+    'mcp__aha__report_done', 'aha__report_done', 'aha/report_done', 'aha.report_done', 'aha: report_done',
+    'mcp__aha_orchestration__report_done', 'mcp_aha_orchestration_report_done', 'aha_orchestration__report_done',
+    'aha_orchestration/report_done', 'aha_orchestration: report_done',
+  ]) {
     assert.equal(parseAhaMcpToolName(name), 'report_done', name);
   }
+  assert.equal(parseAhaMcpToolName('aha_helper'), null);
   assert.equal(parseAhaMcpToolName('mcp__github__list_prs'), null);
   assert.equal(parseAhaMcpToolName('Bash'), null);
 });
@@ -446,7 +458,7 @@ function holdingLaunch() {
   return { log, held, launch };
 }
 
-for (const provider of ['claude', 'grok']) {
+for (const provider of ['claude', 'antigravity', 'grok']) {
   test(`manager: a ${provider} Coordinator switches between turns, resumes the same conversation, and keeps a single writer`, async () => {
     const fake = holdingLaunch();
     const userTurns = [];
@@ -646,7 +658,7 @@ test('service gate: non-Codex session Coordinators follow the Codex approval tie
   const gated = { 'role-manage': 'manage_worker', 'worker-integrate': 'integrate_worker', 'run-finalize': 'finalize_run_integration' };
   const payload = { dispatchId: 'missing-dispatch', runId: 'missing-run', role: 'nobody', action: 'release' };
 
-  for (const provider of ['claude', 'grok']) {
+  for (const provider of ['claude', 'antigravity', 'grok']) {
     for (const policy of ['workspace-write', 'read-only']) {
       app.sessions.set(SESSION_A, { cwd: sessionCwd, provider, active: true, policy });
       for (const [action, tool] of Object.entries(gated)) {
@@ -755,7 +767,7 @@ test('terminal fallback: read-only Grok, drivers without headless support, and u
   app.sessions.set(SESSION_A, { cwd: sessionCwd, provider: 'claude', active: true, idle: true, policy: 'workspace-write' });
   const cases = [
     ['grok', { taskKind: 'research' }],
-    ['antigravity', {}],
+    ['antigravity', { taskKind: 'research' }],
     ['pi', {}],
     ['claude', {}],
   ];
@@ -964,4 +976,94 @@ test('headless Worker approvals record real provider/toolName, follow-up errors 
     }
     fake.held.shift()?.finish();
   }
+});
+
+test('Antigravity Coordinator & Worker: systemPrompt _meta, call_mcp_tool permissions, and headless Antigravity Worker', async (t) => {
+  const AGY_INIT = {
+    protocolVersion: 1,
+    agentCapabilities: {
+      loadSession: true,
+      sessionCapabilities: { resume: {} },
+      promptCapabilities: { image: true },
+      _meta: { antigravity: { systemPrompt: { append: true } } },
+    },
+    authMethods: [],
+  };
+  const agyAgent = (child, onPrompt = (message, io) => io.send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } })) =>
+    wire(child, (message) => {
+      if (message.method === 'initialize') io.send({ jsonrpc: '2.0', id: message.id, result: AGY_INIT });
+      else if (message.method === 'session/new') io.send({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'agy-1' } });
+      else if (message.method === 'session/prompt') void onPrompt(message, io);
+      else if (message.method && message.id !== undefined) io.send({ jsonrpc: '2.0', id: message.id, result: {} });
+    });
+
+  // 1. Coordinator sends _meta.antigravity.systemPrompt.append on new & resume without polluting user prompts.
+  const child = fakeChild();
+  const io = wire(child, (message) => {
+    if (message.method === 'initialize') io.send({ jsonrpc: '2.0', id: message.id, result: AGY_INIT });
+    else if (message.method === 'session/new') io.send({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'agy-1' } });
+    else if (message.method === 'session/prompt') io.send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } });
+    else if (message.method && message.id !== undefined) io.send({ jsonrpc: '2.0', id: message.id, result: {} });
+  });
+  const agyServers = [{ name: 'aha_orchestration', command: 'node', args: ['aha-mcp-server.cjs'], env: [{ name: 'AHA_SESSION_TOKEN', value: SECRET }] }];
+  const rec = recorder();
+  const coord = new AcpSessionDriver(child, ACP_LAUNCH_SPECS.antigravity, rec.events, {
+    mcpServers: agyServers, ahaMcp: { role: 'coordinator', serverName: 'aha_orchestration' }, secrets: [SECRET],
+  });
+  assert.equal(await coord.open({ cwd: tmpdir(), model: null, policy: 'workspace-write', developerInstructions: 'AGY RULES' }), 'agy-1');
+  const newReq = io.seen.find((m) => m.method === 'session/new');
+  assert.deepEqual(newReq.params.mcpServers, agyServers);
+  assert.deepEqual(newReq.params._meta, { antigravity: { systemPrompt: { append: 'AGY RULES' } } });
+  await coord.startTurn({ turnKey: 'a1', prompt: 'hello' });
+  await until(() => rec.completed.length === 1);
+  assert.equal(promptText(io.seen.find((m) => m.method === 'session/prompt')), 'hello', 'native _meta leaves user prompt untouched');
+  await coord.close();
+
+  // 2. Antigravity Worker recognizes call_mcp_tool rawInput (ServerName/ToolName) for aha_orchestration.
+  const workerReplies = [];
+  const workerChild = fakeChild();
+  const wIo = wire(workerChild, async (message) => {
+    if (message.method === 'initialize') wIo.send({ jsonrpc: '2.0', id: message.id, result: AGY_INIT });
+    else if (message.method === 'session/new') wIo.send({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'agy-w1' } });
+    else if (message.method === 'session/prompt') {
+      wIo.send({ jsonrpc: '2.0', id: 971, method: 'session/request_permission', params: {
+        sessionId: 'agy-w1', options: PERMISSION_OPTIONS,
+        toolCall: { toolCallId: 't1', title: 'call_mcp_tool', rawInput: { ServerName: 'aha_orchestration', ToolName: 'report_done' } },
+      } });
+      workerReplies.push((await wIo.waitFor((sent) => sent.id === 971 && !sent.method)).result);
+      wIo.send({ jsonrpc: '2.0', id: 972, method: 'session/request_permission', params: {
+        sessionId: 'agy-w1', options: PERMISSION_OPTIONS,
+        toolCall: { toolCallId: 't2', title: 'call_mcp_tool', rawInput: { ServerName: 'aha_orchestration', ToolName: 'delegate_task' } },
+      } });
+      workerReplies.push((await wIo.waitFor((sent) => sent.id === 972 && !sent.method)).result);
+      wIo.send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } });
+    } else if (message.method && message.id !== undefined) wIo.send({ jsonrpc: '2.0', id: message.id, result: {} });
+  });
+  const wRec = recorder();
+  const worker = new AcpSessionDriver(workerChild, ACP_LAUNCH_SPECS.antigravity, wRec.events, {
+    mcpServers: agyServers, ahaMcp: { role: 'worker', serverName: 'aha_orchestration' }, secrets: [SECRET],
+  });
+  await worker.open({ cwd: tmpdir(), model: null, policy: 'workspace-write' });
+  await worker.startTurn({ turnKey: 'w1', prompt: 'work' });
+  await until(() => wRec.completed.length === 1);
+  assert.deepEqual(workerReplies[0], { outcome: { outcome: 'selected', optionId: 'allow' } }, 'report_done runs unprompted');
+  assert.deepEqual(workerReplies[1], { outcome: { outcome: 'selected', optionId: 'reject' } }, 'person-only Aha tool asks and declines');
+  assert.equal(wRec.requests.length, 1);
+  await worker.close();
+
+  // 3. End-to-end headless Antigravity Worker spawned by an Antigravity Coordinator.
+  const app = await serviceSetup(t);
+  const sessionCwd = mkdtempSync(join(app.dir, 'agy-session-'));
+  app.sessions.set(SESSION_A, { cwd: sessionCwd, provider: 'antigravity', active: true, idle: true, network: false, policy: 'workspace-write' });
+  const started = await app.call(SESSION_A, 'delegate-task', { role: 'builder', task: 'Build it', agent: 'antigravity', worktree: false });
+  assert.equal(started.ok, true, started.error);
+  const { dispatch } = started.result;
+  assert.match(dispatch.assigneeHandle, /^antigravity-worker-[a-f0-9-]{36}$/);
+  assert.equal(dispatch.executionMode, 'codex-app-server');
+  assert.equal(dispatch.assigneePaneId, null);
+  assert.equal(app.launches[0].cliId, 'antigravity');
+  assert.equal(app.launches[0].policy, 'workspace-write');
+  const post = await until(() => app.store.listBoardPosts(started.result.run.id).find((p) => p.subject?.startsWith('Antigravity turn ended')));
+  assert.ok(post, 'Coordinator hears about pending turn under the Antigravity label');
+  void agyAgent;
 });

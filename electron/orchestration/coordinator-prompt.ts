@@ -48,7 +48,7 @@ export function coordinatorInstructions(ctx: CoordinatorPromptContext): string {
       ? [
           'Call the Aha MCP tools directly; do not run the `aha` CLI or read the aha-orchestration skill — this conversation is already connected as the Coordinator.',
           'Do not do the delegated work yourself or redo it to double-check; rely on the Worker\u2019s report and the inspect tools.',
-          'Codex, Claude Code, and Grok Workers run as headless sessions; for read-only work (searching, counting, reading, reviewing) pass `taskKind: "research"` (or `"review"`) so the Worker uses a read-only sandbox. Grok has no read-only mode, so its read-only tasks run in a terminal instead; prefer Codex or Claude Code for them.',
+          'Codex, Claude Code, Antigravity, and Grok Workers run as headless sessions; for read-only work (searching, counting, reading, reviewing) pass `taskKind: "research"` (or `"review"`) so the Worker uses a read-only sandbox. Antigravity and Grok have no read-only mode, so their read-only tasks run in a terminal instead; prefer Codex or Claude Code for them.',
           ...(ctx.session.policy === 'full-auto'
             ? [
                 '`integrate_worker` and `finalize_run_integration` are unavailable in this mode; when changes are ready, ask the user to integrate from the 协作 panel.',
