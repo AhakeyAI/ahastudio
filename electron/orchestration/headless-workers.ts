@@ -1,6 +1,6 @@
 import { driverCapabilities, type AgentDriverId } from '../agent-drivers/driver-capabilities.js';
 import type { AgentSessionPolicy } from './agent-session-driver.js';
-import { WORKER_APPROVED_MCP_TOOLS, coordinatorApprovedMcpTools } from './codex-app-server-pilot.js';
+import { coordinatorApprovedMcpTools, workerApprovedMcpTools } from './codex-app-server-pilot.js';
 
 /**
  * Drivers that run session-coordinated Workers headless, over their native protocol, with the Aha
@@ -42,9 +42,37 @@ export const AHA_TOOL_DENIED = 'Full-auto cannot ask the person, and this AhaSta
 
 export function ahaToolDecision(
   role: 'coordinator' | 'worker', tool: string, policy: AgentSessionPolicy,
+  options: { allowSubWorkers?: boolean } = {},
 ): 'allow' | 'ask' | 'deny' {
-  if (role === 'coordinator' || (WORKER_APPROVED_MCP_TOOLS as readonly string[]).includes(tool)) return 'allow';
+  if (role === 'coordinator') return 'allow';
+  if (workerApprovedMcpTools({ policy, allowSubWorkers: options.allowSubWorkers }).includes(tool)) return 'allow';
   return policy === 'full-auto' ? 'deny' : 'ask';
+}
+
+/**
+ * Coordinator actions a headless Worker may call over HTTP once the person allowed it to start
+ * sub-Workers (`allowSubWorkers`); every other Worker keeps the narrow Worker action set. Stopping,
+ * releasing, and approving (`role-manage`) stay with the Coordinator, where the person gates them.
+ */
+export const HEADLESS_SUB_WORKER_ACTIONS: ReadonlySet<string> = new Set([
+  'agents', 'delegate-task', 'role-message',
+]);
+
+/**
+ * Why `driver` cannot run a headless Worker with these controls, or null when it can. Policies
+ * come from the driver's own tiers and network access only from drivers that sandbox it per turn.
+ */
+export function headlessWorkerControlsError(
+  driver: HeadlessWorkerDriver, controls: { policy?: AgentSessionPolicy; network?: boolean },
+): string | null {
+  const caps = driverCapabilities(driver);
+  if (controls.policy !== undefined && !caps.policies.includes(controls.policy)) {
+    return `${HEADLESS_DRIVER_LABELS[driver]} headless Workers do not support the ${controls.policy} policy.`;
+  }
+  if (controls.network === true && !caps.network) {
+    return `${HEADLESS_DRIVER_LABELS[driver]} headless Workers cannot enable network access.`;
+  }
+  return null;
 }
 
 /** Coordinator actions that change Workers or Git history, by the Aha tool that calls them. */

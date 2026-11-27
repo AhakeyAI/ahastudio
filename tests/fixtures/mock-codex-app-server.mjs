@@ -208,7 +208,7 @@ for await (const line of history) {
         id: approvalId, method: 'item/tool/requestUserInput',
         params: { threadId, turnId, itemId: 'ask', isBlocking: true, autoResolutionMs: null, questions: [{
           id: 'db', header: 'Database', question: 'Which database?', isOther: false,
-          isSecret: prompt.includes('SECRET'),
+          isSecret: prompt.includes('SECRET'), ...(prompt.includes('MULTI') ? { multiSelect: true } : {}),
           options: [{ label: 'SQLite', description: 'Local file' }, { label: 'Postgres', description: 'Server' }],
         }] },
       });

@@ -775,6 +775,27 @@ export type OrchestrationDispatchStage =
 
 export type WorkerApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired';
 
+export type WorkerNativeQuestionStatus = 'pending' | 'answered' | 'skipped' | 'expired';
+
+/** A structured question a headless Worker's own agent asked through its native protocol. */
+export interface WorkerNativeQuestionPayload {
+  requestId: string;
+  dispatchId: string;
+  taskId: string;
+  runId: string;
+  workerHandle: string;
+  /** The driver that asked (codex, claude, antigravity, grok). */
+  provider: string;
+  method: string;
+  questions: AgentSessionQuestion[];
+  status: WorkerNativeQuestionStatus;
+  createdAt: string;
+  resolvedAt?: string | null;
+  resolvedBy?: string | null;
+  answers?: Record<string, string[]> | null;
+  reason?: string | null;
+}
+
 export interface WorkerApprovalPayload {
   approvalId: string;
   dispatchId: string;
@@ -872,6 +893,12 @@ interface OrchestrationTaskContextInput {
 export interface OrchestrationDispatchRecord {
   executionMode?: 'codex-app-server';
   providerSessionId?: string;
+  /** Headless Workers only: permission tier, network access, and sub-Worker opt-in. */
+  workerPolicy?: AgentSessionPolicy;
+  workerNetwork?: boolean;
+  allowSubWorkers?: boolean;
+  /** Snapshot only, never stored: whether a headless Worker's process is alive and a turn is running. */
+  headlessLive?: { alive: boolean; busy: boolean };
   codexTurn?: {
     turnId: string;
     stopReason: string;
@@ -1183,6 +1210,9 @@ export interface OrchestrationDispatchProposal {
   model: string | null;
   effort: string | null;
   terminal: string | null;
+  policy?: AgentSessionPolicy | null;
+  network?: boolean | null;
+  allowSubWorkers?: boolean;
   authorizeReviews?: boolean;
   status: 'pending' | 'approved' | 'rejected' | 'expired';
   createdAt: string;
@@ -1198,6 +1228,7 @@ export interface OrchestrationSnapshot {
   messages: OrchestrationMessageRecord[];
   questions: OrchestrationQuestionRecord[];
   openApprovals?: WorkerApprovalPayload[];
+  openNativeQuestions?: WorkerNativeQuestionPayload[];
   pendingProposals?: OrchestrationDispatchProposal[];
   orchestrationModePanes?: string[];
   memberCursorsByRun?: Record<string, Record<string, OrchestrationMemberCursor>>;
@@ -1345,6 +1376,9 @@ export interface WorkerTimelineSnapshot {
   cliId: string;
   model: string | null;
   readOnly: boolean;
+  /** Absent on timelines saved before per-Worker controls: `readOnly` decides, with network off. */
+  policy?: AgentSessionPolicy;
+  network?: boolean;
   alive: boolean;
   seq: number;
   turns: WorkerTimelineTurn[];
@@ -1530,6 +1564,9 @@ export interface OrchestrationApi {
     effort?: string;
     terminal?: string;
     readOnly?: boolean;
+    policy?: AgentSessionPolicy;
+    network?: boolean;
+    allowSubWorkers?: boolean;
     worktree?: string | boolean;
     noWorktree?: boolean;
     branch?: string;
@@ -1598,6 +1635,16 @@ export interface OrchestrationApi {
     worker?: string;
     taskId?: string;
   }) => Promise<OrchestrationResult<{ dispatch: OrchestrationDispatchRecord; interrupted: boolean }>>;
+  /** Changes a live headless Worker's permission tier or network access; its next turn runs with them. */
+  workerUpdateControls?: (opts: {
+    dispatchId?: string;
+    worker?: string;
+    taskId?: string;
+    policy?: AgentSessionPolicy;
+    network?: boolean;
+  }) => Promise<
+    OrchestrationResult<{ dispatch: OrchestrationDispatchRecord; policy: AgentSessionPolicy; network: boolean }>
+  >;
   workerKeepOpen?: (opts: {
     dispatchId?: string;
     worker?: string;
@@ -1673,6 +1720,12 @@ export interface OrchestrationApi {
     from?: string;
     reason?: string;
   }) => Promise<OrchestrationResult<{ approval: WorkerApprovalPayload }>>;
+  /** Answers (or, with `answers: null`, skips) a headless Worker's native question. */
+  workerAnswerQuestion?: (opts: {
+    id: string;
+    dispatchId?: string;
+    answers: Record<string, string[]> | null;
+  }) => Promise<OrchestrationResult<{ question: WorkerNativeQuestionPayload }>>;
   check: (opts?: {
     from?: string;
     runId?: string;
@@ -1788,6 +1841,9 @@ export interface OrchestrationApi {
     model?: string;
     effort?: string;
     terminal?: string;
+    policy?: AgentSessionPolicy;
+    network?: boolean;
+    allowSubWorkers?: boolean;
     callerCwd?: string;
     userInitiated?: boolean;
     confirmed?: boolean;
@@ -1816,6 +1872,9 @@ export interface OrchestrationApi {
     worktree?: boolean;
     model?: string | null;
     effort?: string | null;
+    policy?: AgentSessionPolicy | null;
+    network?: boolean | null;
+    allowSubWorkers?: boolean;
     authorizeReviews?: boolean;
   }) => Promise<
     OrchestrationResult<{

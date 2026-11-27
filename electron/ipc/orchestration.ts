@@ -186,6 +186,9 @@ const workerStartSchema = z
     effort: nonEmptyId.optional(),
     terminal: nonEmptyId.optional(),
     readOnly: z.boolean().optional(),
+    policy: z.enum(['read-only', 'workspace-write', 'full-auto']).optional(),
+    network: z.boolean().optional(),
+    allowSubWorkers: z.boolean().optional(),
     worktree: z.union([z.string().trim().max(1024), z.boolean()]).optional(),
     noWorktree: z.boolean().optional(),
     branch: nonEmptyId.optional(),
@@ -419,6 +422,9 @@ const delegateTaskSchema = z
     model: nonEmptyId.optional(),
     effort: nonEmptyId.optional(),
     terminal: nonEmptyId.optional(),
+    policy: z.enum(['read-only', 'workspace-write', 'full-auto']).optional(),
+    network: z.boolean().optional(),
+    allowSubWorkers: z.boolean().optional(),
     userInitiated: z.boolean().optional(),
     confirmed: z.boolean().optional(),
     planSummary: z.string().trim().max(1_000).optional(),
@@ -437,9 +443,37 @@ const proposalApproveSchema = z
     worktree: z.boolean().optional(),
     model: z.union([nonEmptyId, z.null()]).optional(),
     effort: z.union([nonEmptyId, z.null()]).optional(),
+    policy: z.union([z.enum(['read-only', 'workspace-write', 'full-auto']), z.null()]).optional(),
+    network: z.union([z.boolean(), z.null()]).optional(),
+    allowSubWorkers: z.boolean().optional(),
     authorizeReviews: z.boolean().optional(),
   })
   .strict();
+
+const workerAnswerQuestionSchema = z
+  .object({
+    id: nonEmptyId,
+    dispatchId: nonEmptyId.optional(),
+    // null skips the question; the Worker's agent is told it was declined.
+    answers: z.union([
+      z.record(z.string().trim().min(1).max(200), z.array(z.string().max(4_000)).max(50)),
+      z.null(),
+    ]),
+  })
+  .strict();
+
+const workerUpdateControlsSchema = z
+  .object({
+    dispatchId: nonEmptyId.optional(),
+    worker: nonEmptyId.optional(),
+    taskId: nonEmptyId.optional(),
+    policy: z.enum(['read-only', 'workspace-write', 'full-auto']).optional(),
+    network: z.boolean().optional(),
+  })
+  .strict()
+  .refine((value) => value.policy !== undefined || value.network !== undefined, {
+    message: 'policy or network is required',
+  });
 
 const workerDiffSchema = z
   .object({
@@ -735,7 +769,22 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     schema: workerStartSchema,
     authorize,
     authorizeError,
-    handler: (payload) => act(() => requireService().workerStart(payload)),
+    // The renderer only calls this for a person's own start, so it may choose full-auto.
+    handler: (payload) => act(() => requireService().workerStart({ ...payload, userInitiated: true })),
+  });
+
+  handleSecure('orchestration:worker-answer-question', {
+    schema: workerAnswerQuestionSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().answerWorkerNativeQuestion({ ...payload, from: 'user' })),
+  });
+
+  handleSecure('orchestration:worker-update-controls', {
+    schema: workerUpdateControlsSchema,
+    authorize,
+    authorizeError,
+    handler: (payload) => act(() => requireService().workerUpdateControls(payload)),
   });
 
   handleSecure('orchestration:worker-list', {
@@ -918,13 +967,16 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     schema: proposalApproveSchema,
     authorize,
     authorizeError,
-    handler: ({ id, agent, worktree, model, effort, authorizeReviews }) =>
+    handler: ({ id, agent, worktree, model, effort, policy, network, allowSubWorkers, authorizeReviews }) =>
       runAction(() =>
         requireService().approveDispatchProposal(id, {
           agent,
           worktree,
           model,
           effort,
+          ...(policy !== undefined ? { policy } : {}),
+          ...(network !== undefined ? { network } : {}),
+          ...(allowSubWorkers !== undefined ? { allowSubWorkers } : {}),
           authorizeReviews,
         })
       ),

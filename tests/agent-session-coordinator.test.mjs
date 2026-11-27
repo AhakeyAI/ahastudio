@@ -126,7 +126,7 @@ test('session MCP launch carries session credentials and keeps destructive Coord
     assert.ok(!approved.includes(tool), tool);
   }
   const worker = codexMcpConfigArgs('node', { serverPath: 'x', env: {} }).filter((arg) => arg.endsWith('"approve"'));
-  assert.deepEqual(worker.map((arg) => arg.split('.')[3]), ['report_done', 'read_board', 'ask_coordinator', 'post_message']);
+  assert.deepEqual(worker.map((arg) => arg.split('.')[3]), ['report_done', 'read_board', 'board_wait', 'ask_coordinator', 'post_message']);
 });
 
 test('session credentials authenticate only as that session and only on orchestration routes', async (t) => {

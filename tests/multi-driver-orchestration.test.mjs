@@ -607,6 +607,8 @@ async function serviceSetup(t, { allowPtySpawn = false, available = () => true }
         // The fake Grok agent stands in for every CLI, but Grok itself has no read-only mode.
         const open = driver.open.bind(driver);
         driver.open = (options) => open({ ...options, policy: options.policy === 'read-only' ? 'workspace-write' : options.policy });
+        const startTurn = driver.startTurn.bind(driver);
+        driver.startTurn = (turn) => startTurn({ ...turn, policy: turn.policy === 'read-only' ? 'workspace-write' : turn.policy });
         return driver;
       },
     },

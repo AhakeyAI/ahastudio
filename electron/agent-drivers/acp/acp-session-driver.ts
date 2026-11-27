@@ -70,7 +70,7 @@ export interface AcpDriverOptions {
    * (the orchestration service gates the ones that change Workers or Git history); a Worker's only
    * for its dispatch contract.
    */
-  ahaMcp?: { role: 'coordinator' | 'worker'; serverName?: string };
+  ahaMcp?: { role: 'coordinator' | 'worker'; serverName?: string; allowSubWorkers?: boolean };
   /** Credentials the process was given, redacted from everything the driver reports. */
   secrets?: readonly string[];
 }
@@ -397,7 +397,7 @@ export class AcpSessionDriver implements AgentSessionDriver {
       isAhaServer(rawServer) && rawTool ? `${rawServer}__${rawTool}` : undefined,
     ];
     const tool = names.map(parseAhaMcpToolName).find(Boolean);
-    return tool ? ahaToolDecision(this.ahaMcp.role, tool, this.policy) : null;
+    return tool ? ahaToolDecision(this.ahaMcp.role, tool, this.policy, { allowSubWorkers: this.ahaMcp.allowSubWorkers }) : null;
   }
 
   close(interrupt = false): Promise<void> {

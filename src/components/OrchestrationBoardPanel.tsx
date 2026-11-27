@@ -47,7 +47,14 @@ import { dispatchFocusOrchestrationTarget } from '../lib/terminal-links/orchestr
 import { headlessDispatchForTarget } from '../lib/orchestration-view';
 import { useAgentStatuses } from './AgentStatusBadge';
 import type { AgentPromptTarget } from './PanelPreview';
+import {
+  proposalControlOverrides,
+  proposalControlsDefault,
+  type ProposalWorkerControlsDraft,
+} from '../lib/session-capabilities';
+import { ProposalWorkerControls } from './ProposalWorkerControls';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
+import { WorkerNativeQuestionCard } from './WorkerNativeQuestionCard';
 import './orchestration-board-panel.css';
 
 type BoardSubTab = 'board' | 'members' | 'graph';
@@ -170,7 +177,7 @@ export function OrchestrationBoardPanel({
   const [questionDrafts, setQuestionDrafts] = useState<Record<string, string>>({});
   const [agentsRoster, setAgentsRoster] = useState<OrchestrationAgentRosterEntry[]>([]);
   const [proposalDrafts, setProposalDrafts] = useState<
-    Record<string, { agent: string; worktree: boolean; authorizeReviews: boolean }>
+    Record<string, ProposalWorkerControlsDraft & { agent: string; worktree: boolean; authorizeReviews: boolean }>
   >({});
 
   // Members search state
@@ -527,6 +534,7 @@ export function OrchestrationBoardPanel({
     proposalDrafts[p.id] ?? {
       agent: p.resolvedAgent || p.requestedAgent || 'auto',
       worktree: p.worktree,
+      ...proposalControlsDefault(p),
       authorizeReviews: p.authorizeReviews ?? true,
     };
 
@@ -540,6 +548,7 @@ export function OrchestrationBoardPanel({
         id: proposal.id,
         agent: draft.agent,
         worktree: draft.worktree,
+        ...proposalControlOverrides(proposal, draft.agent, draft, snapshot.dispatches),
         authorizeReviews: draft.authorizeReviews,
       });
       if (!res.ok) onNotify?.(res.error);
@@ -1191,6 +1200,17 @@ export function OrchestrationBoardPanel({
               />
               <span>worktree</span>
             </label>
+            <ProposalWorkerControls
+              variant="board"
+              proposal={proposal}
+              agent={draft.agent}
+              draft={draft}
+              dispatches={snapshot.dispatches}
+              disabled={busyId === `prop:${proposal.id}`}
+              onChange={(patch) =>
+                setProposalDrafts((prev) => ({ ...prev, [proposal.id]: { ...draft, ...patch } }))
+              }
+            />
             <label
               className="wrp-check obp-wt-check"
               title="批准后本轮 Run 内的后续异构审查与整体验收自动放行，不再重复弹窗确认"
@@ -1685,9 +1705,35 @@ export function OrchestrationBoardPanel({
               })
             )}
 
-            {/* Unmatched pending approvals & decision gates */}
-            {(approvalByPostId.unclaimed.length > 0 || model.openGates.length > 0) && (
+            {/* Unmatched pending approvals, native questions & decision gates */}
+            {(approvalByPostId.unclaimed.length > 0 ||
+              model.openNativeQuestions.length > 0 ||
+              model.openGates.length > 0) && (
               <div className="obp-attention-stack">
+                {model.openNativeQuestions.map((nq) => {
+                  const member = model.members.find((m) => m.dispatchId === nq.dispatchId);
+                  const dispatch = snapshot.dispatches.find((d) => d.id === nq.dispatchId);
+                  return (
+                    <WorkerNativeQuestionCard
+                      key={nq.requestId}
+                      entry={nq}
+                      workerLabel={member?.label ?? nq.workerHandle}
+                      variant="board"
+                      onFocusWorker={() =>
+                        dispatchFocusOrchestrationTarget({
+                          kind: 'dispatch',
+                          label: member?.label ?? nq.workerHandle,
+                          ptyId: nq.workerHandle,
+                          dispatchId: nq.dispatchId,
+                          taskId: nq.taskId,
+                          cwd: member?.worktreePath ?? dispatch?.worktreePath ?? null,
+                          cliId: nq.provider,
+                        })
+                      }
+                      onNotify={onNotify}
+                    />
+                  );
+                })}
                 {approvalByPostId.unclaimed.map((app) => (
                   <div key={app.approvalId} className="obp-inline-card is-warn">
                     <div className="obp-inline-card-head">

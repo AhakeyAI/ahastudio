@@ -17,7 +17,12 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import type { OrchestrationAgentRosterEntry, OrchestrationDispatchProposal } from '../types';
+import type {
+  AgentSessionPolicy,
+  OrchestrationAgentRosterEntry,
+  OrchestrationDispatchProposal,
+} from '../types';
+import { POLICY_LABELS } from '../lib/agent-session-client';
 import { ptyIdForLeaf } from '../lib/agent-status-view';
 import { agentStatusClient } from '../lib/agent-status-client';
 import { orchestrationClient } from '../lib/orchestration-client';
@@ -30,7 +35,15 @@ import {
 import { isMacSearchPlatform } from '../lib/terminal-search-options';
 import { dispatchFocusOrchestrationTarget } from '../lib/terminal-links/orchestration-terminal-links';
 import { headlessDispatchForTarget } from '../lib/orchestration-view';
+import {
+  headlessWorkerControls,
+  proposalControlOverrides,
+  proposalControlsDefault,
+  type ProposalWorkerControlsDraft,
+} from '../lib/session-capabilities';
+import { ProposalWorkerControls } from './ProposalWorkerControls';
 import { TerminalProfileIcon } from './TerminalProfileIcon';
+import { WorkerNativeQuestionCard } from './WorkerNativeQuestionCard';
 import './orchestration-crew-panel.css';
 
 export interface OrchestrationCrewPanelProps {
@@ -42,7 +55,7 @@ export interface OrchestrationCrewPanelProps {
   onNotify?: (message: string) => void;
 }
 
-interface ProposalDraft {
+interface ProposalDraft extends ProposalWorkerControlsDraft {
   agent: string;
   worktree: boolean;
   reason: string;
@@ -219,6 +232,7 @@ export function OrchestrationCrewPanel({
     proposalDrafts[proposal.id] ?? {
       agent: proposal.resolvedAgent || proposal.requestedAgent || 'auto',
       worktree: proposal.worktree,
+      ...proposalControlsDefault(proposal),
       reason: '',
     };
 
@@ -254,6 +268,7 @@ export function OrchestrationCrewPanel({
         id: proposal.id,
         agent: draft.agent,
         worktree: draft.worktree,
+        ...proposalControlOverrides(proposal, draft.agent, draft, snapshot.dispatches),
       });
       if (!res.ok) {
         onNotify?.(res.error);
@@ -450,6 +465,23 @@ export function OrchestrationCrewPanel({
     }
   };
 
+  const handleWorkerControls = async (
+    entry: CrewMemberEntry,
+    patch: { policy?: AgentSessionPolicy; network?: boolean },
+  ) => {
+    const api = window.vibeMeet.orchestration?.workerUpdateControls;
+    if (!entry.dispatch || !api) return;
+    const dId = entry.dispatch.id;
+    setBusyId(`ctl:${dId}`);
+    try {
+      const res = await api({ dispatchId: dId, ...patch });
+      if (!res.ok) onNotify?.(res.error);
+      else onNotify?.(`已更新 ${entry.label} 的权限，下一条消息起生效`);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const handleRelease = async (entry: CrewMemberEntry, force = false) => {
     const api = window.vibeMeet.orchestration?.workerRelease;
     if (!entry.dispatch || !api) return;
@@ -509,6 +541,7 @@ export function OrchestrationCrewPanel({
     crew.pendingProposals.length > 0 ||
     crew.openApprovals.length > 0 ||
     crew.openQuestions.length > 0 ||
+    crew.openNativeQuestions.length > 0 ||
     crew.openGates.length > 0 ||
     Boolean(crew.managedBy) ||
     crew.managing.length > 0 ||
@@ -636,6 +669,15 @@ export function OrchestrationCrewPanel({
                         />
                         <span>worktree</span>
                       </label>
+                      <ProposalWorkerControls
+                        variant="crew"
+                        proposal={proposal}
+                        agent={draft.agent}
+                        draft={draft}
+                        dispatches={snapshot.dispatches}
+                        disabled={busyId === proposal.id}
+                        onChange={(patch) => updateProposalDraft(proposal, patch)}
+                      />
                     </div>
                     <div className="aha-crew-inline-actions">
                       <input
@@ -716,11 +758,35 @@ export function OrchestrationCrewPanel({
             </section>
           )}
 
-          {crew.openQuestions.length > 0 && (
+          {(crew.openQuestions.length > 0 || crew.openNativeQuestions.length > 0) && (
             <section className="aha-crew-section is-alert">
               <header className="aha-crew-section-header">
-                <span>Worker 提问 ({crew.openQuestions.length})</span>
+                <span>Worker 提问 ({crew.openQuestions.length + crew.openNativeQuestions.length})</span>
               </header>
+              {crew.openNativeQuestions.map((nq) => {
+                const member = crew.managing.find((m) => m.dispatch?.id === nq.dispatchId);
+                const dispatch = snapshot.dispatches.find((d) => d.id === nq.dispatchId);
+                return (
+                  <WorkerNativeQuestionCard
+                    key={nq.requestId}
+                    entry={nq}
+                    workerLabel={member?.label ?? nq.workerHandle}
+                    variant="crew"
+                    onFocusWorker={() =>
+                      dispatchFocusOrchestrationTarget({
+                        kind: 'dispatch',
+                        label: member?.label ?? nq.workerHandle,
+                        ptyId: nq.workerHandle,
+                        dispatchId: nq.dispatchId,
+                        taskId: nq.taskId,
+                        cwd: member?.worktreePath ?? dispatch?.worktreePath ?? null,
+                        cliId: nq.provider,
+                      })
+                    }
+                    onNotify={onNotify}
+                  />
+                );
+              })}
               {crew.openQuestions.map((q) => (
                 <div key={q.messageId} className="aha-crew-alert-card">
                   <p className="aha-crew-question-text">{q.question}</p>
@@ -941,6 +1007,54 @@ export function OrchestrationCrewPanel({
                         )}
                       </div>
                     </div>
+                    {entry.workerControls && (() => {
+                      const controls = entry.workerControls;
+                      const caps = headlessWorkerControls(entry.cliId);
+                      const editable = Boolean(caps && controls.changeable &&
+                        window.vibeMeet.orchestration?.workerUpdateControls);
+                      const busy = busyId === `ctl:${dId}`;
+                      return (
+                        <div className="aha-crew-worker-controls">
+                          {editable && caps!.policies.includes(controls.policy) ? (
+                            <select
+                              className="aha-crew-select"
+                              aria-label={`${entry.label} 的权限`}
+                              title="权限：下一条消息起生效"
+                              value={controls.policy}
+                              disabled={busy}
+                              onChange={(e) =>
+                                void handleWorkerControls(entry, { policy: e.target.value as AgentSessionPolicy })
+                              }
+                            >
+                              {caps!.policies.map((value) => (
+                                <option key={value} value={value}>{POLICY_LABELS[value]}</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <span
+                              className="aha-crew-badge"
+                              title={controls.locked ? '审查任务锁定只读' : undefined}
+                            >
+                              {POLICY_LABELS[controls.policy]}
+                            </span>
+                          )}
+                          {editable && caps!.network ? (
+                            <label className="aha-crew-wt-check" title="命令能否联网：下一条消息起生效">
+                              <input
+                                type="checkbox"
+                                checked={controls.network}
+                                disabled={busy}
+                                onChange={(e) => void handleWorkerControls(entry, { network: e.target.checked })}
+                              />
+                              <span>联网</span>
+                            </label>
+                          ) : controls.network ? (
+                            <span className="aha-crew-badge">联网</span>
+                          ) : null}
+                          {controls.allowSubWorkers && <span className="aha-crew-badge">可派子 Worker</span>}
+                        </div>
+                      );
+                    })()}
                     {forceReleaseReason && (
                       <div className="aha-crew-force-confirm" role="alert">
                         <span>{forceReleaseReason}</span>
