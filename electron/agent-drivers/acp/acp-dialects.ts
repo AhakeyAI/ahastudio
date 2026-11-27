@@ -1,7 +1,7 @@
 // ACP launch specs and dialect hooks for Antigravity, Grok, and OpenCode.
 // Adapted from Orca (MIT, Copyright (c) 2026 Lovecast Inc.):
 // - src/main/acp/acp-dialects/acp-dialect.ts, antigravity-dialect.ts, grok-dialect.ts, grok-requests.ts, opencode-dialect.ts
-// - src/main/acp/launch/acp-launch-registry.ts, src/main/antigravity/antigravity-acp-launch-spec.ts
+// - src/main/acp/launch/acp-launch-registry.ts, acp-instructions.ts, src/main/antigravity/antigravity-acp-launch-spec.ts
 import type { AgentQuestion } from '../../orchestration/agent-session-driver.js';
 import { ACP_FORM_ELICITATION_METHOD, AcpRequestError, acpFormQuestions, type AcpQuestionPresentation } from './acp-form-elicitation.js';
 
@@ -55,6 +55,8 @@ export interface AcpDialect {
   compactCommand?: string;
   /** The mode that makes the agent read-only, and the one it normally runs in. */
   readOnlyMode?: { value: string; normal: string };
+  /** Builds `_meta` for `session/new|load|resume` when the agent accepts appended system instructions natively. */
+  systemPromptMeta?(initialized: Obj, instructions: string): Obj | undefined;
   /** Picks the authentication method when `session/new` says sign-in is required. */
   authMethod?(advertised: readonly string[], env: NodeJS.ProcessEnv): string | undefined;
   promptErrorDetail?(error: { message: string; data?: unknown }): string | undefined;
@@ -152,6 +154,10 @@ export const ANTIGRAVITY_DIALECT: AcpDialect = {
   normalizeToolUpdate: normalizeAgyToolUpdate,
   // Avoid using the full command line as the tool name.
   toolName: (update) => (update.kind === 'execute' ? 'execute' : undefined),
+  systemPromptMeta: (initialized, instructions) =>
+    object(object(object(object(initialized.agentCapabilities)._meta).antigravity).systemPrompt).append === true
+      ? { antigravity: { systemPrompt: { append: instructions } } }
+      : undefined,
   retryNotice: (chunk) => {
     const cause = AGY_RETRY_NOTICE.exec(chunk)?.[1];
     return cause ? `模型输出无效，Antigravity 正在重试（${cause}）` : undefined;

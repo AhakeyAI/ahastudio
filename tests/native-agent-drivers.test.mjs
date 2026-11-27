@@ -537,7 +537,8 @@ test('capability table: legacy providers fall back to Codex, policies never wide
     'Codex keeps every capability it had');
   for (const id of ['claude', 'antigravity', 'grok', 'opencode', 'pi']) {
     const caps = AGENT_DRIVER_CAPABILITIES[id];
-    assert.equal(caps.goal || caps.feedback || caps.usageLimits || caps.skills || caps.plugins || caps.history || caps.orchestration || caps.network, false, id);
+    assert.equal(caps.goal || caps.feedback || caps.usageLimits || caps.skills || caps.plugins || caps.history || caps.network, false, id);
+    assert.equal(caps.orchestration, id === 'claude' || id === 'antigravity' || id === 'grok', `${id} orchestration`);
   }
   const claude = AGENT_DRIVER_CAPABILITIES.claude;
   assert.deepEqual(claude.policies, ['workspace-write', 'read-only', 'full-auto']);
@@ -601,9 +602,12 @@ test('manager: legacy saved sessions load as Codex with its capabilities; other 
   assert.equal(grok.provider, 'grok');
   assert.equal(grok.policy, 'workspace-write');
   assert.equal(grok.network, false, 'no network switch for a driver without one');
-  assert.deepEqual(await manager.setOrchestration(grok.id, true), { ok: false, error: '当前会话驱动不支持编排模式' });
   assert.equal((await manager.send(grok.id, { text: 'x', network: true })).status, 'not_accepted');
   assert.equal(log.at(-1).provider, 'grok');
+  const opencode = await manager.create({ cwd: dir, policy: 'workspace-write', provider: 'opencode' });
+  assert.deepEqual(await manager.setOrchestration(opencode.id, true), { ok: false, error: '当前会话驱动不支持编排模式' });
+  const agy = await manager.create({ cwd: dir, policy: 'workspace-write', provider: 'antigravity' });
+  assert.deepEqual(await manager.setOrchestration(agy.id, true), { ok: true });
   await manager.dispose();
 });
 
@@ -712,4 +716,80 @@ test('ACP: prefers session/resume over session/load when both are advertised, an
   assert.ok(thoughtClosedIndex >= 0 && firstToolIndex > thoughtClosedIndex, 'reasoning item must settle before tool starts');
   assert.ok(messageClosedIndex > firstToolIndex, 'streamed message item must settle on turn end');
   await driver.close();
+});
+
+test('manager: caches non-Codex models across restarts so suspended sessions can pick a model before resuming', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aha-model-cache-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, 'agent-sessions.json');
+  const catalog = [
+    { id: 'gemini-4-neon', model: 'gemini-4-neon', displayName: 'Gemini 4 Neon', description: '', isDefault: true, efforts: [{ value: 'high', description: '' }, { value: 'xhigh', description: '' }], defaultEffort: 'high', images: true },
+    { id: 'gemini-4-carbon', model: 'gemini-4-carbon', displayName: 'Gemini 4 Carbon', description: '', isDefault: false, efforts: [{ value: 'medium', description: '' }, { value: 'high', description: '' }], defaultEffort: 'high', images: true },
+  ];
+  const opens = [];
+  let failOpen = false;
+  const launch = (_sessionId, _cwd, events, options) => {
+    const driver = {
+      provider: options.provider,
+      capabilities: { resume: true, steer: false, policies: AGENT_DRIVER_CAPABILITIES[options.provider].policies },
+      alive: true, busy: false, closing: false, sessionId: null, latestTurnKey: null,
+      effectiveModel: null, effectiveEffort: null,
+      models: () => catalog,
+      async open(openOpts) {
+        opens.push(openOpts);
+        if (failOpen) throw new Error('offline');
+        driver.sessionId = openOpts.resumeSessionId ?? 'agy-sess-1';
+        driver.effectiveModel = openOpts.model ?? 'gemini-4-neon';
+        driver.effectiveEffort = openOpts.effort ?? 'high';
+        return driver.sessionId;
+      },
+      async startTurn({ turnKey }) {
+        driver.busy = true;
+        driver.latestTurnKey = turnKey;
+        setImmediate(() => {
+          driver.busy = false;
+          events.onTurnCompleted(turnKey, { turnId: 't1', stopReason: 'completed', finalText: 'ok', diff: null, usage: null, error: null });
+        });
+        return { status: 'accepted' };
+      },
+      async interrupt() { return false; },
+      async waitForIdle() { return true; },
+      read() { return null; },
+      redactText: (text) => text,
+      async close() { driver.alive = false; driver.closing = true; },
+    };
+    return driver;
+  };
+
+  // 1. Live Antigravity session populates and persists the provider model cache.
+  const first = new AgentSessionManager({ launch, storageFile: () => file });
+  const created = await first.create({ cwd: dir, policy: 'workspace-write', provider: 'antigravity' });
+  assert.equal((await first.send(created.id, { text: 'hello' })).status, 'accepted');
+  await until(() => first.list()[0].status === 'idle');
+  await first.dispose();
+
+  // 2. After restart, the session is suspended (no live process) yet models() returns the cached list immediately.
+  const second = new AgentSessionManager({ launch, storageFile: () => file });
+  t.after(() => second.dispose());
+  const [suspended] = second.list();
+  assert.equal(suspended.status, 'suspended');
+  assert.deepEqual(second.models(suspended.id).map((m) => m.id), ['gemini-4-neon', 'gemini-4-carbon']);
+
+  // 3. Failed resume rolls back model/effort cleanly.
+  failOpen = true;
+  const failed = await second.send(suspended.id, { text: 'switch', model: 'gemini-4-carbon', effort: 'medium' });
+  assert.equal(failed.status, 'not_accepted');
+  assert.equal(second.list()[0].model, 'gemini-4-neon');
+  assert.equal(second.list()[0].effort, 'high');
+
+  // 4. Successful resume opens directly with the newly chosen model and effort.
+  failOpen = false;
+  const resumed = await second.send(suspended.id, { text: 'switch now', model: 'gemini-4-carbon', effort: 'medium' });
+  assert.equal(resumed.status, 'accepted');
+  assert.equal(opens.at(-1).resumeSessionId, 'agy-sess-1');
+  assert.equal(opens.at(-1).model, 'gemini-4-carbon');
+  assert.equal(opens.at(-1).effort, 'medium');
+  await until(() => second.list()[0].status === 'idle');
+  assert.equal(second.list()[0].model, 'gemini-4-carbon');
+  assert.equal(second.list()[0].effort, 'medium');
 });

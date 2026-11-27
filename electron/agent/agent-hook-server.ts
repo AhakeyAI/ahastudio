@@ -9,7 +9,7 @@ import {
   type AgentWaitKind,
   type NormalizedAgentHookEvent,
 } from './agent-status-store.js';
-import { CODEX_WORKER_ID } from '../orchestration/codex-app-server-pilot.js';
+import { HEADLESS_WORKER_ID } from '../orchestration/headless-workers.js';
 import { AGENT_SESSION_ID } from '../orchestration/agent-session-manager.js';
 import { isProgramStatusKind, normalizeAgentId } from './program-status-osc.js';
 
@@ -797,7 +797,7 @@ export class AgentHookServer {
   }
 
   envForWorker(workerId: string): Record<string, string> {
-    if (this.boundPort === null || !CODEX_WORKER_ID.test(workerId)) {
+    if (this.boundPort === null || !HEADLESS_WORKER_ID.test(workerId)) {
       throw new Error('Cannot configure authentication for the headless Worker');
     }
     return {
@@ -826,7 +826,7 @@ export class AgentHookServer {
     }
     if (claimsWorker) {
       // A Worker must not be able to use its transport token with the identity headers removed.
-      return url.startsWith('/orchestration/') && typeof workerId === 'string' && CODEX_WORKER_ID.test(workerId) &&
+      return url.startsWith('/orchestration/') && typeof workerId === 'string' && HEADLESS_WORKER_ID.test(workerId) &&
         typeof workerToken === 'string' && tokensEqual(this.workerToken(workerId, 'identity'), workerToken) &&
         tokensEqual(this.workerToken(workerId, 'transport'), candidate)
         ? workerId : undefined;
@@ -835,7 +835,7 @@ export class AgentHookServer {
 
     const ptyId = req.headers['x-aha-pty-id'];
     const credential = req.headers['x-aha-pane-token'];
-    return typeof ptyId === 'string' && PTY_ID_RE.test(ptyId) && !CODEX_WORKER_ID.test(ptyId) &&
+    return typeof ptyId === 'string' && PTY_ID_RE.test(ptyId) && !HEADLESS_WORKER_ID.test(ptyId) &&
       !AGENT_SESSION_ID.test(ptyId) &&
       typeof credential === 'string' && tokensEqual(this.paneToken(ptyId), credential)
       ? ptyId : null;

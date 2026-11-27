@@ -16,8 +16,10 @@ import type {
   TurnDelivery,
 } from '../../orchestration/agent-session-driver.js';
 import type { CodexModelOption } from '../../orchestration/codex-catalog.js';
+import { AHA_TOOL_DENIED, ahaToolDecision, parseAhaMcpToolName } from '../../orchestration/headless-workers.js';
 import type { WorkerTimelineEvent } from '../../orchestration/worker-timeline.js';
 import { AgentProcessHandle, type AgentChild } from '../agent-process.js';
+import { redactSecrets, redactTimelineEvent } from '../secret-redaction.js';
 import { driverCapabilities } from '../driver-capabilities.js';
 import {
   JsonlRpc,
@@ -32,6 +34,8 @@ import {
   asObject,
   asText,
   buildClaudeUserContent,
+  CLAUDE_AHA_MCP_HOOK_ID,
+  CLAUDE_AHA_MCP_HOOK_MATCHER,
   CLAUDE_CONTROL_ENVELOPE,
   CLAUDE_READ_ONLY_HOOK_ID,
   CLAUDE_READ_ONLY_HOOK_MATCHER,
@@ -117,7 +121,18 @@ export interface ClaudeDriverOptions {
   gracefulCloseMs?: number;
   requestTimeoutMs?: number;
   setupTimeoutMs?: number;
+  /**
+   * The process was launched with the Aha MCP server (`--mcp-config`). A Coordinator's Aha tools all
+   * run unprompted (the orchestration service gates the ones that change Workers or Git history);
+   * a Worker's run unprompted only for its dispatch contract. `requiredTool` must be listed before
+   * the session is usable.
+   */
+  ahaMcp?: { role: 'coordinator' | 'worker'; requiredTool?: string };
+  /** Credentials the process was given, redacted from everything the driver reports. */
+  secrets?: readonly string[];
 }
+
+const AHA_MCP_FINAL_STATES = new Set(['connected', 'failed', 'needs-auth', 'disabled']);
 
 /** One Claude Code conversation driven over bidirectional stream-json stdio. */
 export class ClaudeSessionDriver implements AgentSessionDriver {
@@ -130,6 +145,8 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
   private readonly acceptanceWindowMs: number;
   private readonly gracefulCloseMs: number;
   private readonly setupTimeoutMs: number;
+  private readonly ahaMcp: ClaudeDriverOptions['ahaMcp'] | null;
+  private readonly secrets: readonly string[];
   private claudeSessionId: string | null;
   private policy: AgentSessionPolicy;
   private currentPermissionMode: ClaudePermissionMode | null = null;
@@ -159,6 +176,8 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     this.acceptanceWindowMs = options.acceptanceWindowMs ?? 1_500;
     this.gracefulCloseMs = options.gracefulCloseMs ?? 1_500;
     this.setupTimeoutMs = options.setupTimeoutMs ?? 60_000;
+    this.ahaMcp = options.ahaMcp ?? null;
+    this.secrets = options.secrets ?? [];
     this.proc = new AgentProcessHandle(child);
     this.rpc = new JsonlRpc(child.stdout, child.stdin, CLAUDE_CONTROL_ENVELOPE, {
       onRecord: (record) => this.receive(record),
@@ -196,7 +215,10 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
         {
           supportedDialogKinds: [],
           hooks: {
-            PreToolUse: [{ matcher: CLAUDE_READ_ONLY_HOOK_MATCHER, hookCallbackIds: [CLAUDE_READ_ONLY_HOOK_ID] }],
+            PreToolUse: [
+              { matcher: CLAUDE_READ_ONLY_HOOK_MATCHER, hookCallbackIds: [CLAUDE_READ_ONLY_HOOK_ID] },
+              ...(this.ahaMcp ? [{ matcher: CLAUDE_AHA_MCP_HOOK_MATCHER, hookCallbackIds: [CLAUDE_AHA_MCP_HOOK_ID] }] : []),
+            ],
           },
         },
         { timeoutMs: this.setupTimeoutMs },
@@ -238,10 +260,33 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
         await this.setEffort(effort);
       }
       await this.applyPolicy(policy);
+      if (this.ahaMcp?.requiredTool) await this.waitForAhaTool(this.ahaMcp.requiredTool);
       return this.claudeSessionId;
     } catch (error) {
-      throw new Error(this.proc.withStderr(describe(error)));
+      throw new Error(this.proc.withStderr(this.redact(describe(error)), (text) => this.redact(text)));
     }
+  }
+
+  /** Claude connects MCP servers in the background; poll until Aha lists the tool or settles without it. */
+  private async waitForAhaTool(tool: string): Promise<void> {
+    const deadline = Date.now() + this.setupTimeoutMs;
+    let state = 'missing';
+    for (;;) {
+      const status = asObject(await this.rpc.request('mcp_status', {}, { timeoutMs: 15_000 }));
+      const aha = asArray(status.mcpServers).map(asObject).find((server) => server.name === 'aha');
+      state = asNonEmptyText(aha?.status) ?? 'missing';
+      const names = asArray(aha?.tools).map((entry) => (typeof entry === 'string' ? entry : asText(asObject(entry).name)));
+      if (names.some((name) => name === tool || name === `mcp__aha__${tool}`)) return;
+      if (AHA_MCP_FINAL_STATES.has(state) || Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error(`Aha MCP did not expose ${tool} to Claude Code (${state})`);
+  }
+
+  /** How this session's role answers an Aha tool call; null for every other tool. */
+  private ahaDecision(toolName: string): 'allow' | 'ask' | 'deny' | null {
+    const tool = this.ahaMcp ? parseAhaMcpToolName(toolName) : null;
+    return tool ? ahaToolDecision(this.ahaMcp!.role, tool, this.policy) : null;
   }
 
   async startTurn({ turnKey, prompt, effort, model, policy, attachments = [] }: {
@@ -307,7 +352,7 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     const slice = this.output.slice(start - this.offset, screen ? undefined : start - this.offset + size);
     return {
       screen,
-      text: slice,
+      text: this.redact(slice),
       cursor: start,
       nextCursor: start + slice.length,
       truncated: cursor < this.offset,
@@ -318,7 +363,11 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
   }
 
   redactText(value: string): string {
-    return value;
+    return this.redact(value);
+  }
+
+  private redact(value: string): string {
+    return redactSecrets(value, this.secrets);
   }
 
   close(interrupt = false): Promise<void> {
@@ -1101,10 +1150,10 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     this.events.onTurnCompleted(turn.turnKey, {
       turnId: turn.turnId,
       stopReason,
-      finalText,
+      finalText: this.redact(finalText),
       diff: null,
       usage,
-      error,
+      error: error === null ? null : this.redact(error),
     });
   }
 
@@ -1148,6 +1197,21 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
   }
 
   private handleHookCallback(req: Obj): Obj {
+    if (req.callback_id === CLAUDE_AHA_MCP_HOOK_ID) {
+      const toolName = asNonEmptyText(asObject(req.input).tool_name) ?? '';
+      const decision = this.ahaDecision(toolName);
+      // "ask" falls through to can_use_tool, which puts the call to the person.
+      if (decision !== 'allow' && decision !== 'deny') return {};
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: decision,
+          permissionDecisionReason: decision === 'allow'
+            ? 'AhaStation orchestration tool for this role.'
+            : AHA_TOOL_DENIED,
+        },
+      };
+    }
     if (req.callback_id === CLAUDE_READ_ONLY_HOOK_ID && this.policy === 'read-only') {
       const turn = this.active;
       const toolUseId = asNonEmptyText(req.tool_use_id);
@@ -1184,6 +1248,17 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     }
     this.sawEvidence(turn);
 
+    // The role's Aha tools never wait on a prompt, read-only included: report_done must always work.
+    // Other Aha tools go to the person in every tier but full-auto, which refuses them.
+    const aha = this.ahaDecision(toolName);
+    if (aha === 'allow') {
+      return { behavior: 'allow', updatedInput: input, ...(toolUseId ? { toolUseID: toolUseId } : {}) };
+    }
+    if (aha === 'deny') {
+      if (toolUseId) turn.declinedTools.add(toolUseId);
+      return { behavior: 'deny', message: AHA_TOOL_DENIED, ...(toolUseId ? { toolUseID: toolUseId } : {}) };
+    }
+
     // AskUserQuestion always asks the person regardless of permission tier.
     if (toolName === 'AskUserQuestion') {
       const parsed = parseClaudeAskUserQuestion(input);
@@ -1208,7 +1283,7 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     }
 
     // Read-only denies any action that asks for write/execution approval.
-    if (this.policy === 'read-only') {
+    if (this.policy === 'read-only' && aha !== 'ask') {
       if (toolUseId) turn.declinedTools.add(toolUseId);
       this.timeline(turn, { type: 'notice', level: 'warning', text: '只读模式：已拒绝一次需要授权的操作' });
       return {
@@ -1219,7 +1294,7 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     }
 
     // Full-auto approves ordinary tool permissions automatically, never questions or plan/person-only prompts.
-    if (this.policy === 'full-auto' && !claudeRequestRequiresPerson(toolName, req)) {
+    if (this.policy === 'full-auto' && aha === null && !claudeRequestRequiresPerson(toolName, req)) {
       return {
         behavior: 'allow',
         updatedInput: input,
@@ -1233,8 +1308,8 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
       response = await this.events.onRequest(turn.turnKey, {
         kind: 'approval',
         method: `claude/${toolName}`,
-        toolInput: formatClaudeApprovalInput(toolName, input, req),
-        ...(message ? { message } : {}),
+        toolInput: this.redact(formatClaudeApprovalInput(toolName, input, req)),
+        ...(message ? { message: this.redact(message) } : {}),
         signal,
       });
     } catch {
@@ -1313,7 +1388,7 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
     this.rpc.close(new JsonlRpcClosedError(reason));
     if (this.active) this.dropTurn(this.active);
     try {
-      this.events.onExit(this.proc.withStderr(reason), exitCode);
+      this.events.onExit(this.proc.withStderr(this.redact(reason), (text) => this.redact(text)), exitCode);
     } finally {
       void this.close();
     }
@@ -1321,7 +1396,7 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
 
   private timeline(turn: ClaudeTurn, event: WorkerTimelineEvent): void {
     try {
-      this.events.onTimeline?.(turn.turnKey, event);
+      this.events.onTimeline?.(turn.turnKey, redactTimelineEvent(event, this.secrets));
     } catch (error) {
       console.warn('[agent-drivers] Claude Code timeline listener failed:', error);
     }

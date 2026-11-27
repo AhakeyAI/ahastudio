@@ -49,26 +49,34 @@ export const AGENT_DRIVER_CAPABILITIES: Readonly<Record<AgentDriverId, AgentDriv
     plugins: true, history: true, orchestration: true, rename: true, resume: true, terminalResume: true,
   },
   // Claude Code runs over bidirectional stream-json stdio with live permission modes and can_use_tool prompts.
+  // Orchestration: Aha MCP per process via `--mcp-config`, Coordinator rules via `--append-system-prompt`.
   claude: {
     ...NONE, policies: ['workspace-write', 'read-only', 'full-auto'], models: true, efforts: true, images: true,
-    compact: true, rename: true, resume: true, terminalResume: true,
+    compact: true, orchestration: true, rename: true, resume: true, terminalResume: true,
   },
   // ACP agents ask through session/request_permission; AhaStation answers by policy or asks the person.
+  // Orchestration: Antigravity starts ACP `mcpServers` under `aha_orchestration` (a global terminal
+  // `aha` entry shadows a same-named ACP server) and takes Coordinator rules via
+  // `_meta.antigravity.systemPrompt.append` (falling back to the first prompt when absent).
   antigravity: {
-    ...NONE, policies: ['workspace-write', 'full-auto'], models: true, efforts: true, images: true, resume: true,
-    terminalResume: true,
+    ...NONE, policies: ['workspace-write', 'full-auto'], models: true, efforts: true, images: true,
+    orchestration: true, resume: true, terminalResume: true,
   },
-  // Effort is each agent's `thought_level` session option.
+  // Effort is each agent's `thought_level` session option. Orchestration: Grok starts the ACP
+  // `mcpServers` it is given on session/new|load|resume; ACP has no system prompt, so the
+  // Coordinator rules lead the first message of each process.
   grok: {
-    ...NONE, policies: ['workspace-write', 'full-auto'], models: true, efforts: true, images: true, compact: true, resume: true,
-    terminalResume: true,
+    ...NONE, policies: ['workspace-write', 'full-auto'], models: true, efforts: true, images: true, compact: true,
+    orchestration: true, resume: true, terminalResume: true,
   },
   // OpenCode's read-only tier is its own `plan` mode, with every permission request refused as well.
+  // No orchestration until its ACP `mcpServers` support is verified.
   opencode: {
     ...NONE, policies: ['workspace-write', 'read-only', 'full-auto'], models: true, compact: true, resume: true,
     terminalResume: true,
   },
   // Pi never asks before using a tool, so its only tiers are its read-only tool set or all tools.
+  // No orchestration: its RPC mode has no per-process MCP configuration.
   pi: {
     ...NONE, policies: ['full-auto', 'read-only'], policyNeedsRelaunch: true, models: true, efforts: true,
     images: true, compact: true, rename: true, resume: true, terminalResume: true,

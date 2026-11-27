@@ -355,6 +355,17 @@ app.whenReady().then(async () => {
   const mcpCliIdSet = new Set<string>(AGENT_MCP_CLI_IDS);
   const { coordinatorApprovedMcpTools, enabledCodexPilot, launchCodexPilot } =
     await import('./orchestration/codex-app-server-pilot.js');
+  const { DriverRegistry, nativeDriverEntries, launchHeadlessWorkerDriver, headlessWorkerCommand } =
+    await import('./agent-drivers/driver-registry.js');
+  const { resolveAgentCommand } = await import('./agent-drivers/agent-process.js');
+  const { resolveBinaryFromPath } = await import('./bin-resolve.js');
+  // The Aha MCP server over stdio for one caller's credentials, the way the Codex pilot starts it.
+  const ahaMcpServer = (env: Record<string, string>) => {
+    const serverPath = resolveActiveMcpServerPath();
+    const node = resolveBinaryFromPath('node');
+    if (!serverPath || !node) throw new Error('Aha MCP Server is unavailable');
+    return { command: node, args: [serverPath], env };
+  };
   const orchestrationStore = OrchestrationStore.forUserDataDir(() => app.getPath('userData'));
   const orchestrationService = new OrchestrationService({
     store: orchestrationStore,
@@ -383,6 +394,13 @@ app.whenReady().then(async () => {
         const mcpServerPath = resolveActiveMcpServerPath();
         if (!agentHookServer || !mcpServerPath) throw new Error('Aha MCP Server is unavailable');
         return launchCodexPilot({ cwd, events, mcp: { serverPath: mcpServerPath, env: agentHookServer.envForWorker(workerId) } });
+      },
+    },
+    headlessWorkers: {
+      available: (cliId) => resolveAgentCommand(headlessWorkerCommand(cliId)) !== null,
+      launch: (cliId, workerId, cwd, events, { policy }) => {
+        if (!agentHookServer) throw new Error('Aha MCP Server is unavailable');
+        return launchHeadlessWorkerDriver(cliId, cwd, events, { policy, mcp: ahaMcpServer(agentHookServer.envForWorker(workerId)) });
       },
     },
     closeWorkerPty: (ptyId) => shellPtyCtrl.closePty(ptyId),
@@ -526,7 +544,6 @@ app.whenReady().then(async () => {
   const orchestrationIpc = registerOrchestrationIpc(ipcCtx);
   const { AgentSessionManager } = await import('./orchestration/agent-session-manager.js');
   const { registerAgentSessionsIpc } = await import('./ipc/agent-sessions.js');
-  const { DriverRegistry, nativeDriverEntries } = await import('./agent-drivers/driver-registry.js');
   const { driverCapabilities } = await import('./agent-drivers/driver-capabilities.js');
   // Codex keeps its own app-server pilot (catalog, history, orchestration); the rest are ACP or Pi.
   const driverRegistry = new DriverRegistry([
@@ -545,7 +562,12 @@ app.whenReady().then(async () => {
         });
       },
     },
-    ...nativeDriverEntries(),
+    ...nativeDriverEntries({
+      coordinatorMcp: (sessionId) => {
+        if (!agentHookServer) throw new Error('Aha MCP Server is unavailable');
+        return ahaMcpServer(agentHookServer.envForSession(sessionId));
+      },
+    }),
   ]);
   const agentSessions = new AgentSessionManager({
     launch: (sessionId, cwd, events, options) => driverRegistry.launch(sessionId, cwd, events, options),
@@ -562,6 +584,7 @@ app.whenReady().then(async () => {
   orchestrationService.setSessionCoordinators({
     get: (id) => agentSessions.coordinatorState(id),
     wake: (id, prompt) => agentSessions.wake(id, prompt),
+    requestApproval: (id, request, signal) => agentSessions.requestCoordinatorApproval(id, request, signal),
   });
   const { CodexCatalog } = await import('./orchestration/codex-catalog.js');
   const noSessionEvents = {

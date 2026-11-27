@@ -1,5 +1,5 @@
 import { AGENT_SESSION_ID } from './agent-session-manager.js';
-import { CODEX_WORKER_ID } from './codex-app-server-pilot.js';
+import { HEADLESS_WORKER_ID } from './headless-workers.js';
 import { z } from 'zod';
 import { OrchestrationService } from './orchestration-service.js';
 import { taskContextFields } from './task-context-schema.js';
@@ -452,7 +452,10 @@ export function isLongPollOrchestrationAction(action: string): boolean {
     action === 'ask' ||
     action === 'ask-self' ||
     action === 'delegate-task' ||
-    action === 'board-wait'
+    action === 'board-wait' ||
+    action === 'role-manage' ||
+    action === 'worker-integrate' ||
+    action === 'run-finalize'
   );
 }
 
@@ -540,7 +543,7 @@ export async function dispatchOrchestrationHttpAction(
       : {};
   const formatReceipt = payload.receiptText === true;
   const full = payload.full === true;
-  const codexCaller = context.callerPaneId && CODEX_WORKER_ID.test(context.callerPaneId)
+  const codexCaller = context.callerPaneId && HEADLESS_WORKER_ID.test(context.callerPaneId)
     ? context.callerPaneId : null;
   const sessionCaller = context.callerPaneId && AGENT_SESSION_ID.test(context.callerPaneId)
     ? context.callerPaneId : null;
@@ -578,6 +581,7 @@ export async function dispatchOrchestrationHttpAction(
       if (!AGENT_SESSION_COORDINATOR_ACTIONS.has(action)) {
         throw new OrchestrationError('operation_rejected', 'This action is unavailable to an Agent session Coordinator.');
       }
+      await service.gateSessionCoordinatorAction(sessionCaller, action, payload, context.signal);
     }
     let result: unknown;
     switch (action) {

@@ -6,6 +6,8 @@ import {
 } from '../agent-drivers/driver-capabilities.js';
 import { AtomicSnapshotWriter } from '../persistence/atomic-snapshot-writer.js';
 import type { CodexModelOption } from './codex-catalog.js';
+import { ORCHESTRATION_ENDED_INSTRUCTIONS } from './coordinator-prompt.js';
+import { approvalToolName } from './headless-workers.js';
 import type {
   AgentGoalAction, AgentProvider, AgentQuestion, AgentRuntimeRequest, AgentRuntimeResponse, AgentSessionDriver,
   AgentSessionEvents, AgentSessionGoal, AgentSessionPolicy, AgentTurnAttachment, TurnDelivery,
@@ -95,18 +97,26 @@ interface Session {
   generation: number;
   /** The provider accepted a turn; Codex saves a thread only then, so before it there is nothing to resume. */
   hasTurns: boolean;
+  /** The provider accepted an orchestrated turn on this conversation (ACP keeps those rules in history). */
+  hadOrchestrationTurn?: boolean;
   /** The person interrupted while a `/goal` turn was being started; its goal must not stay active. */
   goalTurnInterrupted?: boolean;
   /** Policy the live process was launched with; Aha MCP approvals are baked in at that point. */
   launchedPolicy: AgentSessionPolicy | null;
   /** A title the person chose that the provider has not stored yet; sent when a process is next up. */
   unsyncedName: string | null;
+  /** Events of the live process, so orchestration can ask the person inside the running turn. */
+  events?: AgentSessionEvents;
 }
 
 export interface AgentSessionManagerDependencies {
   launch: (
     sessionId: string, cwd: string, events: AgentSessionEvents,
-    options: { orchestration: boolean; policy: AgentSessionPolicy; provider: AgentProvider; resumeSessionId?: string },
+    options: {
+      orchestration: boolean; policy: AgentSessionPolicy; provider: AgentProvider; resumeSessionId?: string;
+      /** Coordinator rules, for drivers that take them at launch (Claude Code) rather than in `open`. */
+      developerInstructions?: string;
+    },
   ) => AgentSessionDriver;
   /** Coordinator rules for an orchestrating session's conversation; without it orchestration mode is unavailable. */
   coordinatorInstructions?: (sessionId: string, options: { policy: AgentSessionPolicy }) => string;
@@ -146,6 +156,7 @@ const describeGoal = (goal: AgentSessionGoal) => `当前目标（${GOAL_STATUS_L
  */
 export class AgentSessionManager {
   private readonly sessions = new Map<string, Session>();
+  private readonly providerModels = new Map<AgentProvider, CodexModelOption[]>();
   private readonly timelineListeners = new Set<(change: WorkerTimelineChange) => void>();
   private readonly sessionListeners = new Set<(sessions: AgentSessionInfo[]) => void>();
   private readonly now: () => number;
@@ -247,10 +258,15 @@ export class AgentSessionManager {
         return { status: 'not_accepted', reason: `Session is ${info.status}` };
       }
       if (info.status === 'closed') return { status: 'not_accepted', reason: 'Session is closed' };
-      const previous = info.policy;
+      const previousPolicy = info.policy;
+      const previousModel = info.model;
+      const previousEffort = info.effort;
       if (info.orchestration || info.capabilities.policyNeedsRelaunch) info.policy = wanted;
+      if (input.model) info.model = input.model;
+      if (input.effort !== undefined) info.effort = input.effort;
       info.goal = null;
       session.hasTurns = false;
+      session.hadOrchestrationTurn = false;
       if (info.title) session.unsyncedName = info.title;
       if (session.driver?.alive) {
         const driver = session.driver;
@@ -262,16 +278,24 @@ export class AgentSessionManager {
       }
       await this.connect(session, false);
       if ((info.status as AgentSessionStatus) !== 'idle') {
-        info.policy = previous;
+        info.policy = previousPolicy;
+        info.model = previousModel;
+        info.effort = previousEffort;
         this.sessionsChanged();
         return { status: 'not_accepted', reason: info.error ?? '无法开启新上下文' };
       }
     } else if (this.resumable(session)) {
-      const previous = info.policy;
+      const previousPolicy = info.policy;
+      const previousModel = info.model;
+      const previousEffort = info.effort;
       if (info.orchestration || info.capabilities.policyNeedsRelaunch) info.policy = wanted;
+      if (input.model) info.model = input.model;
+      if (input.effort !== undefined) info.effort = input.effort;
       await this.connect(session, true);
       if (session.info.status !== 'idle') {
-        info.policy = previous;
+        info.policy = previousPolicy;
+        info.model = previousModel;
+        info.effort = previousEffort;
         this.sessionsChanged();
         return { status: 'not_accepted', reason: session.info.error ?? 'Session did not resume' };
       }
@@ -417,6 +441,8 @@ export class AgentSessionManager {
     const driver = session.driver!;
     const turnKey = `${info.id}:${++session.turns}`;
     const attachments = input.attachments ?? [];
+    const previousPolicy = info.policy;
+    if (input.policy) info.policy = input.policy;
     info.status = 'running';
     timeline.beginTurn({
       dispatchId: turnKey, prompt: display?.prompt ?? text, ...(origin ? { origin } : {}),
@@ -431,11 +457,12 @@ export class AgentSessionManager {
       turnKey, prompt: text, ...(attachments.length ? { attachments } : {}),
       effort: input.effort !== undefined ? input.effort : info.effort,
       ...(input.model && input.model !== info.model ? { model: input.model } : {}),
-      ...(input.policy && input.policy !== info.policy ? { policy: input.policy } : {}),
+      ...(input.policy && input.policy !== previousPolicy ? { policy: input.policy } : {}),
       ...(input.network !== undefined && input.network !== info.network ? { network: input.network } : {}),
     });
     if (delivery.status === 'accepted') {
       session.hasTurns = true;
+      session.hadOrchestrationTurn = info.orchestration;
       if (driver.sessionId) info.providerSessionId = driver.sessionId;
       if (driver.provider !== 'codex') {
         if (input.model) info.model = driver.effectiveModel ?? input.model;
@@ -445,13 +472,13 @@ export class AgentSessionManager {
         if (input.model) info.model = input.model;
         if (input.effort !== undefined) info.effort = input.effort;
       }
-      if (input.policy) info.policy = input.policy;
       if (input.network !== undefined) info.network = input.network;
       timeline.setMeta({
         model: info.model, readOnly: info.policy === 'read-only',
         ...(info.providerSessionId ? { providerSessionId: info.providerSessionId } : {}),
       });
     } else {
+      info.policy = previousPolicy;
       timeline.endActiveTurn('failed', delivery.reason);
       // Unknown acceptance leaves the provider thread in an unknown state; do not send into it again.
       if (delivery.status === 'unknown_acceptance') {
@@ -627,14 +654,35 @@ export class AgentSessionManager {
   }
 
   /** Coordinator state the orchestration service checks before trusting the session's MCP calls. */
-  coordinatorState(id: string): { cwd: string; provider: string; active: boolean; idle: boolean; network: boolean } | null {
+  coordinatorState(id: string): {
+    cwd: string; provider: string; active: boolean; idle: boolean; network: boolean; policy: AgentSessionPolicy;
+  } | null {
     const session = this.sessions.get(id);
     if (!session) return null;
     const { info, driver } = session;
     const live = info.status === 'starting' || info.status === 'idle' || info.status === 'running';
     const active = info.orchestration && live;
     const idle = active && info.status === 'idle' && Boolean(driver?.alive) && !driver?.busy && session.requests.size === 0;
-    return { cwd: info.cwd, provider: info.provider, active, idle, network: info.network };
+    const policy = session.launchedPolicy === 'full-auto' || info.policy === 'full-auto'
+      ? (session.launchedPolicy ?? info.policy)
+      : info.policy;
+    return {
+      cwd: info.cwd, provider: info.provider, active, idle, network: info.network, policy,
+    };
+  }
+
+  /**
+   * Puts an orchestration action the Coordinator called to the person, as an approval in its running
+   * turn. Resolves false when declined, or when there is no turn to ask in.
+   */
+  async requestCoordinatorApproval(
+    id: string, request: { method: string; toolInput: string; message?: string }, signal: AbortSignal,
+  ): Promise<boolean> {
+    const session = this.sessions.get(id);
+    const turnKey = session?.timeline.activeTurn?.dispatchId;
+    if (!session?.info.orchestration || !session.events || !session.driver?.alive || !turnKey) return false;
+    const response = await session.events.onRequest(turnKey, { kind: 'approval', ...request, signal });
+    return 'decision' in response && response.decision === 'accept';
   }
 
   /** Requests an in-place tool config reload on the active Codex thread between turns. */
@@ -781,6 +829,7 @@ export class AgentSessionManager {
     const session: Session = {
       info, driver: null, requests: new Map(), generation: 0, launchedPolicy: null, unsyncedName: null,
       turns: initial?.turns.length ?? 0,
+      hadOrchestrationTurn: Boolean(info.orchestration && initial?.turns.length),
       // A turn that never reached the provider ends failed with no turn id and no output.
       hasTurns: initial?.turns.some((turn) => turn.status !== 'failed' || turn.turnId !== null || turn.items.length > 0) ?? false,
       timeline: new WorkerTimeline({
@@ -802,9 +851,24 @@ export class AgentSessionManager {
     return !handoff && Boolean(providerSessionId) && !session.driver?.alive && (status === 'suspended' || status === 'failed');
   }
 
-  /** Models the session's live process offered; Codex sessions list theirs from `CodexCatalog` instead. */
+  /**
+   * Models the session's driver offers: the live process first, then another live session of the
+   * same provider, then the last persisted catalog for that provider so suspended tabs can pick a
+   * model before resuming. Codex sessions read theirs from `CodexCatalog` instead.
+   */
   models(id: string): CodexModelOption[] {
-    return this.sessions.get(id)?.driver?.models?.() ?? [];
+    const session = this.sessions.get(id);
+    if (!session) return [];
+    const live = session.driver?.models?.();
+    if (live && live.length > 0) return live;
+    const provider = session.info.provider;
+    for (const other of this.sessions.values()) {
+      if (other.info.provider === provider && other.driver?.alive) {
+        const offered = other.driver.models?.();
+        if (offered && offered.length > 0) return offered;
+      }
+    }
+    return structuredClone(this.providerModels.get(provider) ?? []);
   }
 
   /**
@@ -880,9 +944,14 @@ export class AgentSessionManager {
       const orchestration = info.orchestration;
       const developerInstructions = orchestration
         ? this.deps.coordinatorInstructions?.(info.id, { policy: info.policy })
-        : undefined;
-      session.driver = this.deps.launch(info.id, info.cwd, this.eventsFor(session, generation), {
+        : rejoin && session.hadOrchestrationTurn && info.provider === 'grok'
+          ? ORCHESTRATION_ENDED_INSTRUCTIONS
+          : undefined;
+      const events = this.eventsFor(session, generation);
+      session.events = events;
+      session.driver = this.deps.launch(info.id, info.cwd, events, {
         orchestration, policy: info.policy, provider: info.provider,
+        ...(developerInstructions ? { developerInstructions } : {}),
         ...(rejoin && info.providerSessionId ? { resumeSessionId: info.providerSessionId } : {}),
       });
       session.launchedPolicy = info.policy;
@@ -894,6 +963,8 @@ export class AgentSessionManager {
         ...(rejoin && info.providerSessionId ? { resumeSessionId: info.providerSessionId } : {}),
       });
       if (!session.driver.alive) throw new Error(info.error ?? 'The agent closed while starting');
+      const offeredModels = session.driver.models?.() ?? [];
+      if (offeredModels.length > 0) this.providerModels.set(info.provider, structuredClone(offeredModels));
       // What the provider actually uses, e.g. a default from the person's own config.
       info.model = session.driver.effectiveModel ?? info.model;
       info.effort = session.driver.provider !== 'codex' && session.driver.effectiveEffort !== undefined
@@ -969,7 +1040,7 @@ export class AgentSessionManager {
           }
           timeline.upsertApproval({
             approvalId: requestId, dispatchId: turnKey, method: request.method,
-            tool: request.method.split('/')[1] ?? request.method,
+            tool: approvalToolName(request.method),
             input: request.toolInput, reason: request.message ?? null, status: 'pending',
           });
         });
@@ -1002,7 +1073,7 @@ export class AgentSessionManager {
     }
     session.timeline.upsertApproval({
       approvalId: requestId, dispatchId: pending.turnKey, method: pending.request.method,
-      tool: pending.request.method.split('/')[1] ?? pending.request.method,
+      tool: approvalToolName(pending.request.method),
       input: pending.request.toolInput, reason: pending.request.message ?? null, status, resolution: reason,
     });
   }
@@ -1018,11 +1089,30 @@ export class AgentSessionManager {
     const file = this.deps.storageFile?.();
     if (!file || !existsSync(file)) return;
     let saved: SavedSession[] = [];
+    let savedModels: Record<string, unknown> | null = null;
     try {
-      const parsed = JSON.parse(readFileSync(file, 'utf8')) as { version?: number; sessions?: SavedSession[] };
+      const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
+        version?: number; sessions?: SavedSession[]; providerModels?: Record<string, unknown>;
+      };
       if (parsed.version === 1 && Array.isArray(parsed.sessions)) saved = parsed.sessions;
+      if (parsed.version === 1 && parsed.providerModels && typeof parsed.providerModels === 'object' && !Array.isArray(parsed.providerModels)) {
+        savedModels = parsed.providerModels;
+      }
     } catch (error) {
       console.warn('[agent-sessions] ignoring unreadable saved sessions:', error);
+    }
+    if (savedModels) {
+      for (const [key, list] of Object.entries(savedModels)) {
+        const provider = normalizeDriverId(key);
+        if (provider !== key || !Array.isArray(list)) continue;
+        const valid = list.filter((entry): entry is CodexModelOption => (
+          Boolean(entry) && typeof entry === 'object' && !Array.isArray(entry) &&
+          typeof (entry as CodexModelOption).id === 'string' &&
+          typeof (entry as CodexModelOption).displayName === 'string' &&
+          Array.isArray((entry as CodexModelOption).efforts)
+        ));
+        if (valid.length > 0) this.providerModels.set(provider, valid);
+      }
     }
     for (const entry of saved) {
       if (!entry?.id || !AGENT_SESSION_ID.test(entry.id) || !entry.providerSessionId || !entry.timeline) continue;
@@ -1055,7 +1145,11 @@ export class AgentSessionManager {
         } = info;
         return { ...rest, timeline: timeline.archive() };
       });
-    return JSON.stringify({ version: 1, sessions });
+    return JSON.stringify({
+      version: 1,
+      sessions,
+      ...(this.providerModels.size > 0 ? { providerModels: Object.fromEntries(this.providerModels) } : {}),
+    });
   }
 
   private sessionsChanged(): void {
