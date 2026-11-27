@@ -22,6 +22,8 @@ export interface BoardReportArtifacts {
 }
 
 export interface BoardPostFormatInput {
+  id?: string;
+  type?: string;
   boardSeq?: number;
   seq: number;
   fromRole?: string;
@@ -231,6 +233,17 @@ export async function collectWorkerReportArtifacts(
   }
 }
 
+/** read_board limits each named lookup to 200 posts. Sequence numbers are local to a Run. */
+export function boardLookupCommands(posts: readonly { runId: string; boardSeq?: number }[]): string | null {
+  if (!posts.length || posts.some(post => post.runId !== posts[0].runId || !post.boardSeq)) return null;
+  const commands: string[] = [];
+  for (let i = 0; i < posts.length; i += 200) {
+    const seqs = posts.slice(i, i + 200).map(post => post.boardSeq);
+    commands.push('read_board(seqs=[' + seqs.join(',') + '])');
+  }
+  return commands.join(', ');
+}
+
 export function formatBoardPostForAgent(post: BoardPostFormatInput): string {
   const seq = post.boardSeq ?? post.seq;
   const from = normalizeRoleKey(post.fromRole?.trim() || post.fromHandle) || 'unknown';
@@ -242,6 +255,7 @@ export function formatBoardPostForAgent(post: BoardPostFormatInput): string {
   const header = `[#${seq} · @${from}${targetPart}${kindPart}]`;
 
   const lines = [header];
+  if (post.type === 'question' && post.id) lines.push('questionId: ' + post.id);
   const trimmedSubject = post.subject?.trim();
   const trimmedBody = post.body.trim();
   if (trimmedSubject && trimmedSubject !== trimmedBody && !trimmedBody.startsWith(trimmedSubject)) {

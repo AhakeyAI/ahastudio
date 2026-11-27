@@ -280,6 +280,7 @@ test('OrchestrationStore boardSeq, member cursors, seqs lookup, persistence & le
     [1]
   );
 
+  store1.advanceMemberCursor(run.id, 'watcher', { lastMentionReadSeq: 2 });
   store1.flushSync();
   store1.close();
 
@@ -288,6 +289,8 @@ test('OrchestrationStore boardSeq, member cursors, seqs lookup, persistence & le
   store2.load();
   t.after(() => store2.close());
   assert.equal(store2.getHeadBoardSeq(run.id), 2);
+  assert.equal(store2.getMemberCursor(run.id, 'watcher').lastMentionReadSeq, 2);
+  assert.equal(store2.getMemberCursor(run.id, 'watcher').lastReadSeq, 0);
   assert.deepEqual(store2.getMemberCursor(run.id, 'api'), {
     lastReadSeq: 2,
     lastDeliveredSeq: 2,
@@ -538,7 +541,7 @@ test('boardWait(since, mentionsOnly), boardRead(seqs), privileged question answe
   assert.equal(namedLookup.posts[0].boardSeq, api.briefBoardSeq);
   assert.equal(
     store.getMemberCursor(runId, 'coordinator').lastReadSeq,
-    earlyPost.boardSeq,
+    coordCursorBefore,
     'read_board(seqs=[...]) must not advance lastReadSeq'
   );
 
@@ -561,7 +564,7 @@ test('boardWait(since, mentionsOnly), boardRead(seqs), privileged question answe
   assert.equal(waitAll.timedOut, false);
   assert.equal(waitAll.posts.some((p) => p.boardSeq === unaddressed.boardSeq), true);
 
-  // Worker asks via askCoordinatorByPane; human @user posting '@api ...' auto-answers the pending question!
+  // A plain user mention leaves the question open; the question card answers by ID.
   const askPromise = service.askCoordinatorByPane(api.ptyId, {
     question: 'Use Stripe v14 or v15?',
     wait: true,
@@ -575,10 +578,12 @@ test('boardWait(since, mentionsOnly), boardRead(seqs), privileged question answe
     isUser: true,
     text: '@api Use Stripe v15',
   });
-  assert.equal(userAnswer.post.kind, 'answer');
+  assert.equal(userAnswer.post.kind, 'post');
+  const [question] = store.listQuestions({ dispatchId: api.dispatch.id, status: 'pending' });
+  service.reply({ id: question.messageId, from: 'user', body: 'v15' });
   assert.equal(userAnswer.post.fromRole, 'user');
   const askRes = await askPromise;
-  assert.equal(askRes.answer, '@api Use Stripe v15');
+  assert.equal(askRes.answer, 'v15');
 
   // Worker settles -> coordinator/user boardPost mentioning @api reactivates it!
   await service.workerDoneByPane(api.ptyId, {
@@ -709,7 +714,7 @@ test('Tier 2 PostToolUse/AfterTool mid-turn injection prevents duplicate Tier 3 
   assert.equal(shortWrites.includes('aha orchestration check'), false);
   assert.equal(store.getMemberCursor(api.run.id, 'api').lastDeliveredSeq, shortPost.boardSeq);
 
-  // Tier 3 Case B: large batch (3 messages) -> compact read_board(since=...) pointer written to PTY!
+  // Tier 3 Case B: large batch (3 messages) -> targeted read_board(seqs=[...]) pointer written to PTY!
   writtenPty.length = 0;
   agentStatusStore.ingestHookEvent({ ptyId: api.ptyId, agentId: 'claude', state: 'working', toolName: 'Edit' });
   await service.boardPost({ from: coordPaneId, text: '@api batch item 1' });
@@ -723,7 +728,7 @@ test('Tier 2 PostToolUse/AfterTool mid-turn injection prevents duplicate Tier 3 
     .map((w) => w.data)
     .join('');
   assert.match(batchWrites, /Board 有 3 条 @你的新消息/);
-  assert.match(batchWrites, /read_board\(since=\d+\)/);
+  assert.match(batchWrites, /read_board\(seqs=\[\d+,\d+,\d+\]\)/);
   assert.equal(store.getMemberCursor(api.run.id, 'api').lastDeliveredSeq, lastBatch.boardSeq);
 
   // Unaddressed worker post must NEVER trigger Tier 3 idle delivery to coordinator!
@@ -1053,7 +1058,7 @@ test('Regression: settled workers & unrelated panes cannot impersonate @coordina
   );
 });
 
-test('Regression: privileged multi-mention boardPost answering a pending question & reactivating a settled worker inserts exactly ONE board post', async (t) => {
+test('Regression: multi-mention boardPost leaves questions pending and reactivates a settled worker with one post', async (t) => {
   const { coordPaneId, service, store } = createHarness(t);
 
   const api = await service.delegateTask({
@@ -1104,8 +1109,41 @@ test('Regression: privileged multi-mention boardPost answering a pending questio
   assert.equal(multiRes.boardSeq, headBefore + 1);
   assert.equal(multiRes.headSeq, headBefore + 1);
 
-  // Pending question answered & @builder reactivated!
-  const askRes = await askPromise;
-  assert.equal(askRes.answer, '@api @verifier @builder align on v2 schema right away');
+  const [question] = store.listQuestions({ dispatchId: api.dispatch.id, status: 'pending' });
+  await assert.rejects(service.messageWorkerByRole(coordPaneId, { role: 'verifier', message: 'yes', questionId: question.messageId }), /does not belong/);
+  service.reply({ id: question.messageId, from: coordPaneId, body: 'yes' });
+  assert.equal((await askPromise).answer, 'yes');
   assert.equal(store.listDispatches({ runId }).length, dispatchesBefore + 1);
+});
+
+test('posting progress preserves unread mail and delivery can find a mention beyond the first page', async (t) => {
+  const { service, store, coordPaneId } = createHarness(t);
+  const worker = await service.delegateTask({ from: coordPaneId, role: 'api', agent: 'claude', task: 'API work', worktree: false });
+  const runId = worker.run.id;
+  const from = worker.ptyId;
+  const before = store.getMemberCursor(runId, 'api');
+  for (let i = 0; i < 200; i++) {
+    store.insertMessage({ runId, from: 'other', fromRole: 'other', to: 'run:' + runId, subject: 'FYI', kind: 'post' });
+  }
+  const mention = await service.boardPost({ from: coordPaneId, text: '@api preserve compatibility' });
+  await service.boardPost({ from, text: 'Tests running' });
+  assert.equal(store.getMemberCursor(runId, 'api').lastReadSeq, before.lastReadSeq);
+  assert.match(service.consumeMidTurnBoardInjections(from), /preserve compatibility/);
+  const wait = await service.boardWait({ from, timeoutMs: 0 });
+  assert.deepEqual(wait.posts.map(post => post.id), [mention.post.id]);
+  assert.equal((await service.boardWait({ from, timeoutMs: 0 })).timedOut, true);
+  const general = await service.boardWait({ from, mentionsOnly: false, timeoutMs: 0 });
+  assert.equal(general.posts[0].subject, 'FYI');
+});
+
+test('only an explicit reply marks a referenced post as replied', async (t) => {
+  const { service, store, coordPaneId } = createHarness(t);
+  const worker = await service.delegateTask({ from: coordPaneId, role: 'api', agent: 'claude', task: 'API work', worktree: false });
+  const from = worker.ptyId;
+  const mention = await service.boardPost({ from: coordPaneId, text: '@api preserve compatibility' });
+  service.boardRead({ from, seqs: [mention.boardSeq] });
+  await service.boardPost({ from, text: 'For background see #' + mention.boardSeq, kind: 'update' });
+  assert.equal(store.getMessageById(mention.post.id).receipts.api, 'delivered');
+  service.reply({ id: mention.post.id, from, body: 'Compatibility confirmed' });
+  assert.equal(store.getMessageById(mention.post.id).receipts.api, 'replied');
 });

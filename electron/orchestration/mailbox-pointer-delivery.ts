@@ -1,3 +1,4 @@
+import { boardLookupCommands } from './board-protocol.js';
 import {
   deliverPromptToPty,
   type PtyWriteFn,
@@ -411,17 +412,8 @@ export class MailboxPointerDelivery {
           promptText = directText;
           inline = true;
         } else {
-          const seqs = eligible
-            .map((m) => m.boardSeq ?? m.seq)
-            .filter((n) => Number.isFinite(n))
-            .sort((a, b) => a - b);
-          const minSeq = seqs[0] ?? 1;
-          const maxSeq = seqs[seqs.length - 1] ?? minSeq;
-          const rangeText = minSeq === maxSeq ? `#${minSeq}` : `#${minSeq}-#${maxSeq}`;
-          const sinceSeq = memberInfo
-            ? this.deps.store.getMemberCursor(memberInfo.runId, memberInfo.memberKey).lastReadSeq
-            : Math.max(0, minSeq - 1);
-          promptText = `[Board 有 ${eligible.length} 条 @你的新消息 (${rangeText})] 请调用 read_board(since=${sinceSeq}) 查看。`;
+          const lookup = boardLookupCommands(eligible) ?? 'read_board';
+          promptText = `[Board 有 ${eligible.length} 条 @你的新消息] 请调用 ${lookup} 查看。`;
         }
       } else {
         promptText = formatMessagePointer(

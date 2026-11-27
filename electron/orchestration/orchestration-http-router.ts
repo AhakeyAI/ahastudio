@@ -415,6 +415,7 @@ const paneModeSetSchema = z.object({
 });
 
 const roleMessageSchema = z.object({
+  questionId: z.string().trim().min(1).optional(),
   from: z.string().trim().min(1).optional(),
   role: z.string().trim().min(1),
   message: z.string().trim().min(1),
@@ -1000,6 +1001,7 @@ export async function dispatchOrchestrationHttpAction(
         result = await service.messageWorkerByRole(caller, {
           role: parsed.role,
           message: parsed.message,
+          questionId: parsed.questionId,
           subject: parsed.subject,
         });
         break;

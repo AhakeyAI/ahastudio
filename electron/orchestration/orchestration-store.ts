@@ -459,6 +459,8 @@ export class OrchestrationStore {
         for (const [memberKey, rawCursor] of Object.entries(byMember)) {
           if (!rawCursor || typeof rawCursor !== 'object') continue;
           memberMap.set(memberKey, {
+            ...(typeof rawCursor.lastMentionReadSeq === 'number' && Number.isSafeInteger(rawCursor.lastMentionReadSeq) && rawCursor.lastMentionReadSeq > 0
+              ? { lastMentionReadSeq: rawCursor.lastMentionReadSeq } : {}),
             lastReadSeq:
               typeof rawCursor.lastReadSeq === 'number' && Number.isFinite(rawCursor.lastReadSeq)
                 ? Math.max(0, Math.floor(rawCursor.lastReadSeq))
@@ -705,6 +707,10 @@ export class OrchestrationStore {
       typeof patch.lastReadSeq === 'number' && Number.isFinite(patch.lastReadSeq)
         ? Math.max(existing.lastReadSeq, Math.floor(patch.lastReadSeq))
         : existing.lastReadSeq;
+    const oldMentionRead = existing.lastMentionReadSeq ?? 0;
+    const nextMentionRead = typeof patch.lastMentionReadSeq === 'number' && Number.isFinite(patch.lastMentionReadSeq)
+      ? Math.max(oldMentionRead, Math.floor(patch.lastMentionReadSeq))
+      : oldMentionRead;
     const nextPost =
       typeof patch.lastPostSeq === 'number' && Number.isFinite(patch.lastPostSeq)
         ? Math.max(existing.lastPostSeq, Math.floor(patch.lastPostSeq))
@@ -717,11 +723,13 @@ export class OrchestrationStore {
     const changed =
       !memberMap.has(cleanKey) ||
       nextRead !== existing.lastReadSeq ||
+      nextMentionRead !== oldMentionRead ||
       nextPost !== existing.lastPostSeq ||
       nextDelivered !== existing.lastDeliveredSeq;
 
     const updated: OrchestrationMemberCursor = {
       lastReadSeq: nextRead,
+      ...(nextMentionRead > 0 ? { lastMentionReadSeq: nextMentionRead } : {}),
       lastPostSeq: nextPost,
       lastDeliveredSeq: nextDelivered,
     };
@@ -734,14 +742,19 @@ export class OrchestrationStore {
 
   listBoardPosts(
     runId: string,
-    opts?: { since?: number; seqs?: readonly number[]; limit?: number }
+    opts?: { since?: number; seqs?: readonly number[]; limit?: number; matches?: (post: OrchestrationMessageRecord) => boolean }
   ): OrchestrationMessageRecord[] {
+    const since = opts?.since;
+    const useSince = !opts?.seqs?.length && typeof since === 'number' && Number.isFinite(since);
+    const after = useSince ? Math.max(0, Math.floor(since)) : undefined;
     const allForRun: OrchestrationMessageRecord[] = [];
     for (const id of this.messageOrder) {
       const msg = this.messages.get(id);
       if (!msg || msg.runId !== runId || msg.type === 'heartbeat') continue;
       if (msg.lifecycleRejectedReason) continue;
       if (typeof msg.boardSeq !== 'number') continue;
+      if (after !== undefined && msg.boardSeq <= after) continue;
+      if (opts?.matches && !opts.matches(msg)) continue;
       allForRun.push(msg);
     }
     allForRun.sort((a, b) => (a.boardSeq ?? 0) - (b.boardSeq ?? 0));
@@ -754,13 +767,7 @@ export class OrchestrationStore {
     }
 
     const limit = Math.max(1, Math.min(500, Math.floor(opts?.limit ?? 50)));
-    if (typeof opts?.since === 'number' && Number.isFinite(opts.since)) {
-      const since = Math.max(0, Math.floor(opts.since));
-      return allForRun
-        .filter((msg) => (msg.boardSeq ?? 0) > since)
-        .slice(0, limit)
-        .map(cloneMessageRecord);
-    }
+    if (after !== undefined) return allForRun.slice(0, limit).map(cloneMessageRecord);
 
     return allForRun.slice(-limit).map(cloneMessageRecord);
   }
@@ -2922,11 +2929,6 @@ export class OrchestrationStore {
 
     this.messages.set(msg.id, msg);
     this.messageOrder.push(msg.id);
-    if (msg.fromRole && msg.refs?.length && (msg.kind === 'answer' || msg.kind === 'update' || msg.kind === 'report' || msg.kind === 'post')) {
-      const refs = new Set(msg.refs);
-      const originals = [...this.messages.values()].filter(m => m.runId === runId && m.boardSeq && refs.has(m.boardSeq));
-      this.recordBoardReceipt(originals.map(m => m.id), msg.fromRole, 'replied');
-    }
     this.prune();
     this.persist();
     return cloneMessageRecord(msg);
@@ -3557,7 +3559,6 @@ export class OrchestrationStore {
     fromRole?: string;
     mentions?: readonly string[];
     refs?: readonly number[];
-    existingAnswerMessageId?: string;
   }): {
     question: OrchestrationQuestionRecord;
     message: OrchestrationMessageRecord;
@@ -3605,25 +3606,20 @@ export class OrchestrationStore {
       );
     }
 
-    const reusedMsg = input.existingAnswerMessageId
-      ? this.messages.get(input.existingAnswerMessageId)
-      : undefined;
-    const answerMsg =
-      reusedMsg ??
-      this.insertMessage({
-        runId: q.runId,
-        from: input.answeredBy,
-        to: `dispatch:${q.dispatchId}`,
-        type: 'status',
-        priority: 'high',
-        subject: `Answer to question ${q.messageId}`,
-        body: input.body,
-        threadId: q.messageId,
-        fromRole: input.fromRole,
-        mentions: input.mentions,
-        refs: input.refs,
-        kind: 'answer',
-      });
+    const answerMsg = this.insertMessage({
+      runId: q.runId,
+      from: input.answeredBy,
+      to: `dispatch:${q.dispatchId}`,
+      type: 'status',
+      priority: 'high',
+      subject: `Answer to question ${q.messageId}`,
+      body: input.body,
+      threadId: q.messageId,
+      fromRole: input.fromRole,
+      mentions: input.mentions,
+      refs: input.refs,
+      kind: 'answer',
+    });
     this.markAsRead([q.messageId]);
     this.acknowledgeDeliveriesForMessages([q.messageId]);
 

@@ -148,6 +148,8 @@ export const ORCHESTRATION_BOARD_POST_KINDS = [
 export type OrchestrationBoardPostKind = (typeof ORCHESTRATION_BOARD_POST_KINDS)[number];
 
 export interface OrchestrationMemberCursor {
+  /** Last targeted post returned by a mentions-only wait. */
+  lastMentionReadSeq?: number;
   lastReadSeq: number;
   lastPostSeq: number;
   lastDeliveredSeq: number;
