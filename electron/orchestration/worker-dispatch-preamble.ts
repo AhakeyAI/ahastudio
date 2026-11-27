@@ -171,6 +171,8 @@ function renderDispatchPreamble(
       '',
       `- Need clarification or blocked? Call MCP tool \`ask_coordinator\` (wait=true).`,
       `- When finished or blocked, call MCP tool \`report_done\` with outcome & brief summary.`,
+      `- Board: mention only the member who must act next (e.g. hand off to the next sibling @role), and cite earlier posts by #seq instead of pasting them.`,
+      `- Never write \`[done]\` in posts or summaries; \`report_done\` alone marks your task finished.`,
       ...(input.leaveUncommitted
         ? [`- Do not run \`git commit\`; leave your changes uncommitted in the workspace and call \`report_done\` so the coordinator can integrate them.`]
         : []),

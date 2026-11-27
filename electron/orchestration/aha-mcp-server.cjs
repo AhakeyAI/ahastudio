@@ -313,8 +313,8 @@ function buildPostMessageTool(ctx) {
   return {
     name: 'post_message',
     description: isWorker
-      ? 'Post a message to the shared run board. Mention @coordinator or an active sibling @role (e.g. @verifier) to wake them, cite earlier posts by #seq (e.g. #4), or post unaddressed status updates without waking anyone. Worker @all is visible on the board but never wakes peers.'
-      : 'Post a message to the shared run board. Mention @role to answer a pending question, steer an active worker, or reactivate a settled worker; mention @all to broadcast to all active workers; cite earlier posts by #seq.',
+      ? 'Post a message to the shared run board. Mention @coordinator or an active sibling @role (e.g. @verifier) to wake them, cite earlier posts by #seq (e.g. #4), or post unaddressed status updates without waking anyone. Worker @all is visible on the board but never wakes peers. Mention only who must act next; in a peer handoff, mention the next @role without @coordinator. Never write [done]; finish with report_done.'
+      : 'Post a message to the shared run board. @role is a doorbell, not a CC: mention only members who must act next (a mention answers that worker\u2019s pending question, steers it, or reactivates it if settled); mention @all to broadcast to all active workers; cite earlier posts by #seq instead of pasting them. Prefer message_worker when addressing exactly one worker.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -367,7 +367,7 @@ function buildBoardWaitTool() {
   return {
     name: 'board_wait',
     description:
-      'Sleep reactively until another member posts to the shared board (never poll in a loop). Pass since=<lastReadSeq> so messages posted while you were busy wake you immediately. Defaults to mentionsOnly=true (wakes on @your-role, reports/questions/approvals, or coordinator @all); pass mentionsOnly=false to wake on any new post.',
+      'Sleep reactively until another member posts to the shared board (never poll in a loop). Pass since=<lastReadSeq> so messages posted while you were busy wake you immediately. Defaults to mentionsOnly=true (wakes on @your-role, reports/questions/approvals, or coordinator @all); pass mentionsOnly=false to wake on any new post. Prefer board_wait over team_wait inside a Run.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -396,7 +396,7 @@ function buildTeamWaitTool() {
   return {
     name: 'team_wait',
     description:
-      'Alias of board_wait: wait reactively for board updates, worker completions, questions, permission approval requests, or turn-stop escalations (never poll in a loop).',
+      'Like board_wait, but when you have no board Run it falls back to waiting on your mailbox for worker completions, questions, permission approval requests, or turn-stop escalations (never poll in a loop).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -430,7 +430,7 @@ function buildToolsForContext(ctx) {
     const tools = [
       {
         name: 'report_done',
-        description: 'Report task completion, failure, or blocker back to your coordinator.',
+        description: 'Report task completion, failure, or blocker back to your coordinator. This is the only way to finish a task; never write [done] on the board.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -542,7 +542,7 @@ function buildToolsForContext(ctx) {
     {
       name: 'message_worker',
       description:
-        'Reply to a worker pending question, steer an active worker, or reactivate a settled worker by @role (or dispatch id).',
+        'Address exactly one worker by @role (or dispatch id): answers its pending question first, otherwise steers it, or reactivates it with its previous context if settled. Prefer this over delegating a new worker for rework.',
       inputSchema: {
         type: 'object',
         properties: {
