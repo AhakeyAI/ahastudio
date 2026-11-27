@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createTrackedTestService } from './fixtures/tracked-orchestration-service.mjs';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
@@ -11,7 +12,6 @@ import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
 import { Coordinator } from '../dist-electron/orchestration/coordinator.js';
 import { resolveDefaultOrchestrationCliPath } from '../dist-electron/orchestration/orchestration-bin-shim.js';
 import { dispatchOrchestrationHttpAction } from '../dist-electron/orchestration/orchestration-http-router.js';
-import { OrchestrationService } from '../dist-electron/orchestration/orchestration-service.js';
 import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
 
 const require = createRequire(import.meta.url);
@@ -32,7 +32,7 @@ function createHarness(opts = {}) {
   const writes = [];
   const exited = new Set();
 
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore,
     writePty: async (ptyId, data) => {
@@ -340,7 +340,7 @@ test('Fix 4: MailboxPointerDelivery resolves @workers, @all, and run:<id> target
       creatorRunId: run.id,
     });
 
-    const service = new OrchestrationService({
+    const service = createTrackedTestService({
       store,
       agentStatusStore,
       writePty: async (ptyId, data) => {

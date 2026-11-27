@@ -729,6 +729,8 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   agentStatusStore.registerPane('local-coord', { agentId: 'claude' });
   tracker.registerPty({ ptyId: 'local-coord', cwd: process.cwd(), cliId: 'claude' });
 
+  agentStatusStore.registerPane('local-idle-codex', { agentId: 'codex' });
+  tracker.registerPty({ ptyId: 'local-idle-codex', cwd: process.cwd(), cliId: 'codex' });
   let spawnSeq = 0;
   const store = new OrchestrationStore();
   const service = new OrchestrationService({
@@ -873,7 +875,7 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
     },
   });
   assert.equal(startedCall.result.isError, undefined);
-  assert.match(startedCall.result.content[0].text, /Worker started \(@reviewer\)/);
+  assert.match(startedCall.result.content[0].text, /Dispatch sent; start unconfirmed \(@reviewer\)/);
   const workerPtyId = 'local-mcp-w1';
   const firstWorker = service.store.getActiveDispatchForIdentity(workerPtyId, workerPtyId);
   assert.deepEqual(service.store.getTask(firstWorker.taskId).taskContext, {

@@ -86,6 +86,7 @@ function emptyPersistedState(): OrchestrationPersistedState {
 function cloneMessageRecord(msg: OrchestrationMessageRecord): OrchestrationMessageRecord {
   return {
     ...msg,
+    ...(msg.receipts ? { receipts: { ...msg.receipts } } : {}),
     ...(msg.mentions ? { mentions: [...msg.mentions] } : {}),
     ...(msg.refs ? { refs: [...msg.refs] } : {}),
     ...(msg.artifacts
@@ -102,6 +103,8 @@ function cloneMessageRecord(msg: OrchestrationMessageRecord): OrchestrationMessa
 function cloneRunRecord(run: OrchestrationRunRecord): OrchestrationRunRecord {
   return {
     ...run,
+    ...(run.finalizedBatches ? { finalizedBatches: run.finalizedBatches.map(batch => ({ ...batch, members: { ...batch.members } })) } : {}),
+    ...(run.integrationIntent ? { integrationIntent: { ...run.integrationIntent, members: run.integrationIntent.members ? { ...run.integrationIntent.members } : undefined } } : {}),
     ...(run.runReviewFindings
       ? { runReviewFindings: run.runReviewFindings.map((f) => ({ ...f })) }
       : {}),
@@ -113,6 +116,8 @@ function cloneTaskRecord(task: OrchestrationTaskRecord): OrchestrationTaskRecord
   return {
     ...task,
     deps: [...task.deps],
+    ...(task.codeDeps ? { codeDeps: [...task.codeDeps] } : {}),
+    ...(task.queuedLaunch ? { queuedLaunch: { ...task.queuedLaunch } } : {}),
     ...(clonedContext ? { taskContext: clonedContext } : {}),
   };
 }
@@ -591,7 +596,7 @@ export class OrchestrationStore {
       const hasLiveWork = [...this.dispatches.values()].some(
         (d) => d.runId === run.id && ACTIVE_DISPATCH_STATUSES.has(d.status),
       );
-      if (hasLiveWork) continue;
+      if (hasLiveWork || [...this.tasks.values()].some(t => t.runId === run.id && t.queuedLaunch)) continue;
       const runTasks = [...this.tasks.values()].filter((t) => t.runId === run.id);
       if (runTasks.length > 0 && runTasks.every(isTaskSettled)) {
         run.status = runTasks.some((t) => t.status === 'failed' || isBlockedByFailedDependency(t)) ? 'failed' : 'completed';
@@ -601,6 +606,17 @@ export class OrchestrationStore {
       run.endedAt = run.endedAt ?? now;
     }
 
+    for (const task of this.tasks.values()) {
+      if (task.queuedLaunch?.state !== 'claimed') continue;
+      const attempt = this.getLatestDispatchForTask(task.id);
+      if (attempt) {
+        if (ACTIVE_DISPATCH_STATUSES.has(attempt.status) && !attempt.promptSentAt && attempt.startObservation !== 'observed') {
+          this.updateDispatchStage(attempt.id, 'needs_reconciliation');
+        }
+        delete task.queuedLaunch;
+      }
+      else task.queuedLaunch = { ...task.queuedLaunch, state: 'needs_reconciliation', reason: '上次启动被中断，请先核对执行现场。' };
+    }
     this.prune();
   }
 
@@ -985,6 +1001,8 @@ export class OrchestrationStore {
       integrationStatus?: OrchestrationRunIntegrationStatus;
       integrationHeadCommit?: string | null;
       finalizedCommit?: string | null;
+      integrationIntent?: OrchestrationRunRecord['integrationIntent'];
+      finalizedBatch?: NonNullable<OrchestrationRunRecord['finalizedBatches']>[number];
     },
   ): OrchestrationRunRecord | null {
     const run = this.runs.get(runId);
@@ -1006,6 +1024,8 @@ export class OrchestrationStore {
     if (patch.integrationHeadCommit !== undefined) {
       run.integrationHeadCommit = patch.integrationHeadCommit;
     }
+    if (patch.integrationIntent !== undefined) run.integrationIntent = patch.integrationIntent;
+    if (patch.finalizedBatch) run.finalizedBatches = [...(run.finalizedBatches ?? []), patch.finalizedBatch];
     if (patch.finalizedCommit !== undefined) run.finalizedCommit = patch.finalizedCommit;
     run.updatedAt = this.now();
     this.persist();
@@ -1064,6 +1084,8 @@ export class OrchestrationStore {
     taskTitle?: string | null;
     displayName?: string | null;
     deps?: string[];
+    codeDeps?: string[];
+    queuedLaunch?: OrchestrationTaskRecord['queuedLaunch'];
     priority?: OrchestrationMessagePriority;
     worktreePath?: string | null;
     singleShot?: boolean;
@@ -1077,10 +1099,12 @@ export class OrchestrationStore {
       throw new OrchestrationError('duplicate_task', `Task already exists: ${id}`);
     }
     const dedupedDeps = [...new Set((input.deps ?? []).map((d) => d.trim()).filter(Boolean))];
-    if (dedupedDeps.includes(id)) {
+    const codeDeps = [...new Set((input.codeDeps ?? []).map(dep => dep.trim()).filter(Boolean))];
+    const allDeps = [...new Set([...dedupedDeps, ...codeDeps])];
+    if (allDeps.includes(id)) {
       throw new OrchestrationError('task_cycle', `Task ${id} cannot depend on itself.`);
     }
-    for (const depId of dedupedDeps) {
+    for (const depId of allDeps) {
       const depTask = this.tasks.get(depId);
       if (!depTask) {
         throw new OrchestrationError('task_not_found', `Dependency task not found: ${depId}`);
@@ -1092,13 +1116,13 @@ export class OrchestrationStore {
         );
       }
     }
-    if (this.wouldIntroduceCycle(id, dedupedDeps)) {
+    if (this.wouldIntroduceCycle(id, allDeps)) {
       throw new OrchestrationError(
         'cyclic_dependency',
         `Creating task ${id} would introduce a cyclic dependency.`
       );
     }
-    const allDepsCompleted = dedupedDeps.every(
+    const allDepsCompleted = codeDeps.every(dep => this.codeReady(dep)) && dedupedDeps.every(
       (depId) => this.tasks.get(depId)?.status === 'completed'
     );
     const display = buildOrchestrationTaskDisplayMetadata({
@@ -1116,6 +1140,8 @@ export class OrchestrationStore {
       taskTitle: display.taskTitle,
       displayName: display.displayName,
       deps: dedupedDeps,
+      ...(codeDeps.length ? { codeDeps } : {}),
+      ...(input.queuedLaunch ? { queuedLaunch: { ...input.queuedLaunch } } : {}),
       priority: input.priority ?? 'normal',
       status: allDepsCompleted ? 'ready' : 'pending',
       ...(input.singleShot ? { singleShot: true } : {}),
@@ -1124,15 +1150,40 @@ export class OrchestrationStore {
       updatedAt: now,
     };
     this.tasks.set(task.id, task);
+    if (input.queuedLaunch && run.status !== 'active') this.updateRunStatus(run.id, 'active');
+    this.promoteReadyTasks(run.id);
     this.persist();
     return cloneTaskRecord(task);
+  }
+
+  codeReady(taskId: string): boolean {
+    const dispatch = this.codeDependency(taskId);
+    return dispatch?.status === 'completed' && dispatch.integrationStatus === 'merged' && Boolean(dispatch.integratedCommit);
+  }
+
+  codeDependency(taskId: string): OrchestrationDispatchRecord | undefined {
+    const latest = this.getLatestDispatchForTask(taskId);
+    return latest && this.resolveDispatchLineage(latest.id);
+  }
+
+  hasQueuedWork(): boolean {
+    for (const task of this.tasks.values()) if (task.queuedLaunch?.state === 'waiting') return true;
+    return false;
+  }
+
+  setQueuedLaunch(taskId: string, launch?: OrchestrationTaskRecord['queuedLaunch']): void {
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+    if (launch) task.queuedLaunch = { ...launch };
+    else delete task.queuedLaunch;
+    this.persist();
   }
 
   private wouldIntroduceCycle(newTaskId: string, newDeps: readonly string[]): boolean {
     const visiting = new Set<string>([newTaskId]);
     const visited = new Set<string>();
     const dfs = (node: string, depth: number): boolean => {
-      const deps = node === newTaskId ? newDeps : (this.tasks.get(node)?.deps ?? []);
+      const deps = node === newTaskId ? newDeps : [...(this.tasks.get(node)?.deps ?? []), ...(this.tasks.get(node)?.codeDeps ?? [])];
       for (const dep of deps) {
         if (dep === newTaskId && depth >= 1) {
           return true;
@@ -1207,7 +1258,7 @@ export class OrchestrationStore {
       if (task.status !== 'pending') continue;
       if (this.hasPendingGates(task.id)) continue;
       const depsDone = task.deps.every((depId) => this.tasks.get(depId)?.status === 'completed');
-      if (!depsDone) continue;
+      if (!depsDone || task.codeDeps?.some(id => !this.codeReady(id))) continue;
       assertTaskTransition(task.id, task.status, 'ready');
       task.status = 'ready';
       task.updatedAt = now;
@@ -1229,11 +1280,11 @@ export class OrchestrationStore {
           task.blockedReason = null;
           changed = true;
         }
-        const failedDep = task.deps.find((depId) => {
+        const failedDep = [...task.deps, ...(task.codeDeps ?? [])].find((depId) => {
           const dep = this.tasks.get(depId);
-          return Boolean(dep && (dep.status === 'failed' || isBlockedByFailedDependency(dep)));
+          return Boolean(dep && (dep.status === 'failed' || isBlockedByFailedDependency(dep) || (task.codeDeps?.includes(depId) && this.codeDependency(depId)?.status === 'failed')));
         });
-        if (task.status === 'pending' && failedDep) {
+        if ((task.status === 'pending' || task.status === 'ready') && failedDep) {
           task.status = 'blocked';
           task.blockedReason = `${DEPENDENCY_FAILED_REASON}:${failedDep}`;
           task.updatedAt = now;
@@ -1360,6 +1411,7 @@ export class OrchestrationStore {
 
   createDispatchContext(input: {
     taskId: string;
+    approvedQueueLaunch?: boolean;
     providerSessionId?: string;
     workerPolicy?: AgentSessionPolicy;
     workerNetwork?: boolean;
@@ -1377,6 +1429,7 @@ export class OrchestrationStore {
     repoRootPath?: string | null;
     ownsWorktree?: boolean;
     ownsBranch?: boolean;
+    taskKind?: import('./orchestration-types.js').OrchestrationTaskKind;
     isDetachedReviewWorktree?: boolean;
     reviewOfDispatchId?: string | null;
     reviewOfRunId?: string | null;
@@ -1410,6 +1463,12 @@ export class OrchestrationStore {
         `Task ${task.id} is ${task.status}; only ready tasks can be dispatched.`,
         { taskId: task.id, status: task.status }
       );
+    }
+    if (task.queuedLaunch && !(input.approvedQueueLaunch && task.queuedLaunch.state === 'claimed')) {
+      throw new OrchestrationError('task_not_ready', '排队任务需要由已批准的派发领取。');
+    }
+    if (task.codeDeps?.some(dep => !this.codeReady(dep))) {
+      throw new OrchestrationError('task_not_ready', '等待上游代码合入共享分支。');
     }
     if (this.hasPendingGates(task.id)) {
       throw new OrchestrationError(
@@ -1516,6 +1575,7 @@ export class OrchestrationStore {
       ...(input.reviewSnapshotOid ? { reviewSnapshotOid: input.reviewSnapshotOid } : {}),
       ...(input.reviewBaseCommit ? { reviewBaseCommit: input.reviewBaseCommit } : {}),
       ...(typeof input.reviewRound === 'number' && input.reviewRound > 0 ? { reviewRound: input.reviewRound } : {}),
+      taskKind: input.taskKind,
       ownsPane: input.ownsPane ?? false,
       cliId: input.cliId ?? null,
       model: input.model ?? null,
@@ -1804,7 +1864,7 @@ export class OrchestrationStore {
       diff: result.diff === null ? null : this.redactDispatchCredentials(result.diff),
       error: result.error === null ? null : this.redactDispatchCredentials(result.error),
     };
-    if (awaitingReview && ACTIVE_DISPATCH_STATUSES.has(ctx.status)) ctx.stage = 'awaiting_review';
+    if (awaitingReview && ctx.stage !== 'needs_reconciliation' && ACTIVE_DISPATCH_STATUSES.has(ctx.status)) ctx.stage = 'awaiting_review';
     ctx.updatedAt = this.now();
     this.persist();
   }
@@ -1813,7 +1873,15 @@ export class OrchestrationStore {
     const ctx = this.dispatches.get(dispatchId);
     if (!ctx || !ACTIVE_DISPATCH_STATUSES.has(ctx.status)) return;
     ctx.codexDeliveryFailure = failure;
+    if (failure === 'unknown_acceptance') ctx.stage = 'needs_reconciliation';
     ctx.updatedAt = this.now();
+    this.persist();
+  }
+
+  recordReconciliationDiff(dispatchId: string, diff: string | null): void {
+    const dispatch = this.dispatches.get(dispatchId);
+    if (!dispatch) return;
+    dispatch.reconciliationDiff = diff === null ? null : this.redactDispatchCredentials(diff);
     this.persist();
   }
 
@@ -2047,11 +2115,13 @@ export class OrchestrationStore {
       integrationStatus?: OrchestrationIntegrationStatus;
       integratedCommit?: string | null;
       integratedTargetBranch?: string | null;
+      noChanges?: boolean;
     },
   ): OrchestrationDispatchRecord | null {
     const dispatch = this.dispatches.get(dispatchId);
     if (!dispatch) return null;
     if (patch.integrationStatus !== undefined) dispatch.integrationStatus = patch.integrationStatus;
+    if (patch.noChanges !== undefined) dispatch.noChanges = patch.noChanges;
     if (patch.integratedCommit !== undefined) dispatch.integratedCommit = patch.integratedCommit;
     if (patch.integratedTargetBranch !== undefined) {
       dispatch.integratedTargetBranch = patch.integratedTargetBranch;
@@ -2852,6 +2922,11 @@ export class OrchestrationStore {
 
     this.messages.set(msg.id, msg);
     this.messageOrder.push(msg.id);
+    if (msg.fromRole && msg.refs?.length && (msg.kind === 'answer' || msg.kind === 'update' || msg.kind === 'report' || msg.kind === 'post')) {
+      const refs = new Set(msg.refs);
+      const originals = [...this.messages.values()].filter(m => m.runId === runId && m.boardSeq && refs.has(m.boardSeq));
+      this.recordBoardReceipt(originals.map(m => m.id), msg.fromRole, 'replied');
+    }
     this.prune();
     this.persist();
     return cloneMessageRecord(msg);
@@ -3089,6 +3164,29 @@ export class OrchestrationStore {
       this.prune();
       this.persist();
     }
+  }
+
+  recordBoardReceipt(ids: readonly string[], role: string, state: 'notified' | 'delivered' | 'replied'): boolean {
+    const key = role.replace(/^@+/, '').toLowerCase();
+    const rank = { notified: 1, delivered: 2, replied: 3 };
+    let changed = false;
+    for (const id of ids) {
+      const msg = this.messages.get(id);
+      if (!msg?.mentions?.some(m => m.replace(/^@+/, '').toLowerCase() === key)) continue;
+      const current = msg.receipts?.[key];
+      if (current && rank[current] >= rank[state]) continue;
+      msg.receipts = { ...msg.receipts, [key]: state };
+      changed = true;
+    }
+    if (changed) this.persist();
+    return changed;
+  }
+
+  linkFollowUpMessage(dispatchId: string, messageId: string): void {
+    const dispatch = this.dispatches.get(dispatchId);
+    if (!dispatch) return;
+    dispatch.followUpMessageId = messageId;
+    this.persist();
   }
 
   markAsDeliveredForConsumer(messageIds: readonly string[], consumerHandle: string): void {
@@ -3533,6 +3631,7 @@ export class OrchestrationStore {
     q.answerBody = input.body;
     q.answerMessageId = answerMsg.id;
     q.answeredBy = input.answeredBy;
+    if (input.fromRole) this.recordBoardReceipt([q.messageId], input.fromRole, 'replied');
     q.answeredAt = this.now();
     this.persist();
     return {
@@ -3633,7 +3732,7 @@ export class OrchestrationStore {
     const dispatches = this.listDispatches(runId ? { runId } : undefined).map((dispatch) => {
       if (!dispatch.archivedTimeline) return dispatch;
       const { archivedTimeline: _timeline, ...rest } = dispatch;
-      return { ...rest, hasArchivedTimeline: true };
+      return { ...rest, ...(rest.taskKind === undefined && _timeline.readOnly ? { taskKind: 'research' as const } : {}), hasArchivedTimeline: true };
     });
     const gates = this.listGates(runId ? { runId } : undefined);
     const messages = this.listMessages(runId ? { runId, limit: 200 } : { limit: 200 });
@@ -3665,6 +3764,25 @@ export class OrchestrationStore {
       this.consumerDeliveredByMessageId.delete(id);
     }
     this.messageOrder = this.messageOrder.filter((id) => !ids.has(id));
+  }
+
+  protectedRunReason(runId: string): string | null {
+    const run = this.runs.get(runId);
+    if (run?.integrationIntent) return 'Git 操作中断，交付位置待核对';
+    if (run?.integrationStatus === 'active' || run?.integrationStatus === 'conflict') return '集成分支尚未交付';
+    if (run?.integrationWorktreePath) return '保留的集成工作树尚未释放';
+    for (const task of this.tasks.values()) {
+      if (task.runId === runId && task.queuedLaunch) return '有尚未处理的排队任务';
+    }
+    for (const dispatch of this.dispatches.values()) {
+      if (dispatch.runId !== runId) continue;
+      if (dispatch.stage === 'needs_reconciliation' && ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return '派发结果需核对';
+      if (dispatch.ownsWorktree) return '工作树尚未释放';
+      if (dispatch.integrationStatus === 'skipped' && !dispatch.noChanges && !dispatch.reviewOfDispatchId &&
+          !dispatch.reviewOfRunId && dispatch.taskKind !== 'research' && dispatch.taskKind !== 'review') return '共享工作区改动尚未确认交付';
+      if (dispatch.ownsBranch && dispatch.integrationStatus !== 'merged') return '工作分支尚未交付';
+    }
+    return null;
   }
 
   prune(): void {
@@ -3757,6 +3875,7 @@ export class OrchestrationStore {
         .filter(
           (r) =>
             (r.status === 'completed' || r.status === 'failed' || r.status === 'stopped') &&
+            !this.protectedRunReason(r.id) &&
             !boundRunIds.has(r.id) &&
             !activeCoordRunIds.has(r.id) &&
             !activeDispatchRunIds.has(r.id)
@@ -3766,46 +3885,72 @@ export class OrchestrationStore {
       const deleteCount = Math.min(candidates.length, nonUnboundRuns.length - this.maxRuns);
       if (deleteCount > 0) {
         const deletedRunIds = new Set(candidates.slice(0, deleteCount).map((r) => r.id));
-        for (const runId of deletedRunIds) {
-          this.runs.delete(runId);
-          this.nextBoardSeqByRun.delete(runId);
-          this.memberCursorsByRun.delete(runId);
-        }
-        for (const [id, t] of this.tasks.entries()) {
-          if (deletedRunIds.has(t.runId)) this.tasks.delete(id);
-        }
-        for (const [id, d] of this.dispatches.entries()) {
-          if (deletedRunIds.has(d.runId)) {
-            this.cleanupDispatchBrief(id);
-            this.dispatches.delete(id);
-            this.dispatchCapabilities.delete(id);
-          }
-        }
-        for (const [id, g] of this.gates.entries()) {
-          if (deletedRunIds.has(g.runId)) this.gates.delete(id);
-        }
-        for (const [id, q] of this.questions.entries()) {
-          if (deletedRunIds.has(q.runId)) this.questions.delete(id);
-        }
-        for (const [id, d] of this.deliveries.entries()) {
-          if (deletedRunIds.has(d.runId)) this.deliveries.delete(id);
-        }
-        for (const [id, cr] of this.coordinatorRuns.entries()) {
-          if (deletedRunIds.has(cr.runId)) this.coordinatorRuns.delete(id);
-        }
-        const runMsgIds = new Set<string>();
-        for (const [id, m] of this.messages.entries()) {
-          if (deletedRunIds.has(m.runId)) runMsgIds.add(id);
-        }
-        if (runMsgIds.size > 0) {
-          this.deleteMessageIds(runMsgIds);
-        }
+        this.deleteRuns(deletedRunIds);
       }
     }
   }
 
+  private deleteRuns(deletedRunIds: Set<string>): void {
+    for (const [key, runId] of this.currentRunByConsumer) {
+      if (deletedRunIds.has(runId)) this.currentRunByConsumer.delete(key);
+    }
+    for (const runId of deletedRunIds) {
+      this.runs.delete(runId);
+      this.nextBoardSeqByRun.delete(runId);
+      this.memberCursorsByRun.delete(runId);
+    }
+    for (const [id, t] of this.tasks.entries()) {
+      if (deletedRunIds.has(t.runId)) this.tasks.delete(id);
+    }
+    for (const [id, d] of this.dispatches.entries()) {
+      if (deletedRunIds.has(d.runId)) {
+        this.cleanupDispatchBrief(id);
+        this.dispatches.delete(id);
+        this.dispatchCapabilities.delete(id);
+      }
+    }
+    for (const [id, g] of this.gates.entries()) {
+      if (deletedRunIds.has(g.runId)) this.gates.delete(id);
+    }
+    for (const [id, q] of this.questions.entries()) {
+      if (deletedRunIds.has(q.runId)) this.questions.delete(id);
+    }
+    for (const [id, d] of this.deliveries.entries()) {
+      if (deletedRunIds.has(d.runId)) this.deliveries.delete(id);
+    }
+    for (const [id, cr] of this.coordinatorRuns.entries()) {
+      if (deletedRunIds.has(cr.runId)) this.coordinatorRuns.delete(id);
+    }
+    const runMsgIds = new Set<string>();
+    for (const [id, m] of this.messages.entries()) {
+      if (deletedRunIds.has(m.runId)) runMsgIds.add(id);
+    }
+    if (runMsgIds.size > 0) {
+      this.deleteMessageIds(runMsgIds);
+    }
+  }
+
+  clearFinishedHistory(discardRunId?: string): ReturnType<OrchestrationStore['reset']> {
+    const ids = new Set<string>();
+    const retained: Array<{ id: string; reason: string }> = [];
+    for (const run of this.runs.values()) {
+      if (run.id === UNBOUND_RUN_ID || (discardRunId && run.id !== discardRunId)) continue;
+      const live = this.listDispatches({ runId: run.id }).some(d => ACTIVE_DISPATCH_STATUSES.has(d.status));
+      const reason = live || run.status === 'active' ? '协作仍在进行' : this.protectedRunReason(run.id);
+      if (reason && (!discardRunId || live || run.status === 'active')) retained.push({ id: run.id, reason });
+      else ids.add(run.id);
+    }
+    const count = (items: Iterable<{ runId: string }>) => [...items].filter(item => ids.has(item.runId)).length;
+    const removed = { runs: ids.size, tasks: count(this.tasks.values()), dispatches: count(this.dispatches.values()),
+      gates: count(this.gates.values()), messages: count(this.messages.values()) };
+    this.deleteRuns(ids);
+    this.persist();
+    return { reset: 'all', removed, retained };
+  }
+
   reset(scope: 'all' | 'tasks' | 'messages'): {
     reset: 'all' | 'tasks' | 'messages';
+    retained?: Array<{ id: string; reason: string }>;
     removed: {
       runs: number;
       tasks: number;

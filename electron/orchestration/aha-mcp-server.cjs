@@ -224,6 +224,9 @@ function buildDelegateTaskTool(ctx) {
           description:
             'Key file paths, symbols, or design doc paths already located by the coordinator so the worker can jump straight in.',
         },
+        deps: { type: 'array', items: { type: 'string' }, description: 'Task IDs whose reports must be complete.' },
+        codeDeps: { type: 'array', items: { type: 'string' }, description: 'Task IDs whose integrated Git changes must be present in this worker workspace.' },
+        baseBranch: { type: 'string' },
         acceptance: {
           type: 'string',
           maxLength: 4000,
@@ -779,6 +782,7 @@ function formatTeamStatusText(ctx, includeSettled) {
 
 function formatDelegateResultText(res) {
   if (!res || typeof res !== 'object') return 'Unexpected empty response.';
+  if (res.status === 'queued') return `已排队 · ${res.task.id} · ${res.message}`;
   if (res.status === 'confirmation_required') {
     const p = res.proposal || {};
     const lines = [
@@ -795,7 +799,7 @@ function formatDelegateResultText(res) {
     return `Dispatch cancelled: ${res.message || 'Rejected by user.'}`;
   }
   const lines = [
-    `Worker started${res.role ? ` (@${res.role})` : ''}.`,
+    `${res.dispatch?.startObservation === 'observed' ? 'Worker started' : res.dispatch?.startObservation === 'permission' ? (res.dispatch.promptSentAt ? 'Sent; awaiting permission' : 'Awaiting permission; not sent') : res.dispatch?.startObservation === 'queued' ? 'Turn queued' : 'Dispatch sent; start unconfirmed'}${res.role ? ` (@${res.role})` : ''}.`,
     `Agent: ${res.agent}${res.fallbackFrom ? ` (fallback from ${res.fallbackFrom})` : ''}`,
     ...(res.selectionReason ? [`Selection: ${res.selectionReason}`] : []),
     ...(res.dispatch && res.dispatch.id ? [`Dispatch: ${res.dispatch.id}`] : []),
@@ -979,6 +983,9 @@ async function handleToolCall(name, rawArgs, activeRequests) {
         ...(proposalId ? { proposalId } : {}),
         ...(args.constraints !== undefined ? { constraints: args.constraints } : {}),
         ...(args.files !== undefined ? { files: args.files } : {}),
+        deps: args.deps,
+        codeDeps: args.codeDeps,
+        baseBranch: args.baseBranch,
         ...(args.acceptance !== undefined ? { acceptance: args.acceptance } : {}),
         ...(agent ? { agent } : {}),
         ...(taskKind ? { taskKind } : {}),

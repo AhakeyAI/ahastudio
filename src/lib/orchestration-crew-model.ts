@@ -123,6 +123,7 @@ export const STAGE_LABELS: Record<OrchestrationDispatchStage | 'active' | 'idle'
   working: '执行中',
   waiting_permission: '待授权',
   waiting_input: '待输入',
+  needs_reconciliation: '接单需核对',
   awaiting_review: '待检视',
   done: '已完成',
   failed: '失败',
@@ -140,6 +141,7 @@ export function stageTone(stage: OrchestrationDispatchStage | 'active' | 'idle')
       return 'accent';
     case 'waiting_permission':
     case 'waiting_input':
+    case 'needs_reconciliation':
     case 'awaiting_review':
       return 'warn';
     case 'done':
@@ -165,6 +167,7 @@ export function deriveClientDispatchStage(
   if (dispatch.status === 'failed' || dispatch.status === 'circuit_broken') {
     return dispatch.lastFailureReason === 'worker_stopped' ? 'stopped' : 'failed';
   }
+  if (dispatch.stage === 'needs_reconciliation' || (dispatch.executionMode === 'codex-app-server' && dispatch.stage === 'awaiting_review')) return dispatch.stage;
   if (hasOpenApproval) return 'waiting_permission';
   if (agentStatus?.state === 'waiting') {
     return agentStatus.waitKind === 'permission' ? 'waiting_permission' : 'waiting_input';
@@ -267,7 +270,7 @@ function toWorkerCrewEntry(
   const needsAttention =
     stage === 'waiting_permission' ||
     stage === 'waiting_input' ||
-    stage === 'awaiting_review' ||
+    stage === 'needs_reconciliation' || stage === 'awaiting_review' ||
     stage === 'failed';
 
   return {

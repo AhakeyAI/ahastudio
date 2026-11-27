@@ -494,9 +494,44 @@ for (const scenario of ['timeout', 'disconnect', 'started-then-error']) {
     assert.equal(app.ptyStarts(), 0);
     assert.deepEqual(app.writes, []);
     const [dispatch] = app.store.listDispatches();
-    assert.equal(dispatch.status, 'failed');
+    assert.equal(dispatch.status, 'dispatched');
+    assert.equal(dispatch.stage, 'needs_reconciliation');
+    app.service.reconcileStaleDispatches();
+    assert.equal(app.store.getDispatchContext(dispatch.id).stage, 'needs_reconciliation');
     assert.equal(dispatch.codexDeliveryFailure, 'unknown_acceptance');
     assert.equal(app.service.isPaneAlive(dispatch.assigneeHandle), false);
+  });
+}
+
+test('an accepted headless pointer advances notification cursor; the exact board read proves delivery', async t => {
+  const app = await setup(t);
+  const worker = (await app.start('Read the board', { role: 'scout', displayName: 'scout' })).dispatch;
+  await until(() => app.store.getDispatchContext(worker.id)?.codexTurn);
+  await app.service.boardPost({ from: 'coordinator-pane', runId: app.run.id, text: '@scout pointer-marker ' + 'x'.repeat(1400) });
+  const post = app.store.listBoardPosts(app.run.id).find(m => m.body.includes('pointer-marker'));
+  assert.ok(post);
+  await until(() => app.store.getMessageById(post.id).receipts?.scout === 'notified');
+  assert.ok(app.store.getMemberCursor(app.run.id, 'scout').lastDeliveredSeq >= post.boardSeq);
+  app.service.boardRead({ from: worker.assigneeHandle, runId: app.run.id, seqs: [post.boardSeq] });
+  assert.equal(app.store.getMessageById(post.id).receipts.scout, 'delivered');
+});
+
+for (const delivery of ['mailbox', 'follow-up']) {
+  test(delivery + ' with unknown acceptance preserves the active attempt without re-sending', async t => {
+    const app = await setup(t, 'second-timeout');
+    const first = (await app.start('First turn')).dispatch;
+    await until(() => app.store.getDispatchContext(first.id)?.codexTurn);
+    if (delivery === 'follow-up') await app.service.workerDoneByPane(first.assigneeHandle, { outcome: 'completed', summary: 'First result' });
+    const send = () => app.service.send({ from: 'coordinator-pane', to: 'dispatch:' + first.id, runId: app.run.id,
+      type: 'status', subject: 'Second turn', body: 'Read the next detail.' });
+    if (delivery === 'follow-up') await assert.rejects(send, err => err.data?.acceptance === 'unknown_acceptance');
+    else await send();
+    const parked = await until(() => app.store.listDispatches().find(d => d.stage === 'needs_reconciliation'));
+    assert.equal(parked.status, 'dispatched');
+    app.service.reconcileStaleDispatches();
+    assert.equal(app.store.getDispatchContext(parked.id).stage, 'needs_reconciliation');
+    assert.equal(app.getTrace().filter(m => m.method === 'turn/start').length, 2);
+    assert.equal(app.ptyStarts(), 0);
   });
 }
 

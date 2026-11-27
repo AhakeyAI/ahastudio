@@ -63,6 +63,7 @@ class ScreenReadableHeadlessEmulator extends HeadlessEmulator {
 export interface TerminalSummary {
   ptyId: string;
   cwd: string;
+  cwdKnown: boolean;
   cliId: string | null;
   shellId: string | null;
   title: string;
@@ -102,6 +103,7 @@ export interface TerminalWaitResult {
 interface InternalTerminalEntry {
   ptyId: string;
   cwd: string;
+  cwdKnown: boolean;
   cliId: string | null;
   shellId: string | null;
   title: string;
@@ -151,6 +153,7 @@ export class TerminalRuntimeTracker {
       entry = {
         ptyId: input.ptyId,
         cwd: input.cwd ?? process.cwd(),
+        cwdKnown: Boolean(input.cwd),
         cliId: input.cliId ?? null,
         shellId: input.shellId ?? null,
         title: input.title ?? input.cliId ?? input.shellId ?? input.ptyId,
@@ -171,7 +174,7 @@ export class TerminalRuntimeTracker {
       };
       this.entries.set(input.ptyId, entry);
     } else {
-      if (input.cwd) entry.cwd = input.cwd;
+      if (input.cwd) { entry.cwd = input.cwd; entry.cwdKnown = true; }
       if (input.cliId !== undefined && input.cliId !== null) entry.cliId = input.cliId;
       if (input.shellId !== undefined && input.shellId !== null) entry.shellId = input.shellId;
       if (input.title) entry.title = input.title;
@@ -224,7 +227,7 @@ export class TerminalRuntimeTracker {
       : '';
     void screen.write(prefix + snapshot.snapshotAnsi + (snapshot.rehydrateSequences ?? '') +
       (snapshot.pendingEscapeTailAnsi ?? ''));
-    entry.cwd = snapshot.cwd ?? entry.cwd;
+    if (snapshot.cwd) { entry.cwd = snapshot.cwd; entry.cwdKnown = true; }
     entry.title = snapshot.lastTitle ?? entry.title;
     entry.frozenScreen = screen.renderScreenText();
     if (entry.alive) entry.emulator = screen;
@@ -248,7 +251,7 @@ export class TerminalRuntimeTracker {
       void entry.emulator.write(utf8);
       try {
         const snap = entry.emulator.getSnapshot({ scrollbackRows: 0 });
-        if (snap.cwd) entry.cwd = snap.cwd;
+        if (snap.cwd) { entry.cwd = snap.cwd; entry.cwdKnown = true; }
         if (snap.lastTitle) entry.title = snap.lastTitle;
       } catch {
         /* ignore transient headless snapshot failures */
@@ -651,6 +654,7 @@ export class TerminalRuntimeTracker {
     return {
       ptyId: entry.ptyId,
       cwd: entry.cwd,
+      cwdKnown: entry.cwdKnown,
       cliId: entry.cliId,
       shellId: entry.shellId,
       title: entry.title,

@@ -145,6 +145,7 @@ export function LocalTerminalWorkspace({
   const [toast, setToast] = useState<string | null>(null);
   const [pendingClosePane, setPendingClosePane] = useState<{ windowId: string; leafId: string } | null>(null);
   const [rightPanel, setRightPanel] = useState(() => localStorage.getItem('aha.rightPanel.open') === '1');
+  const [boardRequest, setBoardRequest] = useState<{ runId: string }>();
   const [rightTab, setRightTab] = useState<RightPanelTab>(readRightPanelTab);
   const [rightWidth, setRightWidth] = useState(() =>
     clampRightPanelWidth(Number(localStorage.getItem('aha.rightPanel.width')) || 360),
@@ -562,6 +563,15 @@ export function LocalTerminalWorkspace({
 
   const focusOrchestrationTargetRef = useRef<(target: ResolvedOrchestrationLinkTarget) => void>();
   focusOrchestrationTargetRef.current = (target) => {
+    if (target.ptyId && isStandaloneSession(target.ptyId)) {
+      const win = stageWindowStore.findAgentSession(target.ptyId);
+      if (win) {
+        const folder = windowFolder(win);
+        if (folder) selectFolder(folder);
+        stage.setActiveWindow(win.id);
+        return;
+      }
+    }
     const headless = headlessDispatchForTarget(orchestrationClient.getSnapshot(), target);
     if (headless) {
       const task = orchestrationClient.getSnapshot().tasks.find((item) => item.id === headless.taskId);
@@ -606,7 +616,23 @@ export function LocalTerminalWorkspace({
   };
 
   useEffect(() => {
-    const onOpenBoard = () => {
+    const onOpenBoard = (event: Event) => {
+      const detail = (event as CustomEvent<{ runId?: string; coordinator?: boolean }>).detail;
+      if (detail?.runId) {
+        const run = orchestrationClient.getSnapshot().runs.find(item => item.id === detail.runId);
+        const id = run?.coordinatorPaneId ?? run?.coordinatorHandle;
+        if (detail.coordinator && id) {
+          const win = stageWindowStore.findAgentSession(id);
+          if (win && agentSessionClient.getSnapshot().some(session => session.id === id && session.status !== 'closed')) {
+            const folder = windowFolder(win);
+            if (folder) selectFolder(folder);
+            stage.setActiveWindow(win.id);
+            return;
+          }
+          if (findLeafByPtyId(id)) { agentEventsRef.current?.focus(id); return; }
+        }
+        setBoardRequest({ runId: detail.runId });
+      }
       changeRightTab('board');
       toggleRightPanel(true);
     };
@@ -1160,6 +1186,7 @@ export function LocalTerminalWorkspace({
 
       {rightPanel && (
         <WorkspaceRightPanel
+          boardRequest={boardRequest}
           cwd={panelCwd}
           tab={rightTab}
           onTabChange={changeRightTab}

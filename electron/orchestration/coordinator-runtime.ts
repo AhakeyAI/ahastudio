@@ -14,7 +14,9 @@ export interface CoordinatorRuntime {
   buildDispatchBrief?: (input: BuildDispatchPreambleInput) => string;
   cliCommand?: string;
   maxDepth?: number;
-  listWorkerCandidates: (excludePaneIds: ReadonlySet<string>) => WorkerPaneCandidate[];
+  listWorkerCandidates: (excludePaneIds: ReadonlySet<string>, cwd?: string, cliId?: string) => WorkerPaneCandidate[];
+  launchDependent?: (task: OrchestrationTaskRecord, cliId: string) => Promise<void>;
+  verifyCodeInputs?: (task: OrchestrationTaskRecord, cwd?: string) => Promise<void>;
   spawnWorker?: (input: {
     runId: string;
     task: OrchestrationTaskRecord;
@@ -26,6 +28,7 @@ export interface CoordinatorRuntime {
   sendTurn: (input: {
     ptyId: string;
     body: string;
+    freshlySpawned?: boolean;
     submit?: boolean;
   }) => Promise<{
     ok: boolean;

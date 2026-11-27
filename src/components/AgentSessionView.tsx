@@ -29,6 +29,7 @@ import type {
   OrchestrationDispatchRecord,
   OrchestrationDispatchStage,
 } from '../types';
+import { RunAttention } from './RunAttention';
 import type { FeedbackBannerState } from './agent-session/ComposerBanners';
 import { SessionComposer, type ComposerHandle, type ComposerSlashControl } from './agent-session/SessionComposer';
 import { SessionTitle } from './agent-session/SessionTitle';
@@ -51,6 +52,7 @@ const STAGE_LABELS: Record<OrchestrationDispatchStage, string> = {
   working: '工作中',
   waiting_permission: '等待授权',
   waiting_input: '等待输入',
+  needs_reconciliation: '接单结果需核对',
   awaiting_review: '待确认',
   done: '已完成',
   failed: '失败',
@@ -589,6 +591,16 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               <i className="asv-stage-dot" aria-hidden="true" />
               {stageLabel}
             </span>
+          )}
+          {!direct && dispatch && (stage === 'needs_reconciliation' || stage === 'awaiting_review') && (
+            <button type="button" className="asv-btn" onClick={() =>
+              window.dispatchEvent(new CustomEvent('aha:open-orchestration-board', {
+                detail: { runId: dispatch.runId, coordinator: true },
+              }))}>回到主对话处理</button>
+          )}
+          {direct && info?.orchestration && <RunAttention snapshot={snapshot} runId={snapshot.currentRunByConsumer[info.id]} />}
+          {dispatch?.stage === 'needs_reconciliation' && dispatch.reconciliationDiff && (
+            <details><summary>查看保留的工作区差异</summary><pre>{dispatch.reconciliationDiff}</pre></details>
           )}
           {direct && info && caps.terminalResume && !handoff && info.status !== 'closed' && window.vibeMeet?.agentSessions?.handoff && (
             <button

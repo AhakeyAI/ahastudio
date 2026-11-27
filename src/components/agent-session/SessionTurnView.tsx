@@ -167,9 +167,8 @@ function SettlementBlock({ item }: { item: Item<'settlement'> }) {
       <div className={`asv-settle ${ok ? 'is-ok' : 'is-bad'}`} data-asv-row>
         <div className="asv-settle-head">
           {ok ? <CircleCheck size={15} /> : <CircleAlert size={15} />}
-          <span className="asv-settle-title">已提交结果</span>
-          {item.outcome && <span className="asv-tag">{item.outcome}</span>}
-          {item.verdict && <span className="asv-tag">verdict · {item.verdict}</span>}
+          <span className="asv-settle-title">{item.verdict === 'reject' ? '审查已结束，有问题待处理' : item.verdict === 'pass' ? '审查已通过' : '已提交结果'}</span>
+          {item.outcome && !item.verdict && <span className="asv-tag">{item.outcome}</span>}
         </div>
         {item.summary && <SessionMarkdown text={item.summary} linkifyFilePaths />}
         {item.findings.length > 0 && (
@@ -187,7 +186,7 @@ function SettlementBlock({ item }: { item: Item<'settlement'> }) {
         <span className="asv-settle-title">本轮已结束，结果待确认</span>
         {item.stopReason && <span className="asv-tag">{item.stopReason}</span>}
       </div>
-      <div className="asv-settle-note">Worker 没有调用 report_done。请先核对输出与差异，再决定下一步。</div>
+      <div className="asv-settle-note">Worker 尚未提交结论。请核对本轮输出与改动，可回到主对话继续处理。</div>
       {item.diff !== null && (
         <>
           <button type="button" className="asv-text-btn" aria-expanded={showDiff} onClick={() => setShowDiff((value) => !value)}>

@@ -77,6 +77,7 @@ export type OrchestrationDispatchStage =
   | 'working'
   | 'waiting_permission'
   | 'waiting_input'
+  | 'needs_reconciliation'
   | 'awaiting_review'
   | 'done'
   | 'failed'
@@ -227,6 +228,9 @@ export interface OrchestrationTaskContext {
 export type OrchestrationDispatchProposalStatus = 'pending' | 'approved' | 'rejected' | 'expired';
 
 export interface OrchestrationDispatchProposal {
+  deps?: string[];
+  codeDeps?: string[];
+  baseBranch?: string;
   id: string;
   coordinatorPaneId: string;
   runId: string | null;
@@ -300,7 +304,11 @@ export class OrchestrationError extends Error {
   }
 }
 
+export type IntegrationIntent = { repo: string; target: string; commit: string; before: string; sourceHead: string; worktree: string; baseBranch?: string | null; baseCommit?: string | null; dispatchId?: string; members?: Record<string, string> };
+
 export interface OrchestrationRunRecord {
+  integrationIntent?: IntegrationIntent | null;
+  finalizedBatches?: Array<{ sourceHead: string; targetCommit: string; branch: string; members: Record<string, string> }>;
   id: string;
   objective: string;
   status: OrchestrationRunStatus;
@@ -327,7 +335,33 @@ export interface OrchestrationRunRecord {
   reviewAutoAuthorized?: boolean;
 }
 
+export interface QueuedWorkerLaunch {
+  state: 'waiting' | 'claimed' | 'needs_reconciliation';
+  from: string;
+  coordinatorGeneration: number;
+  authorizedNetwork?: boolean;
+  requiresPaneMode?: boolean;
+  callerPaneId?: string;
+  callerCwd?: string;
+  baseBranch?: string;
+  agent: string;
+  role: string;
+  terminal?: string;
+  model?: string;
+  effort?: string;
+  taskKind?: OrchestrationTaskKind;
+  policy?: AgentSessionPolicy;
+  network?: boolean;
+  allowSubWorkers?: boolean;
+  userInitiated?: boolean;
+  worktree: boolean;
+  authorizeReviews: boolean;
+  reason?: string;
+}
+
 export interface OrchestrationTaskRecord {
+  codeDeps?: string[];
+  queuedLaunch?: QueuedWorkerLaunch;
   id: string;
   runId: string;
   spec: string;
@@ -397,6 +431,9 @@ export interface OrchestrationDispatchRecord {
   reviewMutatedWorkspace?: boolean;
   integrationStatus?: OrchestrationIntegrationStatus;
   integratedCommit?: string | null;
+  noChanges?: boolean;
+  reconciliationDiff?: string | null;
+  taskKind?: OrchestrationTaskKind;
   integratedTargetBranch?: string | null;
   ownsPane?: boolean;
   cliId?: string | null;
@@ -405,6 +442,7 @@ export interface OrchestrationDispatchRecord {
   processGeneration?: number;
   stage?: OrchestrationDispatchStage;
   turnStopReportedGeneration?: number | null;
+  followUpMessageId?: string;
   followUpOfDispatchId?: string | null;
   retained?: boolean;
   releasedAt?: string | null;
@@ -452,6 +490,7 @@ export interface OrchestrationGateRecord {
 }
 
 export interface OrchestrationMessageRecord {
+  receipts?: Record<string, 'notified' | 'delivered' | 'replied'>;
   id: string;
   runId: string;
   seq: number;

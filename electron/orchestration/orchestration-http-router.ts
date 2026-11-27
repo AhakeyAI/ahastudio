@@ -54,6 +54,7 @@ const taskCreateSchema = z.object({
   taskTitle: z.string().trim().min(1).optional(),
   displayName: z.string().trim().min(1).optional(),
   deps: z.array(z.string().trim().min(1)).optional(),
+  codeDeps: z.array(z.string().trim().min(1)).max(100).optional(),
   priority: priorityEnum.optional(),
   worktreePath: z.string().trim().min(1).optional(),
 });
@@ -149,6 +150,7 @@ const workerStartSchema = z.object({
   taskTitle: z.string().trim().min(1).optional(),
   displayName: z.string().trim().min(1).optional(),
   deps: z.array(z.string().trim().min(1)).optional(),
+  codeDeps: z.array(z.string().trim().min(1)).max(100).optional(),
   priority: priorityEnum.optional(),
   retryOfDispatchId: z.string().trim().min(1).optional(),
   reviewOf: z.string().trim().min(1).max(128).optional(),
@@ -355,6 +357,9 @@ const delegateTaskSchema = z.object({
   ...taskContextFields,
   agent: z.string().trim().min(1).optional(),
   taskKind: taskKindEnum.optional(),
+  deps: z.array(z.string().trim().min(1)).max(100).optional(),
+  codeDeps: z.array(z.string().trim().min(1)).max(100).optional(),
+  baseBranch: z.string().trim().min(1).optional(),
   worktree: z.boolean().optional(),
   model: z.string().trim().min(1).optional(),
   effort: z.string().trim().min(1).optional(),
@@ -558,7 +563,7 @@ export async function dispatchOrchestrationHttpAction(
   const sessionCaller = context.callerPaneId && AGENT_SESSION_ID.test(context.callerPaneId)
     ? context.callerPaneId : null;
   const requireCallerPane = (): string => {
-    if (!context.callerPaneId || !service.isAuthenticatedCallerActive(context.callerPaneId, action === 'mcp-context')) {
+    if (!context.callerPaneId || !service.isAuthenticatedCallerActive(context.callerPaneId, action === 'mcp-context', action === 'worker-done-self')) {
       throw new OrchestrationError(
         'operation_rejected',
         sessionCaller

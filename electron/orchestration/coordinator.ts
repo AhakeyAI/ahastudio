@@ -143,6 +143,7 @@ export function reconcileExitedDispatches(
 ): void {
   for (const dispatch of store.listDispatches({ runId })) {
     if (dispatch.runId !== runId || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) continue;
+    if (dispatch.stage === 'needs_reconciliation') continue;
     if (options.onlyDelivered && !dispatch.promptSentAt) continue;
     const paneGone =
       Boolean(dispatch.assigneePaneId) &&
@@ -188,6 +189,7 @@ export function reconcileStaleDispatches(
 ): void {
   for (const dispatch of store.listDispatches({ runId })) {
     if (dispatch.runId !== runId || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) continue;
+    if (dispatch.stage === 'needs_reconciliation') continue;
     const obs = dispatch.startObservation ?? 'pending';
     const parkedOnWait =
       dispatch.stage === 'awaiting_review' ||
@@ -502,7 +504,7 @@ export class Coordinator {
 
     const readyTasks = this.store
       .listTasks({ runId, status: 'ready' })
-      .filter((t) => !this.store.hasPendingGates(t.id))
+      .filter((t) => !t.queuedLaunch && !this.store.hasPendingGates(t.id))
       .sort((a, b) => {
         const rankDiff = PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority];
         return rankDiff !== 0 ? rankDiff : a.createdAt.localeCompare(b.createdAt);
@@ -531,9 +533,25 @@ export class Coordinator {
         break;
       }
 
-      const candidates = this.runtime.listWorkerCandidates(busyPaneIds);
+      const candidates = this.runtime.listWorkerCandidates(busyPaneIds, task.worktreePath ?? this.options.cwd, this.options.workerCliId);
       let chosen: WorkerPaneCandidate | null = candidates[0] ?? null;
+      if (task.codeDeps?.length && this.runtime.verifyCodeInputs) {
+        chosen = null;
+        for (const candidate of candidates) {
+          try {
+            await this.runtime.verifyCodeInputs(task, candidate.cwd);
+            chosen = candidate;
+            break;
+          } catch { /* This worktree doesn't contain all of the declared inputs. */ }
+        }
+      }
+      const reusingPane = Boolean(chosen);
 
+      if (!chosen && task.codeDeps?.length && this.options.autoSpawnWorkers && this.options.workerCliId && this.runtime.launchDependent) {
+        await this.runtime.launchDependent(task, this.options.workerCliId);
+        availableSlots -= 1;
+        continue;
+      }
       if (!chosen && this.options.autoSpawnWorkers !== false && this.runtime.spawnWorker) {
         try {
           chosen = await this.runtime.spawnWorker({
@@ -559,6 +577,7 @@ export class Coordinator {
       let delivered = false;
       let obs: OrchestrationStartObservation = 'unsupported';
       try {
+        await this.runtime.verifyCodeInputs?.(task, chosen.cwd);
         const ctx = this.store.createDispatchContext({
           taskId: task.id,
           assigneeHandle: chosen.ptyId,
@@ -588,6 +607,7 @@ export class Coordinator {
         const delivery = await this.runtime.sendTurn({
           ptyId: chosen.ptyId,
           body: preamble,
+          freshlySpawned: !reusingPane,
           submit: true,
         });
         if (!delivery.ok) {

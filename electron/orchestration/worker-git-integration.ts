@@ -79,6 +79,17 @@ export interface WorkerIntegrationCheckResult {
   message: string;
 }
 
+interface Publication {
+  target: string;
+  commit: string;
+  before: string;
+  sourceHead: string;
+  worktree: string;
+  baseBranch?: string | null;
+  baseCommit?: string | null;
+}
+type BeforePublish = (publication: Publication) => Promise<void>;
+
 export interface WorkerIntegrationResult {
   mode: WorkerIntegrateMode;
   checkStatus: WorkerIntegrationCheckStatus;
@@ -1386,6 +1397,7 @@ async function publishIntegrationCommit(
 }
 
 async function integrateWorkerChangesUnlocked(opts: {
+  beforePublish?: BeforePublish;
   targetRepoPath: string;
   worktreePath: string;
   baseCommit?: string | null;
@@ -1413,8 +1425,15 @@ async function integrateWorkerChangesUnlocked(opts: {
     });
   }
 
+  const publishIntent = async (commit: string | null) => {
+    if (commit && check.targetHead && check.targetBranch) await opts.beforePublish?.({
+      target: check.targetBranch, commit, before: check.targetHead, sourceHead: check.snapshotOid,
+      worktree: opts.targetRepoPath,
+    });
+  };
   if (check.noChanges) {
     await assertTargetUnchanged(check);
+    await publishIntent(check.targetHead);
     return {
       mode,
       checkStatus: check.checkStatus,
@@ -1467,6 +1486,7 @@ async function integrateWorkerChangesUnlocked(opts: {
     { strictReviewedTree: opts.strictReviewedTree ?? Boolean(opts.expectedSnapshotOid) },
   );
   const noChanges = commit === check.targetHead;
+  await publishIntent(commit);
   if (!noChanges) await publishIntegrationCommit(check, commit);
   else await assertTargetUnchanged(check);
 
@@ -1491,6 +1511,7 @@ async function integrateWorkerChangesUnlocked(opts: {
 }
 
 export async function integrateWorkerChanges(opts: {
+  beforePublish?: BeforePublish;
   targetRepoPath: string;
   worktreePath: string;
   baseCommit?: string | null;
@@ -1534,6 +1555,7 @@ export async function integrateWorkerChanges(opts: {
 
   return withRepoIntegrationLock(opts.targetRepoPath, () =>
     integrateWorkerChangesUnlocked({
+      beforePublish: opts.beforePublish,
       targetRepoPath: opts.targetRepoPath,
       worktreePath: opts.worktreePath,
       baseCommit: opts.baseCommit,
@@ -1633,6 +1655,7 @@ async function inspectAndValidateRunBranchTarget(opts: {
  * Never copies or touches uncommitted files in the main workspace.
  */
 export async function integrateWorkerIntoRunBranch(opts: {
+  beforePublish?: BeforePublish;
   mainRepoRoot: string;
   runId: string;
   existingBranch?: string | null;
@@ -1795,6 +1818,7 @@ export async function integrateWorkerIntoRunBranch(opts: {
     let result: WorkerIntegrationResult;
     try {
       result = await integrateWorkerChangesUnlocked({
+        beforePublish: p => opts.beforePublish?.({ ...p, baseBranch: integrationBaseBranch, baseCommit: integrationBaseCommit }) ?? Promise.resolve(),
         targetRepoPath: integrationWorktreePath,
         worktreePath: opts.worktreePath,
         baseCommit: opts.baseCommit,
@@ -1863,6 +1887,7 @@ async function assertCleanRunIntegrationWorktree(
  * merge-tree & ignored-file collision checks, and atomic CAS branch cleanup after promotion.
  */
 export async function finalizeRunIntegrationBranch(opts: {
+  beforePublish?: BeforePublish;
   mainRepoRoot: string;
   integrationBranch: string;
   integrationWorktreePath: string;
@@ -1923,6 +1948,7 @@ export async function finalizeRunIntegrationBranch(opts: {
     );
 
     const result = await integrateWorkerChangesUnlocked({
+      beforePublish: p => opts.beforePublish?.({ ...p, sourceHead: runBranchOidBefore }) ?? Promise.resolve(),
       targetRepoPath: opts.mainRepoRoot,
       worktreePath: opts.integrationWorktreePath,
       baseCommit: opts.baseCommit,

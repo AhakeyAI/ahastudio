@@ -767,6 +767,7 @@ export type OrchestrationDispatchStage =
   | 'working'
   | 'waiting_permission'
   | 'waiting_input'
+  | 'needs_reconciliation'
   | 'awaiting_review'
   | 'done'
   | 'failed'
@@ -834,6 +835,8 @@ export type OrchestrationCoordinatorStatus =
 export type OrchestrationQuestionStatus = 'pending' | 'answered' | 'closed';
 
 export interface OrchestrationRunRecord {
+  integrationIntent?: { target: string; commit: string } | null;
+  finalizedBatches?: Array<{ sourceHead: string; targetCommit: string; branch: string; members: Record<string, string> }>;
   id: string;
   objective: string;
   status: OrchestrationRunStatus;
@@ -938,6 +941,9 @@ export interface OrchestrationDispatchRecord {
   reviewMutatedWorkspace?: boolean;
   integrationStatus?: OrchestrationIntegrationStatus;
   integratedCommit?: string | null;
+  noChanges?: boolean;
+  reconciliationDiff?: string | null;
+  taskKind?: OrchestrationTaskKind;
   integratedTargetBranch?: string | null;
   ownsPane?: boolean;
   cliId?: string | null;
@@ -946,6 +952,7 @@ export interface OrchestrationDispatchRecord {
   processGeneration?: number;
   stage?: OrchestrationDispatchStage;
   turnStopReportedGeneration?: number | null;
+  followUpMessageId?: string;
   followUpOfDispatchId?: string | null;
   retained?: boolean;
   releasedAt?: string | null;
@@ -968,7 +975,33 @@ export interface OrchestrationDispatchRecord {
   staleWarningAt?: string | null;
 }
 
+export interface QueuedWorkerLaunch {
+  state: 'waiting' | 'claimed' | 'needs_reconciliation';
+  from: string;
+  coordinatorGeneration: number;
+  authorizedNetwork?: boolean;
+  requiresPaneMode?: boolean;
+  callerPaneId?: string;
+  callerCwd?: string;
+  baseBranch?: string;
+  agent: string;
+  role: string;
+  terminal?: string;
+  model?: string;
+  effort?: string;
+  taskKind?: OrchestrationTaskKind;
+  policy?: AgentSessionPolicy;
+  network?: boolean;
+  allowSubWorkers?: boolean;
+  userInitiated?: boolean;
+  worktree: boolean;
+  authorizeReviews: boolean;
+  reason?: string;
+}
+
 export interface OrchestrationTaskRecord {
+  codeDeps?: string[];
+  queuedLaunch?: QueuedWorkerLaunch;
   id: string;
   runId: string;
   spec: string;
@@ -1004,6 +1037,7 @@ export interface OrchestrationGateRecord {
 }
 
 export interface OrchestrationMessageRecord {
+  receipts?: Record<string, 'notified' | 'delivered' | 'replied'>;
   id: string;
   runId: string;
   seq: number;
@@ -1196,6 +1230,9 @@ export interface OrchestrationAgentRosterEntry {
 }
 
 export interface OrchestrationDispatchProposal {
+  deps?: string[];
+  codeDeps?: string[];
+  baseBranch?: string;
   id: string;
   coordinatorPaneId: string;
   runId: string | null;
@@ -1432,6 +1469,7 @@ export interface OrchestrationApi {
     paneId?: string;
   }) => Promise<OrchestrationResult<{ run: OrchestrationRunRecord }>>;
   runUse: (opts: {
+    takeOverQueue?: boolean;
     id: string;
     from?: string;
     paneId?: string;
@@ -1459,6 +1497,7 @@ export interface OrchestrationApi {
     taskTitle?: string;
     displayName?: string;
     deps?: string[];
+    codeDeps?: string[];
     priority?: OrchestrationMessagePriority;
     worktreePath?: string;
   }) => Promise<OrchestrationResult<{ task: OrchestrationTaskRecord }>>;
@@ -1472,6 +1511,7 @@ export interface OrchestrationApi {
     id: string;
   }) => Promise<OrchestrationResult<OrchestrationTaskShowResult>>;
   taskUpdate: (opts: {
+    queueDecision?: 'cancel' | 'resume';
     id: string;
     status: OrchestrationTaskStatus;
   }) => Promise<OrchestrationResult<{ task: OrchestrationTaskRecord }>>;
@@ -1556,6 +1596,7 @@ export interface OrchestrationApi {
     taskId?: string;
     spec?: string;
     taskTitle?: string;
+    codeDeps?: string[];
     deps?: string[];
     priority?: OrchestrationMessagePriority;
     cliId?: string;
@@ -1563,6 +1604,7 @@ export interface OrchestrationApi {
     model?: string;
     effort?: string;
     terminal?: string;
+    retryOfDispatchId?: string;
     readOnly?: boolean;
     policy?: AgentSessionPolicy;
     network?: boolean;
@@ -1692,12 +1734,15 @@ export interface OrchestrationApi {
     }>
   >;
   reset?: (opts: {
+    historyOnly?: boolean;
+    discardRunId?: string;
     all?: boolean;
     tasks?: boolean;
     messages?: boolean;
   }) => Promise<
     OrchestrationResult<{
       reset: 'all' | 'tasks' | 'messages';
+      retained?: Array<{ id: string; reason: string }>;
       removed: {
         runs: number;
         tasks: number;
@@ -1836,6 +1881,9 @@ export interface OrchestrationApi {
     reviewFocus?: string;
     authorizeReviews?: boolean;
     agent?: string;
+    deps?: string[];
+    codeDeps?: string[];
+    baseBranch?: string;
     taskKind?: OrchestrationTaskKind;
     worktree?: boolean;
     model?: string;
@@ -1851,7 +1899,7 @@ export interface OrchestrationApi {
     requestId?: string;
   }) => Promise<
     OrchestrationResult<{
-      status: 'started' | 'confirmation_required' | 'rejected';
+      status: 'started' | 'confirmation_required' | 'rejected' | 'queued';
       role?: string;
       agent?: string;
       selectionReason?: string;
@@ -1952,6 +2000,7 @@ export interface OrchestrationApi {
       diffStat: string;
     }>
   >;
+  reconcilePublication?: (opts: { runId: string; expectedCommit: string; acceptUnpublished?: boolean }) => Promise<OrchestrationResult<{ message: string }>>;
   runFinalize?: (opts?: {
     runId?: string;
     mode?: 'check' | 'squash' | 'merge';

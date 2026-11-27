@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createTrackedTestService } from './fixtures/tracked-orchestration-service.mjs';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -8,7 +9,6 @@ import { join } from 'node:path';
 import { AgentHookServer } from '../dist-electron/agent/agent-hook-server.js';
 import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
 import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
-import { OrchestrationService } from '../dist-electron/orchestration/orchestration-service.js';
 import {
   INLINE_SPEC_MAX_BYTES,
   buildDispatchPreamble,
@@ -22,7 +22,7 @@ function harness(extra = {}) {
   const store = new OrchestrationStore();
   const writes = [];
   const spawned = [];
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore,
     writePty: async (ptyId, data) => {

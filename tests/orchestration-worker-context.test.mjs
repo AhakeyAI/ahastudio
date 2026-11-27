@@ -5,13 +5,13 @@ import { ipcMain } from 'electron';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
+import { atNextDelivery, createTrackedTestService } from './fixtures/tracked-orchestration-service.mjs';
 import { createRequire } from 'node:module';
 
 import { deliverPromptToPty } from '../dist-electron/agent/agent-prompt-delivery.js';
 import { registerOrchestrationIpc } from '../dist-electron/ipc/orchestration.js';
 import { AgentStatusStore } from '../dist-electron/agent/agent-status-store.js';
 import { dispatchOrchestrationHttpAction } from '../dist-electron/orchestration/orchestration-http-router.js';
-import { OrchestrationService } from '../dist-electron/orchestration/orchestration-service.js';
 import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
 import {
   buildDispatchPreambleWithBrief,
@@ -136,7 +136,7 @@ test('OrchestrationService delegateTask passes taskContext through proposals, au
 
   const writtenPrompts = [];
   let spawnIdx = 0;
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore,
     writePty: (ptyId, data) => {
@@ -328,7 +328,7 @@ function createContextHarness(t, options = {}) {
     return id;
   };
   const from = register('local-ctx-coordinator');
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore,
     getDefaultCwd: () => dir,
@@ -675,7 +675,7 @@ test('deferred delivery stores a token-free template and cleans its brief when P
     },
   });
   const target = register('local-ctx-waiting');
-  agentStatusStore.ingestHookEvent({ ptyId: target, agentId: 'claude', state: 'waiting' });
+  atNextDelivery(service, () => agentStatusStore.ingestHookEvent({ ptyId: target, agentId: 'claude', state: 'waiting' }));
   const worker = await start({
     terminal: target, spec: 'Wait on trusted input', context: 'Deferred brief '.repeat(460),
   });

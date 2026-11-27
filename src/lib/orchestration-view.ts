@@ -202,12 +202,22 @@ export function buildTaskRows(
     if (!task || visiting.has(id)) return 0;
     visiting.add(id);
     let level = 0;
-    for (const dep of task.deps) {
+    for (const dep of [...task.deps, ...(task.codeDeps ?? [])]) {
       if (byId.has(dep)) level = Math.max(level, levelOf(dep) + 1);
     }
     visiting.delete(id);
     levels.set(id, level);
     return level;
+  };
+  const dispatchByParent = new Map(tasks.flatMap(t => t.latestDispatch?.followUpOfDispatchId ? [[t.latestDispatch.followUpOfDispatchId, t.latestDispatch] as const] : []));
+  const codeDelivered = (id: string) => {
+    let head = byId.get(id)?.latestDispatch;
+    const seen = new Set<string>();
+    while (head && !seen.has(head.id) && dispatchByParent.has(head.id)) {
+      seen.add(head.id);
+      head = dispatchByParent.get(head.id);
+    }
+    return head?.status === 'completed' && head.integrationStatus === 'merged' && Boolean(head.integratedCommit);
   };
   const pendingGateCount = new Map<string, number>();
   for (const gate of gates) {
@@ -217,8 +227,8 @@ export function buildTaskRows(
     .map((task) => ({
       task,
       level: levelOf(task.id),
-      waitingOn: task.deps.filter((dep) => byId.has(dep) && byId.get(dep)!.status !== 'completed'),
-      missingDeps: task.deps.filter((dep) => !byId.has(dep)),
+      waitingOn: [...new Set([...task.deps.filter(dep => byId.has(dep) && byId.get(dep)!.status !== 'completed'), ...(task.codeDeps ?? []).filter(dep => byId.has(dep) && !codeDelivered(dep))])],
+      missingDeps: [...new Set([...task.deps, ...(task.codeDeps ?? [])])].filter(dep => !byId.has(dep)),
       pendingGates: pendingGateCount.get(task.id) ?? 0,
     }))
     .sort((a, b) => a.level - b.level || a.task.createdAt.localeCompare(b.task.createdAt) || a.task.id.localeCompare(b.task.id));

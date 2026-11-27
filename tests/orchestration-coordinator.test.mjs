@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { atNextDelivery, createTrackedTestService } from './fixtures/tracked-orchestration-service.mjs';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -12,14 +13,13 @@ import { registerShellPtyIpc } from '../dist-electron/ipc/shell-pty.js';
 import { getPtyHost } from '../dist-electron/pty-host.js';
 import { OrchestrationError } from '../dist-electron/orchestration/orchestration-types.js';
 import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
-import { OrchestrationService } from '../dist-electron/orchestration/orchestration-service.js';
 
 function createHarness() {
   const agentStatusStore = new AgentStatusStore();
   const writes = [];
   const store = new OrchestrationStore();
   const spawned = [];
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore,
     writePty: async (ptyId, data) => {
@@ -256,8 +256,8 @@ test('coordinator handles escalation, worker pane exit, decision gates, and back
     summary: 'Deployed cleanly',
   });
 
-  // Wait for coordinator convergence.
-  for (let i = 0; i < 40; i++) {
+  // Allow the real start-observation window to finish before the convergence poll.
+  for (let i = 0; i < 200; i++) {
     if (service.store.getRun(run.id)?.status === 'completed') break;
     await new Promise((r) => setTimeout(r, 25));
   }
@@ -398,7 +398,7 @@ test('registerShellPtyIpc createPty defaults cleanly to shellId=default, validat
     getCurrentCwd: () => process.cwd(),
     agentStatusStore,
   });
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore,
     writePty: shellPtyCtrl.sendInput,
@@ -448,7 +448,7 @@ test('emitChanged scopes snapshots to runId, auto-closes finished spawned worker
   let confirmClosed;
   const closeConfirmation = new Promise((resolve) => { confirmClosed = resolve; });
 
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore,
     writePty: async () => ({ ok: true }),
@@ -539,7 +539,7 @@ test('emitChanged scopes snapshots to runId, auto-closes finished spawned worker
     assert.equal(store.getRun(runResume.id)?.status, 'stopped');
 
     // New service on same store resumes the stopped bound run without spec/runId.
-    const resumedService = new OrchestrationService({
+    const resumedService = createTrackedTestService({
       store,
       agentStatusStore,
       writePty: async () => ({ ok: true }),
@@ -561,7 +561,7 @@ test('IPC check/ask with wait can be cancelled via orchestration:cancel-wait and
   const sender = Object.assign(new EventEmitter(), { id: 77, send: () => {} });
   const agentStatusStore = new AgentStatusStore();
   const store = new OrchestrationStore();
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore,
     writePty: async () => ({ ok: true }),
@@ -703,7 +703,7 @@ test('startup trust confirmation blocks quiet-ready return and defers dispatch p
   // 2. Dispatching to a pane already stuck on directory trust defers the prompt until confirmed.
   const store = new OrchestrationStore();
   const writes = [];
-  const service = new OrchestrationService({
+  const service = createTrackedTestService({
     store,
     agentStatusStore,
     writePty: async (ptyId, data) => {
@@ -714,8 +714,7 @@ test('startup trust confirmation blocks quiet-ready return and defers dispatch p
   try {
     agentStatusStore.registerPane('coord', { agentId: 'claude' });
     agentStatusStore.registerPane('w_trust', { agentId: 'claude' });
-    agentStatusStore.ingestPtyData('w_trust', 'Do you trust the files in this folder?\nYes, proceed');
-    assert.equal(agentStatusStore.get('w_trust')?.state, 'waiting');
+    atNextDelivery(service, () => agentStatusStore.ingestPtyData('w_trust', 'Do you trust the files in this folder?\nYes, proceed'));
 
     const { run } = service.runCreate({ id: 'run_trust', objective: 'Trust guard', from: 'coord', paneId: 'coord' });
     const { task } = service.taskCreate({ id: 't_trust', runId: run.id, spec: 'Safe task' });
@@ -727,7 +726,7 @@ test('startup trust confirmation blocks quiet-ready return and defers dispatch p
 
     // User presses Enter on trust dialog -> pane returns to idle -> deferred prompt is delivered once.
     agentStatusStore.notifyUserInput('w_trust', '\r');
-    await new Promise((r) => setTimeout(r, 150));
+    for (let i = 0; i < 200 && !service.store.getLatestDispatchForTask(task.id)?.promptSentAt; i++) await new Promise(r => setTimeout(r, 25));
     assert.ok(writes.some((w) => w.ptyId === 'w_trust' && w.data.includes('\x1b[200~')));
     assert.ok(writes.some((w) => w.ptyId === 'w_trust' && w.data === '\r'));
     assert.ok(service.store.getLatestDispatchForTask(task.id)?.promptSentAt);
