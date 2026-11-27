@@ -124,7 +124,7 @@ const PREAMBLE_HEAD_RE = /^\[(?:Worker|ORCHESTRATION)\b[^\]]*\]\s*$/;
 const PREAMBLE_META_RE = /^(?:Workspace|Branch|Full Brief File): |^Read full context file first\.$/;
 // Matched against the exact protocol lines, so a task that merely starts a bullet the same way stays whole.
 const PREAMBLE_TAIL_RE =
-  /^(?:- Need clarification or blocked\? Call MCP tool |- When finished or blocked, call MCP tool |- Do not run `git commit`; |- Sub-tasks permitted: use MCP tools |Use MCP ask_coordinator or report_done\.$|Dispatch Capability: |Use \S+ orchestration worker-done with --capability )/;
+  /^(?:- Need clarification or blocked\? Call MCP tool |- When finished or blocked, call MCP tool |- Board: mention only the member who must act next |- Never write `\[done\]` in posts or summaries; |- Do not run `git commit`; |- Sub-tasks permitted: use MCP tools |Use MCP ask_coordinator or report_done\.$|Dispatch Capability: |Use \S+ orchestration worker-done with --capability )/;
 const SPEC_OPEN_RE = /^=== (?:TASK SPECIFICATION|FOLLOW-UP INSTRUCTIONS) ===$/;
 const SPEC_CLOSE_RE = /^=== END (?:TASK SPECIFICATION|FOLLOW-UP INSTRUCTIONS) ===$/;
 

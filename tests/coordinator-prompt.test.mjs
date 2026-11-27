@@ -15,7 +15,12 @@ test('the terminal Coordinator prompt stays byte-identical', () => {
     '[AhaStation Orchestration Mode Active — Coordinator]\n' +
       'Prefer AhaStation MCP tools (`delegate_task`, `post_message`, `read_board`, `board_wait`, `team_status`, `manage_worker`) over built-in subagents so tasks run in visible AhaStation Coding Agent terminals with optional isolated Git worktrees.\n' +
       'Available Coding Agents: codex: general purpose.\n' +
-      'Pick the Coding Agent best suited to each subtask (prefer a heterogeneous CLI for independent review/tests).',
+      'Pick the Coding Agent best suited to each subtask (prefer a heterogeneous CLI for independent review/tests).\n' +
+      'Board protocol: an @role mention is a doorbell that wakes that member, not a CC — mention only whoever must act next. In non-review peer handoffs (e.g. researcher → implementer) the Worker mentions the next Worker directly, without @coordinator.\n' +
+      'Cite board posts by #seq instead of pasting their content (e.g. "check #4 and #6"; the reader calls `read_board` with `seqs: [4, 6]`). Review Workers cannot see the author’s reports or handoff posts, so give a reviewer its scope, not those #seq.\n' +
+      'Before dispatching parallel writable Workers, split file ownership so no two edit the same file. Keep your own turns short: delegate research, builds, and tests, then wait with `board_wait` or end the turn.\n' +
+      'Workers finish only through `report_done`; post `[done]` yourself only when the whole Run is complete, because it pauses stall detection.\n' +
+      'A settled Worker idles at no cost: send rework or small follow-ups to the same @role with `message_worker` to reuse its context instead of delegating a new Worker; `manage_worker` stop/release ends it and is not a pause.',
   );
   assert.match(
     coordinatorInstructions(ctx({ confirmMode: 'chat-and-guard' })),
