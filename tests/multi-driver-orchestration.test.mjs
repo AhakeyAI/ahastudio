@@ -588,6 +588,9 @@ async function serviceSetup(t, { allowPtySpawn = false, available = () => true }
               toolCallId: 'c-perm', kind: 'execute', title: 'Run npm test', rawInput: { command: 'npm test' },
             });
           }
+          if (scenario === 'secret-file') {
+            writeFileSync(join(workdir, `note-${env.AHA_WORKER_TOKEN}.txt`), 'x\n');
+          }
           chunk(agent, `Worker finished; token ${env.AHA_WORKER_TOKEN}`);
           if (scenario === 'report') {
             launch.report = await workerHttp(workerId, 'worker-done-self', { summary: 'Reported by report_done' });
@@ -701,6 +704,7 @@ test('headless Grok Worker: own credentials, no pane, provider session id, works
   const app = await serviceSetup(t);
   const repo = sparseRepo(app.dir);
   app.sessions.set(SESSION_A, { cwd: repo, provider: 'claude', active: true, idle: true, network: false, policy: 'full-auto' });
+  app.scenario = 'secret-file';
 
   const started = await app.call(SESSION_A, 'delegate-task', { role: 'builder', task: 'Implement it', agent: 'grok', worktree: false });
   assert.equal(started.ok, true, started.error);
@@ -720,8 +724,7 @@ test('headless Grok Worker: own credentials, no pane, provider session id, works
   const mcpEnv = launch.io.seen.find((m) => m.method === 'session/new').params.mcpServers[0].env;
   assert.ok(mcpEnv.some(({ name, value }) => name === 'AHA_WORKER_ID' && value === dispatch.assigneeHandle));
 
-  // The Worker leaves an untracked file whose name holds its token.
-  writeFileSync(join(repo, `note-${launch.env.AHA_WORKER_TOKEN}.txt`), 'x\n');
+  // The Worker wrote an untracked file whose name holds its token before ending the turn.
   const timeline = () => app.service.getWorkerTimeline({ dispatchId: dispatch.id });
   assert.equal(timeline().cliId, 'grok');
   assert.equal(timeline().readOnly, false);
