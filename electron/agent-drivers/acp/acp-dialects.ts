@@ -71,9 +71,11 @@ export interface AcpLaunchSpec {
   dialect: AcpDialect;
 }
 
-function choiceQuestion(id: string, prompt: string, options: { label: string; description?: string }[], allowOther: boolean): AgentQuestion {
+function choiceQuestion(
+  id: string, prompt: string, options: { label: string; description?: string }[], allowOther: boolean, multiSelect = false,
+): AgentQuestion {
   return {
-    id, header: '', prompt, allowOther,
+    id, header: '', prompt, allowOther, ...(multiSelect ? { multiSelect: true } : {}),
     options: options.map((option) => ({ label: option.label, description: option.description ?? '' })),
   };
 }
@@ -189,6 +191,7 @@ function grokQuestions(params: unknown): AcpQuestionPresentation {
       .filter((option) => typeof option.label === 'string')
       .map((option) => ({ label: option.label as string, ...(text(option.description) ? { description: text(option.description)! } : {}) })),
     true,
+    question.multiSelect === true,
   ));
   return {
     questions,

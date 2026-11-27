@@ -353,7 +353,7 @@ app.whenReady().then(async () => {
 
   const hookInstaller = new AgentHookInstaller();
   const mcpCliIdSet = new Set<string>(AGENT_MCP_CLI_IDS);
-  const { coordinatorApprovedMcpTools, enabledCodexPilot, launchCodexPilot } =
+  const { coordinatorApprovedMcpTools, enabledCodexPilot, launchCodexPilot, workerApprovedMcpTools } =
     await import('./orchestration/codex-app-server-pilot.js');
   const { DriverRegistry, nativeDriverEntries, launchHeadlessWorkerDriver, headlessWorkerCommand } =
     await import('./agent-drivers/driver-registry.js');
@@ -390,17 +390,25 @@ app.whenReady().then(async () => {
         normalizeOrchestrationSettings(getSettings().orchestration).codexAppServerPilot ?? false,
         process.env.AHA_CODEX_APP_SERVER_PILOT,
       ),
-      launch: (workerId, cwd, events) => {
+      launch: (workerId, cwd, events, options) => {
         const mcpServerPath = resolveActiveMcpServerPath();
         if (!agentHookServer || !mcpServerPath) throw new Error('Aha MCP Server is unavailable');
-        return launchCodexPilot({ cwd, events, mcp: { serverPath: mcpServerPath, env: agentHookServer.envForWorker(workerId) } });
+        return launchCodexPilot({
+          cwd, events,
+          mcp: {
+            serverPath: mcpServerPath, env: agentHookServer.envForWorker(workerId),
+            approvedTools: workerApprovedMcpTools(options),
+          },
+        });
       },
     },
     headlessWorkers: {
       available: (cliId) => resolveAgentCommand(headlessWorkerCommand(cliId)) !== null,
-      launch: (cliId, workerId, cwd, events, { policy }) => {
+      launch: (cliId, workerId, cwd, events, { policy, allowSubWorkers }) => {
         if (!agentHookServer) throw new Error('Aha MCP Server is unavailable');
-        return launchHeadlessWorkerDriver(cliId, cwd, events, { policy, mcp: ahaMcpServer(agentHookServer.envForWorker(workerId)) });
+        return launchHeadlessWorkerDriver(cliId, cwd, events, {
+          policy, allowSubWorkers, mcp: ahaMcpServer(agentHookServer.envForWorker(workerId)),
+        });
       },
     },
     closeWorkerPty: (ptyId) => shellPtyCtrl.closePty(ptyId),

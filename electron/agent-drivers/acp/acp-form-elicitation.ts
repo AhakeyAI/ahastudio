@@ -109,6 +109,7 @@ export function acpFormQuestions(params: unknown): AcpQuestionPresentation {
         header: text(property.title) ?? '',
         prompt: [...new Set([...shared, ...own])].join('\n\n'),
         allowOther: !choices || Boolean(otherKey),
+        ...(type === 'array' ? { multiSelect: true } : {}),
         options: (choices ?? []).map((choice) => ({
           label: choice.value === property.default ? `${choice.label}（推荐）` : choice.label,
           description: choice.description,

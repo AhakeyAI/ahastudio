@@ -251,12 +251,20 @@ export interface SessionComposerProps {
   questions: readonly OrchestrationQuestionRecord[];
   branch: string | null;
   readOnly?: boolean;
-  /** Direct sessions only: the permission level, switchable between turns. */
+  /** The permission level, switchable between turns for direct sessions and live headless Workers. */
   policy?: AgentSessionPolicy;
   onPolicyChange?: (policy: AgentSessionPolicy) => void;
+  /** Tiers the picker offers when there is no toolbar (headless Workers: their driver's own tiers). */
+  policyChoices?: readonly AgentSessionPolicy[];
+  /** Why the permission level cannot change, shown on the locked chip. */
+  policyLockedReason?: string;
   network?: boolean;
   onNetworkChange?: (network: boolean) => void;
+  /** A control change is being saved. */
+  controlsBusy?: boolean;
   directQuestions?: readonly DirectQuestion[];
+  /** Who asked `directQuestions`; defaults to the toolbar's driver. */
+  questionProviderLabel?: string;
   onAnswer?: (requestId: string, answers: Record<string, string[]> | null) => Promise<boolean>;
   /** The session is not running but sending a message resumes it. */
   resumable?: boolean;
@@ -895,7 +903,8 @@ export function SessionComposer(props: SessionComposerProps) {
   const hasBannerLane =
     props.approvals.length > 0 || props.questions.length > 0 || Boolean(props.directQuestions?.length) || hasSlashBanners;
   const hasEndedStrip = !props.alive && Boolean(
-    props.branch || (!props.direct && props.readOnly !== undefined) || props.readOnly || props.usageLimits || props.usage,
+    props.branch || props.policy || (!props.direct && props.readOnly !== undefined) || props.readOnly ||
+      props.usageLimits || props.usage,
   );
 
   return (
@@ -909,7 +918,7 @@ export function SessionComposer(props: SessionComposerProps) {
               key={entry.requestId}
               entry={entry}
               onAnswer={props.onAnswer!}
-              providerLabel={toolbar?.provider ? DRIVER_LABELS[toolbar.provider] : 'Codex'}
+              providerLabel={props.questionProviderLabel ?? (toolbar?.provider ? DRIVER_LABELS[toolbar.provider] : 'Codex')}
             />
           ))}
           {slash?.goal && (
@@ -1108,16 +1117,20 @@ export function SessionComposer(props: SessionComposerProps) {
                   <Lock size={12} aria-hidden="true" />
                   <select
                     value={props.policy}
-                    disabled={props.running}
+                    disabled={props.running || props.controlsBusy}
                     aria-label="权限"
                     onChange={(event) => props.onPolicyChange!(event.target.value as AgentSessionPolicy)}
                   >
-                    {(toolbar ? capabilities.policies : Object.keys(POLICY_LABELS) as AgentSessionPolicy[]).map((value) => (
+                    {(toolbar ? capabilities.policies : props.policyChoices ?? Object.keys(POLICY_LABELS) as AgentSessionPolicy[]).map((value) => (
                       <option key={value} value={value}>{POLICY_LABELS[value]}</option>
                     ))}
                   </select>
                   <ChevronDown size={11} className="asv-policy-caret" aria-hidden="true" />
                 </label>
+              ) : props.policy ? (
+                <Chip icon={<Lock size={12} />} {...(props.policyLockedReason ? { title: props.policyLockedReason } : {})}>
+                  {POLICY_LABELS[props.policy]}
+                </Chip>
               ) : !props.direct && props.readOnly !== undefined ? (
                 <Chip icon={<Lock size={12} />}>{props.readOnly ? POLICY_LABELS['read-only'] : POLICY_LABELS['workspace-write']}</Chip>
               ) : props.readOnly && <Chip icon={<Lock size={12} />}>{POLICY_LABELS['read-only']}</Chip>}
@@ -1125,7 +1138,7 @@ export function SessionComposer(props: SessionComposerProps) {
                 <button
                   type="button"
                   className={`asv-chip asv-chip-toggle asv-composer-ctrl${props.network ? ' is-on' : ''}`}
-                  disabled={props.running}
+                  disabled={props.running || props.controlsBusy}
                   aria-pressed={Boolean(props.network)}
                   title={props.network ? '命令可以联网：下一条消息起生效' : '命令不能联网（npm install 等会失败）：下一条消息起生效'}
                   onClick={() => props.onNetworkChange!(!props.network)}
@@ -1133,6 +1146,9 @@ export function SessionComposer(props: SessionComposerProps) {
                   <Globe size={12} aria-hidden="true" />
                   <span>{props.network ? '联网' : '不联网'}</span>
                 </button>
+              )}
+              {!props.direct && !props.onNetworkChange && props.network === true && (
+                <Chip icon={<Globe size={12} />}>联网</Chip>
               )}
               {props.usageLimits && <UsageLimitChip summary={props.usageLimits} />}
               {props.usage && (
@@ -1166,9 +1182,12 @@ export function SessionComposer(props: SessionComposerProps) {
       {hasEndedStrip && (
         <div className="asv-context-strip">
           {props.branch && <Chip icon={<GitBranch size={12} />} title={props.branch}>{props.branch}</Chip>}
-          {!props.direct && props.readOnly !== undefined ? (
+          {props.policy ? (
+            <Chip icon={<Lock size={12} />}>{POLICY_LABELS[props.policy]}</Chip>
+          ) : !props.direct && props.readOnly !== undefined ? (
             <Chip icon={<Lock size={12} />}>{props.readOnly ? POLICY_LABELS['read-only'] : POLICY_LABELS['workspace-write']}</Chip>
           ) : props.readOnly && <Chip icon={<Lock size={12} />}>{POLICY_LABELS['read-only']}</Chip>}
+          {!props.direct && props.network === true && <Chip icon={<Globe size={12} />}>联网</Chip>}
           <span className="asv-strip-spacer" />
           {props.usageLimits && <UsageLimitChip summary={props.usageLimits} />}
           {props.usage && (

@@ -202,8 +202,9 @@ export function WorkspaceRightPanel({
     const proposals = (orchestration.pendingProposals ?? []).filter((p) => p.status === 'pending').length;
     const approvals = (orchestration.openApprovals ?? []).filter((a) => a.status === 'pending').length;
     const questions = orchestration.questions.filter((q) => q.status === 'pending').length;
+    const nativeQuestions = (orchestration.openNativeQuestions ?? []).filter((q) => q.status === 'pending').length;
     const gates = orchestration.gates.filter((g) => g.status === 'pending').length;
-    return proposals + approvals + questions + gates;
+    return proposals + approvals + questions + nativeQuestions + gates;
   }, [orchestration]);
   const boardWorking = useMemo(
     () =>

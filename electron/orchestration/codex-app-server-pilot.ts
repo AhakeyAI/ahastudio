@@ -249,6 +249,22 @@ export function enabledCodexPilot(platform: NodeJS.Platform, setting: boolean, o
 export const WORKER_APPROVED_MCP_TOOLS = ['report_done', 'read_board', 'ask_coordinator', 'post_message'] as const;
 
 /**
+ * Aha tools a headless Worker runs without a driver prompt: the dispatch contract, plus
+ * `board_wait` under `full-auto` (where an unapproved tool fails outright), plus `delegate_task`
+ * and `team_wait` when the person let this Worker start sub-Workers. Sub-Worker starts stay gated
+ * by the orchestration service (depth limit and dispatch confirmation), not by the driver.
+ */
+export function workerApprovedMcpTools(options?: {
+  policy?: AgentSessionPolicy;
+  allowSubWorkers?: boolean;
+}): readonly string[] {
+  const tools: string[] = [...WORKER_APPROVED_MCP_TOOLS];
+  if (options?.allowSubWorkers) tools.push('board_wait', 'delegate_task', 'team_wait');
+  else if (options?.policy === 'full-auto') tools.push('board_wait');
+  return tools;
+}
+
+/**
  * Coordinator tools a session runs without a Codex prompt: reads, plus calls the orchestration
  * service already gates (delegate_task waits for the person's confirmation in chat or in the UI).
  * Tools that stop Workers or write Git history keep Codex's approval prompt.

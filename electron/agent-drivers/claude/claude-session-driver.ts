@@ -127,7 +127,7 @@ export interface ClaudeDriverOptions {
    * a Worker's run unprompted only for its dispatch contract. `requiredTool` must be listed before
    * the session is usable.
    */
-  ahaMcp?: { role: 'coordinator' | 'worker'; requiredTool?: string };
+  ahaMcp?: { role: 'coordinator' | 'worker'; requiredTool?: string; allowSubWorkers?: boolean };
   /** Credentials the process was given, redacted from everything the driver reports. */
   secrets?: readonly string[];
 }
@@ -286,7 +286,7 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
   /** How this session's role answers an Aha tool call; null for every other tool. */
   private ahaDecision(toolName: string): 'allow' | 'ask' | 'deny' | null {
     const tool = this.ahaMcp ? parseAhaMcpToolName(toolName) : null;
-    return tool ? ahaToolDecision(this.ahaMcp!.role, tool, this.policy) : null;
+    return tool ? ahaToolDecision(this.ahaMcp!.role, tool, this.policy, { allowSubWorkers: this.ahaMcp!.allowSubWorkers }) : null;
   }
 
   async startTurn({ turnKey, prompt, effort, model, policy, attachments = [] }: {

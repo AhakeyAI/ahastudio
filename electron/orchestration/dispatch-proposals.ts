@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import type { AgentSessionPolicy } from './agent-session-driver.js';
 import {
   OrchestrationError,
   type OrchestrationDispatchProposal,
@@ -19,6 +20,9 @@ export interface DispatchProposalOverrides {
   worktree?: boolean;
   model?: string | null;
   effort?: string | null;
+  policy?: AgentSessionPolicy | null;
+  network?: boolean | null;
+  allowSubWorkers?: boolean;
   authorizeReviews?: boolean;
 }
 
@@ -36,6 +40,9 @@ export interface CreateHeldProposalInput {
   model: string | null;
   effort: string | null;
   terminal: string | null;
+  policy?: AgentSessionPolicy | null;
+  network?: boolean | null;
+  allowSubWorkers?: boolean;
   authorizeReviews?: boolean;
 }
 
@@ -174,6 +181,9 @@ export class DispatchProposalManager {
       prior.model === input.model &&
       prior.effort === input.effort &&
       prior.terminal === input.terminal &&
+      (prior.policy ?? null) === (input.policy ?? null) &&
+      (prior.network ?? null) === (input.network ?? null) &&
+      Boolean(prior.allowSubWorkers) === Boolean(input.allowSubWorkers) &&
       Boolean(prior.authorizeReviews) === Boolean(input.authorizeReviews) &&
       JSON.stringify(cloneTaskContext(prior.taskContext)) === JSON.stringify(merged);
     if (confirmed && prior && samePlan && state.lastTurnAt >= match.createdAt) {
@@ -242,6 +252,9 @@ export class DispatchProposalManager {
       model: input.model,
       effort: input.effort,
       terminal: input.terminal,
+      ...(input.policy !== undefined ? { policy: input.policy } : {}),
+      ...(input.network !== undefined ? { network: input.network } : {}),
+      ...(typeof input.allowSubWorkers === 'boolean' ? { allowSubWorkers: input.allowSubWorkers } : {}),
       ...(typeof input.authorizeReviews === 'boolean'
         ? { authorizeReviews: input.authorizeReviews }
         : {}),
@@ -293,6 +306,16 @@ export class DispatchProposalManager {
   ): { proposal: OrchestrationDispatchProposal } {
     const cleanId = id.trim();
     const entry = this.requireOpenEntry(cleanId);
+    if (entry.proposal.taskKind === 'review') {
+      if (overrides?.allowSubWorkers === true || overrides?.network === true ||
+          (overrides?.policy != null && overrides.policy !== 'read-only')) {
+        throw new OrchestrationError(
+          'operation_rejected',
+          'Review Workers stay read-only, without network access or sub-Workers.',
+          { proposalId: cleanId },
+        );
+      }
+    }
     this.removeOpenEntry(entry);
 
     const nowIso = new Date(this.clock()).toISOString();
@@ -309,6 +332,15 @@ export class DispatchProposalManager {
     }
     if (overrides?.effort !== undefined) {
       entry.proposal.effort = overrides.effort?.trim() || null;
+    }
+    if (overrides?.policy !== undefined) {
+      entry.proposal.policy = overrides.policy ?? null;
+    }
+    if (overrides?.network !== undefined) {
+      entry.proposal.network = overrides.network ?? null;
+    }
+    if (typeof overrides?.allowSubWorkers === 'boolean') {
+      entry.proposal.allowSubWorkers = overrides.allowSubWorkers;
     }
     if (typeof overrides?.authorizeReviews === 'boolean') {
       entry.proposal.authorizeReviews = overrides.authorizeReviews;

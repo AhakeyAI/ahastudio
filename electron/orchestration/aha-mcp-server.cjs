@@ -271,6 +271,22 @@ function buildDelegateTaskTool(ctx) {
           type: 'string',
           description: 'Optional existing idle pane ptyId to reuse.',
         },
+        policy: {
+          type: 'string',
+          enum: ['read-only', 'workspace-write', 'full-auto'],
+          description:
+            'Headless Worker permission tier (default: read-only for review/research, else workspace-write). full-auto is refused unless the user approves it in the AhaStation UI. Reviews are always read-only.',
+        },
+        network: {
+          type: 'boolean',
+          description:
+            'Let the headless Worker\'s sandboxed commands reach the network (Codex only; default follows your session). Never for reviews.',
+        },
+        allowSubWorkers: {
+          type: 'boolean',
+          description:
+            'Let the headless Worker start its own sub-Workers with delegate_task (still limited by max depth and dispatch confirmation). Never for reviews.',
+        },
         confirmed: {
           type: 'boolean',
           description: 'Set to true only after the user has explicitly confirmed dispatch in chat.',
@@ -942,6 +958,8 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       const context = nonEmptyStr(args.context) || nonEmptyStr(args.background);
       const proposalId = nonEmptyStr(args.proposalId);
       const taskContext = args.taskContext;
+      const policy = nonEmptyStr(args.policy);
+      const rawAllowSubWorkers = args.allowSubWorkers !== undefined ? args.allowSubWorkers : args.allow_sub_workers;
 
       const payload = {
         ...(role ? { role } : {}),
@@ -961,6 +979,9 @@ async function handleToolCall(name, rawArgs, activeRequests) {
         ...(model ? { model } : {}),
         ...(effort ? { effort } : {}),
         ...(terminal ? { terminal } : {}),
+        ...(policy ? { policy } : {}),
+        ...(typeof args.network === 'boolean' ? { network: args.network } : {}),
+        ...(typeof rawAllowSubWorkers === 'boolean' ? { allowSubWorkers: rawAllowSubWorkers } : {}),
         ...(typeof args.confirmed === 'boolean' ? { confirmed: args.confirmed } : {}),
         ...(typeof (args.authorizeReviews ?? args.authorize_reviews) === 'boolean'
           ? { authorizeReviews: Boolean(args.authorizeReviews ?? args.authorize_reviews) }

@@ -731,6 +731,12 @@
   gap: 5px;
 }
 
+.obp-native-qa {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
 .obp-reply-row {
   display: flex;
   align-items: center;

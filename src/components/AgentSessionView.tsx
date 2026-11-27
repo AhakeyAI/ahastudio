@@ -3,7 +3,7 @@ import { ArrowDown, Cpu, Folder, History, Square, SquareTerminal, Workflow } fro
 import { useTimelineScroll } from '../hooks/useTimelineScroll';
 import { useWorkerTimeline } from '../hooks/useWorkerTimeline';
 import { agentSessionClient, codexCatalogClient, isStandaloneSession, usageLimitsClient } from '../lib/agent-session-client';
-import { DRIVER_LABELS, sessionCapabilities } from '../lib/session-capabilities';
+import { DRIVER_LABELS, headlessWorkerControls, sessionCapabilities } from '../lib/session-capabilities';
 import { summarizeUsage, type UsageSummary } from '../lib/usage-limits';
 import type { GoalCommandAction } from '../lib/composer-slash-commands';
 import { effortLabel } from '../lib/composer-tokens';
@@ -21,6 +21,7 @@ import {
   totalTokenUsage,
 } from '../lib/worker-timeline-model';
 import type {
+  AgentDriverId,
   AgentSessionInfo,
   AgentSessionPolicy,
   AgentTurnAttachment,
@@ -93,6 +94,15 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const resumable = !handoff && Boolean(info?.providerSessionId) && (info?.status === 'suspended' || info?.status === 'failed');
   const dispatch = direct ? null : latestDispatchFor(snapshot.dispatches, win.workerId ?? timeline?.workerHandle, win.dispatchId);
   const task = dispatch ? snapshot.tasks.find((t) => t.id === dispatch.taskId) : undefined;
+  const isReviewWorker = Boolean(dispatch?.reviewOfDispatchId || dispatch?.reviewOfRunId);
+  const workerCaps = direct ? null : headlessWorkerControls(timeline?.cliId ?? dispatch?.cliId);
+  // Records from before per-Worker controls only say whether the Worker was read-only, with network off.
+  const workerPolicy: AgentSessionPolicy | undefined = direct || !timeline
+    ? undefined
+    : isReviewWorker
+      ? 'read-only'
+      : dispatch?.workerPolicy ?? timeline.policy ?? (timeline.readOnly ? 'read-only' : 'workspace-write');
+  const workerNetwork = direct || !timeline ? undefined : !isReviewWorker && (dispatch?.workerNetwork ?? timeline.network ?? false);
   const role = task?.displayName?.trim().replace(/^@+/, '');
   const title = direct ? info?.title || win.title : role ? `@${role}` : task?.taskTitle || win.title;
   const usage = totalTokenUsage(timeline);
@@ -104,6 +114,12 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   const questions = useMemo(
     () => snapshot.questions.filter((q) => q.status === 'pending' && q.dispatchId === targetDispatchId),
     [snapshot.questions, targetDispatchId],
+  );
+  const nativeQuestions = useMemo(
+    () => direct ? [] : (snapshot.openNativeQuestions ?? []).filter((q) =>
+      q.status === 'pending' &&
+      ((targetDispatchId && q.dispatchId === targetDispatchId) || (win.workerId && q.workerHandle === win.workerId))),
+    [direct, snapshot.openNativeQuestions, targetDispatchId, win.workerId],
   );
   const appearance = useSyncExternalStore(terminalSessionStore.subscribe, terminalSessionStore.getAppearance);
   const sessionId = direct ? win.workerId : undefined;
@@ -242,9 +258,22 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
   };
 
   const answer = async (requestId: string, answers: Record<string, string[]> | null) => {
-    if (!sessionId) return false;
-    return run('answer', async () => window.vibeMeet?.agentSessions?.answer({ id: sessionId, requestId, answers }));
+    if (sessionId) {
+      return run('answer', async () => window.vibeMeet?.agentSessions?.answer({ id: sessionId, requestId, answers }));
+    }
+    if (!api?.workerAnswerQuestion) return false;
+    return run('answer', () => api.workerAnswerQuestion!({
+      id: requestId, ...(targetDispatchId ? { dispatchId: targetDispatchId } : {}), answers,
+    }));
   };
+
+  const updateWorkerControls = (patch: { policy?: AgentSessionPolicy; network?: boolean }) => {
+    if (direct || !targetDispatchId || !api?.workerUpdateControls) return;
+    void run('controls', () => api.workerUpdateControls!({ dispatchId: targetDispatchId, ...patch }));
+  };
+  const canChangeWorkerControls = Boolean(
+    !direct && alive && !running && !isReviewWorker && workerCaps && targetDispatchId && api?.workerUpdateControls,
+  );
 
   const interrupt = () => {
     if (sessionId) {
@@ -527,7 +556,9 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
     runGoalCommand, runFeedbackCommand, dismissFeedback,
   ]);
 
-  const stage = dispatch?.stage;
+  const stage = approvals.length > 0
+    ? 'waiting_permission'
+    : questions.length > 0 || nativeQuestions.length > 0 ? 'waiting_input' : dispatch?.stage;
   const stageLabel = direct
     ? (info ? SESSION_STATUS_LABELS[info.status] : '已结束')
     : stage ? STAGE_LABELS[stage] ?? stage : timeline ? (alive ? '运行中' : '已结束') : '';
@@ -673,7 +704,25 @@ export function AgentSessionView({ win, onNotify }: { win: StageWindow; onNotify
               ...(handoff ? { endedText: '会话正在终端中继续，这里暂停发送' } : {}),
               resumable,
               directQuestions: info?.pendingQuestions ?? [], onAnswer: answer,
-            } : {})}
+            } : {
+              ...(workerPolicy ? {
+                policy: workerPolicy,
+                ...(canChangeWorkerControls && workerCaps!.policies.includes(workerPolicy) ? {
+                  onPolicyChange: (next: AgentSessionPolicy) => updateWorkerControls({ policy: next }),
+                  policyChoices: workerCaps!.policies,
+                } : isReviewWorker ? { policyLockedReason: '审查任务锁定只读' } : {}),
+              } : {}),
+              ...(workerNetwork !== undefined ? {
+                network: workerNetwork,
+                ...(canChangeWorkerControls && workerCaps!.network
+                  ? { onNetworkChange: (next: boolean) => updateWorkerControls({ network: next }) } : {}),
+              } : {}),
+              controlsBusy: busy === 'controls',
+              ...(nativeQuestions.length > 0 ? {
+                directQuestions: nativeQuestions, onAnswer: answer,
+                questionProviderLabel: `${DRIVER_LABELS[(nativeQuestions[0]!.provider) as AgentDriverId] ?? nativeQuestions[0]!.provider} Worker`,
+              } : {}),
+            })}
             {...(direct && sessionId && info && info.status !== 'closed' ? {
               toolbar: {
                 sessionId,

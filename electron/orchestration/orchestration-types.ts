@@ -1,3 +1,4 @@
+import type { AgentQuestion, AgentSessionPolicy } from './agent-session-driver.js';
 import type { WorkerTimelineSnapshot } from './worker-timeline.js';
 
 export const ORCHESTRATION_MESSAGE_TYPES = [
@@ -102,6 +103,27 @@ export interface WorkerApprovalPayload {
   createdAt: string;
   resolvedAt?: string | null;
   resolvedBy?: string | null;
+  reason?: string | null;
+}
+
+export type WorkerNativeQuestionStatus = 'pending' | 'answered' | 'skipped' | 'expired';
+
+/** A structured question a headless Worker's own agent asked through its native protocol. */
+export interface WorkerNativeQuestionPayload {
+  requestId: string;
+  dispatchId: string;
+  taskId: string;
+  runId: string;
+  workerHandle: string;
+  /** The driver that asked (codex, claude, antigravity, grok). */
+  provider: string;
+  method: string;
+  questions: AgentQuestion[];
+  status: WorkerNativeQuestionStatus;
+  createdAt: string;
+  resolvedAt?: string | null;
+  resolvedBy?: string | null;
+  answers?: Record<string, string[]> | null;
   reason?: string | null;
 }
 
@@ -219,6 +241,10 @@ export interface OrchestrationDispatchProposal {
   model: string | null;
   effort: string | null;
   terminal: string | null;
+  /** Headless Worker permission tier, network access, and sub-Worker opt-in; the person may change them on approval. */
+  policy?: AgentSessionPolicy | null;
+  network?: boolean | null;
+  allowSubWorkers?: boolean;
   authorizeReviews?: boolean;
   status: OrchestrationDispatchProposalStatus;
   createdAt: string;
@@ -332,6 +358,10 @@ export interface CodexPilotTurnRecord {
 export interface OrchestrationDispatchRecord {
   executionMode?: 'codex-app-server';
   providerSessionId?: string;
+  /** Headless Workers only. Records without them are read-only exactly when the timeline says so, with network off. */
+  workerPolicy?: AgentSessionPolicy;
+  workerNetwork?: boolean;
+  allowSubWorkers?: boolean;
   codexTurn?: CodexPilotTurnRecord;
   codexDeliveryFailure?: 'unknown_acceptance' | 'not_accepted';
   id: string;
@@ -568,6 +598,7 @@ export interface OrchestrationSnapshot {
   messages: OrchestrationMessageRecord[];
   questions: OrchestrationQuestionRecord[];
   openApprovals?: WorkerApprovalPayload[];
+  openNativeQuestions?: WorkerNativeQuestionPayload[];
   pendingProposals?: OrchestrationDispatchProposal[];
   orchestrationModePanes?: string[];
   memberCursorsByRun?: Record<string, Record<string, OrchestrationMemberCursor>>;

@@ -50,8 +50,9 @@ function acpMcpServers(mcp: AhaMcpServerSpec, name: string) {
 
 function launchClaude(cwd: string, events: AgentSessionEvents, options: {
   policy: AgentSessionPolicy; resumeSessionId?: string; mcp?: AhaMcpServerSpec; role?: 'coordinator' | 'worker'; instructions?: string;
+  allowSubWorkers?: boolean;
 }): ClaudeSessionDriver {
-  const { policy, resumeSessionId, mcp, role, instructions } = options;
+  const { policy, resumeSessionId, mcp, role, instructions, allowSubWorkers } = options;
   const sessionId = resumeSessionId ?? randomUUID();
   return new ClaudeSessionDriver(
     spawnAgentProcess({
@@ -67,19 +68,19 @@ function launchClaude(cwd: string, events: AgentSessionEvents, options: {
     }),
     events, {
       sessionId, policy,
-      ...(mcp && role ? { ahaMcp: { role, requiredTool: role === 'coordinator' ? 'delegate_task' : 'report_done' }, secrets: ahaMcpSecrets(mcp.env) } : {}),
+      ...(mcp && role ? { ahaMcp: { role, requiredTool: role === 'coordinator' ? 'delegate_task' : 'report_done', ...(allowSubWorkers ? { allowSubWorkers: true } : {}) }, secrets: ahaMcpSecrets(mcp.env) } : {}),
     },
   );
 }
 
 function launchAcp(spec: AcpLaunchSpec, cwd: string, events: AgentSessionEvents, options: {
-  mcp?: AhaMcpServerSpec; role?: 'coordinator' | 'worker';
+  mcp?: AhaMcpServerSpec; role?: 'coordinator' | 'worker'; allowSubWorkers?: boolean;
 }): AcpSessionDriver {
-  const { mcp, role } = options;
+  const { mcp, role, allowSubWorkers } = options;
   const serverName = AHA_ACP_SERVER_NAME[spec.driver];
   return new AcpSessionDriver(
     spawnAgentProcess({ command: spec.command, args: spec.args, cwd, env: spec.env }), spec, events,
-    mcp && role ? { mcpServers: acpMcpServers(mcp, serverName), ahaMcp: { role, serverName }, secrets: ahaMcpSecrets(mcp.env) } : {},
+    mcp && role ? { mcpServers: acpMcpServers(mcp, serverName), ahaMcp: { role, serverName, ...(allowSubWorkers ? { allowSubWorkers: true } : {}) }, secrets: ahaMcpSecrets(mcp.env) } : {},
   );
 }
 
@@ -94,10 +95,11 @@ export function headlessWorkerCommand(cliId: 'claude' | 'antigravity' | 'grok'):
  */
 export function launchHeadlessWorkerDriver(
   cliId: 'claude' | 'antigravity' | 'grok', cwd: string, events: AgentSessionEvents,
-  options: { policy: AgentSessionPolicy; mcp: AhaMcpServerSpec },
+  options: { policy: AgentSessionPolicy; mcp: AhaMcpServerSpec; allowSubWorkers?: boolean },
 ): AgentSessionDriver {
-  if (cliId === 'claude') return launchClaude(cwd, events, { policy: options.policy, mcp: options.mcp, role: 'worker' });
-  return launchAcp(ACP_LAUNCH_SPECS[cliId], cwd, events, { mcp: options.mcp, role: 'worker' });
+  const { allowSubWorkers } = options;
+  if (cliId === 'claude') return launchClaude(cwd, events, { policy: options.policy, mcp: options.mcp, role: 'worker', allowSubWorkers });
+  return launchAcp(ACP_LAUNCH_SPECS[cliId], cwd, events, { mcp: options.mcp, role: 'worker', allowSubWorkers });
 }
 
 export type DriverLaunch = (sessionId: string, cwd: string, events: AgentSessionEvents, options: DriverLaunchOptions) => AgentSessionDriver;

@@ -2,6 +2,8 @@
 // Providers translate their wire events into WorkerTimelineEvent; this module owns
 // state, redaction, size caps, patches, and archival trimming.
 
+import type { AgentSessionPolicy } from './agent-session-driver.js';
+
 export type WorkerTimelineTurnStatus = 'running' | 'completed' | 'interrupted' | 'failed';
 export type WorkerTimelineItemStatus = 'running' | 'completed' | 'failed' | 'declined';
 export type WorkerTimelineApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired';
@@ -157,6 +159,9 @@ export interface WorkerTimelineSnapshot {
   cliId: string;
   model: string | null;
   readOnly: boolean;
+  /** Absent on timelines saved before per-Worker controls: `readOnly` decides, with network off. */
+  policy?: AgentSessionPolicy;
+  network?: boolean;
   alive: boolean;
   seq: number;
   turns: WorkerTimelineTurn[];
@@ -375,6 +380,8 @@ export interface WorkerTimelineOptions {
   cliId: string;
   model: string | null;
   readOnly: boolean;
+  policy?: AgentSessionPolicy;
+  network?: boolean;
   redact?: (text: string) => string;
   now?: () => number;
   onPatch?: (patch: WorkerTimelineChange) => void;
@@ -405,6 +412,8 @@ export class WorkerTimeline {
       cliId: options.cliId,
       model: options.model,
       readOnly: options.readOnly,
+      ...(options.policy !== undefined ? { policy: options.policy } : {}),
+      ...(options.network !== undefined ? { network: options.network } : {}),
       alive: true,
       seq: 0,
     };
@@ -416,6 +425,8 @@ export class WorkerTimeline {
 
   private restore(initial: WorkerTimelineSnapshot): void {
     this.header.providerSessionId = initial.providerSessionId;
+    if (initial.policy !== undefined && this.header.policy === undefined) this.header.policy = initial.policy;
+    if (initial.network !== undefined && this.header.network === undefined) this.header.network = initial.network;
     for (const turn of structuredClone(initial.turns)) {
       // A turn still running when the snapshot was taken can never finish now.
       if (turn.status === 'running') {
@@ -443,8 +454,11 @@ export class WorkerTimeline {
     return this.turns.some((turn) => turn.dispatchId === dispatchId);
   }
 
-  setMeta(meta: Partial<Pick<WorkerTimelineHeader, 'alive' | 'providerSessionId' | 'model' | 'readOnly'>>): void {
+  setMeta(
+    meta: Partial<Pick<WorkerTimelineHeader, 'alive' | 'providerSessionId' | 'model' | 'readOnly' | 'policy' | 'network'>>,
+  ): void {
     Object.assign(this.header, meta);
+    if (meta.policy !== undefined) this.header.readOnly = meta.policy === 'read-only';
     this.changed(null, null);
   }
 

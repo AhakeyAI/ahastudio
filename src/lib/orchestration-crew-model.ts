@@ -1,5 +1,6 @@
 import type {
   AgentPaneStatus,
+  AgentSessionPolicy,
   OrchestrationDispatchProposal,
   OrchestrationDispatchRecord,
   OrchestrationDispatchStage,
@@ -9,6 +10,7 @@ import type {
   OrchestrationSnapshot,
   OrchestrationTaskRecord,
   WorkerApprovalPayload,
+  WorkerNativeQuestionPayload,
 } from '../types';
 import { isSamePath } from './git-panel-model';
 import { shortId, taskTitle, type StatusTone } from './orchestration-view';
@@ -37,6 +39,14 @@ export interface CrewMemberEntry {
   retained: boolean;
   isSettled: boolean;
   needsAttention: boolean;
+  /** Headless Workers: the tier and network access their next turn runs with. */
+  workerControls?: {
+    policy: AgentSessionPolicy;
+    network: boolean;
+    allowSubWorkers: boolean;
+    /** Reviews stay read-only without network access. */
+    locked: boolean;
+  };
 }
 
 export interface CrewPeerEntry {
@@ -63,6 +73,7 @@ export interface PaneCrewViewModel {
   talkingWith: CrewPeerEntry[];
   openApprovals: WorkerApprovalPayload[];
   openQuestions: OrchestrationQuestionRecord[];
+  openNativeQuestions: WorkerNativeQuestionPayload[];
   openGates: OrchestrationGateRecord[];
   workingCount: number;
   attentionCount: number;
@@ -240,14 +251,17 @@ function toWorkerCrewEntry(
   const hasOpenApproval = (snapshot.openApprovals ?? []).some(
     (a) => a.dispatchId === dispatch.id && a.status === 'pending',
   );
-  const hasOpenQuestion = snapshot.questions.some(
-    (q) => q.dispatchId === dispatch.id && q.status === 'pending',
-  );
+  const hasOpenQuestion =
+    snapshot.questions.some((q) => q.dispatchId === dispatch.id && q.status === 'pending') ||
+    (snapshot.openNativeQuestions ?? []).some(
+      (q) => q.dispatchId === dispatch.id && q.status === 'pending',
+    );
   const stage = deriveClientDispatchStage(dispatch, agentStatus, hasOpenApproval, hasOpenQuestion);
   const isSettled = !isActiveStatus(dispatch.status);
   const roleName = task?.displayName?.trim().replace(/^@+/, '') || null;
   const title = task ? taskTitle(task) : shortId(dispatch.taskId);
   const cliId = dispatch.cliId ?? agentStatus?.agentId ?? null;
+  const isReview = Boolean(dispatch.reviewOfDispatchId || dispatch.reviewOfRunId);
   const needsAttention =
     stage === 'waiting_permission' ||
     stage === 'waiting_input' ||
@@ -280,6 +294,14 @@ function toWorkerCrewEntry(
     retained: Boolean(dispatch.retained),
     isSettled,
     needsAttention,
+    ...(dispatch.executionMode === 'codex-app-server' && (dispatch.workerPolicy || isReview) ? {
+      workerControls: {
+        policy: isReview ? 'read-only' as const : dispatch.workerPolicy!,
+        network: !isReview && dispatch.workerNetwork === true,
+        allowSubWorkers: !isReview && dispatch.allowSubWorkers === true,
+        locked: isReview,
+      },
+    } : {}),
   };
 }
 
@@ -428,6 +450,13 @@ export function buildCrewViewForPane(
         q.toHandle === ptyId ||
         (ownDispatch !== null && q.toHandle === `dispatch:${ownDispatch.id}`)),
   );
+  const openNativeQuestions = (snapshot.openNativeQuestions ?? []).filter(
+    (q) =>
+      q.status === 'pending' &&
+      (managedDispatchIdSet.has(q.dispatchId) ||
+        coordinatedRunIds.has(q.runId) ||
+        (ownDispatch !== null && q.dispatchId === ownDispatch.id)),
+  );
   const managedTaskIds = new Set(managing.map((m) => m.task?.id).filter((id): id is string => Boolean(id)));
   const openGates = snapshot.gates.filter(
     (g) =>
@@ -514,6 +543,7 @@ export function buildCrewViewForPane(
     pendingProposals.length +
     openApprovals.length +
     openQuestions.length +
+    openNativeQuestions.length +
     openGates.length +
     memberAttention;
   const totalCount = (managedBy ? 1 : 0) + managing.length + talkingWith.length;
@@ -524,6 +554,7 @@ export function buildCrewViewForPane(
     totalCount > 0 ||
     openApprovals.length > 0 ||
     openQuestions.length > 0 ||
+    openNativeQuestions.length > 0 ||
     openGates.length > 0;
 
   let pillLabel = isOrchestrationMode ? '编排中' : '编排';
@@ -538,8 +569,8 @@ export function buildCrewViewForPane(
   } else if (openApprovals.length > 0) {
     pillLabel = `${openApprovals.length} 待授权`;
     pillTone = 'warn';
-  } else if (openQuestions.length + openGates.length > 0) {
-    pillLabel = `${openQuestions.length + openGates.length} 待回复`;
+  } else if (openQuestions.length + openNativeQuestions.length + openGates.length > 0) {
+    pillLabel = `${openQuestions.length + openNativeQuestions.length + openGates.length} 待回复`;
     pillTone = 'warn';
   } else if (workingCount > 0) {
     pillLabel = `${workingCount} 执行中`;
@@ -590,6 +621,7 @@ export function buildCrewViewForPane(
     talkingWith,
     openApprovals,
     openQuestions,
+    openNativeQuestions,
     openGates,
     workingCount,
     attentionCount,
