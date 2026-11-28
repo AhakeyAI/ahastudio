@@ -288,7 +288,10 @@ export interface HeadlessWorkerControls {
 }
 
 /** How a headless Worker process is launched; sub-Worker tools are fixed for the life of the process. */
-export type HeadlessWorkerLaunchOptions = HeadlessWorkerControls;
+export type HeadlessWorkerLaunchOptions = HeadlessWorkerControls & {
+  /** Reopens this provider conversation instead of starting one (Claude needs it at launch). */
+  resumeSessionId?: string;
+};
 
 export interface OrchestrationServiceDependencies {
   store: OrchestrationStore;
@@ -345,6 +348,13 @@ export interface OrchestrationServiceDependencies {
   proposalTtlMs?: number;
   stallWatchdogIntervalMs?: number;
   stallThresholdMs?: number;
+  /**
+   * Idle time after which a settled headless Worker's process is closed so it sleeps until a
+   * follow-up resumes its conversation; 0 (the default) keeps Workers running.
+   */
+  headlessWorkerDormancyMs?: number;
+  /** How often idle headless Workers are checked for dormancy; 0 leaves it to explicit sweeps. */
+  headlessWorkerDormancySweepMs?: number;
   cliCommand?: string;
   briefsDir?: string | null;
   maxDepth?: number;
@@ -500,6 +510,7 @@ export class OrchestrationService {
       buildWorkerDispatchBrief: (...args) => this.buildWorkerDispatchBrief(...args),
       canHeadlessWorkerDelegate: (...args) => this.canHeadlessWorkerDelegate(...args),
       get cliCommand() { return svc.cliCommand; },
+      clock: () => this.clock(),
       get closeWorkerPty() { return svc.closeWorkerPty; },
       get codexPilot() { return svc.codexPilot; },
       createWorkerTimeline: (...args) => this.createWorkerTimeline(...args),
@@ -512,6 +523,7 @@ export class OrchestrationService {
       get exitedPanes() { return svc.exitedPanes; },
       failTaskIfReady: (...args) => this.failTaskIfReady(...args),
       get getDefaultCwd() { return svc.getDefaultCwd; },
+      headlessWorkerDormancyMs: Math.max(0, deps.headlessWorkerDormancyMs ?? 0),
       get headlessWorkers() { return svc.headlessWorkers; },
       inferRunIdOptional: (...args) => this.inferRunIdOptional(...args),
       get integration() { return svc.integration; },
@@ -719,6 +731,7 @@ export class OrchestrationService {
     if ((deps.stallWatchdogIntervalMs ?? 0) > 0) {
       this.stallWatchdog.start();
     }
+    this.workers.startDormancySweep(deps.headlessWorkerDormancySweepMs ?? 0);
 
     this.disposeStatusListener = this.agentStatusStore.onChange((status) => {
       if (status.state === 'working' || status.state === 'waiting') {
@@ -4734,7 +4747,7 @@ export class OrchestrationService {
     const session = this.workers.codexWorkers.get(dispatch.assigneeHandle);
     const alive = Boolean(session?.alive && !dispatch.releasedAt);
     const busy = alive && (session!.busy || this.workers.codexSubmitting.has(dispatch.id));
-    return { ...dispatch, headlessLive: { alive, busy } };
+    return { ...dispatch, headlessLive: { alive, busy, dormant: !alive && this.workers.isDormant(dispatch) } };
   }
 
   getSnapshot(runId?: string, callerPaneId?: string): OrchestrationSnapshot {
@@ -4828,6 +4841,7 @@ export class OrchestrationService {
     }
     this.activeCoordinator = null;
     this.stallWatchdog.dispose();
+    this.workers.stopDormancySweep();
     this.peerPingPong.clearAll();
     this.turnStopMonitor.dispose();
     this.approvals.dispose();

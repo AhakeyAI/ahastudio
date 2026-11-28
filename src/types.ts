@@ -900,8 +900,11 @@ export interface OrchestrationDispatchRecord {
   workerPolicy?: AgentSessionPolicy;
   workerNetwork?: boolean;
   allowSubWorkers?: boolean;
-  /** Snapshot only, never stored: whether a headless Worker's process is alive and a turn is running. */
-  headlessLive?: { alive: boolean; busy: boolean };
+  /**
+   * Snapshot only, never stored: whether a headless Worker's process is alive and a turn is running,
+   * and whether a Worker without a process can be woken in place from its provider conversation.
+   */
+  headlessLive?: { alive: boolean; busy: boolean; dormant?: boolean };
   codexTurn?: {
     turnId: string;
     stopReason: string;

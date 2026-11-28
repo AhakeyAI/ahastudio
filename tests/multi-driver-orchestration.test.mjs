@@ -924,7 +924,7 @@ test('headless Worker approvals record real provider/toolName, follow-up errors 
   await until(() => app.launches[0].permReply);
   assert.deepEqual(app.launches[0].permReply, { outcome: { outcome: 'selected', optionId: 'allow' } });
 
-  // 2. Exited settled Grok Worker follow-up error names "Grok Worker", not "Codex Worker".
+  // 2. An exited settled Grok Worker is woken in place: same identity, its ACP session loaded again.
   app.scenario = 'report';
   const started = await app.call(coord.id, 'delegate-task', { role: 'fixer', task: 'Fix it', agent: 'grok', worktree: false });
   assert.equal(started.ok, true, started.error);
@@ -932,8 +932,13 @@ test('headless Worker approvals record real provider/toolName, follow-up errors 
   app.launches[1].child.exit(0);
   await delay(50);
   const followUp = await app.call(coord.id, 'role-message', { role: 'fixer', message: 'One more change' });
-  assert.equal(followUp.ok, false);
-  assert.match(followUp.error, /Grok Worker is unavailable/);
+  assert.equal(followUp.ok, true, followUp.error);
+  assert.equal(app.launches.length, 3);
+  assert.equal(app.launches[2].workerId, started.result.dispatch.assigneeHandle);
+  const reloaded = app.launches[2].io.seen.find((m) => m.method === 'session/load' || m.method === 'session/resume');
+  assert.equal(reloaded?.params.sessionId, started.result.dispatch.providerSessionId);
+  await until(() => app.store.listDispatches({ runId: started.result.run.id })
+    .some((d) => d.followUpOfDispatchId === started.result.dispatch.id && d.status === 'completed'));
 
   // 3. Real aha-mcp-server.cjs notifications/cancelled aborts in-flight HTTP gate and expires the Coordinator approval card.
   assert.equal((await manager.send(coord.id, { text: 'HOLD integrate' })).status, 'accepted');

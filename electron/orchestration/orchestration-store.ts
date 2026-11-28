@@ -18,6 +18,7 @@ import type {
   OrchestrationReportArtifacts,
   OrchestrationReviewFinding,
   OrchestrationReviewStatus,
+  OrchestrationResumeClaim,
   OrchestrationRunIntegrationStatus,
   OrchestrationRunRecord,
   OrchestrationSnapshot,
@@ -399,6 +400,24 @@ export class OrchestrationStore implements OrchestrationUnitOfWork {
 
   getActiveDispatchForIdentity(handle: string, paneId?: string | null): OrchestrationDispatchRecord | undefined {
     return this.lifecycle.getActiveDispatchForIdentity(handle, paneId);
+  }
+
+  acquireResumeClaim(
+    ...args: Parameters<OrchestrationLifecycleStore['acquireResumeClaim']>
+  ): ReturnType<OrchestrationLifecycleStore['acquireResumeClaim']> {
+    return this.lifecycle.acquireResumeClaim(...args);
+  }
+
+  activateResumeClaim(claimId: string, pid: number | null): OrchestrationResumeClaim | undefined {
+    return this.lifecycle.activateResumeClaim(claimId, pid);
+  }
+
+  releaseResumeClaims(workerId: string): void {
+    this.lifecycle.releaseResumeClaims(workerId);
+  }
+
+  listResumeClaims(): OrchestrationResumeClaim[] {
+    return this.lifecycle.listResumeClaims();
   }
 
   listDispatches(filter?: {

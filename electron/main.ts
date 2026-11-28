@@ -404,10 +404,11 @@ app.whenReady().then(async () => {
     },
     headlessWorkers: {
       available: (cliId) => resolveAgentCommand(headlessWorkerCommand(cliId)) !== null,
-      launch: (cliId, workerId, cwd, events, { policy, allowSubWorkers }) => {
+      launch: (cliId, workerId, cwd, events, { policy, allowSubWorkers, resumeSessionId }) => {
         if (!agentHookServer) throw new Error('Aha MCP Server is unavailable');
         return launchHeadlessWorkerDriver(cliId, cwd, events, {
           policy, allowSubWorkers, mcp: ahaMcpServer(agentHookServer.envForWorker(workerId)),
+          ...(resumeSessionId ? { resumeSessionId } : {}),
         });
       },
     },
@@ -423,6 +424,8 @@ app.whenReady().then(async () => {
     getPeerMessagingMode: () =>
       normalizeOrchestrationSettings(getSettings().orchestration).peerMessagingMode,
     stallWatchdogIntervalMs: 10_000,
+    headlessWorkerDormancyMs: 5 * 60_000,
+    headlessWorkerDormancySweepMs: 30_000,
     stallThresholdMs: 25_000,
     isMcpEnabledForCli: (cliId) => {
       if (!mcpCliIdSet.has(cliId)) return false;
