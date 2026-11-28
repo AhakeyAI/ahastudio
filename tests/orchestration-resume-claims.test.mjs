@@ -58,6 +58,32 @@ test('claims from an earlier app run stay stale until their process is gone', as
   assert.deepEqual(restarted.listResumeClaims().map((c) => c.id), [next.id]);
 });
 
+test('observation facts are append-only, redacted, bounded per run, and survive a reload', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aha-facts-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const statePath = join(dir, 'state.json');
+  const store = new OrchestrationStore({ resolveFile: () => statePath });
+  const run = store.createRun({ objective: 'Facts', coordinatorHandle: 'coordinator-pane' });
+  const first = store.appendObservationFact({ runId: run.id, dispatchId: 'd-1', workerId: 'w', kind: 'turn_started', data: { n: 0 } });
+  first.data.n = 99;
+  assert.equal(store.listObservationFacts({ runId: run.id })[0].data.n, 0, 'callers get copies; the log never changes');
+  for (let i = 1; i < 450; i++) {
+    store.appendObservationFact({ runId: run.id, dispatchId: 'd-1', workerId: 'w', kind: 'turn_completed', data: { n: i } });
+  }
+  const kept = store.listObservationFacts({ runId: run.id, limit: 1_000 });
+  assert.equal(kept.length, 400);
+  assert.equal(kept[0].data.n, 50, 'the oldest facts of the run go first');
+  assert.ok(kept.every((fact, i) => i === 0 || fact.seq > kept[i - 1].seq));
+  assert.deepEqual(store.listObservationFacts({ runId: run.id, afterSeq: kept.at(-2).seq }).map((f) => f.data.n), [449]);
+  await store.flushDurable();
+
+  const reloaded = new OrchestrationStore({ resolveFile: () => statePath });
+  reloaded.load();
+  assert.equal(reloaded.listObservationFacts({ runId: run.id, limit: 1_000 }).length, 400);
+  const next = reloaded.appendObservationFact({ runId: run.id, dispatchId: null, workerId: null, kind: 'snapshot', data: {} });
+  assert.ok(next.seq > kept.at(-1).seq, 'sequence numbers keep increasing across reloads');
+});
+
 test('killing an agent process tree stops the process and its liveness check follows', async () => {
   const child = markProcessGroupLeader(spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
     stdio: 'ignore', detached: SPAWN_AGENT_PROCESS_GROUP, windowsHide: true,

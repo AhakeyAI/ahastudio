@@ -712,6 +712,9 @@ test('cross-CLI handoff keeps the worktree, starts the new agent from redacted c
 
   const [record] = app.store.listWorkerHandoffs({ runId: source.runId });
   assert.equal(record.status, 'completed');
+  const handoffFacts = app.store.listObservationFacts({ runId: source.runId }).filter((fact) => fact.kind === 'handoff');
+  assert.deepEqual(handoffFacts.map((fact) => fact.data.status), ['pending', 'active', 'completed']);
+  assert.ok(handoffFacts.every((fact) => fact.data.handoffId === record.id && fact.data.toCli === 'claude'));
   assert.equal(record.targetDispatchId, next.id);
   assert.match(record.snapshotOid, /^[0-9a-f]{40}$/);
   assert.equal(app.store.listResumeClaims().find((c) => c.workerId === next.assigneeHandle)?.status, 'active');
@@ -770,6 +773,15 @@ test('a resident Worker keeps its worktree after integration and starts its next
   assert.equal(gitOut(first.worktreePath, 'branch', '--show-current'), next.branch);
   assert.equal(gitOut(repo, 'branch', '--list', first.branch), '', 'the integrated wave-one branch is gone');
   assert.equal(app.store.getDispatchContext(first.id).residentAfterIntegration, undefined);
+  const integratedFact = app.store.listObservationFacts({ dispatchId: first.id }).find((fact) => fact.kind === 'integrated');
+  assert.equal(integratedFact.data.resident, true);
+  assert.equal(integratedFact.data.targetBranch, 'main');
+  const waveFact = app.store.listObservationFacts({ dispatchId: next.id }).find((fact) => fact.kind === 'wave_started');
+  assert.deepEqual([waveFact.data.branch, waveFact.data.inPlace, waveFact.data.previousDispatchId], [next.branch, true, first.id]);
+  const viaHttp = await app.call(SESSION_A, 'facts', { runId: first.runId, afterSeq: integratedFact.seq - 1 });
+  assert.equal(viaHttp.ok, true, viaHttp.error);
+  assert.ok(viaHttp.result.some((fact) => fact.kind === 'wave_started'));
+  assert.ok(viaHttp.result.every((fact) => fact.seq >= integratedFact.seq));
   await until(() => app.store.getDispatchContext(next.id).status === 'completed');
   // The same process reports both waves; let the second reply land before teardown.
   await until(() => app.launches.at(-1).reports >= 2);

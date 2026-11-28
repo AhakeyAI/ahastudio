@@ -42,6 +42,7 @@ import {
   type OrchestrationReviewStatus,
   type OrchestrationResumeClaim,
   type OrchestrationWorkerHandoff,
+  type OrchestrationObservationFact,
   type OrchestrationRunIntegrationStatus,
   type OrchestrationRunRecord,
   type OrchestrationStartObservation,
@@ -60,6 +61,10 @@ import {
 } from './orchestration-state-repository.js';
 import { DISPATCH_CREDENTIAL_PREFIX } from './orchestration-security-store.js';
 import { type OrchestrationStoreContext, OrchestrationStoreSlice } from './orchestration-store-slice.js';
+
+/** Bounds on the append-only observation log. */
+const MAX_FACTS_PER_RUN = 400;
+const MAX_FACTS = 4_000;
 
 export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
   private briefsDirOverride: string | null;
@@ -800,8 +805,55 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
       updatedAt: now,
     };
     this.state.workerHandoffs.set(handoff.id, handoff);
+    this.recordHandoffFact(handoff);
     this.persist();
     return { ...handoff };
+  }
+
+  private recordHandoffFact(handoff: OrchestrationWorkerHandoff): void {
+    this.appendObservationFact({
+      runId: handoff.runId, dispatchId: handoff.targetDispatchId ?? handoff.sourceDispatchId, workerId: handoff.targetWorkerId,
+      kind: 'handoff',
+      data: {
+        handoffId: handoff.id, status: handoff.status, fromCli: handoff.fromCli, toCli: handoff.toCli,
+        snapshotOid: handoff.snapshotOid, sourceDispatchId: handoff.sourceDispatchId,
+      },
+    });
+  }
+
+  /**
+   * Appends a fact; facts are never changed afterwards. Each run keeps its newest
+   * `MAX_FACTS_PER_RUN`, and the whole log its newest `MAX_FACTS`.
+   */
+  appendObservationFact(input: Omit<OrchestrationObservationFact, 'seq' | 'at'>): OrchestrationObservationFact {
+    const fact: OrchestrationObservationFact = {
+      ...input,
+      data: Object.fromEntries(Object.entries(input.data).map(([key, value]) => [
+        key, typeof value === 'string' ? this.security.redactDispatchCredentials(value).slice(0, 500) : value,
+      ])),
+      seq: this.state.nextObservationFactSeq++,
+      at: this.now(),
+    };
+    const facts = this.state.observationFacts;
+    facts.push(fact);
+    const forRun = facts.filter((entry) => entry.runId === fact.runId);
+    if (forRun.length > MAX_FACTS_PER_RUN) {
+      const drop = new Set(forRun.slice(0, forRun.length - MAX_FACTS_PER_RUN).map((entry) => entry.seq));
+      this.state.observationFacts = facts.filter((entry) => !drop.has(entry.seq));
+    }
+    if (this.state.observationFacts.length > MAX_FACTS) this.state.observationFacts.splice(0, this.state.observationFacts.length - MAX_FACTS);
+    this.persist();
+    return { ...fact, data: { ...fact.data } };
+  }
+
+  listObservationFacts(filter: { runId?: string; dispatchId?: string; workerId?: string; afterSeq?: number; limit?: number } = {}): OrchestrationObservationFact[] {
+    const matched = this.state.observationFacts.filter((fact) =>
+      (!filter.runId || fact.runId === filter.runId) &&
+      (!filter.dispatchId || fact.dispatchId === filter.dispatchId) &&
+      (!filter.workerId || fact.workerId === filter.workerId) &&
+      (filter.afterSeq === undefined || fact.seq > filter.afterSeq));
+    const limit = Math.max(1, Math.min(filter.limit ?? 200, 1_000));
+    return matched.slice(-limit).map((fact) => ({ ...fact, data: { ...fact.data } }));
   }
 
   updateWorkerHandoff(
@@ -810,7 +862,9 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
   ): OrchestrationWorkerHandoff | undefined {
     const handoff = this.state.workerHandoffs.get(id);
     if (!handoff) return undefined;
+    const statusChanged = patch.status !== undefined && patch.status !== handoff.status;
     Object.assign(handoff, patch, { updatedAt: this.now() });
+    if (statusChanged) this.recordHandoffFact(handoff);
     this.persist();
     return { ...handoff };
   }

@@ -19,6 +19,7 @@ import type {
   OrchestrationTaskRecord,
   OrchestrationResumeClaim,
   OrchestrationWorkerHandoff,
+  OrchestrationObservationFact,
 } from './orchestration-types.js';
 
 export interface DeferredDispatchPrompt {
@@ -49,6 +50,8 @@ export class OrchestrationStoreState {
   memberCursorsByRun = new Map<string, Map<string, OrchestrationMemberCursor>>();
   resumeClaims = new Map<string, OrchestrationResumeClaim>();
   workerHandoffs = new Map<string, OrchestrationWorkerHandoff>();
+  observationFacts: OrchestrationObservationFact[] = [];
+  nextObservationFactSeq = 1;
 }
 
 export function emptyPersistedState(): OrchestrationPersistedState {
@@ -357,6 +360,13 @@ export function hydrateOrchestrationState(state: OrchestrationStoreState, parsed
       }
       : { ...handoff });
   }
+  state.observationFacts = (parsed.observationFacts ?? []).filter(
+    (fact) => fact && Number.isSafeInteger(fact.seq) && typeof fact.runId === 'string' && typeof fact.kind === 'string',
+  ).map((fact) => ({ ...fact, data: { ...(fact.data ?? {}) } }));
+  state.nextObservationFactSeq = Math.max(
+    Number.isSafeInteger(parsed.nextObservationFactSeq) ? parsed.nextObservationFactSeq! : 1,
+    ...state.observationFacts.map((fact) => fact.seq + 1),
+  );
   state.deferredPrompts.clear();
   for (const [id, prompt] of Object.entries(parsed.deferredDispatchPrompts ?? {})) {
     const dispatch = state.dispatches.get(id);
@@ -396,6 +406,8 @@ export function exportOrchestrationState(state: OrchestrationStoreState): Orches
     memberCursorsByRun: exportMemberCursorsByRun(state),
     resumeClaims: [...state.resumeClaims.values()],
     workerHandoffs: [...state.workerHandoffs.values()],
+    observationFacts: state.observationFacts,
+    nextObservationFactSeq: state.nextObservationFactSeq,
   };
 }
 

@@ -371,6 +371,16 @@ export class OrchestrationIntegrationService {
     };
   }
 
+  private recordIntegratedFact(dispatch: OrchestrationDispatchRecord, result: WorkerIntegrationResult, resident: boolean): void {
+    this.host.store.appendObservationFact({
+      runId: dispatch.runId, dispatchId: dispatch.id, workerId: dispatch.assigneeHandle, kind: 'integrated',
+      data: {
+        mode: result.mode, integrated: result.integrated, snapshotOid: result.snapshotOid || null,
+        integratedCommit: result.integratedCommit, targetBranch: result.targetBranch, resident,
+      },
+    });
+  }
+
   async workerIntegrate(
     input: {
       dispatchId?: string;
@@ -915,6 +925,7 @@ export class OrchestrationIntegrationService {
           this.host.store.setDispatchResident(latestDispatch.id, {
             targetBranch: result.targetBranch, integratedBranchOid: branchOidBeforeIntegrate, integratedSnapshotOid: result.snapshotOid,
           });
+          this.recordIntegratedFact(latestDispatch, result, true);
           this.host.emitChanged('worker:integrated', latestDispatch.runId);
           return {
             ...result, dispatchId: latestDispatch.id, taskId: latestDispatch.taskId, role,
@@ -951,6 +962,7 @@ export class OrchestrationIntegrationService {
         }
       }
 
+      this.recordIntegratedFact(latestDispatch, result, false);
       this.host.emitChanged('worker:integrated', latestDispatch.runId);
       return {
         ...result,

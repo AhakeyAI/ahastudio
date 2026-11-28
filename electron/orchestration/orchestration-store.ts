@@ -20,6 +20,7 @@ import type {
   OrchestrationReviewStatus,
   OrchestrationResumeClaim,
   OrchestrationWorkerHandoff,
+  OrchestrationObservationFact,
   OrchestrationRunIntegrationStatus,
   OrchestrationRunRecord,
   OrchestrationSnapshot,
@@ -437,6 +438,18 @@ export class OrchestrationStore implements OrchestrationUnitOfWork {
     ...args: Parameters<OrchestrationLifecycleStore['listWorkerHandoffs']>
   ): OrchestrationWorkerHandoff[] {
     return this.lifecycle.listWorkerHandoffs(...args);
+  }
+
+  appendObservationFact(
+    ...args: Parameters<OrchestrationLifecycleStore['appendObservationFact']>
+  ): OrchestrationObservationFact {
+    return this.lifecycle.appendObservationFact(...args);
+  }
+
+  listObservationFacts(
+    ...args: Parameters<OrchestrationLifecycleStore['listObservationFacts']>
+  ): OrchestrationObservationFact[] {
+    return this.lifecycle.listObservationFacts(...args);
   }
 
   listDispatches(filter?: {

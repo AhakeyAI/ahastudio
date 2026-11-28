@@ -77,6 +77,7 @@ import {
   type OrchestrationTaskContext,
   type OrchestrationTaskKind,
   type OrchestrationTaskRecord,
+  type OrchestrationObservationFact,
   type OrchestrationTaskShowResult,
   type OrchestrationTaskStatus,
   type OrchestrationTaskWithDispatch,
@@ -1004,6 +1005,10 @@ export class OrchestrationService {
   }
 
   private timelineNativeQuestionAnswered(payload: WorkerNativeQuestionPayload, answers: Record<string, string[]>): void {
+    this.store.appendObservationFact({
+      runId: payload.runId, dispatchId: payload.dispatchId, workerId: payload.workerHandle, kind: 'native_question',
+      data: { status: payload.status, requestId: payload.requestId, answered: Object.keys(answers).length },
+    });
     const timeline = this.workerTimelines.get(payload.workerHandle);
     if (!timeline) return;
     const text = payload.questions
@@ -1050,6 +1055,10 @@ export class OrchestrationService {
   }
 
   private timelineApproval(approval: WorkerApprovalPayload): void {
+    this.store.appendObservationFact({
+      runId: approval.runId, dispatchId: approval.dispatchId, workerId: approval.workerHandle, kind: 'approval',
+      data: { approvalId: approval.approvalId, status: approval.status, toolName: approval.toolName },
+    });
     const timeline = this.workerTimelines.get(approval.workerHandle);
     if (!timeline) return;
     timeline.upsertApproval({
@@ -4269,6 +4278,15 @@ export class OrchestrationService {
     stoppedHelperIds: string[];
   }> {
     return this.workers.workerStop(input, visitedDispatchIds);
+  }
+
+  /** The append-only observation log, scoped to the caller's run when it is an orchestration caller. */
+  listObservationFacts(
+    input: { runId?: string; dispatchId?: string; workerId?: string; afterSeq?: number; limit?: number },
+    callerPaneId?: string,
+  ): OrchestrationObservationFact[] {
+    const runId = callerPaneId === undefined ? input.runId : this.authorizeRunAccess(input.runId, callerPaneId);
+    return this.store.listObservationFacts({ ...input, runId });
   }
 
   /** Hands a stopped or settled headless Worker's task to another Coding Agent in the same worktree. */
