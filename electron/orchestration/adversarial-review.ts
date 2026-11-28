@@ -175,6 +175,8 @@ export interface RunIntegratedWorkerSummaryForReview {
   dispatchId: string;
   role: string;
   cliId?: string | null;
+  /** Every Coding Agent that wrote it, when a cross-CLI handoff added more than `cliId`. */
+  authorCliIds?: readonly string[];
   taskSpec: string;
   taskContext?: OrchestrationTaskContext | null;
   integratedCommit?: string | null;

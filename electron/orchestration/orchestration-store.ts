@@ -19,6 +19,7 @@ import type {
   OrchestrationReviewFinding,
   OrchestrationReviewStatus,
   OrchestrationResumeClaim,
+  OrchestrationWorkerHandoff,
   OrchestrationRunIntegrationStatus,
   OrchestrationRunRecord,
   OrchestrationSnapshot,
@@ -418,6 +419,24 @@ export class OrchestrationStore implements OrchestrationUnitOfWork {
 
   listResumeClaims(): OrchestrationResumeClaim[] {
     return this.lifecycle.listResumeClaims();
+  }
+
+  createWorkerHandoff(
+    ...args: Parameters<OrchestrationLifecycleStore['createWorkerHandoff']>
+  ): OrchestrationWorkerHandoff {
+    return this.lifecycle.createWorkerHandoff(...args);
+  }
+
+  updateWorkerHandoff(
+    ...args: Parameters<OrchestrationLifecycleStore['updateWorkerHandoff']>
+  ): OrchestrationWorkerHandoff | undefined {
+    return this.lifecycle.updateWorkerHandoff(...args);
+  }
+
+  listWorkerHandoffs(
+    ...args: Parameters<OrchestrationLifecycleStore['listWorkerHandoffs']>
+  ): OrchestrationWorkerHandoff[] {
+    return this.lifecycle.listWorkerHandoffs(...args);
   }
 
   listDispatches(filter?: {

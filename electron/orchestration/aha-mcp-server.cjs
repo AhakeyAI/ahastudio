@@ -573,7 +573,7 @@ function buildToolsForContext(ctx) {
     {
       name: 'manage_worker',
       description:
-        'Inspect terminal output, approve/deny a pending permission request, release resources, or stop a worker by @role (or dispatch id).',
+        'Inspect terminal output, approve/deny a pending permission request, release resources, stop a worker, or hand a stopped/finished headless worker\'s task to another Coding Agent in the same worktree (action="handoff" with agent, e.g. when its CLI hit a usage limit) by @role (or dispatch id).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -583,12 +583,16 @@ function buildToolsForContext(ctx) {
           },
           action: {
             type: 'string',
-            enum: ['read', 'approve', 'deny', 'release', 'stop'],
+            enum: ['read', 'approve', 'deny', 'release', 'stop', 'handoff'],
             description: 'Management action to perform on the target worker.',
           },
           reason: {
             type: 'string',
-            description: 'Optional reason when denying an approval or stopping a worker.',
+            description: 'Optional reason when denying an approval or stopping a worker; for action="handoff", instructions for the new agent.',
+          },
+          agent: {
+            type: 'string',
+            description: 'For action="handoff": the Coding Agent that continues the task (codex, claude, antigravity or grok).',
           },
           force: {
             type: 'boolean',
@@ -898,6 +902,8 @@ function formatManageWorkerText(res) {
       return `Released worker ${res.dispatch ? res.dispatch.id : ''} (closedPane=${Boolean(res.closedPane)}, removedWorktree=${Boolean(res.removedWorktree)}).`;
     case 'stop':
       return `Stopped worker ${res.dispatch ? res.dispatch.id : ''} (closedPane=${Boolean(res.closedPane)}, removedWorktree=${Boolean(res.removedWorktree)}).`;
+    case 'handoff':
+      return `Handed ${res.previousDispatchId || ''} to ${res.dispatch ? res.dispatch.cliId : ''} as ${res.dispatch ? res.dispatch.id : ''} (handoff ${res.handoffId || ''}); it continues in the same worktree.`;
     default:
       return JSON.stringify(res, null, 2);
   }
@@ -1113,6 +1119,7 @@ async function handleToolCall(name, rawArgs, activeRequests) {
         role: typeof args.role === 'string' ? args.role : '',
         action: typeof args.action === 'string' ? args.action : '',
         ...(reason ? { reason } : {}),
+        ...(nonEmptyStr(args.agent) ? { agent: nonEmptyStr(args.agent) } : {}),
         ...(typeof args.force === 'boolean' ? { force: args.force } : {}),
         ...(typeof args.screen === 'boolean' ? { screen: args.screen } : {}),
       });

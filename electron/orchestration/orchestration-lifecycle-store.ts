@@ -41,6 +41,7 @@ import {
   type OrchestrationReviewFinding,
   type OrchestrationReviewStatus,
   type OrchestrationResumeClaim,
+  type OrchestrationWorkerHandoff,
   type OrchestrationRunIntegrationStatus,
   type OrchestrationRunRecord,
   type OrchestrationStartObservation,
@@ -779,6 +780,47 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
     }
   }
 
+  createWorkerHandoff(
+    input: Pick<OrchestrationWorkerHandoff,
+      'runId' | 'sourceDispatchId' | 'sourceWorkerId' | 'fromCli' | 'toCli' | 'cwd' | 'targetWorkerId' | 'snapshotOid' | 'context'>
+      & { actor?: OrchestrationWorkerHandoff['actor'] },
+  ): OrchestrationWorkerHandoff {
+    const now = this.now();
+    const handoff: OrchestrationWorkerHandoff = {
+      id: `handoff-${randomUUID()}`,
+      ...input,
+      status: 'pending',
+      targetDispatchId: null,
+      providerSessionId: null,
+      reason: null,
+      announcedAt: null,
+      hostId: 'local',
+      actor: input.actor ?? 'orchestrator',
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.state.workerHandoffs.set(handoff.id, handoff);
+    this.persist();
+    return { ...handoff };
+  }
+
+  updateWorkerHandoff(
+    id: string,
+    patch: Partial<Pick<OrchestrationWorkerHandoff, 'status' | 'targetDispatchId' | 'providerSessionId' | 'reason' | 'announcedAt'>>,
+  ): OrchestrationWorkerHandoff | undefined {
+    const handoff = this.state.workerHandoffs.get(id);
+    if (!handoff) return undefined;
+    Object.assign(handoff, patch, { updatedAt: this.now() });
+    this.persist();
+    return { ...handoff };
+  }
+
+  listWorkerHandoffs(filter: { runId?: string; status?: OrchestrationWorkerHandoff['status'] } = {}): OrchestrationWorkerHandoff[] {
+    return [...this.state.workerHandoffs.values()]
+      .filter((handoff) => (!filter.runId || handoff.runId === filter.runId) && (!filter.status || handoff.status === filter.status))
+      .map((handoff) => ({ ...handoff }));
+  }
+
   listResumeClaims(): OrchestrationResumeClaim[] {
     return [...this.state.resumeClaims.values()].map((claim) => ({ ...claim }));
   }
@@ -831,6 +873,7 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
     approvedQueueLaunch?: boolean;
     providerSessionId?: string;
     providerCwd?: string;
+    authorCliIds?: readonly string[];
     workerPolicy?: AgentSessionPolicy;
     workerNetwork?: boolean;
     allowSubWorkers?: boolean;
@@ -974,6 +1017,7 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
         executionMode: 'codex-app-server' as const,
         providerSessionId: input.providerSessionId,
         ...(input.providerCwd ? { providerCwd: input.providerCwd } : {}),
+        ...(input.authorCliIds && input.authorCliIds.length > 0 ? { authorCliIds: [...new Set(input.authorCliIds)] } : {}),
         ...(input.workerPolicy !== undefined ? { workerPolicy: input.workerPolicy } : {}),
         ...(typeof input.workerNetwork === 'boolean' ? { workerNetwork: input.workerNetwork } : {}),
         ...(input.allowSubWorkers ? { allowSubWorkers: true } : {}),

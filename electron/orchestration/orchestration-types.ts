@@ -397,6 +397,11 @@ export interface OrchestrationDispatchRecord {
   providerSessionId?: string;
   /** Headless Workers only: the directory the provider conversation was opened in, where it resumes. */
   providerCwd?: string;
+  /**
+   * Every Coding Agent that wrote this wave of the task, accumulated across cross-CLI handoffs.
+   * Reviews avoid all of them; absent means only `cliId` wrote it.
+   */
+  authorCliIds?: string[];
   /** Headless Workers only. Records without them are read-only exactly when the timeline says so, with network off. */
   workerPolicy?: AgentSessionPolicy;
   workerNetwork?: boolean;
@@ -642,6 +647,37 @@ export interface OrchestrationResumeClaim {
   updatedAt: string;
 }
 
+/**
+ * A cross-CLI handoff of a headless Worker's task to another Coding Agent in the same worktree.
+ * Recorded `pending` and made durable before the new agent starts, `active` once it has a
+ * conversation, and `completed` when the follow-up dispatch exists. One found `pending` or
+ * `active` after a restart becomes `needs_attention` and is never resumed automatically.
+ */
+export interface OrchestrationWorkerHandoff {
+  id: string;
+  runId: string;
+  sourceDispatchId: string;
+  sourceWorkerId: string;
+  fromCli: string;
+  toCli: string;
+  cwd: string;
+  status: 'pending' | 'active' | 'completed' | 'failed' | 'needs_attention';
+  targetWorkerId: string;
+  targetDispatchId: string | null;
+  providerSessionId: string | null;
+  /** The worktree snapshot both quiescence checks agreed on. */
+  snapshotOid: string | null;
+  /** The redacted, size-capped context the new agent started from. */
+  context: string;
+  reason: string | null;
+  /** When the Coordinator was told an interrupted handoff needs a person. */
+  announcedAt: string | null;
+  hostId: string;
+  actor: 'orchestrator' | 'person';
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface OrchestrationPersistedState {
   version: 1;
   nextSequence: number;
@@ -663,6 +699,7 @@ export interface OrchestrationPersistedState {
   nextBoardSeqByRun?: Record<string, number>;
   memberCursorsByRun?: Record<string, Record<string, OrchestrationMemberCursor>>;
   resumeClaims?: OrchestrationResumeClaim[];
+  workerHandoffs?: OrchestrationWorkerHandoff[];
 }
 
 export interface OrchestrationSnapshot {

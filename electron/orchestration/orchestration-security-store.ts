@@ -239,6 +239,9 @@ export class OrchestrationSecurityStore extends OrchestrationStoreSlice {
     for (const [id, q] of this.state.questions.entries()) {
       if (deletedRunIds.has(q.runId)) this.state.questions.delete(id);
     }
+    for (const [id, handoff] of this.state.workerHandoffs.entries()) {
+      if (deletedRunIds.has(handoff.runId)) this.state.workerHandoffs.delete(id);
+    }
     for (const [id, d] of this.state.deliveries.entries()) {
       if (deletedRunIds.has(d.runId)) this.state.deliveries.delete(id);
     }
@@ -319,6 +322,7 @@ export class OrchestrationSecurityStore extends OrchestrationStoreSlice {
       this.state.nextBoardSeqByRun.clear();
       this.state.memberCursorsByRun.clear();
       this.state.resumeClaims.clear();
+      this.state.workerHandoffs.clear();
     } else if (scope === 'tasks') {
       removed.tasks = this.state.tasks.size;
       removed.dispatches = this.state.dispatches.size;
@@ -331,6 +335,7 @@ export class OrchestrationSecurityStore extends OrchestrationStoreSlice {
       this.state.questions.clear();
       this.state.coordinatorRuns.clear();
       this.state.resumeClaims.clear();
+      this.state.workerHandoffs.clear();
     } else {
       removed.messages = this.state.messages.size;
       this.state.boardReadersByMessageId.clear();

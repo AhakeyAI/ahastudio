@@ -355,6 +355,8 @@ export interface OrchestrationServiceDependencies {
   headlessWorkerDormancyMs?: number;
   /** How often idle headless Workers are checked for dormancy; 0 leaves it to explicit sweeps. */
   headlessWorkerDormancySweepMs?: number;
+  /** Gap between the two worktree snapshots that must agree before a cross-CLI handoff (default 2s). */
+  handoffQuiescenceMs?: number;
   cliCommand?: string;
   briefsDir?: string | null;
   maxDepth?: number;
@@ -523,6 +525,7 @@ export class OrchestrationService {
       get exitedPanes() { return svc.exitedPanes; },
       failTaskIfReady: (...args) => this.failTaskIfReady(...args),
       get getDefaultCwd() { return svc.getDefaultCwd; },
+      handoffQuiescenceMs: Math.max(0, deps.handoffQuiescenceMs ?? 2_000),
       headlessWorkerDormancyMs: Math.max(0, deps.headlessWorkerDormancyMs ?? 0),
       get headlessWorkers() { return svc.headlessWorkers; },
       inferRunIdOptional: (...args) => this.inferRunIdOptional(...args),
@@ -592,6 +595,7 @@ export class OrchestrationService {
       workerRelease: (...args) => this.workers.workerRelease(...args),
       workerStart: (...args) => this.workers.workerStart(...args),
       workerStop: (...args) => this.workers.workerStop(...args),
+      handoffWorker: (...args) => this.handoffWorker(...args),
     });
     this.integration = new OrchestrationIntegrationService({
       assertRunCoordinator: (...args) => this.assertRunCoordinator(...args),
@@ -732,6 +736,7 @@ export class OrchestrationService {
       this.stallWatchdog.start();
     }
     this.workers.startDormancySweep(deps.headlessWorkerDormancySweepMs ?? 0);
+    this.announceInterruptedHandoffs();
 
     this.disposeStatusListener = this.agentStatusStore.onChange((status) => {
       if (status.state === 'working' || status.state === 'waiting') {
@@ -4266,6 +4271,33 @@ export class OrchestrationService {
     return this.workers.workerStop(input, visitedDispatchIds);
   }
 
+  /** Hands a stopped or settled headless Worker's task to another Coding Agent in the same worktree. */
+  handoffWorker(
+    source: OrchestrationDispatchRecord,
+    input: { toCli: string; from: string; instructions?: string },
+  ): Promise<OrchestrationSendResult & { handoffId: string }> {
+    return this.workers.handoffWorker(source, input);
+  }
+
+  /**
+   * Tells each run's Coordinator once about handoffs AhaStation stopped in the middle of; they are
+   * never resumed automatically.
+   */
+  announceInterruptedHandoffs(): void {
+    for (const handoff of this.store.listWorkerHandoffs({ status: 'needs_attention' })) {
+      if (handoff.announcedAt || !this.store.getRun(handoff.runId)) continue;
+      const message = this.store.insertMessage({
+        runId: handoff.runId, from: 'system', to: `run:${handoff.runId}`, type: 'escalation', priority: 'high',
+        subject: `Handoff ${handoff.fromCli} -> ${handoff.toCli} needs attention`,
+        body: `${handoff.reason ?? 'This handoff did not finish.'} Worktree: ${handoff.cwd}. Previous dispatch: ${handoff.sourceDispatchId}. ` +
+          'Nothing was restarted. Check the worktree, then hand off again or follow up with the Worker.',
+        fromRole: 'system', mentions: ['coordinator'], kind: 'post',
+      });
+      this.store.updateWorkerHandoff(handoff.id, { announcedAt: message.createdAt });
+      this.notifyTargetAndAliases(`run:${handoff.runId}`, 'escalation', message);
+    }
+  }
+
   workerAbandon(input: {
     dispatchId?: string;
     worker?: string;
@@ -4618,13 +4650,10 @@ export class OrchestrationService {
     return this.delegation.messageWorkerByRole(callerPaneId, input);
   }
 
-  manageWorkerByRole(callerPaneId: string, input: {
-      role: string;
-      action: 'read' | 'approve' | 'deny' | 'release' | 'stop';
-      reason?: string;
-      force?: boolean;
-      screen?: boolean;
-    }): Promise<Record<string, unknown>> {
+  manageWorkerByRole(
+    callerPaneId: string,
+    input: Parameters<OrchestrationDelegationService['manageWorkerByRole']>[1],
+  ): Promise<Record<string, unknown>> {
     return this.delegation.manageWorkerByRole(callerPaneId, input);
   }
 

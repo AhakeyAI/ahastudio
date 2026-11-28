@@ -427,8 +427,9 @@ const roleMessageSchema = z.object({
 const roleManageSchema = z.object({
   from: z.string().trim().min(1).optional(),
   role: z.string().trim().min(1),
-  action: z.enum(['read', 'approve', 'deny', 'release', 'stop']),
+  action: z.enum(['read', 'approve', 'deny', 'release', 'stop', 'handoff']),
   reason: z.string().max(4_000).optional(),
+  agent: z.string().trim().min(1).max(64).optional(),
   force: z.boolean().optional(),
   screen: z.boolean().optional(),
 });
@@ -1076,6 +1077,7 @@ async function runOrchestrationHttpAction(
           role: parsed.role,
           action: parsed.action,
           reason: parsed.reason,
+          agent: parsed.agent,
           force: parsed.force,
           screen: parsed.screen,
         });

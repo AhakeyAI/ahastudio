@@ -222,6 +222,7 @@ export class OrchestrationIntegrationService {
         dispatchId: d.id,
         role: this.host.resolveRoleNameForDispatch(d) || d.id,
         cliId: d.cliId ?? null,
+        ...(d.authorCliIds?.length ? { authorCliIds: d.authorCliIds } : {}),
         taskSpec: t?.spec ?? '',
         taskContext: t?.taskContext ?? null,
         integratedCommit: d.integratedCommit ?? null,
