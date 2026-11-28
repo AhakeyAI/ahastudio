@@ -239,7 +239,9 @@ flowchart LR
 
 ### Stage 4：收尾 Outbox、看板总览与按需演进持久化（4B / 4C 独立推进，4A 按需双路径）
 
-#### PR 4B：克制版 `CleanupOutbox`（不依赖 SQLite，可独立先做）
+#### PR 4B：克制版 `CleanupOutbox` —— 已完成（PR #31）
+- `cleanup-outbox.ts` 负责意图落盘与重试，`cleanup-git.ts` 负责资源归属与 CAS 校验。复用 lifecycle store、同一 JSON writer、Worker lineage / Run 锁；旧快照默认空队列，不依赖 SQLite。
+- 与草案的差异：分开记录 worktree 绑定分支和删分支授权，保留原始 OID。启动恢复一次，已有 sweep 按 1/2/4/8/16 秒退避；第 6 次失败或遇到脏目录、锁定、OID/身份冲突，转 `needs_attention` 并出现在只读快照。未解除的 claim、常驻或活跃 Worker 跳过，不消耗次数；自动重试永不 force。保留至多 64 条 done，总上限 4096，容量不足不丢弃未完成意图。
 - **明确边界**：仅纳入**幂等、可安全重试的资源收尾副作用**：
   - `worker.release`（worktree 删除 + 分支 CAS 清理）
   - `review_worktree.cleanup`（detached review worktree 清理重试）
