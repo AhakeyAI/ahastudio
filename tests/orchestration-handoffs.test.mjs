@@ -102,9 +102,9 @@ test('board receipts advance independently, and unrelated posts cannot manufactu
   const post = store.insertMessage({ runId: run.id, from: 'coord', to: 'run:' + run.id, subject: 'constraints', mentions: ['one', 'two'], kind: 'post' });
   store.recordBoardReceipt([post.id], 'one', 'notified');
   store.recordBoardReceipt([post.id], 'two', 'delivered');
-  store.insertMessage({ runId: run.id, from: 'two', fromRole: 'two', to: 'coord', kind: 'update', subject: 'unrelated' });
+  store.insertMessage({ runId: run.id, from: 'two', fromRole: 'two', to: 'coord', kind: 'update', subject: 'for reference only', refs: [post.boardSeq] });
   assert.deepEqual(store.getMessageById(post.id).receipts, { one: 'notified', two: 'delivered' });
-  store.insertMessage({ runId: run.id, from: 'one', fromRole: 'one', to: 'coord', kind: 'answer', refs: [post.boardSeq], subject: 'answer' });
+  store.recordBoardReceipt([post.id], 'one', 'replied');
   store.recordBoardReceipt([post.id], 'one', 'delivered');
   assert.equal(store.getMessageById(post.id).receipts.one, 'replied');
 });

@@ -314,13 +314,17 @@ function buildPostMessageTool(ctx) {
     name: 'post_message',
     description: isWorker
       ? 'Post a message to the shared run board. Mention @coordinator or an active sibling @role (e.g. @verifier) to wake them, cite earlier posts by #seq (e.g. #4), or post unaddressed status updates without waking anyone. Worker @all is visible on the board but never wakes peers. Mention only who must act next; in a peer handoff, mention the next @role without @coordinator. Never write [done]; finish with report_done.'
-      : 'Post a message to the shared run board. @role is a doorbell, not a CC: mention only members who must act next (a mention answers that worker\u2019s pending question, steers it, or reactivates it if settled); mention @all to broadcast to all active workers; cite earlier posts by #seq instead of pasting them. Prefer message_worker when addressing exactly one worker.',
+      : 'Post a message to the shared run board. @role is a doorbell, not a CC: mention only members who must act next (a mention steers the worker or reactivates it if settled); mention @all to broadcast to all active workers; cite earlier posts by #seq instead of pasting them. Prefer message_worker when addressing exactly one worker.',
     inputSchema: {
       type: 'object',
       properties: {
         text: {
           type: 'string',
           description: 'Message text to post on the shared board (supports @role mentions and #seq references).',
+        },
+        replyTo: {
+          type: ['string', 'integer'],
+          description: 'Reply to a post addressed to you by its #seq or message ID. Its author is included automatically. Use message_worker with questionId to answer a question.',
         },
         kind: {
           type: 'string',
@@ -367,13 +371,13 @@ function buildBoardWaitTool() {
   return {
     name: 'board_wait',
     description:
-      'Sleep reactively until another member posts to the shared board (never poll in a loop). Pass since=<lastReadSeq> so messages posted while you were busy wake you immediately. Defaults to mentionsOnly=true (wakes on @your-role, reports/questions/approvals, or coordinator @all); pass mentionsOnly=false to wake on any new post. Prefer board_wait over team_wait inside a Run.',
+      'Sleep reactively until another member posts to the shared board (never poll in a loop). Pass since=<lastReadSeq> from the same wait mode to resume explicitly, or omit since to use its saved position. Defaults to mentionsOnly=true (wakes on @your-role, reports/questions/approvals, or coordinator @all); pass mentionsOnly=false to wake on any new post. Prefer board_wait over team_wait inside a Run.',
     inputSchema: {
       type: 'object',
       properties: {
         since: {
           type: 'number',
-          description: 'Highest boardSeq you have already read (defaults to your server-tracked lastReadSeq).',
+          description: 'Highest boardSeq to skip (defaults to your saved position for this wait mode).',
         },
         mentionsOnly: {
           type: 'boolean',
@@ -402,7 +406,7 @@ function buildTeamWaitTool() {
       properties: {
         since: {
           type: 'number',
-          description: 'Highest boardSeq you have already read (defaults to your server-tracked lastReadSeq).',
+          description: 'Highest boardSeq to skip (defaults to your saved position for this wait mode).',
         },
         mentionsOnly: {
           type: 'boolean',
@@ -542,7 +546,7 @@ function buildToolsForContext(ctx) {
     {
       name: 'message_worker',
       description:
-        'Address exactly one worker by @role (or dispatch id): answers its pending question first, otherwise steers it, or reactivates it with its previous context if settled. Prefer this over delegating a new worker for rework.',
+        'Address exactly one worker by @role (or dispatch id): pass questionId to answer that exact question, otherwise steer it or reactivate it with its previous context if settled. Prefer this over delegating a new worker for rework.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -553,6 +557,10 @@ function buildToolsForContext(ctx) {
           message: {
             type: 'string',
             description: 'Reply or follow-up instructions for the worker.',
+          },
+          questionId: {
+            type: 'string',
+            description: 'ID shown on the question post. Supply it only to answer that question.',
           },
           subject: {
             type: 'string',
@@ -908,6 +916,12 @@ function nonEmptyStr(value) {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function normalizeReplyTo(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'string') return nonEmptyStr(value);
+  return value;
+}
+
 function finiteNonNegativeInt(value) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   return Math.max(0, Math.floor(value));
@@ -1021,8 +1035,10 @@ async function handleToolCall(name, rawArgs, activeRequests) {
     case 'post_message': {
       const kind = nonEmptyStr(args.kind);
       const subject = nonEmptyStr(args.subject);
+      const replyTo = normalizeReplyTo(args.replyTo) ?? normalizeReplyTo(args.reply_to);
       const res = await callAction('board-post', {
         text: typeof args.text === 'string' ? args.text : '',
+        ...(replyTo !== undefined ? { replyTo } : {}),
         ...(kind ? { kind } : {}),
         ...(subject ? { subject } : {}),
       });
@@ -1052,20 +1068,8 @@ async function handleToolCall(name, rawArgs, activeRequests) {
             ? args.mentions_only
             : undefined;
       const timeoutMs = finiteNonNegativeInt(args.timeoutMs ?? args.timeout_ms);
-      if (peek) {
-        const res = await callAction('board-read', {
-          ...(since !== undefined ? { since } : {}),
-          markRead: false,
-        });
-        if (!res.ok) {
-          if (name === 'team_wait' && res.code === 'run_not_found') {
-            return toolText('No unread worker updates.');
-          }
-          return toolText(res.errorText, true);
-        }
-        return toolText(formatBoardReadText(res.result));
-      }
       const res = await callAction('board-wait', {
+        peek,
         ...(since !== undefined ? { since } : {}),
         ...(mentionsOnly !== undefined ? { mentionsOnly } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
@@ -1074,8 +1078,8 @@ async function handleToolCall(name, rawArgs, activeRequests) {
         if (name === 'team_wait' && res.code === 'run_not_found') {
           const fallback = await callAction('check', {
             from: callerIdentity(),
-            wait: true,
-            peek: false,
+            wait: !peek,
+            peek,
             format: true,
             ...(timeoutMs !== undefined ? { timeoutMs } : {}),
           });
@@ -1095,6 +1099,7 @@ async function handleToolCall(name, rawArgs, activeRequests) {
     case 'message_worker': {
       const subject = nonEmptyStr(args.subject);
       const res = await callAction('role-message', {
+        questionId: nonEmptyStr(args.questionId) || nonEmptyStr(args.question_id),
         role: typeof args.role === 'string' ? args.role : '',
         message: typeof args.message === 'string' ? args.message : '',
         ...(subject ? { subject } : {}),

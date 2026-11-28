@@ -691,6 +691,7 @@ test('Slim MCP preamble omits capability & CLI manual; workerDoneByPane, askCoor
   // Coordinator replies by semantic @role via messageWorkerByRole.
   const replyRes = await service.messageWorkerByRole('local-coord', {
     role: '@debugger',
+    questionId: store.listQuestions({ dispatchId: delegated.dispatch.id, status: 'pending' })[0].messageId,
     message: 'Yes, preserve v1',
   });
   assert.equal(replyRes.mode, 'replied');
@@ -901,6 +902,14 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   );
 
   // Worker calls ask_coordinator -> Coordinator replies via message_worker -> Worker gets answer!
+  const first = await workerClient.request('tools/call', {
+    name: 'ask_coordinator', arguments: { question: 'Keep v1 API?', wait: false },
+  });
+  assert.equal(first.result.isError, undefined);
+  const firstBoard = await coordClient.request('tools/call', { name: 'read_board', arguments: {} });
+  const peek = await coordClient.request('tools/call', { name: 'team_wait', arguments: { peek: true } });
+  assert.doesNotMatch(peek.result.content[0].text, /Keep v1 API\?/);
+  const sinceFirstQuestion = Number(/head=#(\d+)/.exec(firstBoard.result.content[0].text)[1]);
   const workerAskPromise = workerClient.request('tools/call', {
     name: 'ask_coordinator',
     arguments: {
@@ -909,12 +918,43 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
       timeoutMs: 5_000,
     },
   });
-  await new Promise((r) => setTimeout(r, 40));
+  const questionPost = await coordClient.request('tools/call', {
+    name: 'board_wait', arguments: { since: sinceFirstQuestion, timeoutMs: 2000 },
+  });
+  const questionId = /questionId: (\S+)\s+Should I check token expiry too\?/.exec(questionPost.result.content[0].text)?.[1];
+  assert.ok(questionId, questionPost.result.content[0].text);
+  const steering = await coordClient.request('tools/call', {
+    name: 'message_worker', arguments: { role: '@reviewer', message: 'Please post progress later.', questionId: '   ' },
+  });
+  assert.equal(steering.result.isError, undefined);
+  const steeringSeq = Number(/#(\d+)/.exec(steering.result.content[0].text)?.[1]);
+  assert.ok(steeringSeq, steering.result.content[0].text);
+  const [steeringPost] = service.store.listBoardPosts(firstWorker.runId, { seqs: [steeringSeq] });
+  assert.ok(steeringPost);
+
+  const plainProgress = await workerClient.request('tools/call', {
+    name: 'post_message',
+    arguments: { text: 'Halfway through auth checks', replyTo: '   ', reply_to: null },
+  });
+  assert.equal(plainProgress.result.isError, undefined);
+
+  const steeringReply = await workerClient.request('tools/call', {
+    name: 'post_message',
+    arguments: { text: 'Will post final summary shortly.', reply_to: ' #' + steeringSeq + ' ' },
+  });
+  assert.equal(steeringReply.result.isError, undefined);
+  assert.match(steeringReply.result.content[0].text, /Woke: @coordinator/);
+  assert.equal(service.store.getMessageById(steeringPost.id).receipts.reviewer, 'replied');
+  const consumeReply = await coordClient.request('tools/call', {
+    name: 'board_wait', arguments: { timeoutMs: 2_000 },
+  });
+  assert.match(consumeReply.result.content[0].text, /Will post final summary shortly\./);
 
   const coordReplyCall = await coordClient.request('tools/call', {
     name: 'message_worker',
     arguments: {
       role: '@reviewer',
+      question_id: ' ' + questionId + ' ',
       message: 'Yes, include expiry checks.',
       subject: '   ',
     },
@@ -924,6 +964,10 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
 
   const workerAskRes = await workerAskPromise;
   assert.match(workerAskRes.result.content[0].text, /Yes, include expiry checks\./);
+  const remaining = await coordClient.request('tools/call', {
+    name: 'team_status', arguments: {},
+  });
+  assert.match(remaining.result.content[0].text, /1 pending question/);
 
   // Coordinator starts team_wait (with snake_case timeout_ms), worker calls report_done -> coordinator wakes!
   const waitPromise = coordClient.request('tools/call', {

@@ -514,6 +514,29 @@ test('an accepted headless pointer advances notification cursor; the exact board
   assert.ok(app.store.getMemberCursor(app.run.id, 'scout').lastDeliveredSeq >= post.boardSeq);
   app.service.boardRead({ from: worker.assigneeHandle, runId: app.run.id, seqs: [post.boardSeq] });
   assert.equal(app.store.getMessageById(post.id).receipts.scout, 'delivered');
+  assert.ok(!(await app.service.boardWait({ from: worker.assigneeHandle, timeoutMs: 0 })).posts.some(p => p.id === post.id));
+});
+
+test('a nonblocking question answer reaches its headless worker with the original content', async t => {
+  const app = await setup(t);
+  const { dispatch } = await app.start('Coordinate with me', { role: 'scout', displayName: 'scout' });
+  const from = dispatch.assigneeHandle;
+  await until(() => app.store.getDispatchContext(dispatch.id)?.codexTurn);
+  const asked = await app.workerHttp(from, 'ask-self', { question: 'Which file?', wait: false });
+  assert.equal(asked.ok, true);
+  const answered = await app.service.messageWorkerByRole('coordinator-pane', {
+    role: 'scout', questionId: '  ' + asked.result.messageId + '  ', message: 'Use sample.txt',
+  });
+  await until(() => app.getTrace().some(event => event.method === 'turn/start' && event.params.input[0].text.includes('Use sample.txt')));
+  await until(() => app.store.wasBoardPostRead(answered.message.id, 'scout'));
+  await until(() => app.service.codexWorkers.get(from)?.busy === false);
+  const turnsBefore = app.getTrace().filter(event => event.method === 'turn/start').length;
+  app.service.queueCodexMail(from, app.store.getMessageById(answered.message.id));
+  app.service.deliverCodexMailbox(from);
+  assert.equal(app.getTrace().filter(event => event.method === 'turn/start').length, turnsBefore);
+  assert.ok(!(await app.service.boardWait({ from: 'coordinator-pane', timeoutMs: 0 })).posts.some(post => post.id === asked.result.messageId));
+  const opaque = app.service.codexMailboxPrompt({ opaque: true, messages: [app.store.getMessageById(answered.message.id)] });
+  assert.doesNotMatch(opaque.prompt, /seqs=/);
 });
 
 for (const delivery of ['mailbox', 'follow-up']) {
@@ -912,6 +935,8 @@ test('short mailbox messages are inlined into the next headless turn; long ones 
     return snapshot.turns.length === 2 && snapshot.turns[1].status === 'completed' ? snapshot : null;
   });
   assert.match(timeline.turns[1].prompt, /Please also list the tests folder\./);
+  const next = await app.service.boardWait({ from: dispatch.assigneeHandle, timeoutMs: 0 });
+  assert.ok(!next.posts.some(p => p.subject === 'Quick question'));
 
   await app.service.send({
     from: 'coordinator-pane', to: 'dispatch:' + dispatch.id, runId: app.run.id,

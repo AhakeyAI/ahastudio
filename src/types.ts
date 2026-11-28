@@ -1134,6 +1134,7 @@ export type OrchestrationBoardPostKind =
   | 'system';
 
 export interface OrchestrationMemberCursor {
+  lastMentionReadSeq?: number;
   lastReadSeq: number;
   lastPostSeq: number;
   lastDeliveredSeq: number;

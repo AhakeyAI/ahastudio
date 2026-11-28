@@ -149,7 +149,10 @@ export function formatMessageBanner(
         lines.push(`Artifacts: ${parts.join(' | ')}`);
       }
     }
-    if (msg.kind === 'approval') {
+    if (msg.type === 'question') {
+      lines.push(`questionId: ${msg.id}`);
+      lines.push(`[Reply: message_worker(role=${JSON.stringify(senderTag)}, questionId=${JSON.stringify(msg.id)}, message="...")]`);
+    } else if (msg.kind === 'approval') {
       lines.push(
         `[Action: manage_worker(role="${cleanRole}", action="approve" | "deny")]`
       );
@@ -162,7 +165,9 @@ export function formatMessageBanner(
     } else if (msg.artifacts?.recommendedNextStep) {
       lines.push(`[Next: ${msg.artifacts.recommendedNextStep}]`);
     } else if (msg.type !== 'heartbeat') {
-      lines.push(`[Reply: post_message(text="${senderTag} ...")]`);
+      lines.push(msg.mentions?.length && msg.boardSeq
+        ? `[To reply if addressed: post_message(replyTo=${msg.boardSeq}, text="...")]`
+        : `[Post: post_message(text="${senderTag} ...")]`);
     }
     return lines.join('\n');
   }

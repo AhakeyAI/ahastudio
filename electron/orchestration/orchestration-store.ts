@@ -166,6 +166,7 @@ export class OrchestrationStore {
   private messages = new Map<string, OrchestrationMessageRecord>();
   private messageOrder: string[] = [];
   private deliveries = new Map<string, OrchestrationDeliveryRecord>();
+  private readonly boardReadersByMessageId = new Map<string, Set<string>>();
   private consumerReadByMessageId = new Map<string, Set<string>>();
   private consumerDeliveredByMessageId = new Map<string, Set<string>>();
   private questions = new Map<string, OrchestrationQuestionRecord>();
@@ -459,6 +460,8 @@ export class OrchestrationStore {
         for (const [memberKey, rawCursor] of Object.entries(byMember)) {
           if (!rawCursor || typeof rawCursor !== 'object') continue;
           memberMap.set(memberKey, {
+            ...(typeof rawCursor.lastMentionReadSeq === 'number' && Number.isSafeInteger(rawCursor.lastMentionReadSeq) && rawCursor.lastMentionReadSeq > 0
+              ? { lastMentionReadSeq: rawCursor.lastMentionReadSeq } : {}),
             lastReadSeq:
               typeof rawCursor.lastReadSeq === 'number' && Number.isFinite(rawCursor.lastReadSeq)
                 ? Math.max(0, Math.floor(rawCursor.lastReadSeq))
@@ -517,6 +520,18 @@ export class OrchestrationStore {
       }
     }
 
+    this.boardReadersByMessageId.clear();
+    for (const [id, roles] of Object.entries(parsed.boardReadersByMessageId ?? {})) {
+      if (this.messages.has(id) && Array.isArray(roles)) {
+        const normalized = roles
+          .filter((role): role is string => typeof role === 'string')
+          .map((role) => role.trim().replace(/^@+/, '').toLowerCase())
+          .filter(Boolean);
+        if (normalized.length > 0) {
+          this.boardReadersByMessageId.set(id, new Set(normalized));
+        }
+      }
+    }
     this.consumerReadByMessageId.clear();
     for (const [msgId, consumers] of Object.entries(parsed.consumerReadByMessageId ?? {})) {
       if (Array.isArray(consumers) && consumers.length > 0) {
@@ -633,6 +648,7 @@ export class OrchestrationStore {
         .map((id) => this.messages.get(id))
         .filter((m): m is OrchestrationMessageRecord => m !== undefined),
       deliveries: [...this.deliveries.values()],
+      boardReadersByMessageId: Object.fromEntries([...this.boardReadersByMessageId].map(([id, roles]) => [id, [...roles]])),
       consumerReadByMessageId: Object.fromEntries(
         [...this.consumerReadByMessageId.entries()].map(([k, v]) => [k, [...v]])
       ),
@@ -705,6 +721,10 @@ export class OrchestrationStore {
       typeof patch.lastReadSeq === 'number' && Number.isFinite(patch.lastReadSeq)
         ? Math.max(existing.lastReadSeq, Math.floor(patch.lastReadSeq))
         : existing.lastReadSeq;
+    const oldMentionRead = existing.lastMentionReadSeq ?? 0;
+    const nextMentionRead = typeof patch.lastMentionReadSeq === 'number' && Number.isFinite(patch.lastMentionReadSeq)
+      ? Math.max(oldMentionRead, Math.floor(patch.lastMentionReadSeq))
+      : oldMentionRead;
     const nextPost =
       typeof patch.lastPostSeq === 'number' && Number.isFinite(patch.lastPostSeq)
         ? Math.max(existing.lastPostSeq, Math.floor(patch.lastPostSeq))
@@ -717,11 +737,13 @@ export class OrchestrationStore {
     const changed =
       !memberMap.has(cleanKey) ||
       nextRead !== existing.lastReadSeq ||
+      nextMentionRead !== oldMentionRead ||
       nextPost !== existing.lastPostSeq ||
       nextDelivered !== existing.lastDeliveredSeq;
 
     const updated: OrchestrationMemberCursor = {
       lastReadSeq: nextRead,
+      ...(nextMentionRead > 0 ? { lastMentionReadSeq: nextMentionRead } : {}),
       lastPostSeq: nextPost,
       lastDeliveredSeq: nextDelivered,
     };
@@ -734,14 +756,19 @@ export class OrchestrationStore {
 
   listBoardPosts(
     runId: string,
-    opts?: { since?: number; seqs?: readonly number[]; limit?: number }
+    opts?: { since?: number; seqs?: readonly number[]; limit?: number; matches?: (post: OrchestrationMessageRecord) => boolean }
   ): OrchestrationMessageRecord[] {
+    const since = opts?.since;
+    const useSince = !opts?.seqs?.length && typeof since === 'number' && Number.isFinite(since);
+    const after = useSince ? Math.max(0, Math.floor(since)) : undefined;
     const allForRun: OrchestrationMessageRecord[] = [];
     for (const id of this.messageOrder) {
       const msg = this.messages.get(id);
       if (!msg || msg.runId !== runId || msg.type === 'heartbeat') continue;
       if (msg.lifecycleRejectedReason) continue;
       if (typeof msg.boardSeq !== 'number') continue;
+      if (after !== undefined && msg.boardSeq <= after) continue;
+      if (opts?.matches && !opts.matches(msg)) continue;
       allForRun.push(msg);
     }
     allForRun.sort((a, b) => (a.boardSeq ?? 0) - (b.boardSeq ?? 0));
@@ -754,13 +781,7 @@ export class OrchestrationStore {
     }
 
     const limit = Math.max(1, Math.min(500, Math.floor(opts?.limit ?? 50)));
-    if (typeof opts?.since === 'number' && Number.isFinite(opts.since)) {
-      const since = Math.max(0, Math.floor(opts.since));
-      return allForRun
-        .filter((msg) => (msg.boardSeq ?? 0) > since)
-        .slice(0, limit)
-        .map(cloneMessageRecord);
-    }
+    if (after !== undefined) return allForRun.slice(0, limit).map(cloneMessageRecord);
 
     return allForRun.slice(-limit).map(cloneMessageRecord);
   }
@@ -2922,11 +2943,6 @@ export class OrchestrationStore {
 
     this.messages.set(msg.id, msg);
     this.messageOrder.push(msg.id);
-    if (msg.fromRole && msg.refs?.length && (msg.kind === 'answer' || msg.kind === 'update' || msg.kind === 'report' || msg.kind === 'post')) {
-      const refs = new Set(msg.refs);
-      const originals = [...this.messages.values()].filter(m => m.runId === runId && m.boardSeq && refs.has(m.boardSeq));
-      this.recordBoardReceipt(originals.map(m => m.id), msg.fromRole, 'replied');
-    }
     this.prune();
     this.persist();
     return cloneMessageRecord(msg);
@@ -3164,6 +3180,28 @@ export class OrchestrationStore {
       this.prune();
       this.persist();
     }
+  }
+
+  /** Exact content reads can arrive out of order. A pointer alone never consumes its posts. */
+  recordBoardRead(runId: string, role: string, ids: readonly string[]): void {
+    const key = role.trim().replace(/^@+/, '').toLowerCase();
+    if (!key) return;
+    let changed = false;
+    for (const id of ids) {
+      const message = this.messages.get(id);
+      if (message?.runId !== runId || !message.boardSeq) continue;
+      const readers = this.boardReadersByMessageId.get(id) ?? new Set<string>();
+      if (readers.has(key)) continue;
+      readers.add(key);
+      this.boardReadersByMessageId.set(id, readers);
+      changed = true;
+    }
+    if (changed) this.persist();
+  }
+
+  wasBoardPostRead(id: string, role: string): boolean {
+    const key = role.trim().replace(/^@+/, '').toLowerCase();
+    return key ? (this.boardReadersByMessageId.get(id)?.has(key) ?? false) : false;
   }
 
   recordBoardReceipt(ids: readonly string[], role: string, state: 'notified' | 'delivered' | 'replied'): boolean {
@@ -3557,7 +3595,6 @@ export class OrchestrationStore {
     fromRole?: string;
     mentions?: readonly string[];
     refs?: readonly number[];
-    existingAnswerMessageId?: string;
   }): {
     question: OrchestrationQuestionRecord;
     message: OrchestrationMessageRecord;
@@ -3605,25 +3642,20 @@ export class OrchestrationStore {
       );
     }
 
-    const reusedMsg = input.existingAnswerMessageId
-      ? this.messages.get(input.existingAnswerMessageId)
-      : undefined;
-    const answerMsg =
-      reusedMsg ??
-      this.insertMessage({
-        runId: q.runId,
-        from: input.answeredBy,
-        to: `dispatch:${q.dispatchId}`,
-        type: 'status',
-        priority: 'high',
-        subject: `Answer to question ${q.messageId}`,
-        body: input.body,
-        threadId: q.messageId,
-        fromRole: input.fromRole,
-        mentions: input.mentions,
-        refs: input.refs,
-        kind: 'answer',
-      });
+    const answerMsg = this.insertMessage({
+      runId: q.runId,
+      from: input.answeredBy,
+      to: `dispatch:${q.dispatchId}`,
+      type: 'status',
+      priority: 'high',
+      subject: `Answer to question ${q.messageId}`,
+      body: input.body,
+      threadId: q.messageId,
+      fromRole: input.fromRole,
+      mentions: input.mentions,
+      refs: input.refs,
+      kind: 'answer',
+    });
     this.markAsRead([q.messageId]);
     this.acknowledgeDeliveriesForMessages([q.messageId]);
 
@@ -3760,6 +3792,7 @@ export class OrchestrationStore {
     if (ids.size === 0) return;
     for (const id of ids) {
       this.messages.delete(id);
+      this.boardReadersByMessageId.delete(id);
       this.consumerReadByMessageId.delete(id);
       this.consumerDeliveredByMessageId.delete(id);
     }
@@ -3983,6 +4016,7 @@ export class OrchestrationStore {
       this.dispatchCapabilities.clear();
       this.deferredPrompts.clear();
       this.gates.clear();
+      this.boardReadersByMessageId.clear();
       this.messages.clear();
       this.messageOrder = [];
       this.deliveries.clear();
@@ -4006,6 +4040,7 @@ export class OrchestrationStore {
       this.coordinatorRuns.clear();
     } else {
       removed.messages = this.messages.size;
+      this.boardReadersByMessageId.clear();
       this.messages.clear();
       this.messageOrder = [];
       this.deliveries.clear();

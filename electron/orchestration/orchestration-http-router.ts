@@ -415,6 +415,8 @@ const paneModeSetSchema = z.object({
 });
 
 const roleMessageSchema = z.object({
+  questionId: z.string().trim().nullish(),
+  question_id: z.string().trim().nullish(),
   from: z.string().trim().min(1).optional(),
   role: z.string().trim().min(1),
   message: z.string().trim().min(1),
@@ -430,7 +432,11 @@ const roleManageSchema = z.object({
   screen: z.boolean().optional(),
 });
 
+const replyToValueSchema = z.union([z.number().int().positive(), z.string().trim()]).nullish();
+
 const boardPostSchema = z.object({
+  replyTo: replyToValueSchema,
+  reply_to: replyToValueSchema,
   runId: z.string().trim().min(1).optional(),
   from: z.string().trim().min(1).optional(),
   text: z.string().trim().min(1).max(64_000),
@@ -449,6 +455,7 @@ const boardReadSchema = z.object({
 });
 
 const boardWaitSchema = z.object({
+  peek: z.boolean().optional(),
   runId: z.string().trim().min(1).optional(),
   from: z.string().trim().min(1).optional(),
   since: z.number().int().min(0).optional(),
@@ -1000,6 +1007,7 @@ export async function dispatchOrchestrationHttpAction(
         result = await service.messageWorkerByRole(caller, {
           role: parsed.role,
           message: parsed.message,
+          questionId: parsed.questionId || parsed.question_id || undefined,
           subject: parsed.subject,
         });
         break;
@@ -1035,6 +1043,7 @@ export async function dispatchOrchestrationHttpAction(
           runId: parsed.runId,
           from: caller,
           text: parsed.text,
+          replyTo: parsed.replyTo || parsed.reply_to || undefined,
           kind: parsed.kind,
           subject: parsed.subject,
           isUser: false,
@@ -1070,6 +1079,7 @@ export async function dispatchOrchestrationHttpAction(
             from: caller,
             since: parsed.since,
             mentionsOnly: parsed.mentionsOnly,
+            peek: parsed.peek,
             timeoutMs: parsed.timeoutMs,
           },
           context.signal

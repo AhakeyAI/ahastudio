@@ -61,6 +61,7 @@ import {
   type OrchestrationMessageType,
   type OrchestrationPeerMessagingMode,
   type OrchestrationQuestionRecord,
+  type OrchestrationMemberCursor,
   type OrchestrationReportArtifacts,
   type OrchestrationReviewFinding,
   type OrchestrationReviewVerdict,
@@ -81,6 +82,7 @@ import {
   PeerPingPongTracker,
   collectWorkerReportArtifacts,
   formatBoardPostForAgent,
+  boardLookupCommands,
   formatBoardTeamSummary,
   parseBoardMentions,
   parseBoardRefs,
@@ -383,6 +385,17 @@ export interface OrchestrationServiceDependencies {
   now?: () => number;
 }
 
+interface BoardPostInput {
+  runId?: string;
+  from: string;
+  fromRole?: string;
+  text: string;
+  kind?: OrchestrationBoardPostKind;
+  subject?: string;
+  isUser?: boolean;
+  replyTo?: string | number;
+}
+
 export class OrchestrationService {
   readonly store: OrchestrationStore;
   readonly waiters: RuntimeMessageWaiters;
@@ -509,9 +522,12 @@ export class OrchestrationService {
       resolveMemberKeyForPane: (ptyId) => this.resolveBoardMemberForPane(ptyId),
       findPendingBoardPostsForPane: (ptyId) => this.findUndeliveredBoardPostsForPane(ptyId),
       shouldDeliverMessageToPane: (msg, ptyId) => {
-        if (!msg.kind) return true;
         const member = this.resolveBoardMemberForPane(ptyId);
         if (!member || member.runId !== msg.runId) return true;
+        const firewall = this.getReviewFirewallContext(ptyId);
+        if (firewall && this.isPostHiddenByReviewFirewall(msg, firewall)) return false;
+        if (this.store.wasBoardPostRead(msg.id, member.memberKey)) return false;
+        if (!msg.kind) return true;
         return this.doesBoardPostWakeMember(
           msg,
           member.role,
@@ -3241,6 +3257,10 @@ export class OrchestrationService {
     runId?: string;
     threadId?: string;
     capability?: string;
+    fromRole?: string;
+    mentions?: readonly string[];
+    refs?: readonly number[];
+    kind?: OrchestrationBoardPostKind;
   }): OrchestrationSendResult | Promise<OrchestrationSendResult> {
     const rawInputTo = input.to?.trim() ?? '';
     const isLifecycleReport = input.type === 'worker_done' || input.type === 'heartbeat';
@@ -3768,7 +3788,6 @@ export class OrchestrationService {
     if (workerRole && typeof sent.message.boardSeq === 'number') {
       this.store.advanceMemberCursor(resolvedDispatch.runId, workerRole, {
         lastPostSeq: sent.message.boardSeq,
-        lastReadSeq: sent.message.boardSeq,
       });
     }
 
@@ -4098,6 +4117,10 @@ export class OrchestrationService {
       } = {}
     ) => {
       const visible = firewall ? msgs.filter((message) => !this.isPostHiddenByReviewFirewall(message, firewall)) : msgs;
+      if (!input.peek && !showAll && opts.deliveryId && visible.length) {
+        const member = this.resolveBoardMemberForPane(from);
+        if (member) this.store.recordBoardRead(member.runId, member.memberKey, visible.map(message => message.id));
+      }
       const exposed = exposeMessages(this.store, visible);
       const formatted = shouldFormat
         ? visible
@@ -4444,7 +4467,6 @@ export class OrchestrationService {
         if (askerRole && typeof msg.boardSeq === 'number') {
           this.store.advanceMemberCursor(msg.runId, askerRole, {
             lastPostSeq: msg.boardSeq,
-            lastReadSeq: msg.boardSeq,
           });
         }
 
@@ -4471,7 +4493,7 @@ export class OrchestrationService {
           });
         }
 
-        this.notifyTargetAndAliases(msg.toHandle, 'question');
+        this.notifyTargetAndAliases(msg.toHandle, 'question', msg);
         this.emitChanged('question:asked', msg.runId);
       }
 
@@ -4494,7 +4516,7 @@ export class OrchestrationService {
         const current = this.store.getQuestion(questionRecord.messageId);
         if (signal?.aborted) {
           if (current?.status === 'answered') {
-            this.notifyTargetAndAliases(`dispatch:${current.dispatchId}`, 'status');
+            this.notifyTargetAndAliases(`dispatch:${current.dispatchId}`, 'status', current.answerMessageId ? this.store.getMessageById(current.answerMessageId) : undefined);
           }
           return {
             messageId: questionRecord.messageId,
@@ -4514,6 +4536,8 @@ export class OrchestrationService {
         }
         if (current.status === 'answered') {
           if (current.answerMessageId) {
+            const asker = this.store.getDispatchContext(current.dispatchId);
+            if (asker) this.store.recordBoardRead(current.runId, this.resolveRoleNameForDispatch(asker).toLowerCase() || asker.id, [current.answerMessageId]);
             this.store.markAsReadAndDelivered([current.answerMessageId]);
             this.store.acknowledgeDeliveriesForMessages([current.answerMessageId]);
           }
@@ -4605,6 +4629,7 @@ export class OrchestrationService {
         mentions: targetRole ? [targetRole] : undefined,
         refs: original.boardSeq ? [original.boardSeq] : undefined,
       });
+      this.store.recordBoardRead(question.runId, replierRole, [original.id]);
       this.store.recordHeartbeat(question.dispatchId);
       if (replierRole === 'coordinator' || replierRole === 'user') {
         this.peerPingPong.recordCoordinatorOrUserActivity(question.runId);
@@ -4612,14 +4637,13 @@ export class OrchestrationService {
       if (typeof answered.message.boardSeq === 'number') {
         this.store.advanceMemberCursor(question.runId, replierRole, {
           lastPostSeq: answered.message.boardSeq,
-          lastReadSeq: answered.message.boardSeq,
         });
       }
 
       const waitHandle = `question:${question.dispatchId}:${question.messageId}`;
       const wokeAsker = this.waiters.notify(waitHandle, 'status');
       if (!wokeAsker) {
-        this.notifyTargetAndAliases(`dispatch:${question.dispatchId}`, 'status');
+        this.notifyTargetAndAliases(`dispatch:${question.dispatchId}`, 'status', answered.message);
       }
       this.emitChanged('question:answered', question.runId);
       return {
@@ -4642,11 +4666,17 @@ export class OrchestrationService {
     }
 
     this.store.markAsRead([original.id]);
+    const member = input.from && this.resolveBoardMemberForPane(input.from);
+    const senderRole = member && member.runId === original.runId ? member.role : undefined;
     const replyMsg = this.store.insertMessage({
       runId: original.runId,
       from: input.from?.trim() || original.toHandle,
       to: original.fromHandle,
       type: 'status',
+      fromRole: senderRole,
+      mentions: original.fromRole ? [original.fromRole] : undefined,
+      refs: original.boardSeq ? [original.boardSeq] : undefined,
+      kind: original.fromRole ? 'answer' : undefined,
       subject: original.subject.startsWith('Re:')
         ? original.subject
         : `Re: ${original.subject}`,
@@ -4654,7 +4684,11 @@ export class OrchestrationService {
       threadId: original.threadId ?? original.id,
     });
 
-    this.notifyTargetAndAliases(replyMsg.toHandle, replyMsg.type);
+    if (senderRole) {
+      this.store.recordBoardRead(original.runId, senderRole, [original.id]);
+      this.store.recordBoardReceipt([original.id], senderRole, 'replied');
+    }
+    this.notifyTargetAndAliases(replyMsg.toHandle, replyMsg.type, replyMsg);
     this.emitChanged('message:replied', replyMsg.runId);
     return {
       message: exposeMessage(replyMsg),
@@ -5875,7 +5909,6 @@ export class OrchestrationService {
       }
       this.store.advanceMemberCursor(run.id, briefFromRole, {
         lastPostSeq: auditMsg.boardSeq,
-        lastReadSeq: auditMsg.boardSeq,
       });
     }
 
@@ -6151,6 +6184,10 @@ export class OrchestrationService {
   }
 
   private queueCodexMail(workerId: string, message?: OrchestrationMessageRecord): void {
+    if (message) {
+      const firewall = this.getReviewFirewallContext(workerId);
+      if (firewall && this.isPostHiddenByReviewFirewall(message, firewall)) return;
+    }
     const pending = this.codexMailbox.get(workerId) ?? { messages: [], opaque: false };
     if (!message) pending.opaque = true;
     else if (!pending.messages.some((entry) => entry.id === message.id)) pending.messages.push(message);
@@ -6163,7 +6200,12 @@ export class OrchestrationService {
     const messages = pending.messages
       .map((message) => this.store.getMessageById(message.id) ?? message)
       .filter((message) => message.lifecycleRejectedReason === null && message.type !== 'heartbeat');
-    const notification = { prompt: pointer, messages, inlined: false };
+    const lookups = pending.opaque ? null : boardLookupCommands(messages);
+    const notification = {
+      prompt: lookups ? pointer + ' Fetch the referenced posts with ' + lookups + '.' : pointer,
+      messages,
+      inlined: false,
+    };
     if (pending.opaque || messages.length === 0 || messages.length > 2) return notification;
     const rendered = this.store.redactDispatchCredentials(messages.map((message) => formatBoardPostForAgent(message)).join('\n\n'));
     if (rendered.length > 1_000) return notification;
@@ -6190,11 +6232,21 @@ export class OrchestrationService {
       if (dispatch) this.codexMailbox.set(workerId, pending);
       return;
     }
-    const { prompt, messages, inlined } = this.codexMailboxPrompt(pending);
+    const member = this.resolveBoardMemberForPane(workerId);
+    const unreadMessages = pending.messages.filter(
+      (message) => !(member && message.runId === member.runId && this.store.wasBoardPostRead(message.id, member.memberKey))
+    );
+    if (!pending.opaque && unreadMessages.length === 0) return;
+    const { prompt, messages, inlined } = this.codexMailboxPrompt({
+      opaque: pending.opaque,
+      messages: unreadMessages,
+    });
+    if (!pending.opaque && messages.length === 0) return;
     void this.submitCodexTurn(dispatch, session, prompt).then(async (outcome) => {
       if (outcome.status === 'accepted') {
         const member = this.resolveBoardMemberForPane(workerId);
         this.acknowledgeCodexMail(workerId, messages);
+        if (member && inlined) this.store.recordBoardRead(member.runId, member.memberKey, messages.map(m => m.id));
         if (member && this.store.recordBoardReceipt(messages.map(m => m.id), member.memberKey, inlined ? 'delivered' : 'notified')) {
           this.emitChanged('board:delivery', member.runId);
         }
@@ -6414,13 +6466,6 @@ export class OrchestrationService {
     if (!input.existingMessage) {
       this.store.markAsReadAndDelivered([msg.id]);
     }
-    if (typeof msg.boardSeq === 'number' && followUpRole) {
-      this.store.advanceMemberCursor(settledDispatch.runId, followUpRole.toLowerCase(), {
-        lastReadSeq: msg.boardSeq,
-        lastDeliveredSeq: msg.boardSeq,
-      });
-    }
-
     const coordinatorHandle = this.resolveActiveParentMailbox(nextCtx);
     const followUpMcpEnabled = nextCtx.cliId
       ? (this.isMcpEnabledForCliDep?.(nextCtx.cliId) ?? false)
@@ -6453,6 +6498,7 @@ export class OrchestrationService {
           dispatchId: nextCtx.id, acceptance: outcome.status,
         });
       }
+      if (followUpRole) this.store.recordBoardRead(settledDispatch.runId, followUpRole.toLowerCase(), [msg.id]);
       this.emitChanged('worker:follow-up', settledDispatch.runId);
       return {
         message: exposeMessage(msg),
@@ -6490,6 +6536,9 @@ export class OrchestrationService {
       });
     }
 
+    if (!delivery.promptDeferred && followUpRole) {
+      this.store.recordBoardRead(settledDispatch.runId, followUpRole.toLowerCase(), [msg.id]);
+    }
     this.store.updateDispatchObservation(nextCtx.id, delivery.startObservation, {
       reason: delivery.observationReason ?? null,
       refreshHeartbeat:
@@ -8881,7 +8930,7 @@ export class OrchestrationService {
 
   async messageWorkerByRole(
     callerPaneId: string,
-    input: { role: string; message: string; subject?: string }
+    input: { role: string; message: string; subject?: string; questionId?: string }
   ): Promise<
     | ({ mode: 'replied'; dispatch: OrchestrationDispatchRecord } & ReturnType<
         OrchestrationService['reply']
@@ -8894,12 +8943,12 @@ export class OrchestrationService {
     }
     const dispatch = this.resolveWorkerByRoleOrId(callerPaneId, input.role);
     this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
-    const pendingQuestions = this.store.listQuestions({
-      dispatchId: dispatch.id,
-      status: 'pending',
-    });
-    if (pendingQuestions.length > 0) {
-      const targetQuestion = pendingQuestions[0]!;
+    const questionId = input.questionId?.trim();
+    if (questionId) {
+      const targetQuestion = this.store.getQuestion(questionId);
+      if (!targetQuestion || targetQuestion.dispatchId !== dispatch.id) {
+        throw new OrchestrationError('invalid_argument', 'The question does not belong to the selected worker.');
+      }
       this.assertCanReply(targetQuestion.messageId, callerPaneId);
       const replied = this.reply({
         id: targetQuestion.messageId,
@@ -8908,12 +8957,31 @@ export class OrchestrationService {
       });
       return { mode: 'replied', dispatch, ...replied };
     }
+    const callerDispatch = this.store.getActiveDispatchForIdentity(callerPaneId, callerPaneId);
+    const senderRole = callerDispatch
+      ? this.resolveRoleNameForDispatch(callerDispatch).toLowerCase() || 'worker'
+      : 'coordinator';
+    const targetRole = this.resolveRoleNameForDispatch(dispatch).toLowerCase() || dispatch.id;
+    const refs = parseBoardRefs(cleanMessage);
     const sent = await this.send({
       from: callerPaneId,
       to: `dispatch:${dispatch.id}`,
+      runId: dispatch.runId,
       subject: input.subject?.trim() || 'Coordinator message',
       body: cleanMessage,
+      fromRole: senderRole,
+      mentions: [targetRole],
+      refs: refs.length > 0 ? refs : undefined,
+      kind: 'post',
     });
+    if (senderRole === 'coordinator') {
+      this.peerPingPong.recordCoordinatorOrUserActivity(dispatch.runId);
+    }
+    if (typeof sent.message.boardSeq === 'number') {
+      this.store.advanceMemberCursor(dispatch.runId, senderRole, {
+        lastPostSeq: sent.message.boardSeq,
+      });
+    }
     return {
       mode: sent.followUp ? 'reactivated' : 'sent',
       dispatch: sent.followUp?.dispatch ?? dispatch,
@@ -9176,13 +9244,15 @@ export class OrchestrationService {
     const member = this.resolveBoardMemberForPane(ptyId);
     if (!member) return [];
     const cursor = this.store.getMemberCursor(member.runId, member.memberKey);
-    const posts = this.store.listBoardPosts(member.runId, {
+    const firewall = this.getReviewFirewallContext(ptyId);
+    return this.store.listBoardPosts(member.runId, {
       since: cursor.lastDeliveredSeq,
       limit: 50,
+      matches: (post) =>
+        !this.store.wasBoardPostRead(post.id, member.memberKey) &&
+        !(firewall && this.isPostHiddenByReviewFirewall(post, firewall)) &&
+        this.doesBoardPostWakeMember(post, member.role, ptyId, member.runId, member.dispatchId),
     });
-    return posts.filter((post) =>
-      this.doesBoardPostWakeMember(post, member.role, ptyId, member.runId, member.dispatchId)
-    );
   }
 
   buildBoardTeamSummary(runId: string): string {
@@ -9224,6 +9294,8 @@ export class OrchestrationService {
       this.waiters.notify(paneId, msg.type);
       this.waiters.notify(`board-pane:${paneId}`, msg.type);
       if (HEADLESS_WORKER_ID.test(paneId)) {
+        const member = this.resolveBoardMemberForPane(paneId);
+        if (member?.runId === runId && this.store.wasBoardPostRead(msg.id, member.memberKey)) return;
         this.queueCodexMail(paneId, msg);
         this.deliverCodexMailbox(paneId);
       } else {
@@ -9431,15 +9503,31 @@ export class OrchestrationService {
     };
   }
 
-  async boardPost(input: {
-    runId?: string;
-    from: string;
-    fromRole?: string;
-    text: string;
-    kind?: OrchestrationBoardPostKind;
-    subject?: string;
-    isUser?: boolean;
-  }): Promise<{
+  async boardPost(input: BoardPostInput) {
+    const reference = input.replyTo === undefined || input.replyTo === null ? '' : String(input.replyTo).trim();
+    if (!reference) return this.publishBoardPost(input);
+    const caller = this.resolveBoardCallerContext(input);
+    const seq = /^#?(\d+)$/.exec(reference);
+    const original = seq
+      ? this.store.listBoardPosts(caller.runId, { seqs: [Number(seq[1])] })[0]
+      : this.store.getMessageById(reference);
+    const firewall = this.getReviewFirewallContext(input.from);
+    if (!original?.fromRole || !original.boardSeq || original.runId !== caller.runId ||
+        original.lifecycleRejectedReason ||
+        !original.mentions?.some((m) => m.replace(/^@+/, '').toLowerCase() === caller.memberKey) ||
+        (firewall && this.isPostHiddenByReviewFirewall(original, firewall))) {
+      throw new OrchestrationError('invalid_argument', 'replyTo must identify a visible post addressed to your role in this Run.');
+    }
+    if (original.type === 'question' || original.type === 'worker_done' || original.kind === 'approval') {
+      throw new OrchestrationError('invalid_argument', 'Use the dedicated question, completion or approval action for this post.');
+    }
+    const result = await this.publishBoardPost(input, original);
+    this.store.recordBoardRead(caller.runId, caller.memberKey, [original.id]);
+    if (this.store.recordBoardReceipt([original.id], caller.memberKey, 'replied')) this.emitChanged('board:delivery', caller.runId);
+    return result;
+  }
+
+  private async publishBoardPost(input: BoardPostInput, original?: OrchestrationMessageRecord): Promise<{
     post: OrchestrationExposedMessage;
     boardSeq: number;
     headSeq: number;
@@ -9457,11 +9545,15 @@ export class OrchestrationService {
       isUser: input.isUser,
     });
     const runId = caller.runId;
-    const callerRole = caller.isPrivileged
+    const callerRole = original || caller.isPrivileged
       ? caller.callerRole
       : input.fromRole?.trim().replace(/^@+/, '').toLowerCase() || caller.callerRole;
     const mentions = parseBoardMentions(text);
     const refs = parseBoardRefs(text);
+    const replyAuthorRole = original?.fromRole?.trim().replace(/^@+/, '').toLowerCase();
+    if (replyAuthorRole && !mentions.includes(replyAuthorRole)) mentions.push(replyAuthorRole);
+    if (original?.boardSeq && !refs.includes(original.boardSeq)) refs.push(original.boardSeq);
+    const threadId = original?.threadId ?? original?.id;
     const woke = new Set<string>();
     let escalatedToCoordinator = false;
     const senderPaneId = input.isUser ? undefined : caller.fromHandle;
@@ -9469,54 +9561,17 @@ export class OrchestrationService {
     if (caller.isPrivileged) {
       this.peerPingPong.recordCoordinatorOrUserActivity(runId);
 
-      // Single-target pending question -> answerQuestion creates the single authoritative board post.
+      // A single settled target reuses the follow-up message as its board post.
       if (mentions.length === 1 && mentions[0] !== 'all' && mentions[0] !== 'coordinator' && mentions[0] !== 'user') {
         const targetRole = mentions[0]!;
         const targetDispatch = this.findRunWorkerByRole(runId, targetRole);
         if (targetDispatch) {
-          const pendingQuestions = this.store.listQuestions({
-            dispatchId: targetDispatch.id,
-            status: 'pending',
-          });
-          if (pendingQuestions.length > 0) {
-            const targetQuestion = pendingQuestions[0]!;
-            const answered = this.store.answerQuestion({
-              messageId: targetQuestion.messageId,
-              answeredBy: caller.fromHandle,
-              body: text,
-              fromRole: callerRole,
-              mentions: [targetRole],
-              refs: refs.length > 0 ? refs : undefined,
-            });
-            this.store.recordHeartbeat(targetQuestion.dispatchId);
-            const boardSeq = answered.message.boardSeq ?? this.store.getHeadBoardSeq(runId);
-            this.store.advanceMemberCursor(runId, callerRole, {
-              lastPostSeq: boardSeq,
-              lastReadSeq: boardSeq,
-              lastDeliveredSeq: boardSeq,
-            });
-            const waitHandle = `question:${targetQuestion.dispatchId}:${targetQuestion.messageId}`;
-            const wokeAsker = this.waiters.notify(waitHandle, 'status');
-            if (!wokeAsker) {
-              this.notifyTargetAndAliases(`dispatch:${targetQuestion.dispatchId}`, 'status');
-            }
-            this.notifyBoardPost(runId, answered.message, [targetRole], senderPaneId);
-            this.emitChanged('question:answered', runId);
-            this.emitChanged('board:posted', runId);
-            return {
-              post: exposeMessage(answered.message),
-              boardSeq,
-              headSeq: this.store.getHeadBoardSeq(runId),
-              woke: [targetRole],
-              escalatedToCoordinator: false,
-            };
-          }
-
           // Settled (and not released) worker mentioned by coordinator/user -> reactivate!
           if (!ACTIVE_DISPATCH_STATUSES.has(targetDispatch.status) && !targetDispatch.releasedAt) {
             const sent = await this.followUpSettledWorker(targetDispatch, {
               from: caller.fromHandle,
               to: `dispatch:${targetDispatch.id}`,
+              threadId,
               subject: input.subject?.trim() || `Board follow-up from @${callerRole}`,
               body: text,
               fromRole: callerRole,
@@ -9527,8 +9582,6 @@ export class OrchestrationService {
             const boardSeq = sent.message.boardSeq ?? this.store.getHeadBoardSeq(runId);
             this.store.advanceMemberCursor(runId, callerRole, {
               lastPostSeq: boardSeq,
-              lastReadSeq: boardSeq,
-              lastDeliveredSeq: boardSeq,
             });
             const storedMsg = this.store.getMessageById(sent.message.id);
             if (storedMsg) {
@@ -9547,10 +9600,6 @@ export class OrchestrationService {
       }
 
       // Multi-mention or active worker / @all / general coordinator or user board post.
-      const pendingQuestionsToAnswer: Array<{
-        question: OrchestrationQuestionRecord;
-        role: string;
-      }> = [];
       const settledToReactivate: Array<{
         dispatch: OrchestrationDispatchRecord;
         role: string;
@@ -9567,14 +9616,7 @@ export class OrchestrationService {
         } else {
           const targetDispatch = this.findRunWorkerByRole(runId, mention);
           if (!targetDispatch) continue;
-          const pendingQs = this.store.listQuestions({
-            dispatchId: targetDispatch.id,
-            status: 'pending',
-          });
-          if (pendingQs.length > 0) {
-            pendingQuestionsToAnswer.push({ question: pendingQs[0]!, role: mention });
-            woke.add(mention);
-          } else if (!ACTIVE_DISPATCH_STATUSES.has(targetDispatch.status) && !targetDispatch.releasedAt) {
+          if (!ACTIVE_DISPATCH_STATUSES.has(targetDispatch.status) && !targetDispatch.releasedAt) {
             settledToReactivate.push({ dispatch: targetDispatch, role: mention });
             woke.add(mention);
           } else if (ACTIVE_DISPATCH_STATUSES.has(targetDispatch.status)) {
@@ -9601,6 +9643,7 @@ export class OrchestrationService {
         runId,
         from: caller.fromHandle,
         to: toHandle,
+        threadId,
         type: 'status',
         priority: input.isUser ? 'high' : 'normal',
         subject: input.subject?.trim() || text.split(/\r?\n/)[0]!.slice(0, 80),
@@ -9614,24 +9657,7 @@ export class OrchestrationService {
       const boardSeq = msg.boardSeq ?? this.store.getHeadBoardSeq(runId);
       this.store.advanceMemberCursor(runId, callerRole, {
         lastPostSeq: boardSeq,
-        lastReadSeq: boardSeq,
-        lastDeliveredSeq: boardSeq,
       });
-
-      for (const item of pendingQuestionsToAnswer) {
-        this.store.answerQuestion({
-          messageId: item.question.messageId,
-          answeredBy: caller.fromHandle,
-          body: text,
-          fromRole: callerRole,
-          mentions: [item.role],
-          refs: refs.length > 0 ? refs : undefined,
-          existingAnswerMessageId: msg.id,
-        });
-        this.store.recordHeartbeat(item.question.dispatchId);
-        const waitHandle = `question:${item.question.dispatchId}:${item.question.messageId}`;
-        this.waiters.notify(waitHandle, 'status');
-      }
 
       for (const item of settledToReactivate) {
         await this.followUpSettledWorker(item.dispatch, {
@@ -9732,6 +9758,7 @@ export class OrchestrationService {
       runId,
       from: caller.activeDispatch ? `dispatch:${caller.activeDispatch.id}` : caller.fromHandle,
       to: toHandle,
+      threadId,
       type: postKind === 'handoff' ? 'handoff' : 'status',
       priority: escalatedToCoordinator ? 'high' : 'normal',
       subject: input.subject?.trim() || text.split(/\r?\n/)[0]!.slice(0, 80),
@@ -9745,8 +9772,6 @@ export class OrchestrationService {
     const boardSeq = msg.boardSeq ?? this.store.getHeadBoardSeq(runId);
     this.store.advanceMemberCursor(runId, callerRole, {
       lastPostSeq: boardSeq,
-      lastReadSeq: boardSeq,
-      lastDeliveredSeq: boardSeq,
     });
     if (caller.activeDispatch) {
       this.store.recordHeartbeat(caller.activeDispatch.id);
@@ -9785,17 +9810,19 @@ export class OrchestrationService {
       isUser: input.isUser,
     });
     const firewall = input.isUser ? null : this.getReviewFirewallContext(input.from);
-    const rawPosts = this.store.listBoardPosts(caller.runId, {
+    const posts = this.store.listBoardPosts(caller.runId, {
       since: input.since,
       seqs: input.seqs,
       limit: input.limit,
+      matches: firewall ? post => !this.isPostHiddenByReviewFirewall(post, firewall) : undefined,
     });
-    const posts = firewall
-      ? rawPosts.filter((post) => !this.isPostHiddenByReviewFirewall(post, firewall))
-      : rawPosts;
     const headSeq = this.store.getHeadBoardSeq(caller.runId);
     const isNamedSeqLookup = Boolean(input.seqs && input.seqs.length > 0);
-    if (!input.isUser && this.store.recordBoardReceipt(posts.map(p => p.id), caller.memberKey, 'delivered')) this.emitChanged('board:delivery', caller.runId);
+    if (input.markRead !== false && !input.isUser) {
+      const ids = posts.map(post => post.id);
+      if (isNamedSeqLookup) this.store.recordBoardRead(caller.runId, caller.memberKey, ids);
+      if (this.store.recordBoardReceipt(ids, caller.memberKey, 'delivered')) this.emitChanged('board:delivery', caller.runId);
+    }
     if (input.markRead !== false && posts.length > 0 && !isNamedSeqLookup) {
       const maxSeq = Math.max(...posts.map((p) => p.boardSeq ?? 0));
       if (maxSeq > 0) {
@@ -9831,6 +9858,7 @@ export class OrchestrationService {
       from: string;
       since?: number;
       mentionsOnly?: boolean;
+      peek?: boolean;
       timeoutMs?: number;
     },
     signal?: AbortSignal
@@ -9850,21 +9878,23 @@ export class OrchestrationService {
     });
     const runId = caller.runId;
     const mentionsOnly = input.mentionsOnly !== false;
-    const cursor = this.store.getMemberCursor(runId, caller.memberKey);
-    const effectiveSince =
+    // A targeted wait can skip general posts that a later full-board wait still needs.
+    const readPosition = (position: OrchestrationMemberCursor) => mentionsOnly
+      ? Math.max(position.lastReadSeq, position.lastMentionReadSeq ?? 0)
+      : position.lastReadSeq;
+    const explicitSince =
       typeof input.since === 'number' && Number.isFinite(input.since)
         ? Math.max(0, Math.floor(input.since))
-        : cursor.lastReadSeq;
+        : undefined;
     const timeoutMs = input.timeoutMs ?? ORCHESTRATION_MESSAGE_WAIT_DEFAULT_TIMEOUT_MS;
 
     const firewall = this.getReviewFirewallContext(input.from);
-    const findMatchingBatch = (): OrchestrationMessageRecord[] | null => {
-      const rawPosts = this.store.listBoardPosts(runId, { since: effectiveSince, limit: 200 });
-      const posts = firewall
-        ? rawPosts.filter((post) => !this.isPostHiddenByReviewFirewall(post, firewall))
-        : rawPosts;
-      if (posts.length === 0) return null;
-      const hasTrigger = posts.some((post) => {
+    const findMatchingBatch = () => this.store.listBoardPosts(runId, {
+      since: explicitSince ?? readPosition(this.store.getMemberCursor(runId, caller.memberKey)),
+      limit: 200,
+      matches: (post) => {
+        if (firewall && this.isPostHiddenByReviewFirewall(post, firewall)) return false;
+        if (mentionsOnly && explicitSince === undefined && this.store.wasBoardPostRead(post.id, caller.memberKey)) return false;
         if (!mentionsOnly) {
           const fromRole = post.fromRole?.trim().replace(/^@+/, '').toLowerCase() ?? '';
           if (fromRole === caller.callerRole || post.fromHandle === caller.fromHandle) {
@@ -9882,19 +9912,18 @@ export class OrchestrationService {
           runId,
           caller.activeDispatch?.id
         );
-      });
-      return hasTrigger ? posts : null;
-    };
+      },
+    });
 
     const buildReturn = (
       posts: OrchestrationMessageRecord[],
       flags: { timedOut: boolean; cancelled: boolean }
     ) => {
-      if (posts.length > 0) {
+      if (!input.peek && posts.length > 0) {
         const maxSeq = Math.max(...posts.map((p) => p.boardSeq ?? 0));
         if (maxSeq > 0) {
           this.store.advanceMemberCursor(runId, caller.memberKey, {
-            lastReadSeq: maxSeq,
+            ...(mentionsOnly ? { lastMentionReadSeq: maxSeq } : { lastReadSeq: maxSeq }),
             lastDeliveredSeq: maxSeq,
           });
         }
@@ -9913,7 +9942,7 @@ export class OrchestrationService {
       return {
         runId,
         headSeq: this.store.getHeadBoardSeq(runId),
-        lastReadSeq: nextCursor.lastReadSeq,
+        lastReadSeq: readPosition(nextCursor),
         posts: exposeMessages(this.store, posts),
         formatted,
         teamSummary: this.buildBoardTeamSummary(runId),
@@ -9925,7 +9954,7 @@ export class OrchestrationService {
     const deadline = Date.now() + timeoutMs;
     while (true) {
       const ready = findMatchingBatch();
-      if (ready) {
+      if (ready.length || input.peek) {
         return buildReturn(ready, { timedOut: false, cancelled: false });
       }
       if (signal?.aborted) {
@@ -9969,7 +9998,7 @@ export class OrchestrationService {
       }
       if (outcome === 'timed_out') {
         const lastCheck = findMatchingBatch();
-        if (lastCheck) {
+        if (lastCheck.length) {
           return buildReturn(lastCheck, { timedOut: false, cancelled: false });
         }
         return buildReturn([], { timedOut: true, cancelled: false });
@@ -9980,14 +10009,7 @@ export class OrchestrationService {
   consumeMidTurnBoardInjections(ptyId: string): string | null {
     const member = this.resolveBoardMemberForPane(ptyId);
     if (!member) return null;
-    const cursor = this.store.getMemberCursor(member.runId, member.memberKey);
-    const posts = this.store.listBoardPosts(member.runId, {
-      since: cursor.lastDeliveredSeq,
-      limit: 50,
-    });
-    const matched = posts.filter((post) =>
-      this.doesBoardPostWakeMember(post, member.role, ptyId, member.runId, member.dispatchId)
-    );
+    const matched = this.findUndeliveredBoardPostsForPane(ptyId);
     if (matched.length === 0) return null;
 
     const maxDelivered = Math.max(...matched.map((p) => p.boardSeq ?? 0));
@@ -10006,9 +10028,12 @@ export class OrchestrationService {
     const body = matched.map((p) => formatBoardPostForAgent(p)).join('\n\n');
     const full = `${header}\n${body}`;
     if (full.length <= MAX_CHARS) {
+      const ids = matched.map(post => post.id);
+      this.store.recordBoardRead(member.runId, member.memberKey, ids);
+      this.store.recordBoardReceipt(ids, member.memberKey, 'delivered');
       return full;
     }
-    const suffix = `\n… (call read_board(since=${cursor.lastReadSeq}) for full details)`;
+    const suffix = `\n… (call ${boardLookupCommands(matched) ?? 'read_board'} for full details)`;
     const budget = Math.max(0, MAX_CHARS - suffix.length);
     return `${full.slice(0, budget).trimEnd()}${suffix}`;
   }
