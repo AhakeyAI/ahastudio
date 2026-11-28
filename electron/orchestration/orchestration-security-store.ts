@@ -90,6 +90,7 @@ export class OrchestrationSecurityStore extends OrchestrationStoreSlice {
   }
 
   protectedRunReason(runId: string): string | null {
+    if (this.state.cleanupOutbox.some(e => e.runId === runId && e.status !== 'done')) return '资源清理尚未完成';
     const run = this.state.runs.get(runId);
     if (run?.integrationIntent) return 'Git 操作中断，交付位置待核对';
     if (run?.integrationStatus === 'active' || run?.integrationStatus === 'conflict') return '集成分支尚未交付';
@@ -242,6 +243,7 @@ export class OrchestrationSecurityStore extends OrchestrationStoreSlice {
     for (const [id, handoff] of this.state.workerHandoffs.entries()) {
       if (deletedRunIds.has(handoff.runId)) this.state.workerHandoffs.delete(id);
     }
+    this.state.cleanupOutbox = this.state.cleanupOutbox.filter(e => !deletedRunIds.has(e.runId));
     this.state.observationFacts = this.state.observationFacts.filter((fact) => !deletedRunIds.has(fact.runId));
     for (const [id, d] of this.state.deliveries.entries()) {
       if (deletedRunIds.has(d.runId)) this.state.deliveries.delete(id);
@@ -296,6 +298,7 @@ export class OrchestrationSecurityStore extends OrchestrationStoreSlice {
     };
 
     if (scope !== 'messages') {
+      this.state.cleanupOutbox = scope === 'all' ? [] : this.state.cleanupOutbox.filter(e => !e.dispatchId);
       for (const id of this.state.dispatches.keys()) this.lifecycle.cleanupDispatchBrief(id);
     }
     if (scope === 'all') {

@@ -84,6 +84,7 @@ node --import ./tests/register-electron-stub.mjs --test --test-concurrency=2 tes
   `board-service.ts`, `review-service.ts`, `integration-service.ts`, `delegation-service.ts` and
   `worker-lifecycle-service.ts` (receipt text: `orchestration-text-views.ts`). Each sub-service reaches
   the service only through its explicit `*Host` interface and imports it as a type only.
+- `cleanup-outbox.ts` in `electron/orchestration/` persists and retries only Git cleanup intents; `cleanup-git.ts` verifies ownership, worktree identity, liveness fences and branch CAS.
 - `src/components/AgentSessionView.tsx` + `src/components/agent-session/` — headless Worker
   session UI; pure logic lives in `src/lib/worker-timeline-model.ts` and
   `src/lib/timeline-scroll-anchoring.ts`.

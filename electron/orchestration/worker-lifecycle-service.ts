@@ -63,7 +63,6 @@ import {
   inspectCommitRangeDiff,
   inspectWorkerDiff,
   isSameGitRepo,
-  removeDetachedReviewWorktree,
   resolveBranchRefOid,
   resolveMainRepoRoot,
 } from './worker-git-integration.js';
@@ -114,6 +113,7 @@ export interface OrchestrationWorkerLifecycleHost {
   ) => WorkerTimeline;
   readonly delegation: OrchestrationDelegationService;
   readonly deliverAndObserveDispatchTurn: (dispatchId: string | null, opts: { ptyId: string; prompt: string; submit?: boolean; }) => Promise<DeliverAndObserveAgentTurnResult>;
+  readonly cleanup: import('./cleanup-outbox.js').CleanupOutbox;
   readonly disposed: boolean;
   readonly emitChanged: (reason: string, runId?: string) => void;
   readonly emitPaneClosed: (event: OrchestrationPaneClosedEvent) => void;
@@ -2685,7 +2685,9 @@ export class OrchestrationWorkerLifecycleService {
     dispatch: OrchestrationDispatchRecord,
     input: Parameters<OrchestrationService['workerRelease']>[0],
     integratedSnapshotOid?: string,
+    finalizeResident = false,
   ) {
+    if (this.host.store.getDispatchContext(dispatch.id)?.residentAfterIntegration && !finalizeResident) throw new OrchestrationError('operation_rejected', 'Resident Worker is retained until run-finalize');
     if (ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) {
       throw new OrchestrationError(
         'operation_rejected',
@@ -2790,33 +2792,31 @@ export class OrchestrationWorkerLifecycleService {
     let removedBranch = false;
     let worktreeError: string | undefined;
     if (worktreeToRemove) {
-      if (dispatch.isDetachedReviewWorktree && repoRootPath) {
-        const res = await removeDetachedReviewWorktree(repoRootPath, worktreeToRemove);
-        removedWorktree = res.removed;
-        if (!res.removed) {
-          worktreeError = res.error || `Failed to remove detached review worktree: ${worktreeToRemove}`;
-        }
-      } else {
+      if (!repoRootPath) throw new OrchestrationError('worktree_failed', 'Missing cleanup repository');
+      if (finalizeResident) this.host.store.setDispatchResident(dispatch.id, null);
+      try {
         const shouldDeleteBranch =
           !input.keepBranch &&
           Boolean(dispatch.ownsBranch && dispatch.branch?.startsWith(WORKER_BRANCH_PREFIX)) &&
           Boolean(dispatch.integrationStatus === 'merged' || input.force) &&
           (!integratedSnapshotOid || Boolean(input.expectedBranchOid));
-        const res = await removeOwnedWorkerWorktree({
-          worktreePath: worktreeToRemove,
-          repoRootPath,
-          // When integratedSnapshotOid has been verified after terminal shutdown, every uncommitted
-          // tracked/untracked file in this worktree is already committed into the target branch.
-          force: forceRemoveWorktree || Boolean(integratedSnapshotOid),
-          deleteBranch: shouldDeleteBranch ? dispatch.branch : null,
-          expectedBranchOid: input.expectedBranchOid ?? null,
-          allowSquashCasDelete: Boolean(integratedSnapshotOid && input.expectedBranchOid),
-        });
+        const res = await this.host.cleanup.submit({
+          kind: dispatch.isDetachedReviewWorktree ? 'review_worktree.cleanup' : 'worker.release',
+          runId: dispatch.runId, dispatchId: dispatch.id, worktreePath: worktreeToRemove, repoRootPath,
+          worktreeBranch: dispatch.isDetachedReviewWorktree ? null : dispatch.branch ?? null,
+          deleteBranch: !dispatch.isDetachedReviewWorktree && shouldDeleteBranch,
+          expectedBranchOid: input.expectedBranchOid ?? (shouldDeleteBranch ? await resolveBranchRefOid(repoRootPath, dispatch.branch) : undefined) ?? undefined,
+          expectedReviewHead: dispatch.isDetachedReviewWorktree ? dispatch.reviewSnapshotOid ?? undefined : undefined,
+          allowUnmerged: Boolean(input.force || integratedSnapshotOid),
+        }, forceRemoveWorktree || Boolean(integratedSnapshotOid), Boolean(input.force));
         removedWorktree = res.removed;
         removedBranch = res.removedBranch;
         if (!res.removed) {
           worktreeError = `Worktree was not removed: ${worktreeToRemove}`;
         }
+      } catch (error) {
+        if (!dispatch.isDetachedReviewWorktree) throw error;
+        worktreeError = String(error);
       }
     }
 
