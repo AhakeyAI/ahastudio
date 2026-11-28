@@ -432,8 +432,11 @@ const roleManageSchema = z.object({
   screen: z.boolean().optional(),
 });
 
+const replyToValueSchema = z.union([z.number().int().positive(), z.string().trim()]).nullish();
+
 const boardPostSchema = z.object({
-  replyTo: z.union([z.number().int().positive(), z.string().trim().min(1)]).optional(),
+  replyTo: replyToValueSchema,
+  reply_to: replyToValueSchema,
   runId: z.string().trim().min(1).optional(),
   from: z.string().trim().min(1).optional(),
   text: z.string().trim().min(1).max(64_000),
@@ -1040,7 +1043,7 @@ export async function dispatchOrchestrationHttpAction(
           runId: parsed.runId,
           from: caller,
           text: parsed.text,
-          replyTo: parsed.replyTo,
+          replyTo: parsed.replyTo || parsed.reply_to || undefined,
           kind: parsed.kind,
           subject: parsed.subject,
           isUser: false,

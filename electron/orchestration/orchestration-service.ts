@@ -3257,6 +3257,10 @@ export class OrchestrationService {
     runId?: string;
     threadId?: string;
     capability?: string;
+    fromRole?: string;
+    mentions?: readonly string[];
+    refs?: readonly number[];
+    kind?: OrchestrationBoardPostKind;
   }): OrchestrationSendResult | Promise<OrchestrationSendResult> {
     const rawInputTo = input.to?.trim() ?? '';
     const isLifecycleReport = input.type === 'worker_done' || input.type === 'heartbeat';
@@ -6228,7 +6232,16 @@ export class OrchestrationService {
       if (dispatch) this.codexMailbox.set(workerId, pending);
       return;
     }
-    const { prompt, messages, inlined } = this.codexMailboxPrompt(pending);
+    const member = this.resolveBoardMemberForPane(workerId);
+    const unreadMessages = pending.messages.filter(
+      (message) => !(member && message.runId === member.runId && this.store.wasBoardPostRead(message.id, member.memberKey))
+    );
+    if (!pending.opaque && unreadMessages.length === 0) return;
+    const { prompt, messages, inlined } = this.codexMailboxPrompt({
+      opaque: pending.opaque,
+      messages: unreadMessages,
+    });
+    if (!pending.opaque && messages.length === 0) return;
     void this.submitCodexTurn(dispatch, session, prompt).then(async (outcome) => {
       if (outcome.status === 'accepted') {
         const member = this.resolveBoardMemberForPane(workerId);
@@ -8944,12 +8957,31 @@ export class OrchestrationService {
       });
       return { mode: 'replied', dispatch, ...replied };
     }
+    const callerDispatch = this.store.getActiveDispatchForIdentity(callerPaneId, callerPaneId);
+    const senderRole = callerDispatch
+      ? this.resolveRoleNameForDispatch(callerDispatch).toLowerCase() || 'worker'
+      : 'coordinator';
+    const targetRole = this.resolveRoleNameForDispatch(dispatch).toLowerCase() || dispatch.id;
+    const refs = parseBoardRefs(cleanMessage);
     const sent = await this.send({
       from: callerPaneId,
       to: `dispatch:${dispatch.id}`,
+      runId: dispatch.runId,
       subject: input.subject?.trim() || 'Coordinator message',
       body: cleanMessage,
+      fromRole: senderRole,
+      mentions: [targetRole],
+      refs: refs.length > 0 ? refs : undefined,
+      kind: 'post',
     });
+    if (senderRole === 'coordinator') {
+      this.peerPingPong.recordCoordinatorOrUserActivity(dispatch.runId);
+    }
+    if (typeof sent.message.boardSeq === 'number') {
+      this.store.advanceMemberCursor(dispatch.runId, senderRole, {
+        lastPostSeq: sent.message.boardSeq,
+      });
+    }
     return {
       mode: sent.followUp ? 'reactivated' : 'sent',
       dispatch: sent.followUp?.dispatch ?? dispatch,
@@ -9472,16 +9504,17 @@ export class OrchestrationService {
   }
 
   async boardPost(input: BoardPostInput) {
-    if (input.replyTo === undefined) return this.publishBoardPost(input);
+    const reference = input.replyTo === undefined || input.replyTo === null ? '' : String(input.replyTo).trim();
+    if (!reference) return this.publishBoardPost(input);
     const caller = this.resolveBoardCallerContext(input);
-    const reference = String(input.replyTo).trim();
     const seq = /^#?(\d+)$/.exec(reference);
     const original = seq
       ? this.store.listBoardPosts(caller.runId, { seqs: [Number(seq[1])] })[0]
       : this.store.getMessageById(reference);
     const firewall = this.getReviewFirewallContext(input.from);
     if (!original?.fromRole || !original.boardSeq || original.runId !== caller.runId ||
-        original.lifecycleRejectedReason || !original.mentions?.includes(caller.memberKey) ||
+        original.lifecycleRejectedReason ||
+        !original.mentions?.some((m) => m.replace(/^@+/, '').toLowerCase() === caller.memberKey) ||
         (firewall && this.isPostHiddenByReviewFirewall(original, firewall))) {
       throw new OrchestrationError('invalid_argument', 'replyTo must identify a visible post addressed to your role in this Run.');
     }
@@ -9517,7 +9550,8 @@ export class OrchestrationService {
       : input.fromRole?.trim().replace(/^@+/, '').toLowerCase() || caller.callerRole;
     const mentions = parseBoardMentions(text);
     const refs = parseBoardRefs(text);
-    if (original?.fromRole && !mentions.includes(original.fromRole)) mentions.push(original.fromRole);
+    const replyAuthorRole = original?.fromRole?.trim().replace(/^@+/, '').toLowerCase();
+    if (replyAuthorRole && !mentions.includes(replyAuthorRole)) mentions.push(replyAuthorRole);
     if (original?.boardSeq && !refs.includes(original.boardSeq)) refs.push(original.boardSeq);
     const threadId = original?.threadId ?? original?.id;
     const woke = new Set<string>();

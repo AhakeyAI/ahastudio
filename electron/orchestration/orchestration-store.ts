@@ -523,7 +523,13 @@ export class OrchestrationStore {
     this.boardReadersByMessageId.clear();
     for (const [id, roles] of Object.entries(parsed.boardReadersByMessageId ?? {})) {
       if (this.messages.has(id) && Array.isArray(roles)) {
-        this.boardReadersByMessageId.set(id, new Set(roles.filter(role => typeof role === 'string')));
+        const normalized = roles
+          .filter((role): role is string => typeof role === 'string')
+          .map((role) => role.trim().replace(/^@+/, '').toLowerCase())
+          .filter(Boolean);
+        if (normalized.length > 0) {
+          this.boardReadersByMessageId.set(id, new Set(normalized));
+        }
       }
     }
     this.consumerReadByMessageId.clear();
@@ -3178,13 +3184,15 @@ export class OrchestrationStore {
 
   /** Exact content reads can arrive out of order. A pointer alone never consumes its posts. */
   recordBoardRead(runId: string, role: string, ids: readonly string[]): void {
+    const key = role.trim().replace(/^@+/, '').toLowerCase();
+    if (!key) return;
     let changed = false;
     for (const id of ids) {
       const message = this.messages.get(id);
       if (message?.runId !== runId || !message.boardSeq) continue;
       const readers = this.boardReadersByMessageId.get(id) ?? new Set<string>();
-      if (readers.has(role)) continue;
-      readers.add(role);
+      if (readers.has(key)) continue;
+      readers.add(key);
       this.boardReadersByMessageId.set(id, readers);
       changed = true;
     }
@@ -3192,7 +3200,8 @@ export class OrchestrationStore {
   }
 
   wasBoardPostRead(id: string, role: string): boolean {
-    return this.boardReadersByMessageId.get(id)?.has(role) ?? false;
+    const key = role.trim().replace(/^@+/, '').toLowerCase();
+    return key ? (this.boardReadersByMessageId.get(id)?.has(key) ?? false) : false;
   }
 
   recordBoardReceipt(ids: readonly string[], role: string, state: 'notified' | 'delivered' | 'replied'): boolean {

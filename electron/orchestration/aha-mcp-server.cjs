@@ -916,6 +916,12 @@ function nonEmptyStr(value) {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function normalizeReplyTo(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'string') return nonEmptyStr(value);
+  return value;
+}
+
 function finiteNonNegativeInt(value) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   return Math.max(0, Math.floor(value));
@@ -1029,9 +1035,10 @@ async function handleToolCall(name, rawArgs, activeRequests) {
     case 'post_message': {
       const kind = nonEmptyStr(args.kind);
       const subject = nonEmptyStr(args.subject);
+      const replyTo = normalizeReplyTo(args.replyTo) ?? normalizeReplyTo(args.reply_to);
       const res = await callAction('board-post', {
         text: typeof args.text === 'string' ? args.text : '',
-        replyTo: args.replyTo ?? args.reply_to,
+        ...(replyTo !== undefined ? { replyTo } : {}),
         ...(kind ? { kind } : {}),
         ...(subject ? { subject } : {}),
       });

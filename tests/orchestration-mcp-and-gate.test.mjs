@@ -927,6 +927,28 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
     name: 'message_worker', arguments: { role: '@reviewer', message: 'Please post progress later.', questionId: '   ' },
   });
   assert.equal(steering.result.isError, undefined);
+  const steeringSeq = Number(/#(\d+)/.exec(steering.result.content[0].text)?.[1]);
+  assert.ok(steeringSeq, steering.result.content[0].text);
+  const [steeringPost] = service.store.listBoardPosts(firstWorker.runId, { seqs: [steeringSeq] });
+  assert.ok(steeringPost);
+
+  const plainProgress = await workerClient.request('tools/call', {
+    name: 'post_message',
+    arguments: { text: 'Halfway through auth checks', replyTo: '   ', reply_to: null },
+  });
+  assert.equal(plainProgress.result.isError, undefined);
+
+  const steeringReply = await workerClient.request('tools/call', {
+    name: 'post_message',
+    arguments: { text: 'Will post final summary shortly.', reply_to: ' #' + steeringSeq + ' ' },
+  });
+  assert.equal(steeringReply.result.isError, undefined);
+  assert.match(steeringReply.result.content[0].text, /Woke: @coordinator/);
+  assert.equal(service.store.getMessageById(steeringPost.id).receipts.reviewer, 'replied');
+  const consumeReply = await coordClient.request('tools/call', {
+    name: 'board_wait', arguments: { timeoutMs: 2_000 },
+  });
+  assert.match(consumeReply.result.content[0].text, /Will post final summary shortly\./);
 
   const coordReplyCall = await coordClient.request('tools/call', {
     name: 'message_worker',

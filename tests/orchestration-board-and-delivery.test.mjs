@@ -280,7 +280,7 @@ test('OrchestrationStore boardSeq, member cursors, seqs lookup, persistence & le
     [1]
   );
 
-  store1.recordBoardRead(run.id, 'api', [m2.id]);
+  store1.recordBoardRead(run.id, '@API', [m2.id]);
   store1.advanceMemberCursor(run.id, 'watcher', { lastMentionReadSeq: 2 });
   store1.flushSync();
   store1.close();
@@ -291,6 +291,7 @@ test('OrchestrationStore boardSeq, member cursors, seqs lookup, persistence & le
   t.after(() => store2.close());
   assert.equal(store2.getHeadBoardSeq(run.id), 2);
   assert.equal(store2.wasBoardPostRead(m2.id, 'api'), true);
+  assert.equal(store2.wasBoardPostRead(m2.id, '@API'), true);
   assert.equal(store2.wasBoardPostRead(m1.id, 'api'), false);
   assert.equal(store2.getMemberCursor(run.id, 'watcher').lastMentionReadSeq, 2);
   assert.equal(store2.getMemberCursor(run.id, 'watcher').lastReadSeq, 0);
@@ -1151,7 +1152,7 @@ test('posting progress preserves unread mail and delivery can find a mention bey
   for (let i = 0; i < 200; i++) {
     store.insertMessage({ runId, from: 'other', fromRole: 'other', to: 'run:' + runId, subject: 'FYI', kind: 'post' });
   }
-  const mention = await service.boardPost({ from: coordPaneId, text: '@api preserve compatibility' });
+  const mention = await service.boardPost({ from: coordPaneId, text: '@api preserve compatibility', replyTo: '   ' });
   await service.boardPost({ from, text: 'Tests running' });
   assert.equal(store.getMemberCursor(runId, 'api').lastReadSeq, before.lastReadSeq);
   const wait = await service.boardWait({ from, peek: true });
@@ -1166,7 +1167,7 @@ test('only an explicit reply marks a referenced post as replied', async (t) => {
   const { service, store, coordPaneId } = createHarness(t);
   const worker = await service.delegateTask({ from: coordPaneId, role: 'api', agent: 'claude', task: 'API work', worktree: false });
   const from = worker.ptyId;
-  const mention = await service.boardPost({ from: coordPaneId, text: '@api preserve compatibility' });
+  const mention = await service.boardPost({ from: coordPaneId, text: '@api preserve compatibility', replyTo: '   ' });
   service.boardRead({ from, seqs: [mention.boardSeq] });
   await service.boardPost({ from, text: 'For background see #' + mention.boardSeq, kind: 'update' });
   assert.equal(store.getMessageById(mention.post.id).receipts.api, 'delivered');
