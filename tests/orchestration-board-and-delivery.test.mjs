@@ -1137,6 +1137,8 @@ for (const problem of ['failed', 'process exited or unavailable']) {
     assert.equal(s.sweep().length, 1);
     assert.equal(s.latestStall().body, `@coordinator Unanswered mention for @api at #2: ${problem}. Consider switching CLIs or handling it manually.`);
     assert.deepEqual(wakes, [s.coordPaneId]);
+    const peek = await s.service.boardWait({ from: s.worker.ptyId, since: 2, mentionsOnly: false, peek: true });
+    assert.deepEqual(peek.posts, [], 'a full-board Worker wait does not deliver coordinator-only stalls');
     assert.equal(s.writtenPty.filter(w => w.ptyId === s.worker.ptyId).length, writesBefore);
   });
 }

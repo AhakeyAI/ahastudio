@@ -260,7 +260,8 @@ export class OrchestrationBoardService {
     woke: readonly string[],
     senderPaneId?: string
   ): void {
-    this.host.waiters.notify(`board:${runId}:all`, msg.type);
+    // Watchdog posts notify only the chosen audience, including full-board waiters in that role.
+    if (!isSystemStall(msg)) this.host.waiters.notify(`board:${runId}:all`, msg.type);
     const run = this.host.store.getRun(runId);
 
     const schedulePane = (paneId: string | null | undefined) => {
@@ -866,6 +867,7 @@ export class OrchestrationBoardService {
       limit: 200,
       matches: (post) => {
         if (firewall && this.host.isPostHiddenByReviewFirewall(post, firewall)) return false;
+        if (isSystemStall(post) && !post.mentions?.includes(caller.memberKey)) return false;
         if (mentionsOnly && explicitSince === undefined && this.host.store.wasBoardPostRead(post.id, caller.memberKey)) return false;
         if (!mentionsOnly) {
           const fromRole = post.fromRole?.trim().replace(/^@+/, '').toLowerCase() ?? '';
