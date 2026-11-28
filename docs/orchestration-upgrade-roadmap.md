@@ -76,7 +76,8 @@ flowchart LR
     QG --> S4BC["Stage 4B/4C: CleanupOutbox + 看板 Overview/休眠态"]
     S3A --> S3B1["Stage 3B-1: ResumeClaim + 进程回收 + 休眠自动复活"]
     S3B1 --> S3B2["Stage 3B-2: 跨 CLI 接力 + 常驻角色续波次 + 作者集合回避"]
-    S3B2 --> S3C["Stage 3C: CLI/远程 requestId 幂等与事实完善"]
+    QG --> S3Ca["Stage 3C-a: 写入口 requestId 幂等"]
+    S3B2 --> S3C["Stage 3C-b: 观测事实补齐"]
     S3C -. "按需双路径评估" .-> S4A["Stage 4A: JSONL（历史量） / node:sqlite（联合恢复）"]
 ```
 
@@ -219,7 +220,9 @@ flowchart LR
   4. **失败验收 1（残留子进程仍在写文件）**：旧 CLI 已确认中断，但模拟其衍生的后台进程仍在改写 worktree 文件 → 系统必须**保留 worktree 不清理、暂停移交并返回明确错误**，不得启动新 CLI 造成双写；
   5. **失败验收 2（拉起新 CLI 后、落盘成功前崩溃）**：移交记录落盘后拉起新 CLI，模拟在写入 `active` 之前应用崩溃 → 重启后恢复流程回收孤儿进程、标记 `needs_attention`，**绝不再启动第二份重复 Worker**。
 
-#### PR 3C：CLI / 远程 `requestId` 幂等与观测事实补齐（未来远程控制前置护栏）
+#### PR 3C：CLI / 远程 `requestId` 幂等与观测事实补齐（未来远程控制前置护栏；拆 3C-a / 3C-b）
+- **拆分（已决策）**：3C-a（写入口 `requestId` 幂等）不依赖 3B，与 3A / 3B-1 并行先做；3C-b（`AttemptObservationFact` 事实补齐，含 dormant/resume、handoff）依赖 3B 的事件，排在 3B-2 之后。
+- **3C-a — 已完成**：`request-idempotency.ts` 的 `RequestReceipts` 按 `(action, callerPaneId, requestId)` 记账，`worker-start / worker-integrate / run-finalize / worker-release / approve / deny` 带 `requestId` 时只执行一次：重试（含并发重复）返回首个成功结果并带 `replayed: true`，同 ID 异载荷返回 409 `request_mismatch`，失败结果不入账（重试会重新执行）。收据仅在内存保留（24h / 500 条），应用重启后不重放。CLI 对上述动作自动生成 `requestId`，断线时提示 `--retry-request <id>`。
 - **定位说明**：单机模式下主要服务 CLI/HTTP 断线重试与防连点，但**面向未来的远程控制（手机/弱网重连、重复点击审批/派发/合入）属于必经防双写护栏**，在 3B-2 之后独立收口。
 - **内容**：
   1. 在已有 `startObservation` 与 `IntegrationIntent / finalizedBatches` 基础上，补齐只增不改的 `AttemptObservationFact` 关键事件覆盖（turn、approval、native question、snapshot、dormant/resume、handoff、integration）。
