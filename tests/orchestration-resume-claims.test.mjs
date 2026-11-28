@@ -5,7 +5,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { isProcessTreeAlive, killProcessTree, SPAWN_AGENT_PROCESS_GROUP } from '../dist-electron/agent-drivers/process-tree.js';
+import {
+  isProcessTreeAlive, killProcessTree, markProcessGroupLeader, SPAWN_AGENT_PROCESS_GROUP,
+} from '../dist-electron/agent-drivers/process-tree.js';
 import { OrchestrationStore } from '../dist-electron/orchestration/orchestration-store.js';
 
 function claimInput(overrides = {}) {
@@ -57,9 +59,9 @@ test('claims from an earlier app run stay stale until their process is gone', as
 });
 
 test('killing an agent process tree stops the process and its liveness check follows', async () => {
-  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+  const child = markProcessGroupLeader(spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
     stdio: 'ignore', detached: SPAWN_AGENT_PROCESS_GROUP, windowsHide: true,
-  });
+  }));
   await new Promise((resolve) => child.once('spawn', resolve));
   assert.equal(isProcessTreeAlive(child.pid), true);
   const closed = new Promise((resolve) => child.once('exit', resolve));
@@ -68,4 +70,16 @@ test('killing an agent process tree stops the process and its liveness check fol
   for (let i = 0; i < 50 && isProcessTreeAlive(child.pid); i++) await new Promise((r) => setTimeout(r, 20));
   assert.equal(isProcessTreeAlive(child.pid), false);
   assert.equal(isProcessTreeAlive(-1), false);
+});
+
+test('a child AhaStation did not make a group leader is never signalled as a group', () => {
+  const signals = [];
+  const realKill = process.kill;
+  process.kill = (target, signal) => { signals.push([target, signal]); return true; };
+  try {
+    killProcessTree({ pid: 4343, exitCode: null, signalCode: null, kill: (signal) => { signals.push(['child', signal]); return true; } });
+  } finally {
+    process.kill = realKill;
+  }
+  assert.deepEqual(signals, [['child', 'SIGKILL']]);
 });

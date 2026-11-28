@@ -8,7 +8,7 @@ import type {
   AgentTurnAttachment, TurnDelivery,
 } from './agent-session-driver.js';
 import { spawnWindowsCodexJob } from './windows-codex-job.js';
-import { SPAWN_AGENT_PROCESS_GROUP, killProcessTree } from '../agent-drivers/process-tree.js';
+import { SPAWN_AGENT_PROCESS_GROUP, killProcessTree, markProcessGroupLeader } from '../agent-drivers/process-tree.js';
 import type {
   WorkerTimelineEvent, WorkerTimelineFileChange, WorkerTimelineItemStatus, WorkerTimelineItemUpdate,
 } from './worker-timeline.js';
@@ -358,7 +358,7 @@ export function launchCodexPilot(options: {
   const argv = wrapper ? [entry, ...args] : args;
   const child = process.platform === 'win32'
     ? spawnWindowsCodexJob(executable, argv, options.cwd, env)
-    : spawn(executable, argv, { cwd: options.cwd, env, windowsHide: true, stdio: 'pipe', detached: SPAWN_AGENT_PROCESS_GROUP });
+    : markProcessGroupLeader(spawn(executable, argv, { cwd: options.cwd, env, windowsHide: true, stdio: 'pipe', detached: SPAWN_AGENT_PROCESS_GROUP }));
   return new CodexAppServerPilot(child, options.events, 30_000, [
     options.mcp?.env.AHA_WORKER_TOKEN, options.mcp?.env.AHA_SESSION_TOKEN, options.mcp?.env.AHA_AGENT_HOOK_TOKEN,
   ].filter((value): value is string => Boolean(value)), options.mcp ? options.mcp.requiredTool ?? 'report_done' : null, options.diagnostics === true);

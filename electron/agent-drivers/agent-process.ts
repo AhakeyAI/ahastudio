@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { win32 } from 'node:path';
 import { augmentedPath, resolveBinaryFromPath } from '../bin-resolve.js';
 import { spawnWindowsCodexJob } from '../orchestration/windows-codex-job.js';
-import { SPAWN_AGENT_PROCESS_GROUP, killProcessTree } from './process-tree.js';
+import { SPAWN_AGENT_PROCESS_GROUP, killProcessTree, markProcessGroupLeader } from './process-tree.js';
 
 export type AgentChild = ChildProcessWithoutNullStreams;
 
@@ -61,7 +61,7 @@ export function spawnAgentProcess(input: {
   const env = agentEnvironment(input.env, input.envToDelete);
   return process.platform === 'win32'
     ? spawnWindowsCodexJob(file, args, input.cwd, env)
-    : spawn(file, args, { cwd: input.cwd, env, windowsHide: true, stdio: 'pipe', detached: SPAWN_AGENT_PROCESS_GROUP });
+    : markProcessGroupLeader(spawn(file, args, { cwd: input.cwd, env, windowsHide: true, stdio: 'pipe', detached: SPAWN_AGENT_PROCESS_GROUP }));
 }
 
 const STDERR_LIMIT = 4 * 1024;
