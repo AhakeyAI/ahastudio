@@ -1,18 +1,18 @@
-# AhaStudio 编排模块后续演进规划（v6 · `main @ 8705256`）
+# AhaStudio 编排模块后续演进规划（v7 · `main @ 3dcf3fe`）
 
 > **输入依据**：
 > - 三方只读调研报告（Aha / Orca / T3 Code 编排架构横向深度调研）
-> - `/swarm` 协作机制精华提炼（门铃经济学、零拷贝 `#seq`、语义停摆监测、零成本休眠、交付概览）
-> - 仓库实地核验（`main @ 8705256`，2026-11-28；含 PR #15 / #16 / #17 合入后源码级复核）
+> - `/swarm` 协作机制精华提炼（门铃经济学、零拷贝 `#seq`、语义停摆监测、零成本休眠复活、交付概览）
+> - 仓库实地核验（`main @ 3dcf3fe`，2026-11-28；含 PR #15–#22 合入后复核）
 
 ---
 
-## 1. 核心定位与 `8705256` 实地核验基线
+## 1. 核心定位与 `3dcf3fe` 实地核验基线
 
 AhaStudio 在**本地多 Agent 编码闭环产品语义**上已经领先同类项目（不可变快照、异构对抗评审、集成分支、`report_done` 结算红线、`unknown_acceptance` 不重发），当前升级主线为**双轨推进**：
 
-1. **协作体验轨（源自 `/swarm` + T3 交接理念）**：降 Token、防卡死自愈、跨 CLI 限额原位接力、看板交付总览。
-2. **架构地基轨（源自 Orca 可靠性 + T3 显式边界）**：先定持久化确认与事务边界再拆破万行 Service/Store、完善能力驱动与单写者所有权、按需演进持久化。
+1. **协作体验轨（源自 `/swarm` + T3 交接理念）**：降 Token、防卡死自愈、常驻休眠热复活、跨 CLI 限额原位接力、看板交付总览。
+2. **架构地基轨（源自 Orca 可靠性 + T3 显式边界）**：先定持久化确认与事务边界再拆破万行 Service/Store、完善能力驱动与单写者所有权、架构守门棘轮、按需演进持久化，并为未来远程控制预留干净边界。
 
 ### 已合入 `main` 的里程碑
 
@@ -25,13 +25,17 @@ AhaStudio 在**本地多 Agent 编码闭环产品语义**上已经领先同类�
   2. **游标语义变化**：发帖/回复**不再**推进 `lastReadSeq`；`mentionsOnly` 等待推进独立的 `lastMentionReadSeq`。
   3. **回答问题必须显式**：`message_worker` 需传 `questionId`；`post_message @role` **不再自动回答**待答问题；问题**无过期机制**。
   4. 新增 `post_message(replyTo=#seq|messageId)`；`peek` 统一走 `board-wait` 路径。
+- **PR #18 / #19 / #20 = 前置修复已完成**：已修复「协调者已见过（精确已读或游标覆盖）但未答问题导致停摆永久静默」（`18a4dbc`），并同步更新文档至 v6（`eb3fd73`）。
+- **PR #21 / #22 = Stage 2A / 2B 已完成**：Store 拆为 Facade + state-repository / lifecycle / mailbox / security 子 store（`runMutation` / `flushDurable` 契约落地）；Service 拆为薄 Facade + text-views / board / review / integration / delegation / worker-lifecycle 六个子模块（`3dcf3fe`）。
 
-### `8705256` 关键文件体量基线
+### `3dcf3fe` 关键文件体量基线
 
 | 文件 | 行数 | 当前状态 |
 | --- | --- | --- |
-| [`electron/orchestration/orchestration-service.ts`](../electron/orchestration/orchestration-service.ts) | **10,761** | 已含 handoffs/multi-driver/通信修复全量逻辑 |
-| [`electron/orchestration/orchestration-store.ts`](../electron/orchestration/orchestration-store.ts) | **4,060** | 单文件 `orchestration-state.json`（上限 200 消息/Run、50 Run，异步写盘），含 `boardReadersByMessageId` |
+| [`electron/orchestration/orchestration-service.ts`](../electron/orchestration/orchestration-service.ts) | **5,032** | Stage 2B 后保留鉴权、Run/Task、消息收发与 Coordinator 循环，其余经 `*Host` 接口委托给子服务（拆分前 10,796） |
+| [`electron/orchestration/orchestration-store.ts`](../electron/orchestration/orchestration-store.ts) | **964** | Facade；单文件 `orchestration-state.json`（上限 200 消息/Run、50 Run，异步写盘），实现在 lifecycle（2,080）/ mailbox（1,140，含 `boardReadersByMessageId`）/ security 子 store（拆分前 4,060） |
+| [`electron/orchestration/board-service.ts`](../electron/orchestration/board-service.ts) | **1,116** | 看板发帖/游标/精确已读/`board_wait`/停摆监测（Stage 1B 主战场） |
+| [`electron/orchestration/worker-lifecycle-service.ts`](../electron/orchestration/worker-lifecycle-service.ts) | **2,580** | `workerStart` / `startFollowUp` / stop / release / abandon + Headless 桥接（Stage 3B 主战场） |
 | [`electron/orchestration/worker-git-integration.ts`](../electron/orchestration/worker-git-integration.ts) | **2,251** | 已含 `IntegrationIntent` 钩子，后续与清理 Outbox 解耦 |
 | [`src/components/OrchestrationBoardPanel.tsx`](../src/components/OrchestrationBoardPanel.tsx) | **2,425** | 已有 `board / members / graph`、原生提问与送达状态，缺 `Overview` 与视觉时间线 |
 | [`electron/orchestration/headless-workers.ts`](../electron/orchestration/headless-workers.ts) | **114** | 多 driver headless 策略基座（Stage 3A/3B 直接复用与扩展） |
@@ -60,18 +64,19 @@ AhaStudio 在**本地多 Agent 编码闭环产品语义**上已经领先同类�
 
 ## 3. 演进依赖与推进图
 
-Stage 0 / 1A 已完成，后续所有阶段按 **独立 PR 粒度** 在独立 worktree 中推进；Stage 2 之后 1B / 3A / 4B+4C **互不依赖、可并行**：
+Stage 0 / 1A / 前置修复 / 2A / 2B 均已完成（`main @ 3dcf3fe`）；下一步先补轻量质量守门，随后 1B / 3A / 4B+4C **互不依赖、可并行**：
 
 ```mermaid
 flowchart LR
-    S0["Stage 0 + 1A: 已完成（main @ 8705256）"] --> SF["前置修复: 已读未答问题致停摆静默"]
-    SF --> S2A["Stage 2A: Store runMutation / flushDurable + 拆分"]
-    S2A --> S2B["Stage 2B: Service 物理拆解（按耦合低→高）"]
-    S2B --> S1B["Stage 1B: board-service 语义停摆监测"]
-    S2B --> S3A["Stage 3A: 能力矩阵 + ProviderRefs"]
-    S2B --> S4BC["Stage 4B/4C: CleanupOutbox + 看板 Overview"]
-    S3A --> S3B["Stage 3B: 跨 CLI 接力 + ResumeClaim + 作者集合回避"]
-    S3B --> S3C["Stage 3C: CLI 断线 requestId 幂等与事实完善"]
+    S0["Stage 0 + 1A + 前置修复: 已完成"] --> S2A["Stage 2A: Store runMutation / flushDurable + 拆分（已完成 #21）"]
+    S2A --> S2B["Stage 2B: Service 物理拆解（已完成 #22）"]
+    S2B --> QG["质量守门: check-architecture + npm run check"]
+    QG --> S1B["Stage 1B: board-service 语义停摆监测"]
+    QG --> S3A["Stage 3A: 能力矩阵 + ProviderRefs"]
+    QG --> S4BC["Stage 4B/4C: CleanupOutbox + 看板 Overview/休眠态"]
+    S3A --> S3B1["Stage 3B-1: ResumeClaim + 进程回收 + 休眠自动复活"]
+    S3B1 --> S3B2["Stage 3B-2: 跨 CLI 接力 + 常驻角色续波次 + 作者集合回避"]
+    S3B2 --> S3C["Stage 3C: CLI/远程 requestId 幂等与事实完善"]
     S3C -. "按需双路径评估" .-> S4A["Stage 4A: JSONL（历史量） / node:sqlite（联合恢复）"]
 ```
 
@@ -88,13 +93,9 @@ flowchart LR
 - 门铃原则、零拷贝 `#seq`、`[done]` 专属协调者、所有权切分、短 Turn 纪律、热休眠复用、工具消歧均已落地于 `coordinator-prompt.ts` / `worker-dispatch-preamble.ts` / `aha-mcp-server.cjs`。
 - PR #17 已同步修订：`message_worker` 改为显式 `questionId` 回答（不再"自动回答第一个待答问题"），Coordinator 提示词补充 questionId 用法。
 
----
+### 前置修复：已读未答问题导致停摆永久静默 — **已完成（PR #19 / #20）**
 
-### 前置修复：已读未答问题导致停摆永久静默（Stage 2 前合入）
-
-- **问题链**（代码核验确认）：PR #17 后问题只能经 `questionId` 显式回答且无过期机制；等待答复的 Worker 推导为 `waiting_input`（非 `working`）；`hasPendingAttention` 把**所有** pending 问答计入静默保护 → 若协调者**已读**问题却未用 `questionId` 回答（崩溃、误用 `post_message @role`、LLM 遗漏），Run 永久停摆且零提示。
-- **修复设计**：`inspectRunsForStallWatchdog` 中，`toHandle === 'run:<runId>'` 且协调者**已见过**的未答问题**不再计入** `hasPendingAttention`。"已见过"的判定为两者之一：`wasBoardPostRead(q.messageId, 'coordinator')`（精确已读），**或** `post.boardSeq <= coordinatorCursor.lastReadSeq`（宽泛 `read_board` 只推进游标、不记录精确已读，游标覆盖即算见过）。`handleBoardStallDetected` 在存在此类问题时于停摆帖中点名 `#seq` + `questionId` 并提示用 `message_worker` 回答。未读问题与子 Worker 提问（`toHandle = dispatch:<id>`）维持原静默保护。
-- **验收**：已读未答→超阈值发提醒（点名 questionId）；未读→保持静默；已回答→保持静默。
+- 已在 `inspectRunsForStallWatchdog` 中排除协调者已见过（`wasBoardPostRead` 精确已读或 `post.boardSeq <= coordinatorCursor.lastReadSeq` 游标覆盖）的未答 Run 级问题，并在停摆帖中点名 `#seq` + `questionId`；未读问题与子 Worker 提问维持原静默保护。
 
 ---
 
@@ -136,6 +137,13 @@ flowchart LR
   5. `delegation-service.ts`（提案确认链、语义 `delegateTask`、队列发射 `scheduleQueuedLaunches / launchQueuedTask`、角色路由）
   6. `worker-lifecycle-service.ts`（`workerStart` / `followUp` / `stop` / `release` / `abandon` / Headless 桥接，协同 `headless-workers.ts` 与 `worker-native-questions.ts`——耦合最重，最后做）
 
+#### 质量守门（紧跟 2B 合入后的轻量独立 PR）
+- 新增 `scripts/check-architecture.mjs` 与统一门禁脚本 `npm run check`（并接入 `.github/workflows/ci.yml`），在后续 PR 开工前锁死 2A/2B 拆好的边界：
+  1. 禁止 `electron/orchestration/` 直接 `import 'electron'`（保证纯 Node 内核，服务未来远程 Daemon）；
+  2. 禁止子服务与子 Store 出现运行时循环依赖或反向耦合；
+  3. 禁止引入红线依赖（`effect`、`tailwindcss`、`@tiptap/*`、`@base-ui/*`）；
+  4. 为已拆分核心模块设立文件体量棘轮，防止再次长出万行巨无霸。
+
 ---
 
 ### Stage 1B：在拆分后的 `board-service.ts` 升级语义停摆监测（独立 PR）
@@ -168,42 +176,53 @@ flowchart LR
 
 ---
 
-### Stage 3：能力驱动、跨 CLI 原位接力与幂等恢复（拆为 3A / 3B / 3C 三个独立 PR）
+### Stage 3：能力驱动、常驻休眠热复活、跨 CLI 接力与幂等恢复（拆为 3A / 3B-1 / 3B-2 / 3C 四个独立 PR）
 
 #### PR 3A：就地扩展能力矩阵、`headless-workers.ts` 与 `ProviderRefs`
 - **基础**：直接建立在已有 [`driver-capabilities.ts`](../electron/agent-drivers/driver-capabilities.ts) 和 [`headless-workers.ts`](../electron/orchestration/headless-workers.ts) 之上，不重复实现已有的 `headlessWorkerSupports / headlessWorkerControlsError / ahaToolDecision / sessionGateDecision`。
 - **增量内容**：
-  1. 在 `AgentDriverCapabilities` 补充尚未声明的编排维度：`nativeThreadIds: 'strong' | 'weak' | 'none'`、`acceptsDeveloperContext`、`supportsSteer`、`hookApprovalDialect`，收口 [`permission-approvals.ts`](../electron/orchestration/permission-approvals.ts) 和 service 内残余的 `cliId` 硬编码分支。
+  1. 在 `AgentDriverCapabilities` 补充尚未声明的编排维度：`nativeThreadIds: 'strong' | 'weak' | 'none'`、**`resumeAcrossCwd: boolean`**（显式声明是否支持切换 worktree 目录后原生 resume，例如 Claude 会话按 `cwd` 分桶默认 `false`）、`acceptsDeveloperContext`、`supportsSteer`、`hookApprovalDialect`，收口 [`permission-approvals.ts`](../electron/orchestration/permission-approvals.ts) 和 service 内残余的 `cliId` 硬编码分支。
   2. 引入结构化 `ProviderRefs`（App ID 为主身份，Provider session/thread/turn/request ID 仅作引用证据）。
   3. 将散落的策略判断收敛进 `headless-workers.ts` / `orchestration-policy.ts`，能力不足时返回显式结构化原因。
 
-#### PR 3B：跨 CLI 原位接力 + `ResumeClaim` 单写者锁 + 作者集合回避（拆 3B-1 / 3B-2 两个 PR）
+#### PR 3B：常驻休眠 Worker 热复活 + 跨 CLI 原位接力 + `ResumeClaim` 单写者锁（拆 3B-1 / 3B-2 两个 PR）
+- **核心定位（从“一次性 Dispatch”升级为“常驻休眠角色 + 一次性评审者”）**：
+  - **对抗评审者（`reviewOfDispatchId / reviewOfRunId`）永远保持一次性**：审完 detached snapshot 即销毁，严禁休眠复用，杜绝跨轮次锚定偏见。
+  - **领域开发者 / 调研者（`@backend / @frontend / @researcher`）升级为可常驻休眠角色**：空闲时可主动关闭子进程释放内存（真零内存、零 Token 休眠），被 `@role` 唤醒或重启后凭 `providerSessionId` 自动复活，合入第一波代码后也能继续承接下一波任务，直到整个 Run 收尾或人工点「退休」才彻底销毁。
 - **基础**：直接复用已合入的 `needs_reconciliation`、`reconciliationDiff` 与 `QueuedWorkerLaunch` 落盘认领模式，在其之上扩展可审计、经过 `secret-redaction.ts` 与 capability 脱敏的 `ContextTransfer / ContextHandoff` 工件，绝不起第二套平行结构。
-- **PR 3B-1（所有权与进程回收，先行）**：
-  1. 引入显式 `ResumeClaim / WorktreeOwnershipFence`，**claim 中记录 pid / job 句柄**；页面内人工接管同步切到同一套 claim。
+- **PR 3B-1（所有权、进程回收与同 worktree 休眠自动复活，先行）**：
+  1. 引入显式 `ResumeClaim / WorktreeOwnershipFence`，**claim 中记录 pid / job 句柄**（并预留 `hostId?: string` 与 `actor` 来源字段）；页面内人工接管同步切到同一套 claim。
   2. **推广现有 [`windows-codex-job.ts`](../electron/orchestration/windows-codex-job.ts)（当前仅服务 Codex）到全部 headless driver**；macOS / Linux 用进程组回收（`kill(-pgid)`）。
-- **PR 3B-2（接力本体）四条硬约束**：
+  3. **同 worktree 零成本休眠与按 `providerSessionId` 自动复活**：
+     - 改造 `startFollowUp`：当 Headless Worker 进程已退出或应用重启后，若 `settledDispatch.providerSessionId` 存在、worktree 仍在且 `driverCapabilities(cliId).resume === true`，不再直接抛 `dispatch_inactive`，而是获取 `ResumeClaim` 后通过 `open({ cwd, resumeSessionId })` 原位复活会话。
+     - 增加**空闲自动休眠**（可配阈值，如空闲 5 分钟且无活跃 turn / 无待答原生提问 / 无待批权限）：先归档 timeline，再安全 `close()` 释放子进程内存，将成员态置为 `dormant（休眠待命）`，下次被 `@role` 呼叫自动 `resume` 秒醒。
+- **PR 3B-2（跨 CLI 原位接力 + 合入后常驻角色续接下一波任务）五条硬约束**：
   1. **目标 CLI 筛选严格复用现有启动判断**（`workerStart` 内 `headlessWorkerSupports` 调用处）：
      - 必须通过 `headlessWorkerSupports(targetCli, workerPolicy)` 且校验运行时可用性（`headlessWorkers.available?.(targetCli) !== false` / `codexPilot.enabled()`）；
      - 沙箱 root 锁定同一 worktree，策略**宁严勿宽**：`antigravity` / `grok` 无 `read-only` 档，禁止接力只读 headless 任务；**`pi` 和 `opencode` 当前完全没有 headless Worker 支持，即使人工同意切换权限也不可作为 headless 接力目标**（仅显式降级为终端 Worker 流程）。
-  2. **红线 6（异构评审作者集合回避）**：**复用 [`agent-roster.ts`](../electron/orchestration/agent-roster.ts) 已实现的 `authorCliIds / excludeCliIds` 机制**（Run 级评审已传 `integratedAuthorClis`），本 PR 只做两件增量：(a) 接力链路上把累计作者集合持久化到 Worker 记录；(b) 单 Worker 评审把该集合传入 roster。仅当所有可用 CLI 均已参与编写时才显式降级并标明原因。
-  3. **红线 9（单写者 + 写入静止核验）**：移交前先中断原 CLI、回收其子进程组；"写入静止"的判定必须可操作化——**进程树为空，且相隔 N 秒的两次 worktree 快照 OID 一致**；若检测到残留后台进程仍在写入，**保留 worktree 现状并暂停移交**，绝不放行双写。
-  4. **两阶段落盘 + 崩溃恢复（防双实例）**：
+  2. **解耦“合入后释放旧分支”与“退休角色”（续波次且兼容 `cwd` 绑定）**：
+     - `integrate_worker` 合入第一波改动后，允许保留该非评审 `@role` 的常驻会话身份（仅清理旧任务分支，不再把整个人打死为不可唤醒）；
+     - 续接下一波任务时，优先在校验工作区干净 + `ResumeClaim` 单写者锁后，**在同一 worktree 路径原地切出基于最新 `main / aha/run/<runId>` 的新分支**（保持 `cwd` 不变，100% 兼容 Claude 等按 `cwd` 分桶的原生 `resumeSessionId`）；若必须新建不同路径 worktree 且目标 driver `resumeAcrossCwd === false`（或原生 resume 失败），则**自动降级为 `ContextHandoff` 便携上下文续接**，绝不报错卡死。
+     - 只有 Run `finalize` 或人工显式「退休/销毁」才彻底清理角色与 worktree。
+  3. **红线 6（异构评审作者集合回避）**：**复用 [`agent-roster.ts`](../electron/orchestration/agent-roster.ts) 已实现的 `authorCliIds / excludeCliIds` 机制**（Run 级评审已传 `integratedAuthorClis`），本 PR 做两件增量：(a) **单波任务内**的跨 CLI 接力将累计作者集合持久化到该波 Worker 记录（新一波独立任务从空集合重新累计，避免已合并旧波次污染无关任务）；(b) 单 Worker 评审把该集合传入 roster。仅当所有可用 CLI 均已参与编写时才显式降级并标明原因。
+  4. **红线 9（单写者 + 写入静止核验）**：移交或原地切分支前先中断原 CLI、回收其子进程组；"写入静止"的判定必须可操作化——**进程树为空，且相隔 N 秒的两次 worktree 快照 OID 一致**；若检测到残留后台进程仍在写入，**保留 worktree 现状并暂停移交**，绝不放行双写。
+  5. **两阶段落盘 + 崩溃恢复（防双实例）**：
      - **第一段**：启动新 CLI **之前**，先把 `pending` 态移交记录与 `ResumeClaim`（含拟用 targetCli、worktree、来源 dispatch）写入 Store 并 `await store.flushDurable()`；
      - **第二段**：拉起新 CLI 拿到 provider thread id 后，再写 `active` 态并二次 `flushDurable()`；
      - **重启恢复规则（写死）**：发现 `pending/active` 移交记录时，先按 claim 中记录的 pid / job 回收可能存活的孤儿进程（Windows 上 Electron 崩溃不保证子进程退出），随后将该移交标记为 **`needs_attention` 交人工处理**，**绝不自动续跑、绝不重复拉起第二份 Worker**。
 - **附带能力**（可独立后续 PR）：`delegate_task(forkFrom: "@role")` 热上下文派生（评审模式依然经过对抗防火墙，隐藏作者自述）。
-- **必须覆盖的验收用例（含 2 条关键失败验收）**：
-  1. **正常闭环**：保留同一 worktree 未提交改动完成跨 CLI 接力，作者集合 `{A, B}` 触发异构评审回避，脱敏无凭证泄露，最终通过评审合入；
-  2. **能力与策略拒绝**：`antigravity/grok` 拒绝接力 `read-only` headless 任务；`pi / opencode` 即使请求切权也因无 headless 支持而被 `headlessWorkerSupports()` 拒绝；
-  3. **失败验收 1（残留子进程仍在写文件）**：旧 CLI 已确认中断，但模拟其衍生的后台进程仍在改写 worktree 文件 → 系统必须**保留 worktree 不清理、暂停移交并返回明确错误**，不得启动新 CLI 造成双写；
-  4. **失败验收 2（拉起新 CLI 后、落盘成功前崩溃）**：移交记录落盘后拉起新 CLI，模拟在写入 `active` 之前应用崩溃 → 重启后恢复流程回收孤儿进程、标记 `needs_attention`，**绝不再启动第二份重复 Worker**。
+- **必须覆盖的验收用例（含休眠复活与 2 条关键失败验收）**：
+  1. **休眠复活闭环（3B-1）**：Headless Worker 空闲休眠（进程已关闭）或应用重启后，收到 `@role` 返工指令可凭 `providerSessionId` 自动复活并保留上下文；对抗评审者完结后拒绝休眠复用；
+  2. **跨 CLI 接力 & 续波次闭环（3B-2）**：保留同一 worktree 未提交改动完成跨 CLI 接力，作者集合 `{A, B}` 触发异构评审回避，脱敏无凭证泄露，最终通过评审合入；合入后同一 `@role` 可基于最新基线原地切新分支续接第二波任务（以及 `resumeAcrossCwd === false` 跨路径时自动降级 `ContextHandoff`）；
+  3. **能力与策略拒绝**：`antigravity/grok` 拒绝接力 `read-only` headless 任务；`pi / opencode` 即使请求切权也因无 headless 支持而被 `headlessWorkerSupports()` 拒绝；
+  4. **失败验收 1（残留子进程仍在写文件）**：旧 CLI 已确认中断，但模拟其衍生的后台进程仍在改写 worktree 文件 → 系统必须**保留 worktree 不清理、暂停移交并返回明确错误**，不得启动新 CLI 造成双写；
+  5. **失败验收 2（拉起新 CLI 后、落盘成功前崩溃）**：移交记录落盘后拉起新 CLI，模拟在写入 `active` 之前应用崩溃 → 重启后恢复流程回收孤儿进程、标记 `needs_attention`，**绝不再启动第二份重复 Worker**。
 
-#### PR 3C：CLI 断线 `requestId` 幂等与观测事实补齐（优先级低于 3A / 3B）
-- **定位说明**：LLM Agent 调用 MCP 时通常不会跨次携带同一 `requestId` 重试，此项主要服务于 **CLI/HTTP 断线自动重试与前端防重复点击**，排在 3A/3B 之后按轻量范围实现。
+#### PR 3C：CLI / 远程 `requestId` 幂等与观测事实补齐（未来远程控制前置护栏）
+- **定位说明**：单机模式下主要服务 CLI/HTTP 断线重试与防连点，但**面向未来的远程控制（手机/弱网重连、重复点击审批/派发/合入）属于必经防双写护栏**，在 3B-2 之后独立收口。
 - **内容**：
-  1. 在已有 `startObservation` 与 `IntegrationIntent / finalizedBatches` 基础上，补齐只增不改的 `AttemptObservationFact` 关键事件覆盖（turn、approval、native question、snapshot、handoff、integration）。
-  2. 为 HTTP/CLI 写入口（`worker-start / worker-integrate / run-finalize / worker-release`）增加 `(callerFingerprint, requestId)` 幂等收据与 `--retry-request <id>` 恢复指引，同 ID 异载荷返回 `request_mismatch`。
+  1. 在已有 `startObservation` 与 `IntegrationIntent / finalizedBatches` 基础上，补齐只增不改的 `AttemptObservationFact` 关键事件覆盖（turn、approval、native question、snapshot、dormant/resume、handoff、integration）。
+  2. 为 HTTP/CLI/远程写入口（`worker-start / worker-integrate / run-finalize / worker-release` 及审批决策）增加 `(callerFingerprint, requestId)` 幂等收据与 `--retry-request <id>` 恢复指引，同 ID 异载荷返回 `request_mismatch`。
 
 ---
 
@@ -220,12 +239,12 @@ flowchart LR
 - **基础**：直接兼容 `openNativeQuestions`、`ProposalWorkerControls`、`WorkerNativeQuestionCard`、`RunAttention` 及最新 snapshot 合流机制。
 - **改动范围**：[`OrchestrationBoardPanel.tsx`](../src/components/OrchestrationBoardPanel.tsx)、[`orchestration-board-model.ts`](../src/lib/orchestration-board-model.ts)、[`orchestration-client.ts`](../src/lib/orchestration-client.ts)。
 - **内容**：
-  1. **派生式 Overview 页签（借鉴 `swarm_pane`）**：协调者只维护极简目标与按**交付成果**分组的 `threads`，进度/评审门禁/阻塞问答状态全部从看板和 Store 实时派生。
-  2. **视觉变更时间线**：解析看板贴中的 `Screenshot: <path> | <简短说明>` 行（校验仅允许工作区或合法 artifact 目录路径），渲染前后对比缩略图时间线。
-  3. **游标分流订阅**：将前端大快照合并逐步拆为 `runOverview` + `boardCursorStream(since)` + `workerTimelineStream(dispatchId)`，结合引用缓存投影降低大 Run 渲染开销。
+  1. **派生式 Overview 页签（借鉴 `swarm_pane`）**：协调者只维护极简目标与按**交付成果**分组的 `threads`，进度/评审门禁/阻塞问答状态全部从看板和 Store 实时派生；成员状态明确区分 **`工作中` / `休眠待命（可热唤醒）` / `已退休`** 三态，并提供一键「退休/回收」操作。
+  2. **视觉变更时间线**：解析看板贴中的 `Screenshot: <path> | <简短说明>` 行（校验仅允许工作区或合法 artifact 目录路径），统一经服务端资产 ID 接口渲染前后对比缩略图（不直接拼 `file://` 本地路径，确保未来远程浏览器/手机端也能查看）。
+  3. **游标分流订阅（Transport 无关）**：将前端大快照合并逐步拆为 `runOverview` + `boardCursorStream(since)` + `workerTimelineStream(dispatchId)`，底层传输接口与桌面 IPC 解耦（未来可平滑替换为 WebSocket/SSE 远程接入），结合引用缓存投影降低大 Run 渲染开销。
 
 #### Stage 4A（按需双路径，不预设强制迁移）
-基于 Stage 2A 的 `OrchestrationUnitOfWork` / `flushDurable()` 抽象，后续仅在真实痛点出现时分别评估以下两条独立路径：
+基于 Stage 2A 已落地的 `store.runMutation()` / `store.flushDurable()` 契约，后续仅在真实痛点出现时分别评估以下两条独立路径：
 
 1. **路径 A（历史量与截断成为痛点时）→ 评估 Append-only JSONL**：
    - 将只增不改的消息流与观测事实拆出为按 Run 切分的 append-only JSONL 文件，核心热状态仍由原子快照维护，以低改造成本解除 200 消息 / 50 Run 截断与全量覆盖写瓶颈（不强求 JSONL 提供 SQL 事务语义）。
@@ -246,10 +265,16 @@ flowchart LR
 
 ---
 
-## 6. 统一交付与验证门禁
+## 6. 统一交付门禁与未来远程控制前瞻约束
 
+### 交付与验证闭环
 每个 PR 均遵循统一闭环：
 1. 在 `../ahastation-local-cli.aha-worktrees/<branch>` 独立工作树开发；
 2. 补齐对应单元/集成回归测试；
-3. 运行 `npm run typecheck` + `npm run test:fast`（触及 review / integration / worktree / 核心生命周期 / Store 持久化边界时必须加跑 `npm run test:e2e`）；
+3. 运行 `npm run check`（当前为 `npm run typecheck` + `npm run test:fast`；触及 review / integration / worktree / 核心生命周期 / Store 持久化边界时必须加跑 `npm run test:e2e`）；
 4. 逐项核对第 2 节 10 条红线无回退后再合入 `main`。
+
+### 为未来远程控制预留的低成本设计原则（随 Stage 2–4 顺手守住）
+1. **纯 Node 编排内核**：`electron/orchestration/` 严禁直接 `import 'electron'`，所有命令与查询均为纯 JSON DTO，确保未来可无改动跑在独立无界面 Daemon 或远端主机。
+2. **Transport 与资产路径解耦**：前端客户端走可替换订阅接口与 `cursor` 增量流，图片/差异产物走资产路由而非裸 `file://` 路径。
+3. **多端身份与防双写**：新增的 `ResumeClaim`、`ContextHandoff`、`CleanupOutbox` 预留可选 `hostId`（默认 `'local'`）与操作者 `actor`，文件引用优先使用仓库相对 POSIX 路径；远程写入依赖 Stage 3C 的 `requestId` 幂等与独立远程权限策略。
