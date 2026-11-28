@@ -376,6 +376,11 @@ test('full autonomous close-out: server review gate, chat-and-guard non-bypass, 
   assert.match(rev1Prompt, /Keep exported signature unchanged/);
   const boardAsReviewer = service.boardRead({ runId: run.id, from: rev1.ptyId });
   assert.doesNotMatch(boardAsReviewer.formatted, /SECRET_AUTHOR_BOAST/);
+  const report = store.listBoardPosts(run.id, { limit: 500 }).find(post => post.body.includes('SECRET_AUTHOR_BOAST'));
+  const nextVisible = boardAsReviewer.posts.find(post => post.boardSeq > report.boardSeq);
+  assert.ok(nextVisible);
+  const page = service.boardRead({ runId: run.id, from: rev1.ptyId, since: report.boardSeq - 1, limit: 1, markRead: false });
+  assert.equal(page.posts[0]?.id, nextVisible.id);
   const reviewerDiffAttempt = await dispatchOrchestrationHttpAction(
     service,
     'worker-diff',

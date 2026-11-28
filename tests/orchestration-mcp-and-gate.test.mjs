@@ -907,6 +907,8 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   });
   assert.equal(first.result.isError, undefined);
   const firstBoard = await coordClient.request('tools/call', { name: 'read_board', arguments: {} });
+  const peek = await coordClient.request('tools/call', { name: 'team_wait', arguments: { peek: true } });
+  assert.doesNotMatch(peek.result.content[0].text, /Keep v1 API\?/);
   const sinceFirstQuestion = Number(/head=#(\d+)/.exec(firstBoard.result.content[0].text)[1]);
   const workerAskPromise = workerClient.request('tools/call', {
     name: 'ask_coordinator',
@@ -922,7 +924,7 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
   const questionId = /questionId: (\S+)\s+Should I check token expiry too\?/.exec(questionPost.result.content[0].text)?.[1];
   assert.ok(questionId, questionPost.result.content[0].text);
   const steering = await coordClient.request('tools/call', {
-    name: 'message_worker', arguments: { role: '@reviewer', message: 'Please post progress later.' },
+    name: 'message_worker', arguments: { role: '@reviewer', message: 'Please post progress later.', questionId: '   ' },
   });
   assert.equal(steering.result.isError, undefined);
 
@@ -930,7 +932,7 @@ test('Stdio MCP server (aha-mcp-server.cjs): outside AhaStation returns [], insi
     name: 'message_worker',
     arguments: {
       role: '@reviewer',
-      questionId,
+      question_id: ' ' + questionId + ' ',
       message: 'Yes, include expiry checks.',
       subject: '   ',
     },

@@ -622,6 +622,7 @@ export interface OrchestrationPersistedState {
   gates: OrchestrationGateRecord[];
   messages: OrchestrationMessageRecord[];
   deliveries: OrchestrationDeliveryRecord[];
+  boardReadersByMessageId?: Record<string, string[]>;
   consumerReadByMessageId?: Record<string, string[]>;
   consumerDeliveredByMessageId?: Record<string, string[]>;
   questions: OrchestrationQuestionRecord[];

@@ -19,7 +19,7 @@ test('the terminal Coordinator prompt stays byte-identical', () => {
       'Board protocol: an @role mention is a doorbell that wakes that member, not a CC — mention only whoever must act next. In non-review peer handoffs (e.g. researcher → implementer) the Worker mentions the next Worker directly, without @coordinator.\n' +
       'Cite board posts by #seq instead of pasting their content (e.g. "check #4 and #6"; the reader calls `read_board` with `seqs: [4, 6]`). Review Workers cannot see the author’s reports or handoff posts, so give a reviewer its scope, not those #seq.\n' +
       'Before dispatching parallel writable Workers, split file ownership so no two edit the same file. Keep your own turns short: delegate research, builds, and tests, then wait with `board_wait` or end the turn.\n' +
-      'Workers finish only through `report_done`; post `[done]` yourself only when the whole Run is complete, because it pauses stall detection.\n' +
+      'Answer pending questions with `message_worker` using the questionId shown on the post. Workers finish only through `report_done`; post `[done]` yourself only when the whole Run is complete, because it pauses stall detection.\n' +
       'A settled Worker idles at no cost: send rework or small follow-ups to the same @role with `message_worker` to reuse its context instead of delegating a new Worker; `manage_worker` stop/release ends it and is not a pause.',
   );
   assert.match(

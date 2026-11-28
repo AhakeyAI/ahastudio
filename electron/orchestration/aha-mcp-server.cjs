@@ -322,6 +322,10 @@ function buildPostMessageTool(ctx) {
           type: 'string',
           description: 'Message text to post on the shared board (supports @role mentions and #seq references).',
         },
+        replyTo: {
+          type: ['string', 'integer'],
+          description: 'Reply to a post addressed to you by its #seq or message ID. Its author is included automatically. Use message_worker with questionId to answer a question.',
+        },
         kind: {
           type: 'string',
           enum: BOARD_POST_KIND_ENUM,
@@ -1027,6 +1031,7 @@ async function handleToolCall(name, rawArgs, activeRequests) {
       const subject = nonEmptyStr(args.subject);
       const res = await callAction('board-post', {
         text: typeof args.text === 'string' ? args.text : '',
+        replyTo: args.replyTo ?? args.reply_to,
         ...(kind ? { kind } : {}),
         ...(subject ? { subject } : {}),
       });
@@ -1056,20 +1061,8 @@ async function handleToolCall(name, rawArgs, activeRequests) {
             ? args.mentions_only
             : undefined;
       const timeoutMs = finiteNonNegativeInt(args.timeoutMs ?? args.timeout_ms);
-      if (peek) {
-        const res = await callAction('board-read', {
-          ...(since !== undefined ? { since } : {}),
-          markRead: false,
-        });
-        if (!res.ok) {
-          if (name === 'team_wait' && res.code === 'run_not_found') {
-            return toolText('No unread worker updates.');
-          }
-          return toolText(res.errorText, true);
-        }
-        return toolText(formatBoardReadText(res.result));
-      }
       const res = await callAction('board-wait', {
+        peek,
         ...(since !== undefined ? { since } : {}),
         ...(mentionsOnly !== undefined ? { mentionsOnly } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
@@ -1078,8 +1071,8 @@ async function handleToolCall(name, rawArgs, activeRequests) {
         if (name === 'team_wait' && res.code === 'run_not_found') {
           const fallback = await callAction('check', {
             from: callerIdentity(),
-            wait: true,
-            peek: false,
+            wait: !peek,
+            peek,
             format: true,
             ...(timeoutMs !== undefined ? { timeoutMs } : {}),
           });
@@ -1099,7 +1092,7 @@ async function handleToolCall(name, rawArgs, activeRequests) {
     case 'message_worker': {
       const subject = nonEmptyStr(args.subject);
       const res = await callAction('role-message', {
-        questionId: args.questionId,
+        questionId: nonEmptyStr(args.questionId) || nonEmptyStr(args.question_id),
         role: typeof args.role === 'string' ? args.role : '',
         message: typeof args.message === 'string' ? args.message : '',
         ...(subject ? { subject } : {}),

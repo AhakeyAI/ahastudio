@@ -445,7 +445,12 @@ export class MailboxPointerDelivery {
         state.deferredUntilIdle = true;
         return false;
       }
-      if (memberInfo && native?.status !== 'unknown_acceptance' && this.deps.store.recordBoardReceipt(ids, memberInfo.memberKey, inline ? 'delivered' : 'notified')) this.deps.onReceipt?.(memberInfo.runId);
+      if (memberInfo && native?.status !== 'unknown_acceptance') {
+        if (inline) this.deps.store.recordBoardRead(memberInfo.runId, memberInfo.memberKey, ids);
+        if (this.deps.store.recordBoardReceipt(ids, memberInfo.memberKey, inline ? 'delivered' : 'notified')) {
+          this.deps.onReceipt?.(memberInfo.runId);
+        }
+      }
       if (mcpEnabled && memberInfo) {
         let maxBoardSeq = 0;
         for (const msg of eligible) {

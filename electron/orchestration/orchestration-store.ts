@@ -166,6 +166,7 @@ export class OrchestrationStore {
   private messages = new Map<string, OrchestrationMessageRecord>();
   private messageOrder: string[] = [];
   private deliveries = new Map<string, OrchestrationDeliveryRecord>();
+  private readonly boardReadersByMessageId = new Map<string, Set<string>>();
   private consumerReadByMessageId = new Map<string, Set<string>>();
   private consumerDeliveredByMessageId = new Map<string, Set<string>>();
   private questions = new Map<string, OrchestrationQuestionRecord>();
@@ -519,6 +520,12 @@ export class OrchestrationStore {
       }
     }
 
+    this.boardReadersByMessageId.clear();
+    for (const [id, roles] of Object.entries(parsed.boardReadersByMessageId ?? {})) {
+      if (this.messages.has(id) && Array.isArray(roles)) {
+        this.boardReadersByMessageId.set(id, new Set(roles.filter(role => typeof role === 'string')));
+      }
+    }
     this.consumerReadByMessageId.clear();
     for (const [msgId, consumers] of Object.entries(parsed.consumerReadByMessageId ?? {})) {
       if (Array.isArray(consumers) && consumers.length > 0) {
@@ -635,6 +642,7 @@ export class OrchestrationStore {
         .map((id) => this.messages.get(id))
         .filter((m): m is OrchestrationMessageRecord => m !== undefined),
       deliveries: [...this.deliveries.values()],
+      boardReadersByMessageId: Object.fromEntries([...this.boardReadersByMessageId].map(([id, roles]) => [id, [...roles]])),
       consumerReadByMessageId: Object.fromEntries(
         [...this.consumerReadByMessageId.entries()].map(([k, v]) => [k, [...v]])
       ),
@@ -3168,6 +3176,25 @@ export class OrchestrationStore {
     }
   }
 
+  /** Exact content reads can arrive out of order. A pointer alone never consumes its posts. */
+  recordBoardRead(runId: string, role: string, ids: readonly string[]): void {
+    let changed = false;
+    for (const id of ids) {
+      const message = this.messages.get(id);
+      if (message?.runId !== runId || !message.boardSeq) continue;
+      const readers = this.boardReadersByMessageId.get(id) ?? new Set<string>();
+      if (readers.has(role)) continue;
+      readers.add(role);
+      this.boardReadersByMessageId.set(id, readers);
+      changed = true;
+    }
+    if (changed) this.persist();
+  }
+
+  wasBoardPostRead(id: string, role: string): boolean {
+    return this.boardReadersByMessageId.get(id)?.has(role) ?? false;
+  }
+
   recordBoardReceipt(ids: readonly string[], role: string, state: 'notified' | 'delivered' | 'replied'): boolean {
     const key = role.replace(/^@+/, '').toLowerCase();
     const rank = { notified: 1, delivered: 2, replied: 3 };
@@ -3756,6 +3783,7 @@ export class OrchestrationStore {
     if (ids.size === 0) return;
     for (const id of ids) {
       this.messages.delete(id);
+      this.boardReadersByMessageId.delete(id);
       this.consumerReadByMessageId.delete(id);
       this.consumerDeliveredByMessageId.delete(id);
     }
@@ -3979,6 +4007,7 @@ export class OrchestrationStore {
       this.dispatchCapabilities.clear();
       this.deferredPrompts.clear();
       this.gates.clear();
+      this.boardReadersByMessageId.clear();
       this.messages.clear();
       this.messageOrder = [];
       this.deliveries.clear();
@@ -4002,6 +4031,7 @@ export class OrchestrationStore {
       this.coordinatorRuns.clear();
     } else {
       removed.messages = this.messages.size;
+      this.boardReadersByMessageId.clear();
       this.messages.clear();
       this.messageOrder = [];
       this.deliveries.clear();
