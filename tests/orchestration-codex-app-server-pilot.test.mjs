@@ -529,13 +529,13 @@ test('a nonblocking question answer reaches its headless worker with the origina
   });
   await until(() => app.getTrace().some(event => event.method === 'turn/start' && event.params.input[0].text.includes('Use sample.txt')));
   await until(() => app.store.wasBoardPostRead(answered.message.id, 'scout'));
-  await until(() => app.service.codexWorkers.get(from)?.busy === false);
+  await until(() => app.service.workers.codexWorkers.get(from)?.busy === false);
   const turnsBefore = app.getTrace().filter(event => event.method === 'turn/start').length;
-  app.service.queueCodexMail(from, app.store.getMessageById(answered.message.id));
-  app.service.deliverCodexMailbox(from);
+  app.service.workers.queueCodexMail(from, app.store.getMessageById(answered.message.id));
+  app.service.workers.deliverCodexMailbox(from);
   assert.equal(app.getTrace().filter(event => event.method === 'turn/start').length, turnsBefore);
   assert.ok(!(await app.service.boardWait({ from: 'coordinator-pane', timeoutMs: 0 })).posts.some(post => post.id === asked.result.messageId));
-  const opaque = app.service.codexMailboxPrompt({ opaque: true, messages: [app.store.getMessageById(answered.message.id)] });
+  const opaque = app.service.workers.codexMailboxPrompt({ opaque: true, messages: [app.store.getMessageById(answered.message.id)] });
   assert.doesNotMatch(opaque.prompt, /seqs=/);
 });
 
