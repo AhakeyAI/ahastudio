@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentStatusStore } from '../agent/agent-status-store.js';
+import {
+  AGENT_DRIVER_IDS, driverCapabilities, type AgentDriverId, type HookApprovalDialect,
+} from '../agent-drivers/driver-capabilities.js';
 import { approvalToolName, headlessWorkerDriver } from './headless-workers.js';
 import { ACTIVE_DISPATCH_STATUSES } from './orchestration-lifecycle-graph.js';
 import type { OrchestrationStore } from './orchestration-store.js';
@@ -73,72 +76,65 @@ function shouldHoldPermissionEvent(
   return false;
 }
 
-function buildProviderDecisionStdout(
+/** Hook CLIs that are not session drivers, by the dialect their permission hooks read. */
+const NON_DRIVER_HOOK_DIALECTS: Readonly<Record<string, HookApprovalDialect>> = {
+  agy: 'top-level',
+  gemini: 'top-level',
+};
+
+/** The stdout shape `provider`'s permission hook expects; Grok, Qwen and other runners read either. */
+export function hookApprovalDialectFor(provider: string): HookApprovalDialect {
+  const normalized = provider.toLowerCase();
+  if ((AGENT_DRIVER_IDS as readonly string[]).includes(normalized)) {
+    return driverCapabilities(normalized as AgentDriverId).hookApprovalDialect;
+  }
+  return NON_DRIVER_HOOK_DIALECTS[normalized] ?? 'combined';
+}
+
+export function buildProviderDecisionStdout(
   provider: string,
   eventName: string,
   decision: 'allow' | 'deny',
   reason?: string,
   updatedInput?: Record<string, unknown>
 ): string {
-  const normalizedProvider = provider.toLowerCase();
   const denyMessage = reason?.trim() || 'Denied by coordinator';
+  const hookDecision = decision === 'allow'
+    ? { behavior: 'allow', ...(updatedInput ? { updatedInput } : {}) }
+    : { behavior: 'deny', message: denyMessage };
 
-  if (normalizedProvider === 'claude') {
-    if (eventName === 'PreToolUse') {
+  switch (hookApprovalDialectFor(provider)) {
+    case 'hook-specific':
+      if (eventName === 'PreToolUse') {
+        return `${JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: decision,
+            ...(decision === 'deny' ? { permissionDecisionReason: denyMessage } : {}),
+            ...(decision === 'allow' && updatedInput ? { updatedInput } : {}),
+          },
+        })}
+`;
+      }
       return `${JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          permissionDecision: decision,
-          ...(decision === 'deny' ? { permissionDecisionReason: denyMessage } : {}),
-          ...(decision === 'allow' && updatedInput ? { updatedInput } : {}),
-        },
-      })}\n`;
-    }
-    return `${JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: 'PermissionRequest',
-        decision:
-          decision === 'allow'
-            ? {
-                behavior: 'allow',
-                ...(updatedInput ? { updatedInput } : {}),
-              }
-            : {
-                behavior: 'deny',
-                message: denyMessage,
-              },
-      },
-    })}\n`;
-  }
-
-  if (normalizedProvider === 'antigravity' || normalizedProvider === 'agy') {
-    return `${JSON.stringify(
-      decision === 'allow'
-        ? { decision: 'allow' }
-        : { decision: 'deny', reason: denyMessage }
-    )}\n`;
-  }
-
-  if (normalizedProvider === 'gemini') {
-    return `${JSON.stringify(
-      decision === 'allow'
-        ? { decision: 'allow' }
-        : { decision: 'deny', reason: denyMessage }
-    )}\n`;
-  }
-
-  // Grok, Qwen, and Claude-compatible hook runners accept both top-level decision and hookSpecificOutput.
-  return `${JSON.stringify({
-    decision,
-    ...(decision === 'deny' ? { reason: denyMessage } : {}),
-    hookSpecificOutput: {
-      hookEventName: eventName || 'PermissionRequest',
-      decision:
+        hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: hookDecision },
+      })}
+`;
+    case 'top-level':
+      return `${JSON.stringify(
         decision === 'allow'
-          ? { behavior: 'allow', ...(updatedInput ? { updatedInput } : {}) }
-          : { behavior: 'deny', message: denyMessage },
-    },
-  })}\n`;
+          ? { decision: 'allow' }
+          : { decision: 'deny', reason: denyMessage }
+      )}
+`;
+    case 'combined':
+      return `${JSON.stringify({
+        decision,
+        ...(decision === 'deny' ? { reason: denyMessage } : {}),
+        hookSpecificOutput: { hookEventName: eventName || 'PermissionRequest', decision: hookDecision },
+      })}
+`;
+  }
 }
 
 export class PermissionApprovalManager {

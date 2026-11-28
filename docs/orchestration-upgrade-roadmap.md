@@ -178,7 +178,8 @@ flowchart LR
 
 ### Stage 3：能力驱动、常驻休眠热复活、跨 CLI 接力与幂等恢复（拆为 3A / 3B-1 / 3B-2 / 3C 四个独立 PR）
 
-#### PR 3A：就地扩展能力矩阵、`headless-workers.ts` 与 `ProviderRefs`
+#### PR 3A：就地扩展能力矩阵、`headless-workers.ts` 与 `ProviderRefs` — **已完成**
+- 落地：`AgentDriverCapabilities` 新增 `nativeThreadIds / resumeAcrossCwd / acceptsDeveloperContext / supportsSteer / hookApprovalDialect`（Claude `resumeAcrossCwd: false`、Codex `true`，其余保守 `false`）；`permission-approvals.ts` 按 `hookApprovalDialect` 出 hook stdout（逐字节回归测试）；驱动运行时 `steer` 取自能力矩阵；`headless-workers.ts` 新增结构化 `headlessWorkerSupportError` / `headlessResumeError`（`cwd_bound_session` 等）与 `ProviderRefs` / `providerRefs()`，供 3B 直接使用。未建 `orchestration-policy.ts`：现有策略判断已集中在 `headless-workers.ts`。
 - **基础**：直接建立在已有 [`driver-capabilities.ts`](../electron/agent-drivers/driver-capabilities.ts) 和 [`headless-workers.ts`](../electron/orchestration/headless-workers.ts) 之上，不重复实现已有的 `headlessWorkerSupports / headlessWorkerControlsError / ahaToolDecision / sessionGateDecision`。
 - **增量内容**：
   1. 在 `AgentDriverCapabilities` 补充尚未声明的编排维度：`nativeThreadIds: 'strong' | 'weak' | 'none'`、**`resumeAcrossCwd: boolean`**（显式声明是否支持切换 worktree 目录后原生 resume，例如 Claude 会话按 `cwd` 分桶默认 `false`）、`acceptsDeveloperContext`、`supportsSteer`、`hookApprovalDialect`，收口 [`permission-approvals.ts`](../electron/orchestration/permission-approvals.ts) 和 service 内残余的 `cliId` 硬编码分支。

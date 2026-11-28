@@ -62,7 +62,7 @@ interface PiTurn {
 /** One Pi conversation, stored by Pi in its own session file. */
 export class PiSessionDriver implements AgentSessionDriver {
   readonly provider = 'pi' as const;
-  readonly capabilities = { resume: true, steer: false, policies: driverCapabilities('pi').policies };
+  readonly capabilities = { resume: true, steer: driverCapabilities('pi').supportsSteer, policies: driverCapabilities('pi').policies };
   private readonly rpc: JsonlRpc;
   private readonly proc: AgentProcessHandle;
   private readonly disconnect = new AbortController();
