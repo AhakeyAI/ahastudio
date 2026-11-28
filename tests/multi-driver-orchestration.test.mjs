@@ -54,7 +54,7 @@ function fakeChild() {
   const child = new EventEmitter();
   Object.assign(child, {
     stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
-    exitCode: null, signalCode: null, pid: 4343,
+    exitCode: null, signalCode: null, pid: 2_000_000_000, // never a live process, so write-quiescence checks see the fake as gone
   });
   child.exit = (code = 0) => {
     if (child.exitCode !== null || child.signalCode !== null) return;
