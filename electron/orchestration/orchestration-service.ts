@@ -10038,6 +10038,23 @@ export class OrchestrationService {
     return `${full.slice(0, budget).trimEnd()}${suffix}`;
   }
 
+  private listCoordinatorReadUnansweredQuestions(
+    runId: string,
+    pendingQuestions?: readonly OrchestrationQuestionRecord[]
+  ): OrchestrationQuestionRecord[] {
+    const pending = pendingQuestions ?? this.store.listQuestions({ runId, status: 'pending' });
+    const runMailbox = `run:${runId}`;
+    // Broad read_board calls advance the cursor without recording exact reads, so a post counts
+    // as seen when it was either read exactly or lies within the coordinator's broad-read cursor.
+    const coordinatorCursor = this.store.getMemberCursor(runId, 'coordinator');
+    return pending.filter((question) => {
+      if (question.toHandle !== runMailbox) return false;
+      if (this.store.wasBoardPostRead(question.messageId, 'coordinator')) return true;
+      const boardSeq = this.store.getMessageById(question.messageId)?.boardSeq;
+      return typeof boardSeq === 'number' && boardSeq <= coordinatorCursor.lastReadSeq;
+    });
+  }
+
   private inspectRunsForStallWatchdog(): BoardStallRunState[] {
     const states: BoardStallRunState[] = [];
     for (const run of this.store.listRuns({ status: 'active' })) {
@@ -10059,10 +10076,17 @@ export class OrchestrationService {
         }
       }
 
+      const pendingQuestions = this.store.listQuestions({ runId: run.id, status: 'pending' });
+      const coordinatorReadUnanswered = new Set(
+        this.listCoordinatorReadUnansweredQuestions(run.id, pendingQuestions).map((question) => question.messageId)
+      );
+      const hasPendingStoreQuestion = pendingQuestions.some(
+        (question) => !coordinatorReadUnanswered.has(question.messageId)
+      );
       const hasPendingAttention =
         this.approvals.listOpenApprovals({ runId: run.id }).length > 0 ||
         this.nativeQuestions.listOpenQuestions({ runId: run.id }).length > 0 ||
-        this.store.listQuestions({ runId: run.id, status: 'pending' }).length > 0 ||
+        hasPendingStoreQuestion ||
         this.store.listGates({ runId: run.id, status: 'pending' }).length > 0 ||
         this.proposals.listPendingProposals({ runId: run.id }).length > 0;
 
@@ -10110,6 +10134,17 @@ export class OrchestrationService {
     const run = this.store.getRun(runId);
     if (!run || run.status !== 'active') return;
     const secs = Math.max(1, Math.round(idleMs / 1000));
+    const readUnansweredQuestions = this.listCoordinatorReadUnansweredQuestions(runId);
+    const readUnansweredSummary = readUnansweredQuestions
+      .map((question) => {
+        const boardSeq = this.store.getMessageById(question.messageId)?.boardSeq;
+        const seqLabel = typeof boardSeq === 'number' ? `#${boardSeq}` : '#?';
+        return `${seqLabel} (questionId ${question.messageId})`;
+      })
+      .join(', ');
+    const body = readUnansweredQuestions.length > 0
+      ? `@coordinator You already read ${readUnansweredQuestions.length} unanswered question(s): ${readUnansweredSummary}. Answer each with message_worker using its questionId. No active workers and board quiet for ${secs}s since #${headSeq} — review reports, follow up, or wrap up the run.`
+      : `@coordinator No active workers and board has been quiet for ${secs}s since #${headSeq}. Review reports, follow up, or wrap up the run.`;
     const msg = this.store.insertMessage({
       runId,
       from: 'system',
@@ -10117,7 +10152,7 @@ export class OrchestrationService {
       type: 'escalation',
       priority: 'normal',
       subject: `Board stall detected at #${headSeq}`,
-      body: `@coordinator No active workers and board has been quiet for ${secs}s since #${headSeq}. Review reports, follow up, or wrap up the run.`,
+      body,
       fromRole: 'system',
       mentions: ['coordinator'],
       refs: headSeq > 0 ? [headSeq] : undefined,
