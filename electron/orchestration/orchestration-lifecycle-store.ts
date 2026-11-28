@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
+import { isProcessTreeAlive } from '../agent-drivers/process-tree.js';
+import { comparablePath } from './headless-workers.js';
 import {
   listWorkerBriefFiles,
   mergeTaskContext,
@@ -38,6 +40,7 @@ import {
   type OrchestrationMessageRecord,
   type OrchestrationReviewFinding,
   type OrchestrationReviewStatus,
+  type OrchestrationResumeClaim,
   type OrchestrationRunIntegrationStatus,
   type OrchestrationRunRecord,
   type OrchestrationStartObservation,
@@ -698,6 +701,88 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
       .map((d) => ({ ...d }));
   }
 
+  /**
+   * Takes the single-writer claim for resuming `workerId` in `cwd`. Refuses while another claim
+   * holds the Worker or the directory; a stale claim from an earlier app run is cleared once its
+   * recorded process is gone. Callers `flushDurable()` before starting the agent process.
+   */
+  acquireResumeClaim(
+    input: {
+      workerId: string; runId: string; dispatchId: string; cwd: string; driver: string; providerSessionId: string;
+      actor?: OrchestrationResumeClaim['actor'];
+    },
+    isAlive: (pid: number) => boolean = isProcessTreeAlive,
+  ): OrchestrationResumeClaim {
+    const cwd = comparablePath(input.cwd);
+    for (const claim of [...this.state.resumeClaims.values()]) {
+      if (claim.workerId !== input.workerId && comparablePath(claim.cwd) !== cwd) continue;
+      if (claim.status === 'stale' && (claim.pid === null || !isAlive(claim.pid))) {
+        this.state.resumeClaims.delete(claim.id);
+        continue;
+      }
+      throw new OrchestrationError(
+        'operation_rejected',
+        claim.status === 'stale'
+          ? `A Worker process (pid ${claim.pid}) from an earlier AhaStation run may still be writing ${claim.cwd}. Stop it before resuming.`
+          : `Worker ${claim.workerId} already holds ${claim.cwd}; wait for it to finish or stop it first.`,
+        { claimId: claim.id, workerId: claim.workerId },
+      );
+    }
+    const now = this.now();
+    const claim: OrchestrationResumeClaim = {
+      id: `resume-${randomUUID()}`,
+      workerId: input.workerId,
+      runId: input.runId,
+      dispatchId: input.dispatchId,
+      cwd: input.cwd,
+      driver: input.driver,
+      providerSessionId: input.providerSessionId,
+      status: 'pending',
+      pid: null,
+      hostId: 'local',
+      actor: input.actor ?? 'orchestrator',
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.state.resumeClaims.set(claim.id, claim);
+    this.persist();
+    return { ...claim };
+  }
+
+  /** Records the started agent process on a pending claim. */
+  activateResumeClaim(claimId: string, pid: number | null): OrchestrationResumeClaim | undefined {
+    const claim = this.state.resumeClaims.get(claimId);
+    if (!claim || claim.status === 'stale') return undefined;
+    claim.status = 'active';
+    claim.pid = pid !== null && Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+    claim.updatedAt = this.now();
+    this.persist();
+    return { ...claim };
+  }
+
+  /** Drops the live claims for `workerId` once its process is gone; stale ones stay until verified. */
+  releaseResumeClaims(workerId: string): void {
+    let changed = false;
+    for (const [id, claim] of this.state.resumeClaims) {
+      if (claim.workerId === workerId && claim.status !== 'stale') {
+        this.state.resumeClaims.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) this.persist();
+  }
+
+  /** Forgets every claim for `workerId`, e.g. when its run is pruned. */
+  dropResumeClaimsForWorker(workerId: string): void {
+    for (const [id, claim] of this.state.resumeClaims) {
+      if (claim.workerId === workerId) this.state.resumeClaims.delete(id);
+    }
+  }
+
+  listResumeClaims(): OrchestrationResumeClaim[] {
+    return [...this.state.resumeClaims.values()].map((claim) => ({ ...claim }));
+  }
+
   getActiveDispatchForIdentity(
     handle: string,
     paneId?: string | null
@@ -745,6 +830,7 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
     taskId: string;
     approvedQueueLaunch?: boolean;
     providerSessionId?: string;
+    providerCwd?: string;
     workerPolicy?: AgentSessionPolicy;
     workerNetwork?: boolean;
     allowSubWorkers?: boolean;
@@ -887,6 +973,7 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
       ...(input.providerSessionId ? {
         executionMode: 'codex-app-server' as const,
         providerSessionId: input.providerSessionId,
+        ...(input.providerCwd ? { providerCwd: input.providerCwd } : {}),
         ...(input.workerPolicy !== undefined ? { workerPolicy: input.workerPolicy } : {}),
         ...(typeof input.workerNetwork === 'boolean' ? { workerNetwork: input.workerNetwork } : {}),
         ...(input.allowSubWorkers ? { allowSubWorkers: true } : {}),
@@ -1147,6 +1234,7 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
     ctx.ownsPane = true;
     delete ctx.executionMode;
     delete ctx.providerSessionId;
+    delete ctx.providerCwd;
     delete ctx.workerPolicy;
     delete ctx.workerNetwork;
     delete ctx.allowSubWorkers;

@@ -116,6 +116,8 @@ export interface AgentSessionDriver {
   readonly closing: boolean;
   /** The provider's own conversation id, once `open` resolved. */
   readonly sessionId: string | null;
+  /** The agent process (Windows: its job launcher), for single-writer claims. */
+  readonly pid?: number | null;
   /** Model and reasoning effort the provider reported for the conversation, once `open` resolved. */
   readonly effectiveModel?: string | null;
   readonly effectiveEffort?: string | null;

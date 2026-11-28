@@ -8,6 +8,7 @@ import type {
   AgentTurnAttachment, TurnDelivery,
 } from './agent-session-driver.js';
 import { spawnWindowsCodexJob } from './windows-codex-job.js';
+import { SPAWN_AGENT_PROCESS_GROUP, killProcessTree, markProcessGroupLeader } from '../agent-drivers/process-tree.js';
 import type {
   WorkerTimelineEvent, WorkerTimelineFileChange, WorkerTimelineItemStatus, WorkerTimelineItemUpdate,
 } from './worker-timeline.js';
@@ -357,7 +358,7 @@ export function launchCodexPilot(options: {
   const argv = wrapper ? [entry, ...args] : args;
   const child = process.platform === 'win32'
     ? spawnWindowsCodexJob(executable, argv, options.cwd, env)
-    : spawn(executable, argv, { cwd: options.cwd, env, windowsHide: true, stdio: 'pipe' });
+    : markProcessGroupLeader(spawn(executable, argv, { cwd: options.cwd, env, windowsHide: true, stdio: 'pipe', detached: SPAWN_AGENT_PROCESS_GROUP }));
   return new CodexAppServerPilot(child, options.events, 30_000, [
     options.mcp?.env.AHA_WORKER_TOKEN, options.mcp?.env.AHA_SESSION_TOKEN, options.mcp?.env.AHA_AGENT_HOOK_TOKEN,
   ].filter((value): value is string => Boolean(value)), options.mcp ? options.mcp.requiredTool ?? 'report_done' : null, options.diagnostics === true);
@@ -371,6 +372,10 @@ export class CodexAppServerPilot implements AgentSessionDriver {
   };
   private readonly pending = new Map<number, (error: Error | null, value?: unknown) => void>();
   private readonly disconnect = new AbortController();
+
+  get pid(): number | null {
+    return this.child.pid ?? null;
+  }
   private seq = 0;
   private tokenTotal: Record<string, number> | null = {};
   private policy: AgentSessionPolicy = 'read-only';
@@ -709,9 +714,7 @@ export class CodexAppServerPilot implements AgentSessionDriver {
     }
     this.disconnect.abort();
     try {
-      if (this.child.pid && this.child.exitCode === null && this.child.signalCode === null) {
-        this.child.kill('SIGKILL');
-      }
+      if (this.child.pid) killProcessTree(this.child);
     } catch {
       // Still release the pipes and bound the wait for the process.
     }

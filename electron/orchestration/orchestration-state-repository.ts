@@ -17,6 +17,7 @@ import type {
   OrchestrationQuestionRecord,
   OrchestrationRunRecord,
   OrchestrationTaskRecord,
+  OrchestrationResumeClaim,
 } from './orchestration-types.js';
 
 export interface DeferredDispatchPrompt {
@@ -45,6 +46,7 @@ export class OrchestrationStoreState {
   readonly deferredPrompts = new Map<string, DeferredDispatchPrompt>();
   nextBoardSeqByRun = new Map<string, number>();
   memberCursorsByRun = new Map<string, Map<string, OrchestrationMemberCursor>>();
+  resumeClaims = new Map<string, OrchestrationResumeClaim>();
 }
 
 export function emptyPersistedState(): OrchestrationPersistedState {
@@ -334,6 +336,13 @@ export function hydrateOrchestrationState(state: OrchestrationStoreState, parsed
     }
     delete dispatch.hasArchivedTimeline;
   }
+  state.resumeClaims.clear();
+  for (const claim of parsed.resumeClaims ?? []) {
+    if (claim && typeof claim.id === 'string' && typeof claim.workerId === 'string' && typeof claim.cwd === 'string') {
+      // The process that held it belonged to an earlier app run; it stays fenced until that process is gone.
+      state.resumeClaims.set(claim.id, { ...claim, status: 'stale', pid: Number.isSafeInteger(claim.pid) ? claim.pid : null });
+    }
+  }
   state.deferredPrompts.clear();
   for (const [id, prompt] of Object.entries(parsed.deferredDispatchPrompts ?? {})) {
     const dispatch = state.dispatches.get(id);
@@ -371,6 +380,7 @@ export function exportOrchestrationState(state: OrchestrationStoreState): Orches
     deferredDispatchPrompts: Object.fromEntries(listActiveDeferredPrompts(state)),
     nextBoardSeqByRun: Object.fromEntries(state.nextBoardSeqByRun.entries()),
     memberCursorsByRun: exportMemberCursorsByRun(state),
+    resumeClaims: [...state.resumeClaims.values()],
   };
 }
 

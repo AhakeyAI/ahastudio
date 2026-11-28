@@ -677,14 +677,14 @@ test('live controls: a Worker between turns switches tier and network; busy, uns
   assert.equal(grok.ok, true, grok.error);
   const grokDispatch = grok.result.dispatch;
   await until(() => release);
-  assert.deepEqual(controlsFor(grokDispatch.id).live, { alive: true, busy: true });
+  assert.deepEqual(controlsFor(grokDispatch.id).live, { alive: true, busy: true, dormant: false });
   assert.equal(controlsFor(grokDispatch.id).controls.changeable, false, 'the Crew panel locks controls during a turn');
   assert.equal(errorOf(() => app.service.workerUpdateControls({ dispatchId: grokDispatch.id, policy: 'full-auto' })).code, 'worker_busy');
   app.holdTurns = false;
   release();
   await until(() => app.service.getWorkerTimeline({ dispatchId: grokDispatch.id }).turns[0]?.status !== 'running');
   await delay(50);
-  assert.deepEqual(controlsFor(grokDispatch.id).live, { alive: true, busy: false });
+  assert.deepEqual(controlsFor(grokDispatch.id).live, { alive: true, busy: false, dormant: false });
   assert.equal(controlsFor(grokDispatch.id).controls.changeable, true, 'the Crew panel unlocks controls between turns');
 
   assert.equal(errorOf(() => app.service.workerUpdateControls({ dispatchId: grokDispatch.id })).code, 'invalid_argument');

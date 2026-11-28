@@ -395,12 +395,17 @@ export interface CodexPilotTurnRecord {
 export interface OrchestrationDispatchRecord {
   executionMode?: 'codex-app-server';
   providerSessionId?: string;
+  /** Headless Workers only: the directory the provider conversation was opened in, where it resumes. */
+  providerCwd?: string;
   /** Headless Workers only. Records without them are read-only exactly when the timeline says so, with network off. */
   workerPolicy?: AgentSessionPolicy;
   workerNetwork?: boolean;
   allowSubWorkers?: boolean;
-  /** Snapshot only, never stored: whether a headless Worker's process is alive and a turn is running. */
-  headlessLive?: { alive: boolean; busy: boolean };
+  /**
+   * Snapshot only, never stored: whether a headless Worker's process is alive and a turn is running,
+   * and whether a Worker without a process can be woken in place from its provider conversation.
+   */
+  headlessLive?: { alive: boolean; busy: boolean; dormant: boolean };
   codexTurn?: CodexPilotTurnRecord;
   codexDeliveryFailure?: 'unknown_acceptance' | 'not_accepted';
   id: string;
@@ -613,6 +618,30 @@ export type OrchestrationCoordinatorStatusResult = {
   pendingGates: number;
 };
 
+/**
+ * Single-writer lock on a headless Worker identity and the directory it writes, taken before
+ * AhaStation reopens the Worker's provider conversation. A claim left over from an earlier app
+ * process is `stale` until its recorded process is gone, so a resume never races a survivor.
+ */
+export interface OrchestrationResumeClaim {
+  id: string;
+  workerId: string;
+  runId: string;
+  /** The settled dispatch whose conversation is being resumed. */
+  dispatchId: string;
+  cwd: string;
+  driver: string;
+  providerSessionId: string;
+  status: 'pending' | 'active' | 'stale';
+  /** The agent process (Windows: its job launcher; POSIX: its process group leader), once started. */
+  pid: number | null;
+  /** Reserved for remote control: which host and who took the claim. */
+  hostId: string;
+  actor: 'orchestrator' | 'person';
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface OrchestrationPersistedState {
   version: 1;
   nextSequence: number;
@@ -633,6 +662,7 @@ export interface OrchestrationPersistedState {
   deferredDispatchPrompts?: Record<string, { ptyId: string; prompt: string; submit: boolean }>;
   nextBoardSeqByRun?: Record<string, number>;
   memberCursorsByRun?: Record<string, Record<string, OrchestrationMemberCursor>>;
+  resumeClaims?: OrchestrationResumeClaim[];
 }
 
 export interface OrchestrationSnapshot {

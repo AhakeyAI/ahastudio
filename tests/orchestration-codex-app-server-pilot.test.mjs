@@ -48,7 +48,7 @@ async function until(read, timeout = 4_000) {
   assert.fail('Expected pilot state did not appear');
 }
 
-async function setup(t, scenario = 'normal', enabled = true, { confirmMode } = {}) {
+async function setup(t, scenario = 'normal', enabled = true, { confirmMode, dormancyMs } = {}) {
   const dir = mkdtempSync(join(cwd, '.codex-pilot-test-'));
   const trace = join(dir, 'rpc.jsonl');
   const agentStatusStore = new AgentStatusStore();
@@ -66,6 +66,7 @@ async function setup(t, scenario = 'normal', enabled = true, { confirmMode } = {
     store, agentStatusStore, getDefaultCwd: () => cwd,
     settleDelayMs: 0, turnStartObserveTimeoutMs: 250, turnStopSettleMs: 10_000,
     ...(confirmMode ? { getConfirmMode: () => confirmMode } : {}),
+    ...(dormancyMs ? { headlessWorkerDormancyMs: dormancyMs } : {}),
     writePty: async (id, data) => {
       writes.push({ id, data });
       agentStatusStore.ingestHookEvent({ ptyId: id, agentId: 'codex', state: 'working' });
@@ -226,6 +227,44 @@ test('independent Worker auth, long stdin input, pending turn and same-thread re
   assert.equal(app.getTrace().filter((message) => message.method === 'thread/start').length, 1);
   assert.equal(app.getTrace().filter((message) => message.method === 'turn/start').length, 2);
   assert.match(app.service.workerRead({ dispatchId: first.dispatch.id, screen: true }).text, /模拟输出 1/);
+});
+
+test('an idle settled Worker goes dormant and a follow-up resumes its conversation under a claim', async (t) => {
+  const app = await setup(t, 'normal', true, { dormancyMs: 1 });
+  const first = await app.start('Readonly check before dormancy');
+  const id = first.dispatch.assigneeHandle;
+  await until(() => app.store.getDispatchContext(first.dispatch.id)?.codexTurn);
+  await reportDone(app.workers.get(id), 'first wave done');
+  assert.equal(app.store.getDispatchContext(first.dispatch.id).status, 'completed');
+  assert.equal(app.store.getDispatchContext(first.dispatch.id).providerCwd, cwd);
+
+  await delay(5);
+  assert.deepEqual(app.service.workers.sleepIdleHeadlessWorkers(), [id]);
+  await until(() => !app.service.isPaneAlive(id));
+  const asleep = app.service.getSnapshot(app.run.id).dispatches.find((d) => d.id === first.dispatch.id);
+  assert.deepEqual(asleep.headlessLive, { alive: false, busy: false, dormant: true });
+  assert.equal(app.store.getDispatchContext(first.dispatch.id).status, 'completed', 'dormancy never fails a dispatch');
+
+  const follow = await app.service.send({
+    from: 'coordinator-pane', to: 'dispatch:' + first.dispatch.id, runId: app.run.id,
+    type: 'status', subject: 'Wake up', body: 'Check another readonly path',
+  });
+  const second = follow.followUp.dispatch;
+  assert.equal(second.assigneeHandle, id);
+  assert.equal(second.providerSessionId, first.dispatch.providerSessionId);
+  assert.equal(second.providerCwd, cwd);
+  assert.equal(app.codexStarts(), 2);
+  const resumed = app.getTrace().filter((message) => message.method === 'thread/resume');
+  assert.equal(resumed.length, 1);
+  assert.equal(resumed[0].params.threadId, first.dispatch.providerSessionId);
+  const [claim] = app.store.listResumeClaims();
+  assert.equal(claim.workerId, id);
+  assert.equal(claim.status, 'active');
+  assert.equal(typeof claim.pid, 'number');
+  await until(() => app.store.getDispatchContext(second.id)?.codexTurn);
+
+  assert.match(app.service.workers.dormantResumeRefusal({ ...first.dispatch, reviewOfDispatchId: 'd' }), /one-shot/);
+  assert.match(app.service.workers.dormantResumeRefusal({ ...first.dispatch, providerCwd: join(cwd, 'missing-dir') }), /no longer exists/);
 });
 
 test('authenticated catalog discovery before dispatch exposes the Worker role only', async (t) => {

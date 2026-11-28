@@ -95,10 +95,14 @@ export function headlessWorkerCommand(cliId: 'claude' | 'antigravity' | 'grok'):
  */
 export function launchHeadlessWorkerDriver(
   cliId: 'claude' | 'antigravity' | 'grok', cwd: string, events: AgentSessionEvents,
-  options: { policy: AgentSessionPolicy; mcp: AhaMcpServerSpec; allowSubWorkers?: boolean },
+  options: { policy: AgentSessionPolicy; mcp: AhaMcpServerSpec; allowSubWorkers?: boolean; resumeSessionId?: string },
 ): AgentSessionDriver {
-  const { allowSubWorkers } = options;
-  if (cliId === 'claude') return launchClaude(cwd, events, { policy: options.policy, mcp: options.mcp, role: 'worker', allowSubWorkers });
+  const { allowSubWorkers, resumeSessionId } = options;
+  if (cliId === 'claude') {
+    return launchClaude(cwd, events, {
+      policy: options.policy, mcp: options.mcp, role: 'worker', allowSubWorkers, ...(resumeSessionId ? { resumeSessionId } : {}),
+    });
+  }
   return launchAcp(ACP_LAUNCH_SPECS[cliId], cwd, events, { mcp: options.mcp, role: 'worker', allowSubWorkers });
 }
 

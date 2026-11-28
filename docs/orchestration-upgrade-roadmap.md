@@ -192,7 +192,8 @@ flowchart LR
   - **对抗评审者（`reviewOfDispatchId / reviewOfRunId`）永远保持一次性**：审完 detached snapshot 即销毁，严禁休眠复用，杜绝跨轮次锚定偏见。
   - **领域开发者 / 调研者（`@backend / @frontend / @researcher`）升级为可常驻休眠角色**：空闲时可主动关闭子进程释放内存（真零内存、零 Token 休眠），被 `@role` 唤醒或重启后凭 `providerSessionId` 自动复活，合入第一波代码后也能继续承接下一波任务，直到整个 Run 收尾或人工点「退休」才彻底销毁。
 - **基础**：直接复用已合入的 `needs_reconciliation`、`reconciliationDiff` 与 `QueuedWorkerLaunch` 落盘认领模式，在其之上扩展可审计、经过 `secret-redaction.ts` 与 capability 脱敏的 `ContextTransfer / ContextHandoff` 工件，绝不起第二套平行结构。
-- **PR 3B-1（所有权、进程回收与同 worktree 休眠自动复活，先行）**：
+- **PR 3B-1（所有权、进程回收与同 worktree 休眠自动复活，先行）— 已完成**：
+  - 落地：持久化 `ResumeClaim`（Worker 身份 + 目录单写者锁，记录 pid，预留 `hostId / actor`），复活前 `flushDurable()`；上次进程遗留的 claim 重启后为 `stale`，仅在记录的进程确认已退出后才放行（绝不按 pid 盲杀）。Windows 已由 job 对象覆盖全部 headless driver（`spawnAgentProcess` 早已统一走 job），本 PR 补 POSIX：agent 以独立进程组启动，关闭时 `kill(-pgid)`。`startFollowUp` 对无进程的已结算 headless Worker 按 `providerSessionId` 在原目录（新增 `providerCwd`）原位复活；对抗评审者、已释放、目录不存在或 `headlessResumeError` 拒绝时仍报 `dispatch_inactive` 并说明原因。空闲休眠：结算后空闲 `headlessWorkerDormancyMs`（桌面端 5 分钟）且无待处理事项时关闭进程，快照 `headlessLive.dormant` 标记可热唤醒。页面内人工接管目前尚无独立实现，claim 的 `actor: 'person'` 留给其接入。
   1. 引入显式 `ResumeClaim / WorktreeOwnershipFence`，**claim 中记录 pid / job 句柄**（并预留 `hostId?: string` 与 `actor` 来源字段）；页面内人工接管同步切到同一套 claim。
   2. **推广现有 [`windows-codex-job.ts`](../electron/orchestration/windows-codex-job.ts)（当前仅服务 Codex）到全部 headless driver**；macOS / Linux 用进程组回收（`kill(-pgid)`）。
   3. **同 worktree 零成本休眠与按 `providerSessionId` 自动复活**：

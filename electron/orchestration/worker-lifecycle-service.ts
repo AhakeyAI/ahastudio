@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { runGitCommand } from '../git/git-exec.js';
 import { driverCapabilities } from '../agent-drivers/driver-capabilities.js';
 import type { AgentPaneStatus, AgentStatusStore } from '../agent/agent-status-store.js';
@@ -14,6 +15,7 @@ import {
   HEADLESS_DRIVER_LABELS,
   HEADLESS_WORKER_ID,
   headlessWorkerControlsError,
+  headlessResumeError,
   headlessWorkerDriver,
   headlessWorkerSupports,
   isHeadlessWorkerDriver,
@@ -99,6 +101,7 @@ export interface OrchestrationWorkerLifecycleHost {
   readonly buildWorkerDispatchBrief: (input: BuildDispatchPreambleInput) => string;
   readonly canHeadlessWorkerDelegate: OrchestrationService['canHeadlessWorkerDelegate'];
   readonly cliCommand: string;
+  readonly clock: () => number;
   readonly closeWorkerPty: OrchestrationServiceDependencies['closeWorkerPty'] | undefined;
   readonly codexPilot: OrchestrationServiceDependencies['codexPilot'] | undefined;
   readonly createWorkerTimeline: (
@@ -114,6 +117,8 @@ export interface OrchestrationWorkerLifecycleHost {
   readonly exitedPanes: Set<string>;
   readonly failTaskIfReady: (taskId: string) => void;
   readonly getDefaultCwd: (() => string | undefined) | undefined;
+  /** How long a settled headless Worker stays idle before its process is closed; 0 keeps it running. */
+  readonly headlessWorkerDormancyMs: number;
   readonly headlessWorkers: OrchestrationServiceDependencies['headlessWorkers'] | undefined;
   readonly inferRunIdOptional: (from?: string) => string | undefined;
   readonly integration: OrchestrationIntegrationService;
@@ -157,6 +162,11 @@ export class OrchestrationWorkerLifecycleService {
   /** Pending wake-ups per headless Worker; `opaque` means at least one wake carried no message record. */
   private readonly codexMailbox = new Map<string, { messages: OrchestrationMessageRecord[]; opaque: boolean }>();
   private readonly workerMutations = new Set<string>();
+  /** When each live headless Worker last opened or finished a turn, for idle dormancy. */
+  private readonly codexWorkerActivity = new Map<string, number>();
+  /** Workers whose process AhaStation is closing to go dormant, not because it failed. */
+  private readonly dormantClosing = new Set<string>();
+  private dormancyTimer: ReturnType<typeof setInterval> | null = null;
 
   async workerInterrupt(input: { dispatchId?: string; worker?: string; taskId?: string }): Promise<{
     dispatch: OrchestrationDispatchRecord; interrupted: boolean;
@@ -226,6 +236,121 @@ export class OrchestrationWorkerLifecycleService {
       network: dispatch.workerNetwork ?? header?.network ?? false,
       allowSubWorkers: dispatch.allowSubWorkers === true,
     };
+  }
+
+  /** The directory a headless Worker's provider conversation lives in, where it can resume. */
+  private providerCwd(dispatch: OrchestrationDispatchRecord): string | null {
+    return dispatch.providerCwd ?? dispatch.worktreePath ?? null;
+  }
+
+  /**
+   * Why a settled headless Worker cannot be woken from its provider conversation, or null when it
+   * can. Adversarial reviewers stay one-shot so a later round never inherits an earlier verdict.
+   */
+  dormantResumeRefusal(dispatch: OrchestrationDispatchRecord): string | null {
+    if (dispatch.executionMode !== 'codex-app-server') return 'it is not a headless Worker';
+    if (dispatch.releasedAt) return 'it has been released';
+    if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) return 'adversarial reviewers are one-shot';
+    if (this.host.disposed) return 'AhaStation is shutting down';
+    const driver = headlessWorkerDriver(dispatch.assigneeHandle);
+    if (!driver) return 'its driver is unknown';
+    if (driver === 'codex' ? !this.host.codexPilot : !this.host.headlessWorkers || this.host.headlessWorkers.available?.(driver) === false) {
+      return `${HEADLESS_DRIVER_LABELS[driver]} is unavailable on this machine`;
+    }
+    const cwd = this.providerCwd(dispatch);
+    if (!cwd) return 'no working directory was recorded for its conversation';
+    if (!existsSync(cwd)) return `its working directory ${cwd} no longer exists`;
+    return headlessResumeError(driver, { providerSessionId: dispatch.providerSessionId, sessionCwd: cwd, cwd })?.message ?? null;
+  }
+
+  /** A settled headless Worker with no process that a follow-up can wake in place. */
+  isDormant(dispatch: OrchestrationDispatchRecord): boolean {
+    return !ACTIVE_DISPATCH_STATUSES.has(dispatch.status) && !this.codexWorkers.get(dispatch.assigneeHandle)?.alive &&
+      this.dormantResumeRefusal(dispatch) === null;
+  }
+
+  /**
+   * Reopens a dormant Worker's provider conversation under its own identity, holding a resume
+   * claim (made durable before the process starts) so two writers never share its directory.
+   */
+  private async resumeDormantWorker(dispatch: OrchestrationDispatchRecord): Promise<AgentSessionDriver> {
+    const label = this.headlessLabel(dispatch.assigneeHandle);
+    const refusal = this.dormantResumeRefusal(dispatch);
+    if (refusal) {
+      throw new OrchestrationError('dispatch_inactive', `${label} Worker is no longer running and cannot be resumed: ${refusal}.`);
+    }
+    const driver = headlessWorkerDriver(dispatch.assigneeHandle)!;
+    const cwd = this.providerCwd(dispatch)!;
+    const claim = this.host.store.acquireResumeClaim({
+      workerId: dispatch.assigneeHandle, runId: dispatch.runId, dispatchId: dispatch.id, cwd, driver,
+      providerSessionId: dispatch.providerSessionId!,
+    });
+    try {
+      await this.host.store.flushDurable();
+      const opened = await this.openCodexWorker(driver, cwd, dispatch.model ?? null, this.headlessControls(dispatch), {
+        workerId: dispatch.assigneeHandle, sessionId: dispatch.providerSessionId!,
+      });
+      if (!opened) throw new OrchestrationError('dispatch_inactive', `${label} could not reopen the Worker's conversation.`);
+      this.host.store.activateResumeClaim(claim.id, opened.session.pid ?? null);
+      this.host.emitChanged('worker:resumed', dispatch.runId);
+      return opened.session;
+    } catch (error) {
+      this.host.store.releaseResumeClaims(dispatch.assigneeHandle);
+      throw error;
+    }
+  }
+
+  /**
+   * Closes settled headless Workers that sat idle for `headlessWorkerDormancyMs`, when a follow-up
+   * can wake them again; their conversation stays with the provider.
+   */
+  sleepIdleHeadlessWorkers(): string[] {
+    const idleMs = this.host.headlessWorkerDormancyMs;
+    if (idleMs <= 0 || this.host.disposed) return [];
+    const now = this.host.clock();
+    const slept: string[] = [];
+    for (const [workerId, codex] of this.codexWorkers) {
+      if (!codex.alive || codex.busy || codex.closing || !codex.latestTurnKey || this.codexMailbox.has(workerId)) continue;
+      const lastActive = this.codexWorkerActivity.get(workerId);
+      if (lastActive === undefined || now - lastActive < idleMs) continue;
+      if (this.host.store.getActiveDispatchForIdentity(workerId, null)) continue;
+      const dispatch = this.host.store.getDispatchContext(codex.latestTurnKey);
+      if (!dispatch || dispatch.retained || this.codexSubmitting.has(dispatch.id)) continue;
+      if (this.host.approvals.hasOpenApprovalForDispatch(dispatch.id) || this.host.nativeQuestions.hasOpenQuestionForDispatch(dispatch.id)) continue;
+      if (this.dormantResumeRefusal(dispatch) !== null) continue;
+      this.dormantClosing.add(workerId);
+      this.archiveCodexOutput(codex, dispatch.id);
+      this.host.archiveWorkerTimeline(workerId, dispatch.id);
+      void codex.close(true);
+      slept.push(workerId);
+    }
+    return slept;
+  }
+
+  private async waitForWorkerExit(workerId: string, session: AgentSessionDriver, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.codexWorkers.get(workerId) === session) {
+      if (Date.now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return true;
+  }
+
+  startDormancySweep(intervalMs: number): void {
+    if (this.dormancyTimer || intervalMs <= 0 || this.host.headlessWorkerDormancyMs <= 0) return;
+    this.dormancyTimer = setInterval(() => {
+      try {
+        this.sleepIdleHeadlessWorkers();
+      } catch (error) {
+        console.warn('[orchestration] headless Worker dormancy sweep failed:', error);
+      }
+    }, intervalMs);
+    this.dormancyTimer.unref?.();
+  }
+
+  stopDormancySweep(): void {
+    if (this.dormancyTimer) clearInterval(this.dormancyTimer);
+    this.dormancyTimer = null;
   }
 
   retireFinishedCodexWorkers(runId?: string): void {
@@ -1116,7 +1241,7 @@ export class OrchestrationWorkerLifecycleService {
         assigneeHandle: pilot?.id ?? ptyId!,
         assigneePaneId: ptyId,
         ...(pilot ? {
-          providerSessionId: pilot.sessionId, workerPolicy, workerNetwork, allowSubWorkers,
+          providerSessionId: pilot.sessionId, providerCwd: pilot.cwd, workerPolicy, workerNetwork, allowSubWorkers,
         } : {}),
         creator: from,
         creatorRunId: run.id,
@@ -1378,11 +1503,13 @@ export class OrchestrationWorkerLifecycleService {
   /** Starts a headless Worker on `cliId`'s native protocol; null when it could not start, before any turn. */
   private async openCodexWorker(
     cliId: HeadlessWorkerDriver, cwd: string, model: string | null, options: HeadlessWorkerControls,
+    resume?: { workerId: string; sessionId: string },
   ) {
     const codexPilot = this.host.codexPilot;
     const headlessWorkers = this.host.headlessWorkers;
     if (this.host.disposed || (cliId === 'codex' ? !codexPilot : !headlessWorkers)) return null;
-    const id = `${cliId}-worker-${randomUUID()}`;
+    const id = resume?.workerId ?? `${cliId}-worker-${randomUUID()}`;
+    const launchOptions = { ...options, ...(resume ? { resumeSessionId: resume.sessionId } : {}) };
     let session: AgentSessionDriver | undefined;
     const timeline = this.host.createWorkerTimeline(
       id, cliId, model, { policy: options.policy, network: options.network }, (text) => session?.redactText(text) ?? text,
@@ -1390,8 +1517,8 @@ export class OrchestrationWorkerLifecycleService {
     this.codexWorkerControls.set(id, { ...options });
     try {
       const launch = (events: AgentSessionEvents): AgentSessionDriver => cliId === 'codex'
-        ? codexPilot!.launch(id, cwd, events, { ...options })
-        : headlessWorkers!.launch(cliId, id, cwd, events, { ...options });
+        ? codexPilot!.launch(id, cwd, events, launchOptions)
+        : headlessWorkers!.launch(cliId, id, cwd, events, launchOptions);
       session = launch({
         onTimeline: (dispatchId, event) => {
           if (timeline.activeTurn?.dispatchId === dispatchId) timeline.apply(event);
@@ -1405,7 +1532,10 @@ export class OrchestrationWorkerLifecycleService {
           if (updated && !waiting && !asking) this.host.store.updateDispatchStage(dispatchId, 'working');
           if (updated) this.host.emitChanged('worker:turn-started', updated.runId);
         },
-        onTurnCompleted: (dispatchId, result) => this.completeCodexTurn(id, cwd, dispatchId, result),
+        onTurnCompleted: (dispatchId, result) => {
+          this.codexWorkerActivity.set(id, this.host.clock());
+          this.completeCodexTurn(id, cwd, dispatchId, result);
+        },
         onRequest: async (dispatchId, request) => {
           const dispatch = this.host.store.getDispatchContext(dispatchId);
           if (!dispatch || dispatch.assigneeHandle !== id) return { decision: 'decline' };
@@ -1432,6 +1562,9 @@ export class OrchestrationWorkerLifecycleService {
           this.codexWorkers.delete(id);
           this.codexMailbox.delete(id);
           this.codexWorkerControls.delete(id);
+          this.codexWorkerActivity.delete(id);
+          const wentDormant = this.dormantClosing.delete(id);
+          this.host.store.releaseResumeClaims(id);
           this.host.approvals.cancelForPane(id, reason);
           this.host.nativeQuestions.cancelForWorker(id, reason);
           this.host.waiters.cancel(id);
@@ -1439,20 +1572,25 @@ export class OrchestrationWorkerLifecycleService {
           const announced = Boolean(dispatchId && !this.codexSubmitting.has(dispatchId) &&
             this.handleCodexExit(dispatchId, reason, exitCode));
           const exited = !announced && dispatchId ? this.host.store.getDispatchContext(dispatchId) : undefined;
-          if (exited) this.host.emitChanged('worker:exited', exited.runId);
+          if (exited) this.host.emitChanged(wentDormant ? 'worker:dormant' : 'worker:exited', exited.runId);
         },
       });
       this.codexWorkers.set(id, session);
-      const sessionId = await session.open({ cwd, model, policy: options.policy, network: options.network });
+      const sessionId = await session.open({
+        cwd, model, policy: options.policy, network: options.network, ...(resume ? { resumeSessionId: resume.sessionId } : {}),
+      });
       if (!session.alive || this.host.disposed) throw new Error(`${HEADLESS_DRIVER_LABELS[cliId]} closed during initialization`);
+      if (resume && sessionId !== resume.sessionId) throw new Error(`${HEADLESS_DRIVER_LABELS[cliId]} resumed a different conversation`);
       timeline.setMeta({ providerSessionId: sessionId });
-      return { id, session, sessionId };
+      this.codexWorkerActivity.set(id, this.host.clock());
+      return { id, session, sessionId, cwd };
     } catch (error) {
       // No turn was sent, so PTY fallback can safely proceed after process teardown.
       const reason = error instanceof Error ? error.message : String(error);
       console.warn(`[orchestration] ${HEADLESS_DRIVER_LABELS[cliId]} headless Worker startup failed:`, session ? session.redactText(reason) : reason);
       this.codexWorkers.delete(id);
       this.codexWorkerControls.delete(id);
+      this.codexWorkerActivity.delete(id);
       await session?.close();
       this.host.workerTimelines.delete(id);
       return null;
@@ -1736,7 +1874,14 @@ export class OrchestrationWorkerLifecycleService {
       throw new OrchestrationError('operation_rejected', 'This worker terminal is still closing. Retry once it exits.');
     }
     const isHeadless = settledDispatch.executionMode === 'codex-app-server';
-    const session = isHeadless ? this.codexWorkers.get(existingPaneId) : undefined;
+    let session = isHeadless ? this.codexWorkers.get(existingPaneId) : undefined;
+    if (isHeadless && !session?.alive && !this.host.store.getActiveDispatchForIdentity(existingPaneId, null)) {
+      // A closing process still owns the Worker's identity until its exit handler has run.
+      if (session && !await this.waitForWorkerExit(existingPaneId, session, 5_000)) {
+        throw new OrchestrationError('operation_rejected', `${this.headlessLabel(existingPaneId)} Worker is still shutting down. Retry once it exits.`);
+      }
+      session = await this.resumeDormantWorker(settledDispatch);
+    }
     if (isHeadless && (!session?.alive || !await session.waitForIdle(15_000) || !session.alive ||
         this.host.store.getActiveDispatchForIdentity(existingPaneId, null))) {
       throw new OrchestrationError('dispatch_inactive', `${this.headlessLabel(existingPaneId)} Worker is unavailable or still finishing its previous turn.`);
@@ -1808,7 +1953,10 @@ export class OrchestrationWorkerLifecycleService {
         taskKind: settledDispatch.taskKind,
         assigneeHandle: targetPtyId,
         assigneePaneId: session ? null : targetPtyId,
-        ...(session?.sessionId ? { providerSessionId: session.sessionId } : {}),
+        ...(session?.sessionId ? {
+          providerSessionId: session.sessionId,
+          ...(this.providerCwd(settledDispatch) ? { providerCwd: this.providerCwd(settledDispatch)! } : {}),
+        } : {}),
         ...(controls ? {
           workerPolicy: controls.policy, workerNetwork: controls.network, allowSubWorkers: controls.allowSubWorkers,
         } : {}),
