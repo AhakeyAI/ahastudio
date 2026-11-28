@@ -65,6 +65,10 @@ export class PiSessionDriver implements AgentSessionDriver {
   readonly capabilities = { resume: true, steer: driverCapabilities('pi').supportsSteer, policies: driverCapabilities('pi').policies };
   private readonly rpc: JsonlRpc;
   private readonly proc: AgentProcessHandle;
+
+  get pid(): number | null {
+    return this.proc.pid;
+  }
   private readonly disconnect = new AbortController();
   private sessionFile: string | null = null;
   private model: { provider: string; id: string } | null = null;

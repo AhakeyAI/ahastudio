@@ -18,6 +18,9 @@ import type {
   OrchestrationReportArtifacts,
   OrchestrationReviewFinding,
   OrchestrationReviewStatus,
+  OrchestrationResumeClaim,
+  OrchestrationWorkerHandoff,
+  OrchestrationObservationFact,
   OrchestrationRunIntegrationStatus,
   OrchestrationRunRecord,
   OrchestrationSnapshot,
@@ -401,6 +404,54 @@ export class OrchestrationStore implements OrchestrationUnitOfWork {
     return this.lifecycle.getActiveDispatchForIdentity(handle, paneId);
   }
 
+  acquireResumeClaim(
+    ...args: Parameters<OrchestrationLifecycleStore['acquireResumeClaim']>
+  ): ReturnType<OrchestrationLifecycleStore['acquireResumeClaim']> {
+    return this.lifecycle.acquireResumeClaim(...args);
+  }
+
+  activateResumeClaim(claimId: string, pid: number | null): OrchestrationResumeClaim | undefined {
+    return this.lifecycle.activateResumeClaim(claimId, pid);
+  }
+
+  releaseResumeClaims(workerId: string): void {
+    this.lifecycle.releaseResumeClaims(workerId);
+  }
+
+  listResumeClaims(): OrchestrationResumeClaim[] {
+    return this.lifecycle.listResumeClaims();
+  }
+
+  createWorkerHandoff(
+    ...args: Parameters<OrchestrationLifecycleStore['createWorkerHandoff']>
+  ): OrchestrationWorkerHandoff {
+    return this.lifecycle.createWorkerHandoff(...args);
+  }
+
+  updateWorkerHandoff(
+    ...args: Parameters<OrchestrationLifecycleStore['updateWorkerHandoff']>
+  ): OrchestrationWorkerHandoff | undefined {
+    return this.lifecycle.updateWorkerHandoff(...args);
+  }
+
+  listWorkerHandoffs(
+    ...args: Parameters<OrchestrationLifecycleStore['listWorkerHandoffs']>
+  ): OrchestrationWorkerHandoff[] {
+    return this.lifecycle.listWorkerHandoffs(...args);
+  }
+
+  appendObservationFact(
+    ...args: Parameters<OrchestrationLifecycleStore['appendObservationFact']>
+  ): OrchestrationObservationFact {
+    return this.lifecycle.appendObservationFact(...args);
+  }
+
+  listObservationFacts(
+    ...args: Parameters<OrchestrationLifecycleStore['listObservationFacts']>
+  ): OrchestrationObservationFact[] {
+    return this.lifecycle.listObservationFacts(...args);
+  }
+
   listDispatches(filter?: {
     runId?: string;
     taskId?: string;
@@ -478,6 +529,12 @@ export class OrchestrationStore implements OrchestrationUnitOfWork {
   }
 
   /** Records a headless Worker's permission tier and network access for its next turns. */
+  setDispatchResident(
+    ...args: Parameters<OrchestrationLifecycleStore['setDispatchResident']>
+  ): OrchestrationDispatchRecord | null {
+    return this.lifecycle.setDispatchResident(...args);
+  }
+
   updateDispatchWorkerControls(dispatchId: string, patch: { workerPolicy?: AgentSessionPolicy; workerNetwork?: boolean }): OrchestrationDispatchRecord | null {
     return this.lifecycle.updateDispatchWorkerControls(dispatchId, patch);
   }

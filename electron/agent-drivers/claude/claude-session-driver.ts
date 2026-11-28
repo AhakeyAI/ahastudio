@@ -140,6 +140,10 @@ export class ClaudeSessionDriver implements AgentSessionDriver {
   readonly capabilities = { resume: true, steer: driverCapabilities('claude').supportsSteer, policies: driverCapabilities('claude').policies };
   private readonly rpc: JsonlRpc;
   private readonly proc: AgentProcessHandle;
+
+  get pid(): number | null {
+    return this.proc.pid;
+  }
   private readonly disconnect = new AbortController();
   private readonly pendingControls = new Map<string, AbortController>();
   private readonly acceptanceWindowMs: number;

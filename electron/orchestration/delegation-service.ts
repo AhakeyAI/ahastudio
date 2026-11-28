@@ -72,6 +72,7 @@ export interface OrchestrationDelegationHost {
   readonly workerRelease: OrchestrationService['workerRelease'];
   readonly workerStart: OrchestrationService['workerStart'];
   readonly workerStop: OrchestrationService['workerStop'];
+  readonly handoffWorker: OrchestrationService['handoffWorker'];
 }
 
 /** Dispatch proposals, semantic delegate_task, queued launches and role-based Worker routing. */
@@ -391,11 +392,10 @@ export class OrchestrationDelegationService {
           ...new Set(
             this.host.store
               .listIntegratedDispatchesForRun(reviewRunTarget.id)
-              .map((d) => d.cliId)
-              .filter((c): c is string => Boolean(c)),
+              .flatMap((d) => d.authorCliIds ?? (d.cliId ? [d.cliId] : [])),
           ),
         ]
-      : undefined;
+      : reviewTargetDispatch?.authorCliIds;
 
     let resolvedAgent: string;
     let selectionReason: string;
@@ -841,8 +841,10 @@ export class OrchestrationDelegationService {
     callerPaneId: string,
     input: {
       role: string;
-      action: 'read' | 'approve' | 'deny' | 'release' | 'stop';
+      action: 'read' | 'approve' | 'deny' | 'release' | 'stop' | 'handoff';
       reason?: string;
+      /** For `handoff`: the Coding Agent that continues the task. */
+      agent?: string;
       force?: boolean;
       screen?: boolean;
     }
@@ -911,6 +913,13 @@ export class OrchestrationDelegationService {
           force: input.force,
         });
         return { action: 'stop', ...res };
+      }
+      case 'handoff': {
+        if (!input.agent?.trim()) {
+          throw new OrchestrationError('invalid_argument', 'action="handoff" needs agent, the Coding Agent that continues the task.');
+        }
+        const res = await this.host.handoffWorker(dispatch, { toCli: input.agent, from: callerPaneId, instructions: input.reason });
+        return { action: 'handoff', handoffId: res.handoffId, dispatch: res.followUp?.dispatch ?? dispatch, previousDispatchId: dispatch.id };
       }
     }
   }

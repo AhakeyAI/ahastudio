@@ -48,10 +48,14 @@ export function headlessWorkerSupports(cliId: string | null | undefined, policy:
   return headlessWorkerSupportError(cliId, policy) === null;
 }
 
+/** `path` in a form two spellings of the same directory compare equal in (case-insensitive on Windows). */
+export function comparablePath(path: string): string {
+  const resolved = resolve(path);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
 function sameCwd(a: string, b: string): boolean {
-  const left = resolve(a);
-  const right = resolve(b);
-  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+  return comparablePath(a) === comparablePath(b);
 }
 
 /**

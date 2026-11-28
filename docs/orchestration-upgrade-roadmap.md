@@ -76,7 +76,8 @@ flowchart LR
     QG --> S4BC["Stage 4B/4C: CleanupOutbox + 看板 Overview/休眠态"]
     S3A --> S3B1["Stage 3B-1: ResumeClaim + 进程回收 + 休眠自动复活"]
     S3B1 --> S3B2["Stage 3B-2: 跨 CLI 接力 + 常驻角色续波次 + 作者集合回避"]
-    S3B2 --> S3C["Stage 3C: CLI/远程 requestId 幂等与事实完善"]
+    QG --> S3Ca["Stage 3C-a: 写入口 requestId 幂等"]
+    S3B2 --> S3C["Stage 3C-b: 观测事实补齐"]
     S3C -. "按需双路径评估" .-> S4A["Stage 4A: JSONL（历史量） / node:sqlite（联合恢复）"]
 ```
 
@@ -193,12 +194,16 @@ flowchart LR
   - **对抗评审者（`reviewOfDispatchId / reviewOfRunId`）永远保持一次性**：审完 detached snapshot 即销毁，严禁休眠复用，杜绝跨轮次锚定偏见。
   - **领域开发者 / 调研者（`@backend / @frontend / @researcher`）升级为可常驻休眠角色**：空闲时可主动关闭子进程释放内存（真零内存、零 Token 休眠），被 `@role` 唤醒或重启后凭 `providerSessionId` 自动复活，合入第一波代码后也能继续承接下一波任务，直到整个 Run 收尾或人工点「退休」才彻底销毁。
 - **基础**：直接复用已合入的 `needs_reconciliation`、`reconciliationDiff` 与 `QueuedWorkerLaunch` 落盘认领模式，在其之上扩展可审计、经过 `secret-redaction.ts` 与 capability 脱敏的 `ContextTransfer / ContextHandoff` 工件，绝不起第二套平行结构。
-- **PR 3B-1（所有权、进程回收与同 worktree 休眠自动复活，先行）**：
+- **PR 3B-1（所有权、进程回收与同 worktree 休眠自动复活，先行）— 已完成**：
+  - 落地：持久化 `ResumeClaim`（Worker 身份 + 目录单写者锁，记录 pid，预留 `hostId / actor`），复活前 `flushDurable()`；上次进程遗留的 claim 重启后为 `stale`，仅在记录的进程确认已退出后才放行（绝不按 pid 盲杀）。Windows 已由 job 对象覆盖全部 headless driver（`spawnAgentProcess` 早已统一走 job），本 PR 补 POSIX：agent 以独立进程组启动，关闭时 `kill(-pgid)`。`startFollowUp` 对无进程的已结算 headless Worker 按 `providerSessionId` 在原目录（新增 `providerCwd`）原位复活；对抗评审者、已释放、目录不存在或 `headlessResumeError` 拒绝时仍报 `dispatch_inactive` 并说明原因。空闲休眠：结算后空闲 `headlessWorkerDormancyMs`（桌面端 5 分钟）且无待处理事项时关闭进程，快照 `headlessLive.dormant` 标记可热唤醒。页面内人工接管目前尚无独立实现，claim 的 `actor: 'person'` 留给其接入。
   1. 引入显式 `ResumeClaim / WorktreeOwnershipFence`，**claim 中记录 pid / job 句柄**（并预留 `hostId?: string` 与 `actor` 来源字段）；页面内人工接管同步切到同一套 claim。
   2. **推广现有 [`windows-codex-job.ts`](../electron/orchestration/windows-codex-job.ts)（当前仅服务 Codex）到全部 headless driver**；macOS / Linux 用进程组回收（`kill(-pgid)`）。
   3. **同 worktree 零成本休眠与按 `providerSessionId` 自动复活**：
      - 改造 `startFollowUp`：当 Headless Worker 进程已退出或应用重启后，若 `settledDispatch.providerSessionId` 存在、worktree 仍在且 `driverCapabilities(cliId).resume === true`，不再直接抛 `dispatch_inactive`，而是获取 `ResumeClaim` 后通过 `open({ cwd, resumeSessionId })` 原位复活会话。
      - 增加**空闲自动休眠**（可配阈值，如空闲 5 分钟且无活跃 turn / 无待答原生提问 / 无待批权限）：先归档 timeline，再安全 `close()` 释放子进程内存，将成员态置为 `dormant（休眠待命）`，下次被 `@role` 呼叫自动 `resume` 秒醒。
+- **PR 3B-2 拆分（已决策）**：3B-2a 跨 CLI 原位接力（约束 1 / 3 / 4 / 5）— **已完成**；3B-2b 合入后常驻角色续接下一波任务（约束 2）— **已完成**。
+  - 3B-2b 落地：`integrate_worker(keepResident=true)` 对拥有独立 worktree/分支的 headless Worker 只合入、不释放，记录 `residentAfterIntegration`（目标分支、合入时分支 OID 与快照 OID）。下一次 follow-up 即新一波：worktree 快照仍等于已合入快照时（Worker 默认不提交，worktree 里就是已合入内容）才清空并在**同一路径**从最新目标分支切出新 `aha/worker/*` 分支，旧分支按 CAS 删除，cwd 不变故原生 resume 照常；合入后又有新改动则拒绝并保留（`resident_worktree_changed`）。worktree 已不存在时在新 worktree 起新会话并以 `ContextHandoff` 续接（跨目录原生 resume 暂不尝试，统一走便携上下文）。新一波 `authorCliIds` 从当前 CLI 重新累计。`run-finalize` 释放所有常驻 Worker。
+  - 3B-2a 落地：`manage_worker action="handoff" agent=<cli>`（HTTP `role-manage`）把已停止/已结算的 headless Worker 任务交给另一 CLI，同一 worktree、保留未提交改动。目标按 `headlessWorkerSupportError` + 运行时可用性筛选（pi/opencode、grok/antigravity 只读一律拒绝）。写入静止：旧会话关闭且其最后进程树已不存活，再两次快照（间隔 `handoffQuiescenceMs`，默认 2s）OID 一致，否则保留 worktree 并拒绝（`writer_still_running` / `worktree_still_changing`）。两阶段：`pending` 移交记录 + 新 Worker 的 `ResumeClaim` 先 `flushDurable()`，拿到会话后写 `active` 再落盘，follow-up 派发后 `completed`；重启时 `pending/active` 一律转 `needs_attention` 并向协调者发一次告警，绝不自动续跑（不按 pid 盲杀，遗留 claim 保持 `stale` 直到进程确认退出）。新 Agent 从脱敏的 `ContextHandoff`（接力说明、前任报告、末轮输出，12KB 上限）+ 原任务启动；dispatch 记录 `authorCliIds`（单波内累计），单 Worker 与 Run 级评审都回避整个作者集合。
 - **PR 3B-2（跨 CLI 原位接力 + 合入后常驻角色续接下一波任务）五条硬约束**：
   1. **目标 CLI 筛选严格复用现有启动判断**（`workerStart` 内 `headlessWorkerSupports` 调用处）：
      - 必须通过 `headlessWorkerSupports(targetCli, workerPolicy)` 且校验运行时可用性（`headlessWorkers.available?.(targetCli) !== false` / `codexPilot.enabled()`）；
@@ -221,7 +226,10 @@ flowchart LR
   4. **失败验收 1（残留子进程仍在写文件）**：旧 CLI 已确认中断，但模拟其衍生的后台进程仍在改写 worktree 文件 → 系统必须**保留 worktree 不清理、暂停移交并返回明确错误**，不得启动新 CLI 造成双写；
   5. **失败验收 2（拉起新 CLI 后、落盘成功前崩溃）**：移交记录落盘后拉起新 CLI，模拟在写入 `active` 之前应用崩溃 → 重启后恢复流程回收孤儿进程、标记 `needs_attention`，**绝不再启动第二份重复 Worker**。
 
-#### PR 3C：CLI / 远程 `requestId` 幂等与观测事实补齐（未来远程控制前置护栏）
+#### PR 3C：CLI / 远程 `requestId` 幂等与观测事实补齐（未来远程控制前置护栏；拆 3C-a / 3C-b）
+- **拆分（已决策）**：3C-a（写入口 `requestId` 幂等）不依赖 3B，与 3A / 3B-1 并行先做；3C-b（`AttemptObservationFact` 事实补齐，含 dormant/resume、handoff）依赖 3B 的事件，排在 3B-2 之后。
+- **3C-a — 已完成**：`request-idempotency.ts` 的 `RequestReceipts` 按 `(action, callerPaneId, requestId)` 记账，`worker-start / worker-integrate / run-finalize / worker-release / approve / deny` 带 `requestId` 时只执行一次：重试（含并发重复）返回首个成功结果并带 `replayed: true`，同 ID 异载荷返回 409 `request_mismatch`，失败结果不入账（重试会重新执行）。收据仅在内存保留（24h / 500 条），应用重启后不重放。CLI 对上述动作自动生成 `requestId`，断线时提示 `--retry-request <id>`。
+- **3C-b — 已完成**：新增只增不改的 `OrchestrationObservationFact` 日志（持久化，单 Run 保留最新 400 条、总计 4000 条，字符串值脱敏并截断），覆盖 `turn_started / turn_completed / approval / native_question / snapshot`（评审快照）/ `dormant / resumed / handoff`（每次状态变化）/ `integrated / wave_started`；`seq` 跨重启单调递增。读取走只读 HTTP `facts`（按调用方 Run 鉴权，支持 `afterSeq` 游标增量拉取，供未来远程端续读）。
 - **定位说明**：单机模式下主要服务 CLI/HTTP 断线重试与防连点，但**面向未来的远程控制（手机/弱网重连、重复点击审批/派发/合入）属于必经防双写护栏**，在 3B-2 之后独立收口。
 - **内容**：
   1. 在已有 `startObservation` 与 `IntegrationIntent / finalizedBatches` 基础上，补齐只增不改的 `AttemptObservationFact` 关键事件覆盖（turn、approval、native question、snapshot、dormant/resume、handoff、integration）。

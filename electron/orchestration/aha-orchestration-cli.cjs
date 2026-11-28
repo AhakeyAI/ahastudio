@@ -4,6 +4,7 @@
 const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
+const { randomUUID } = require('node:crypto');
 
 const TWO_WORD_COMMANDS = {
   run: ['create', 'use', 'current', 'list', 'show', 'diff', 'finalize'],
@@ -365,6 +366,18 @@ function resolveBaseUrl(namespace = 'orchestration') {
   throw new Error(
     'Missing orchestration endpoint env (AHA_ORCHESTRATION_URL or AHA_AGENT_HOOK_URL).'
   );
+}
+
+// Write actions the server runs once per requestId; keep in sync with IDEMPOTENT_ORCHESTRATION_ACTIONS.
+const IDEMPOTENT_ACTIONS = new Set(['worker-start', 'worker-integrate', 'run-finalize', 'worker-release', 'approve', 'deny']);
+
+/** Gives an idempotent write a requestId: the one from --retry-request, or a fresh one. */
+function withRequestId(namespace, action, payload, flags) {
+  if (namespace !== 'orchestration' || !IDEMPOTENT_ACTIONS.has(action)) return { payload, requestId: null };
+  const retry = flags.retryRequest;
+  if (retry === true || retry === false) throw new Error('--retry-request needs the requestId printed by the interrupted command');
+  const requestId = retry !== undefined ? String(retry) : randomUUID();
+  return { payload: { ...payload, requestId }, requestId };
 }
 
 function postJson(urlStr, token, bodyObj) {
@@ -1231,6 +1244,8 @@ async function main() {
         '  worker-start | worker-list | worker-show | worker-read | worker-diff | worker-integrate | worker-keep-open | worker-release | worker-stop | worker-abandon',
         '  approve | deny | reset',
         '  run-create | run-use | run-current | run-list | run-show | run-diff | run-finalize',
+        '  (worker-start, worker-integrate, run-finalize, worker-release, approve and deny run once per request;',
+        '   after a dropped connection, re-run with the printed --retry-request <id> to get the first result)',
         '  task-create | task-list | task-update | task-show | task-done | task-fail',
         '  dispatch | dispatch-show',
         '  coordinator-start | coordinator-stop | coordinator-tick | coordinator-status',
@@ -1243,7 +1258,9 @@ async function main() {
 
   const namespace = parsed.namespace || 'orchestration';
   const { baseUrl, token } = resolveEndpoint(namespace);
-  const { action, payload } = buildPayload(parsed.verb, parsed.flags, parsed.positional, namespace);
+  const built = buildPayload(parsed.verb, parsed.flags, parsed.positional, namespace);
+  const action = built.action;
+  const { payload, requestId } = withRequestId(namespace, action, built.payload, parsed.flags);
 
   const isWaitCall =
     namespace === 'orchestration' &&
@@ -1269,6 +1286,13 @@ async function main() {
   let res;
   try {
     res = await postJson(`${baseUrl}/${action}`, token, payload);
+  } catch (error) {
+    if (requestId) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`${reason}
+The ${action} request may already have run. Re-run the same command with --retry-request ${requestId} to get its result without running it twice.`);
+    }
+    throw error;
   } finally {
     if (keepaliveTimer !== null) clearInterval(keepaliveTimer);
   }
@@ -1322,6 +1346,7 @@ if (require.main === module) {
 
 module.exports = {
   parseCliArgs,
+  withRequestId,
   resolveEndpoint,
   buildPayload,
   toBoolean,

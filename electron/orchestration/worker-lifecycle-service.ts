@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { isProcessTreeAlive } from '../agent-drivers/process-tree.js';
 import { runGitCommand } from '../git/git-exec.js';
 import { driverCapabilities } from '../agent-drivers/driver-capabilities.js';
 import type { AgentPaneStatus, AgentStatusStore } from '../agent/agent-status-store.js';
@@ -15,7 +17,9 @@ import {
   HEADLESS_DRIVER_LABELS,
   HEADLESS_WORKER_ID,
   headlessWorkerControlsError,
+  headlessResumeError,
   headlessWorkerDriver,
+  headlessWorkerSupportError,
   headlessWorkerSupports,
   isHeadlessWorkerDriver,
   type HeadlessWorkerDriver,
@@ -65,6 +69,7 @@ import {
 } from './worker-git-integration.js';
 import {
   assertWorkerWorktreeClean,
+  deleteOwnedWorkerBranch,
   prepareWorkerWorktreePlacement,
   removeOwnedWorkerWorktree,
   WORKER_BRANCH_PREFIX,
@@ -100,6 +105,7 @@ export interface OrchestrationWorkerLifecycleHost {
   readonly buildWorkerDispatchBrief: (input: BuildDispatchPreambleInput) => string;
   readonly canHeadlessWorkerDelegate: OrchestrationService['canHeadlessWorkerDelegate'];
   readonly cliCommand: string;
+  readonly clock: () => number;
   readonly closeWorkerPty: OrchestrationServiceDependencies['closeWorkerPty'] | undefined;
   readonly codexPilot: OrchestrationServiceDependencies['codexPilot'] | undefined;
   readonly createWorkerTimeline: (
@@ -115,6 +121,10 @@ export interface OrchestrationWorkerLifecycleHost {
   readonly exitedPanes: Set<string>;
   readonly failTaskIfReady: (taskId: string) => void;
   readonly getDefaultCwd: (() => string | undefined) | undefined;
+  /** Time between the two worktree snapshots that must match before a cross-CLI handoff starts. */
+  readonly handoffQuiescenceMs: number;
+  /** How long a settled headless Worker stays idle before its process is closed; 0 keeps it running. */
+  readonly headlessWorkerDormancyMs: number;
   readonly headlessWorkers: OrchestrationServiceDependencies['headlessWorkers'] | undefined;
   readonly inferRunIdOptional: (from?: string) => string | undefined;
   readonly integration: OrchestrationIntegrationService;
@@ -146,6 +156,16 @@ export interface OrchestrationWorkerLifecycleHost {
   readonly workerTimelines: Map<string, WorkerTimeline>;
 }
 
+/** Where a resident Worker's next wave runs after integration. */
+interface NextWavePlacement {
+  worktreePath: string;
+  branch: string | null;
+  baseCommit: string | null;
+  ownsWorktree: boolean;
+  ownsBranch: boolean;
+  repoRootPath: string | null;
+}
+
 /** Worker start, follow-up, stop, release and abandon, plus the headless Worker session bridge. */
 export class OrchestrationWorkerLifecycleService {
   constructor(private readonly host: OrchestrationWorkerLifecycleHost) {}
@@ -159,6 +179,13 @@ export class OrchestrationWorkerLifecycleService {
   /** Pending wake-ups per headless Worker; `opaque` means at least one wake carried no message record. */
   private readonly codexMailbox = new Map<string, { messages: OrchestrationMessageRecord[]; opaque: boolean }>();
   private readonly workerMutations = new Set<string>();
+  /** When each live headless Worker last opened or finished a turn, for idle dormancy. */
+  private readonly codexWorkerActivity = new Map<string, number>();
+  /** Workers whose process AhaStation is closing to go dormant, not because it failed. */
+  private readonly dormantClosing = new Set<string>();
+  private dormancyTimer: ReturnType<typeof setInterval> | null = null;
+  /** The last agent process of each headless Worker, kept after exit to verify nothing it started still runs. */
+  private readonly lastWorkerPid = new Map<string, number>();
 
   getWorkerGoalLimit(workerId: string) {
     return this.workerGoalLimits.get(workerId);
@@ -232,6 +259,125 @@ export class OrchestrationWorkerLifecycleService {
       network: dispatch.workerNetwork ?? header?.network ?? false,
       allowSubWorkers: dispatch.allowSubWorkers === true,
     };
+  }
+
+  /** The directory a headless Worker's provider conversation lives in, where it can resume. */
+  private providerCwd(dispatch: OrchestrationDispatchRecord): string | null {
+    return dispatch.providerCwd ?? dispatch.worktreePath ?? null;
+  }
+
+  /**
+   * Why a settled headless Worker cannot be woken from its provider conversation, or null when it
+   * can. Adversarial reviewers stay one-shot so a later round never inherits an earlier verdict.
+   */
+  dormantResumeRefusal(dispatch: OrchestrationDispatchRecord): string | null {
+    if (dispatch.executionMode !== 'codex-app-server') return 'it is not a headless Worker';
+    if (dispatch.releasedAt) return 'it has been released';
+    if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) return 'adversarial reviewers are one-shot';
+    if (this.host.disposed) return 'AhaStation is shutting down';
+    const driver = headlessWorkerDriver(dispatch.assigneeHandle);
+    if (!driver) return 'its driver is unknown';
+    if (driver === 'codex' ? !this.host.codexPilot : !this.host.headlessWorkers || this.host.headlessWorkers.available?.(driver) === false) {
+      return `${HEADLESS_DRIVER_LABELS[driver]} is unavailable on this machine`;
+    }
+    const cwd = this.providerCwd(dispatch);
+    if (!cwd) return 'no working directory was recorded for its conversation';
+    if (!existsSync(cwd)) return `its working directory ${cwd} no longer exists`;
+    return headlessResumeError(driver, { providerSessionId: dispatch.providerSessionId, sessionCwd: cwd, cwd })?.message ?? null;
+  }
+
+  /** A settled headless Worker with no process that a follow-up can wake in place. */
+  isDormant(dispatch: OrchestrationDispatchRecord): boolean {
+    return !ACTIVE_DISPATCH_STATUSES.has(dispatch.status) && !this.codexWorkers.get(dispatch.assigneeHandle)?.alive &&
+      this.dormantResumeRefusal(dispatch) === null;
+  }
+
+  /**
+   * Reopens a dormant Worker's provider conversation under its own identity, holding a resume
+   * claim (made durable before the process starts) so two writers never share its directory.
+   */
+  private async resumeDormantWorker(dispatch: OrchestrationDispatchRecord): Promise<AgentSessionDriver> {
+    const label = this.headlessLabel(dispatch.assigneeHandle);
+    const refusal = this.dormantResumeRefusal(dispatch);
+    if (refusal) {
+      throw new OrchestrationError('dispatch_inactive', `${label} Worker is no longer running and cannot be resumed: ${refusal}.`);
+    }
+    const driver = headlessWorkerDriver(dispatch.assigneeHandle)!;
+    const cwd = this.providerCwd(dispatch)!;
+    const claim = this.host.store.acquireResumeClaim({
+      workerId: dispatch.assigneeHandle, runId: dispatch.runId, dispatchId: dispatch.id, cwd, driver,
+      providerSessionId: dispatch.providerSessionId!,
+    });
+    try {
+      await this.host.store.flushDurable();
+      const opened = await this.openCodexWorker(driver, cwd, dispatch.model ?? null, this.headlessControls(dispatch), {
+        workerId: dispatch.assigneeHandle, sessionId: dispatch.providerSessionId!,
+      });
+      if (!opened) throw new OrchestrationError('dispatch_inactive', `${label} could not reopen the Worker's conversation.`);
+      this.host.store.activateResumeClaim(claim.id, opened.session.pid ?? null);
+      this.host.store.appendObservationFact({
+        runId: dispatch.runId, dispatchId: dispatch.id, workerId: dispatch.assigneeHandle, kind: 'resumed',
+        data: { providerSessionId: opened.sessionId, cwd, pid: opened.session.pid ?? null, claimId: claim.id },
+      });
+      this.host.emitChanged('worker:resumed', dispatch.runId);
+      return opened.session;
+    } catch (error) {
+      this.host.store.releaseResumeClaims(dispatch.assigneeHandle);
+      throw error;
+    }
+  }
+
+  /**
+   * Closes settled headless Workers that sat idle for `headlessWorkerDormancyMs`, when a follow-up
+   * can wake them again; their conversation stays with the provider.
+   */
+  sleepIdleHeadlessWorkers(): string[] {
+    const idleMs = this.host.headlessWorkerDormancyMs;
+    if (idleMs <= 0 || this.host.disposed) return [];
+    const now = this.host.clock();
+    const slept: string[] = [];
+    for (const [workerId, codex] of this.codexWorkers) {
+      if (!codex.alive || codex.busy || codex.closing || !codex.latestTurnKey || this.codexMailbox.has(workerId)) continue;
+      const lastActive = this.codexWorkerActivity.get(workerId);
+      if (lastActive === undefined || now - lastActive < idleMs) continue;
+      if (this.host.store.getActiveDispatchForIdentity(workerId, null)) continue;
+      const dispatch = this.host.store.getDispatchContext(codex.latestTurnKey);
+      if (!dispatch || dispatch.retained || this.codexSubmitting.has(dispatch.id)) continue;
+      if (this.host.approvals.hasOpenApprovalForDispatch(dispatch.id) || this.host.nativeQuestions.hasOpenQuestionForDispatch(dispatch.id)) continue;
+      if (this.dormantResumeRefusal(dispatch) !== null) continue;
+      this.dormantClosing.add(workerId);
+      this.archiveCodexOutput(codex, dispatch.id);
+      this.host.archiveWorkerTimeline(workerId, dispatch.id);
+      void codex.close(true);
+      slept.push(workerId);
+    }
+    return slept;
+  }
+
+  private async waitForWorkerExit(workerId: string, session: AgentSessionDriver, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.codexWorkers.get(workerId) === session) {
+      if (Date.now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return true;
+  }
+
+  startDormancySweep(intervalMs: number): void {
+    if (this.dormancyTimer || intervalMs <= 0 || this.host.headlessWorkerDormancyMs <= 0) return;
+    this.dormancyTimer = setInterval(() => {
+      try {
+        this.sleepIdleHeadlessWorkers();
+      } catch (error) {
+        console.warn('[orchestration] headless Worker dormancy sweep failed:', error);
+      }
+    }, intervalMs);
+    this.dormancyTimer.unref?.();
+  }
+
+  stopDormancySweep(): void {
+    if (this.dormancyTimer) clearInterval(this.dormancyTimer);
+    this.dormancyTimer = null;
   }
 
   retireFinishedCodexWorkers(runId?: string): void {
@@ -594,17 +740,19 @@ export class OrchestrationWorkerLifecycleService {
           `Target worker ${target.id} is still active (${target.status}). Wait for it to report done before starting an adversarial review.`,
         );
       }
-      if (target.cliId && this.host.listCodingAgentsDep) {
-        const authorCli = normalizeWorkerCliId(target.cliId);
+      const authorClis = new Set<string>(
+        (target.authorCliIds ?? (target.cliId ? [target.cliId] : [])).map((id) => normalizeWorkerCliId(id)).filter(Boolean),
+      );
+      if (authorClis.size > 0 && this.host.listCodingAgentsDep) {
         const reviewerCli = normalizeWorkerCliId(launchConfig.cliId);
-        if (authorCli && reviewerCli === authorCli) {
+        if (authorClis.has(reviewerCli)) {
           const available = this.host.listCodingAgents(from).filter((entry) => entry.available);
-          const heterogeneous = available.filter((entry) => entry.cliId !== authorCli);
+          const heterogeneous = available.filter((entry) => !authorClis.has(entry.cliId));
           if (heterogeneous.length > 0) {
             throw new OrchestrationError(
               'operation_rejected',
-              `Heterogeneous review must avoid the author's Coding Agent (${authorCli}); available alternative(s): ${heterogeneous.map((e) => e.cliId).join(', ')}.`,
-              { authorCliId: authorCli, requestedCliId: reviewerCli },
+              `Heterogeneous review must avoid ${authorClis.size === 1 ? "the author's Coding Agent" : 'every Coding Agent that wrote this work'} (${[...authorClis].join(', ')}); available alternative(s): ${heterogeneous.map((e) => e.cliId).join(', ')}.`,
+              { authorCliId: reviewerCli, authorCliIds: [...authorClis], requestedCliId: reviewerCli },
             );
           }
         }
@@ -639,6 +787,12 @@ export class OrchestrationWorkerLifecycleService {
         );
       }
 
+      if (reviewSnapshotOid) {
+        this.host.store.appendObservationFact({
+          runId: target.runId, dispatchId: target.id, workerId: target.assigneeHandle, kind: 'snapshot',
+          data: { purpose: 'review', snapshotOid: reviewSnapshotOid },
+        });
+      }
       const effectiveReviewBase = await this.host.integration.resolveEffectiveWorkerDiffBase(
         run,
         target,
@@ -745,7 +899,8 @@ export class OrchestrationWorkerLifecycleService {
       if (this.host.listCodingAgentsDep) {
         const integratedAuthorClis = new Set<string>(
           resolvedTarget.integratedWorkers
-            .map((w) => (w.cliId ? normalizeWorkerCliId(w.cliId) : ''))
+            .flatMap((w) => w.authorCliIds ?? (w.cliId ? [w.cliId] : []))
+            .map((id) => normalizeWorkerCliId(id))
             .filter(Boolean),
         );
         const reviewerCli = normalizeWorkerCliId(launchConfig.cliId);
@@ -1122,7 +1277,7 @@ export class OrchestrationWorkerLifecycleService {
         assigneeHandle: pilot?.id ?? ptyId!,
         assigneePaneId: ptyId,
         ...(pilot ? {
-          providerSessionId: pilot.sessionId, workerPolicy, workerNetwork, allowSubWorkers,
+          providerSessionId: pilot.sessionId, providerCwd: pilot.cwd, workerPolicy, workerNetwork, allowSubWorkers,
         } : {}),
         creator: from,
         creatorRunId: run.id,
@@ -1384,11 +1539,13 @@ export class OrchestrationWorkerLifecycleService {
   /** Starts a headless Worker on `cliId`'s native protocol; null when it could not start, before any turn. */
   private async openCodexWorker(
     cliId: HeadlessWorkerDriver, cwd: string, model: string | null, options: HeadlessWorkerControls,
+    resume?: { workerId: string; sessionId?: string },
   ) {
     const codexPilot = this.host.codexPilot;
     const headlessWorkers = this.host.headlessWorkers;
     if (this.host.disposed || (cliId === 'codex' ? !codexPilot : !headlessWorkers)) return null;
-    const id = `${cliId}-worker-${randomUUID()}`;
+    const id = resume?.workerId ?? `${cliId}-worker-${randomUUID()}`;
+    const launchOptions = { ...options, ...(resume?.sessionId ? { resumeSessionId: resume.sessionId } : {}) };
     let session: AgentSessionDriver | undefined;
     const timeline = this.host.createWorkerTimeline(
       id, cliId, model, { policy: options.policy, network: options.network }, (text) => session?.redactText(text) ?? text,
@@ -1396,8 +1553,8 @@ export class OrchestrationWorkerLifecycleService {
     this.codexWorkerControls.set(id, { ...options });
     try {
       const launch = (events: AgentSessionEvents): AgentSessionDriver => cliId === 'codex'
-        ? codexPilot!.launch(id, cwd, events, { ...options })
-        : headlessWorkers!.launch(cliId, id, cwd, events, { ...options });
+        ? codexPilot!.launch(id, cwd, events, launchOptions)
+        : headlessWorkers!.launch(cliId, id, cwd, events, launchOptions);
       session = launch({
         onGoalChanged: (goal) => {
           if (goal?.status === 'usageLimited' || goal?.status === 'budgetLimited') {
@@ -1416,13 +1573,26 @@ export class OrchestrationWorkerLifecycleService {
             promptSent: true, refreshHeartbeat: true,
           });
           if (updated && !waiting && !asking) this.host.store.updateDispatchStage(dispatchId, 'working');
+          if (updated) {
+            this.host.store.appendObservationFact({
+              runId: updated.runId, dispatchId, workerId: id, kind: 'turn_started',
+              data: { providerSessionId: session?.sessionId ?? null, waitingForPermission: waiting },
+            });
+          }
           if (updated) this.host.emitChanged('worker:turn-started', updated.runId);
         },
-        onTurnCompleted: (dispatchId, result) => this.completeCodexTurn(id, cwd, dispatchId, result),
+        onTurnCompleted: (dispatchId, result) => {
+          this.codexWorkerActivity.set(id, this.host.clock());
+          this.completeCodexTurn(id, cwd, dispatchId, result);
+        },
         onRequest: async (dispatchId, request) => {
           const dispatch = this.host.store.getDispatchContext(dispatchId);
           if (!dispatch || dispatch.assigneeHandle !== id) return { decision: 'decline' };
           if (request.kind === 'question') {
+            this.host.store.appendObservationFact({
+              runId: dispatch.runId, dispatchId, workerId: id, kind: 'native_question',
+              data: { status: 'requested', method: request.method, questions: request.questions?.length ?? 0 },
+            });
             return this.host.nativeQuestions.holdQuestion(dispatch, {
               provider: headlessWorkerDriver(id) ?? dispatch.cliId ?? 'codex',
               method: request.method,
@@ -1446,6 +1616,9 @@ export class OrchestrationWorkerLifecycleService {
           this.workerGoalLimits.delete(id);
           this.codexMailbox.delete(id);
           this.codexWorkerControls.delete(id);
+          this.codexWorkerActivity.delete(id);
+          const wentDormant = this.dormantClosing.delete(id);
+          this.host.store.releaseResumeClaims(id);
           this.host.approvals.cancelForPane(id, reason);
           this.host.nativeQuestions.cancelForWorker(id, reason);
           this.host.waiters.cancel(id);
@@ -1453,14 +1626,25 @@ export class OrchestrationWorkerLifecycleService {
           const announced = Boolean(dispatchId && !this.codexSubmitting.has(dispatchId) &&
             this.handleCodexExit(dispatchId, reason, exitCode));
           const exited = !announced && dispatchId ? this.host.store.getDispatchContext(dispatchId) : undefined;
-          if (exited) this.host.emitChanged('worker:exited', exited.runId);
+          if (exited && wentDormant) {
+            this.host.store.appendObservationFact({
+              runId: exited.runId, dispatchId: exited.id, workerId: id, kind: 'dormant',
+              data: { providerSessionId: exited.providerSessionId ?? null, cwd: exited.providerCwd ?? exited.worktreePath ?? null },
+            });
+          }
+          if (exited) this.host.emitChanged(wentDormant ? 'worker:dormant' : 'worker:exited', exited.runId);
         },
       });
       this.codexWorkers.set(id, session);
-      const sessionId = await session.open({ cwd, model, policy: options.policy, network: options.network });
+      const sessionId = await session.open({
+        cwd, model, policy: options.policy, network: options.network, ...(resume?.sessionId ? { resumeSessionId: resume.sessionId } : {}),
+      });
       if (!session.alive || this.host.disposed) throw new Error(`${HEADLESS_DRIVER_LABELS[cliId]} closed during initialization`);
+      if (resume?.sessionId && sessionId !== resume.sessionId) throw new Error(`${HEADLESS_DRIVER_LABELS[cliId]} resumed a different conversation`);
+      if (session.pid) this.lastWorkerPid.set(id, session.pid);
       timeline.setMeta({ providerSessionId: sessionId });
-      return { id, session, sessionId };
+      this.codexWorkerActivity.set(id, this.host.clock());
+      return { id, session, sessionId, cwd };
     } catch (error) {
       // No turn was sent, so PTY fallback can safely proceed after process teardown.
       const reason = error instanceof Error ? error.message : String(error);
@@ -1468,6 +1652,7 @@ export class OrchestrationWorkerLifecycleService {
       this.codexWorkers.delete(id);
       this.workerGoalLimits.delete(id);
       this.codexWorkerControls.delete(id);
+      this.codexWorkerActivity.delete(id);
       await session?.close();
       this.host.workerTimelines.delete(id);
       return null;
@@ -1506,6 +1691,13 @@ export class OrchestrationWorkerLifecycleService {
       turnId: result.turnId, status, stopReason: result.stopReason, usage: result.usage, error: result.error,
     });
     this.host.store.recordCodexTurn(dispatchId, result);
+    const turnRunId = this.host.store.getDispatchContext(dispatchId)?.runId;
+    if (turnRunId) {
+      this.host.store.appendObservationFact({
+        runId: turnRunId, dispatchId, workerId, kind: 'turn_completed',
+        data: { turnId: result.turnId, stopReason: result.stopReason, error: result.error },
+      });
+    }
     this.host.archiveWorkerTimeline(workerId, dispatchId);
     const dispatch = this.host.store.getDispatchContext(dispatchId);
     if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
@@ -1721,12 +1913,259 @@ export class OrchestrationWorkerLifecycleService {
     settledDispatch: OrchestrationDispatchRecord,
     input: SettledWorkerFollowUpInput,
   ): Promise<OrchestrationSendResult> {
-    return this.mutateWorkerResources(settledDispatch, () => this.startFollowUp(settledDispatch, input));
+    return this.mutateWorkerResources(settledDispatch, async () => {
+      if (!settledDispatch.residentAfterIntegration || settledDispatch.releasedAt) return this.startFollowUp(settledDispatch, input);
+      const next = await this.prepareNextWave(settledDispatch);
+      try {
+        const result = await this.startFollowUp(settledDispatch, input, next.replacement, next.wave);
+        this.host.store.setDispatchResident(settledDispatch.id, null);
+        const started = result.followUp?.dispatch;
+        if (started) {
+          this.host.store.appendObservationFact({
+            runId: started.runId, dispatchId: started.id, workerId: started.assigneeHandle, kind: 'wave_started',
+            data: {
+              branch: next.wave.branch, baseCommit: next.wave.baseCommit, worktreePath: next.wave.worktreePath,
+              inPlace: !next.replacement, previousDispatchId: settledDispatch.id,
+            },
+          });
+        }
+        return result;
+      } catch (error) {
+        if (next.replacement?.session.alive) await next.replacement.session.close(true);
+        throw error;
+      }
+    });
+  }
+
+  /**
+   * Starts a resident Worker's next wave after integration. In its own worktree, once clean, it
+   * switches to a fresh branch from the latest target branch so the cwd (and native resume) stay the
+   * same. If the worktree is gone, a new one is placed and a new conversation starts from a portable
+   * context instead, since provider sessions can be tied to the old directory.
+   */
+  private async prepareNextWave(settled: OrchestrationDispatchRecord): Promise<{
+    wave: NextWavePlacement;
+    replacement?: Parameters<OrchestrationWorkerLifecycleService['startFollowUp']>[2];
+  }> {
+    const marker = settled.residentAfterIntegration!;
+    const repoRoot = settled.repoRootPath;
+    if (!repoRoot) throw new OrchestrationError('operation_rejected', 'The resident Worker has no recorded repository.');
+    const baseCommit = await resolveBranchRefOid(repoRoot, marker.targetBranch);
+    if (!baseCommit) {
+      throw new OrchestrationError('operation_rejected', `Cannot resolve ${marker.targetBranch} to start the next wave.`);
+    }
+    const role = this.host.delegation.resolveRoleNameForDispatch(settled) || 'worker';
+    const slug = role.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'worker';
+    const branch = `${WORKER_BRANCH_PREFIX}${slug}-${Date.now().toString(36).slice(-4)}-${randomUUID().slice(0, 4)}`;
+    const cwd = settled.worktreePath;
+    if (cwd && existsSync(cwd)) {
+      if (this.codexWorkers.get(settled.assigneeHandle)?.busy) {
+        throw new OrchestrationError('operation_rejected', 'The Worker is still running a turn. Retry once it is idle.');
+      }
+      // Workers leave their work uncommitted, so the worktree still holds what was integrated. Only
+      // that exact snapshot may be replaced by the new base; anything written since stays put.
+      const current = await captureWorkerSnapshotOid(cwd);
+      if (current.snapshotOid !== marker.integratedSnapshotOid) {
+        throw new OrchestrationError('operation_rejected',
+          `${cwd} changed after it was integrated. Integrate or discard those changes before the next wave.`,
+          { code: 'resident_worktree_changed' });
+      }
+      for (const args of [['reset', '--hard', '--quiet'], ['clean', '-fd', '--quiet']]) {
+        const cleared = await runGitCommand(args, { cwd, timeoutMs: 15_000 });
+        if (cleared.exitCode !== 0) {
+          throw new OrchestrationError('worktree_failed', `Could not clear the integrated wave in ${cwd}: ${cleared.stderr.trim()}`);
+        }
+      }
+      const switched = await runGitCommand(['switch', '-c', branch, baseCommit], { cwd, timeoutMs: 15_000 });
+      if (switched.exitCode !== 0) {
+        throw new OrchestrationError('worktree_failed', `Could not start the next wave in ${cwd}: ${switched.stderr.trim()}`);
+      }
+      await assertWorkerWorktreeClean(cwd);
+      await deleteOwnedWorkerBranch(repoRoot, settled.branch, marker.integratedBranchOid, { allowSquashCasDelete: true }).catch(() => false);
+      return { wave: { worktreePath: cwd, branch, baseCommit, ownsWorktree: true, ownsBranch: true, repoRootPath: repoRoot } };
+    }
+    const driver = headlessWorkerDriver(settled.assigneeHandle);
+    if (!driver) throw new OrchestrationError('operation_rejected', 'The resident Worker\'s Coding Agent is unknown.');
+    const placement = await prepareWorkerWorktreePlacement({
+      baseCwd: repoRoot, taskId: settled.taskId, name: slug, worktree: true, branch, baseBranch: baseCommit,
+    });
+    const controls = this.headlessControls(settled);
+    const context = this.buildHandoffContext(settled, driver, driver,
+      `Your previous worktree is gone. You continue in ${placement.cwd}, a fresh worktree on ${marker.targetBranch}; your earlier changes are already integrated there.`);
+    const opened = await this.openReplacementWorker(settled, driver, placement.cwd, controls);
+    return {
+      wave: {
+        worktreePath: placement.worktreePath ?? placement.cwd, branch: placement.branch, baseCommit: placement.baseCommit,
+        ownsWorktree: placement.ownsWorktree, ownsBranch: placement.ownsBranch, repoRootPath: placement.repoRootPath,
+      },
+      replacement: { session: opened.session, workerId: opened.workerId, cliId: driver, cwd: placement.cwd, context },
+    };
+  }
+
+  /**
+   * Starts a new headless Worker identity in `cwd` under a durable resume claim, for a handoff or a
+   * replacement conversation. The claim is recorded before the agent process exists.
+   */
+  private async openReplacementWorker(
+    source: OrchestrationDispatchRecord, driver: HeadlessWorkerDriver, cwd: string, controls: HeadlessWorkerControls,
+    workerId = `${driver}-worker-${randomUUID()}`,
+  ): Promise<{ session: AgentSessionDriver; workerId: string; sessionId: string }> {
+    const claim = this.host.store.acquireResumeClaim({
+      workerId, runId: source.runId, dispatchId: source.id, cwd, driver, providerSessionId: '',
+    });
+    try {
+      await this.host.store.flushDurable();
+      const network = controls.network && driverCapabilities(driver).network;
+      const opened = await this.openCodexWorker(driver, cwd, null, { ...controls, network }, { workerId });
+      if (!opened) throw new OrchestrationError('dispatch_inactive', `${HEADLESS_DRIVER_LABELS[driver]} could not start in ${cwd}.`);
+      this.host.store.activateResumeClaim(claim.id, opened.session.pid ?? null);
+      return { session: opened.session, workerId, sessionId: opened.sessionId };
+    } catch (error) {
+      this.host.store.releaseResumeClaims(workerId);
+      throw error;
+    }
+  }
+
+  /**
+   * Hands a stopped or settled headless Worker's task to another Coding Agent in the same worktree,
+   * keeping its uncommitted changes. The new agent starts from a portable, redacted context and
+   * joins the task's author set, so reviews avoid every agent that wrote it.
+   */
+  async handoffWorker(
+    source: OrchestrationDispatchRecord,
+    input: { toCli: string; from: string; instructions?: string },
+  ): Promise<OrchestrationSendResult & { handoffId: string }> {
+    return this.mutateWorkerResources(source, () => this.startHandoff(source, input));
+  }
+
+  private async startHandoff(
+    source: OrchestrationDispatchRecord,
+    input: { toCli: string; from: string; instructions?: string },
+  ): Promise<OrchestrationSendResult & { handoffId: string }> {
+    const reject = (message: string, data?: Record<string, unknown>): never => {
+      throw new OrchestrationError('operation_rejected', message, data);
+    };
+    if (source.executionMode !== 'codex-app-server') reject('Only headless Workers can be handed to another Coding Agent.');
+    if (source.releasedAt) reject(`Worker dispatch ${source.id} has been released.`);
+    if (source.reviewOfDispatchId || source.reviewOfRunId) reject('Adversarial reviewers are one-shot and cannot be handed off.');
+    if (ACTIVE_DISPATCH_STATUSES.has(source.status)) {
+      reject('Stop the Worker (manage_worker action="stop") before handing its task to another Coding Agent.');
+    }
+    const fromCli = headlessWorkerDriver(source.assigneeHandle);
+    const toCli = normalizeWorkerCliId(input.toCli);
+    if (!fromCli) reject('The Worker\'s Coding Agent is unknown.');
+    if (toCli === fromCli) reject(`The Worker already runs on ${HEADLESS_DRIVER_LABELS[fromCli!]}; send it a follow-up instead.`);
+    const controls = this.headlessControls(source);
+    const unsupported = headlessWorkerSupportError(toCli, controls.policy);
+    if (unsupported) reject(unsupported.message, { code: unsupported.code, toCli, policy: controls.policy });
+    const target = toCli as HeadlessWorkerDriver;
+    const run = this.host.store.requireRun(source.runId);
+    const sessionRun = AGENT_SESSION_ID.test(run.coordinatorPaneId ?? '') || this.host.isActiveSessionCoordinator(input.from);
+    const available = target === 'codex'
+      ? Boolean(this.host.codexPilot && (sessionRun || this.host.codexPilot.enabled()))
+      : Boolean(sessionRun && this.host.headlessWorkers && this.host.headlessWorkers.available?.(target) !== false);
+    if (!available) reject(`${HEADLESS_DRIVER_LABELS[target]} cannot run a headless Worker for this run on this machine.`);
+    const cwd = this.providerCwd(source);
+    if (!cwd || !existsSync(cwd)) reject('The Worker\'s working directory no longer exists.');
+
+    const snapshotOid = await this.waitForWriteQuiescence(source, cwd!);
+    const targetWorkerId = `${target}-worker-${randomUUID()}`;
+    const context = this.buildHandoffContext(source, fromCli!, target, input.instructions);
+    const handoff = this.host.store.createWorkerHandoff({
+      runId: source.runId, sourceDispatchId: source.id, sourceWorkerId: source.assigneeHandle,
+      fromCli: fromCli!, toCli: target, cwd: cwd!, targetWorkerId, snapshotOid, context,
+    });
+    let session: AgentSessionDriver | undefined;
+    try {
+      // The handoff record and the claim are durable before the new agent exists, so a crash leaves
+      // a record a person can act on.
+      const opened = await this.openReplacementWorker(source, target, cwd!, controls, targetWorkerId);
+      session = opened.session;
+      this.host.store.updateWorkerHandoff(handoff.id, { status: 'active', providerSessionId: opened.sessionId });
+      await this.host.store.flushDurable();
+      const result = await this.startFollowUp(source, {
+        from: input.from, to: `dispatch:${source.id}`, type: 'status',
+        subject: `Continue this task on ${HEADLESS_DRIVER_LABELS[target]}`,
+        body: input.instructions?.trim() || undefined,
+      }, { session, workerId: targetWorkerId, cliId: target, cwd: cwd!, context });
+      this.host.store.updateWorkerHandoff(handoff.id, { status: 'completed', targetDispatchId: result.followUp?.dispatch.id ?? null });
+      this.host.emitChanged('worker:handed-off', source.runId);
+      return { ...result, handoffId: handoff.id };
+    } catch (error) {
+      this.host.store.updateWorkerHandoff(handoff.id, {
+        status: 'failed', reason: error instanceof Error ? error.message : String(error),
+      });
+      if (session?.alive) await session.close(true);
+      this.host.store.releaseResumeClaims(targetWorkerId);
+      throw error;
+    }
+  }
+
+  /**
+   * Single-writer check before another agent takes the worktree: the old agent's process tree is
+   * gone and two snapshots `handoffQuiescenceMs` apart agree. Anything else leaves the worktree as
+   * it is and refuses the handoff.
+   */
+  private async waitForWriteQuiescence(source: OrchestrationDispatchRecord, cwd: string): Promise<string> {
+    const workerId = source.assigneeHandle;
+    const live = this.codexWorkers.get(workerId);
+    if (live) {
+      if (live.busy && !await live.waitForIdle(15_000)) {
+        throw new OrchestrationError('operation_rejected', 'The Worker is still running a turn; stop it first.');
+      }
+      this.dormantClosing.add(workerId);
+      await live.close(true);
+      if (!await this.waitForWorkerExit(workerId, live, 5_000)) {
+        throw new OrchestrationError('operation_rejected', 'The Worker is still shutting down. Retry once it exits.');
+      }
+    }
+    const pid = this.lastWorkerPid.get(workerId);
+    if (pid !== undefined && isProcessTreeAlive(pid)) {
+      throw new OrchestrationError('operation_rejected',
+        `Processes started by the previous agent (pid ${pid}) are still running in ${cwd}. The worktree was left as it is; stop them before handing off.`,
+        { code: 'writer_still_running', pid });
+    }
+    const first = await captureWorkerSnapshotOid(cwd);
+    if (!first.snapshotOid) {
+      throw new OrchestrationError('operation_rejected', `Cannot verify that ${cwd} stopped changing: it is not a Git worktree.`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, this.host.handoffQuiescenceMs));
+    const second = await captureWorkerSnapshotOid(cwd);
+    if (second.snapshotOid !== first.snapshotOid) {
+      throw new OrchestrationError('operation_rejected',
+        `Files in ${cwd} are still changing, so something from the previous agent may still be writing. The worktree was left as it is; retry once it is quiet.`,
+        { code: 'worktree_still_changing', snapshotOids: [first.snapshotOid, second.snapshotOid] });
+    }
+    return first.snapshotOid;
+  }
+
+  /** What the new agent needs to continue: the task, what the previous agent reported, and its last output. */
+  private buildHandoffContext(
+    source: OrchestrationDispatchRecord, fromCli: HeadlessWorkerDriver, toCli: HeadlessWorkerDriver, instructions?: string,
+  ): string {
+    const lineage = [source.id, ...this.host.store.listDispatchAncestorIds(source.id)];
+    const reports = lineage
+      .flatMap((id) => this.host.store.listMessages({ runId: source.runId, fromHandle: `dispatch:${id}`, limit: 20 }))
+      .filter((message) => message.type === 'worker_done' || message.type === 'status' || message.type === 'escalation')
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .slice(-4)
+      .map((message) => `- ${message.subject}${message.body?.trim() ? `\n  ${message.body.trim().slice(0, 1_200).replace(/\n/g, '\n  ')}` : ''}`);
+    const lastText = source.codexTurn?.finalText?.trim().slice(-2_000);
+    const text = [
+      `You are taking over this task from ${HEADLESS_DRIVER_LABELS[fromCli]}; you now run on ${HEADLESS_DRIVER_LABELS[toCli]}.`,
+      'The worktree still holds the previous agent\'s uncommitted changes. Inspect them (git status, git diff) before editing, and keep the work that is correct.',
+      ...(instructions?.trim() ? ['', '### Handoff Instructions', instructions.trim()] : []),
+      ...(reports.length ? ['', '### What the previous agent reported', ...reports] : []),
+      ...(lastText ? ['', '### The previous agent\'s last output', lastText] : []),
+    ].join('\n');
+    return this.host.store.redactDispatchCredentials(text).slice(0, 12_000);
   }
 
   private async startFollowUp(
     settledDispatch: OrchestrationDispatchRecord,
     input: SettledWorkerFollowUpInput,
+    handoff?: { session: AgentSessionDriver; workerId: string; cliId: HeadlessWorkerDriver; cwd: string; context: string },
+    wave?: NextWavePlacement,
   ): Promise<OrchestrationSendResult> {
     if (settledDispatch.releasedAt) {
       throw new OrchestrationError(
@@ -1751,12 +2190,19 @@ export class OrchestrationWorkerLifecycleService {
       throw new OrchestrationError('operation_rejected', 'This worker terminal is still closing. Retry once it exits.');
     }
     const isHeadless = settledDispatch.executionMode === 'codex-app-server';
-    const session = isHeadless ? this.codexWorkers.get(existingPaneId) : undefined;
+    let session = handoff ? handoff.session : isHeadless ? this.codexWorkers.get(existingPaneId) : undefined;
+    if (!handoff && isHeadless && !session?.alive && !this.host.store.getActiveDispatchForIdentity(existingPaneId, null)) {
+      // A closing process still owns the Worker's identity until its exit handler has run.
+      if (session && !await this.waitForWorkerExit(existingPaneId, session, 5_000)) {
+        throw new OrchestrationError('operation_rejected', `${this.headlessLabel(existingPaneId)} Worker is still shutting down. Retry once it exits.`);
+      }
+      session = await this.resumeDormantWorker(settledDispatch);
+    }
     if (isHeadless && (!session?.alive || !await session.waitForIdle(15_000) || !session.alive ||
-        this.host.store.getActiveDispatchForIdentity(existingPaneId, null))) {
+        this.host.store.getActiveDispatchForIdentity(handoff?.workerId ?? existingPaneId, null))) {
       throw new OrchestrationError('dispatch_inactive', `${this.headlessLabel(existingPaneId)} Worker is unavailable or still finishing its previous turn.`);
     }
-    const canReuseLivePane =
+    const canReuseLivePane = !handoff &&
       Boolean(existingPaneId) &&
       this.host.isPaneAlive(existingPaneId) &&
       !this.host.store.getActiveDispatchForIdentity(existingPaneId, existingPaneId);
@@ -1765,7 +2211,11 @@ export class OrchestrationWorkerLifecycleService {
     const originalDispatch = originalDispatchId ? this.host.store.getDispatchContext(originalDispatchId) : undefined;
     const originalTask = originalDispatch ? this.host.store.getTask(originalDispatch.taskId) : prevTask;
     const followUpSpec = !canReuseLivePane && originalTask
-      ? ['### Follow-up Instructions', followUpInstructions, '### Original Task', originalTask.spec].join('\n\n')
+      ? [
+        '### Follow-up Instructions', followUpInstructions,
+        ...(handoff ? ['### Handoff Context', handoff.context] : []),
+        '### Original Task', originalTask.spec,
+      ].join('\n\n')
       : followUpInstructions;
     const followUpTask = this.host.store.createTask({
       singleShot: true,
@@ -1774,14 +2224,16 @@ export class OrchestrationWorkerLifecycleService {
       taskContext: prevTask?.taskContext ?? originalTask?.taskContext,
       taskTitle: 'Follow-up: ' + input.subject.slice(0, 80),
       priority: input.priority ?? prevTask?.priority ?? 'normal',
-      worktreePath: settledDispatch.worktreePath ?? prevTask?.worktreePath ?? null,
+      worktreePath: wave?.worktreePath ?? settledDispatch.worktreePath ?? prevTask?.worktreePath ?? null,
     });
 
     let targetPtyId: string;
     let reusedPane = false;
     let spawnedNewPane = false;
 
-    if (canReuseLivePane) {
+    if (handoff) {
+      targetPtyId = handoff.workerId;
+    } else if (canReuseLivePane) {
       targetPtyId = existingPaneId;
       reusedPane = !session;
     } else {
@@ -1815,7 +2267,13 @@ export class OrchestrationWorkerLifecycleService {
     }
 
     const nextGeneration = (settledDispatch.processGeneration ?? 1) + 1;
-    const controls = session ? this.headlessControls(settledDispatch) : null;
+    const controls = handoff ? this.codexWorkerControls.get(handoff.workerId) ?? this.headlessControls(settledDispatch)
+      : session ? this.headlessControls(settledDispatch) : null;
+    const sessionCwd = handoff?.cwd ?? this.providerCwd(settledDispatch);
+    const priorAuthors = settledDispatch.authorCliIds ?? (settledDispatch.cliId ? [normalizeWorkerCliId(settledDispatch.cliId)] : []);
+    // A new wave is new work: its author set starts over with whoever writes it.
+    const authorCliIds = wave ? [handoff?.cliId ?? priorAuthors.at(-1) ?? ''].filter(Boolean)
+      : handoff ? [...new Set([...priorAuthors, handoff.cliId])] : settledDispatch.authorCliIds;
     let nextCtx: OrchestrationDispatchRecord;
     try {
       nextCtx = this.host.store.createDispatchContext({
@@ -1823,7 +2281,11 @@ export class OrchestrationWorkerLifecycleService {
         taskKind: settledDispatch.taskKind,
         assigneeHandle: targetPtyId,
         assigneePaneId: session ? null : targetPtyId,
-        ...(session?.sessionId ? { providerSessionId: session.sessionId } : {}),
+        ...(session?.sessionId ? {
+          providerSessionId: session.sessionId,
+          ...(sessionCwd ? { providerCwd: sessionCwd } : {}),
+        } : {}),
+        ...(authorCliIds?.length ? { authorCliIds } : {}),
         ...(controls ? {
           workerPolicy: controls.policy, workerNetwork: controls.network, allowSubWorkers: controls.allowSubWorkers,
         } : {}),
@@ -1831,17 +2293,17 @@ export class OrchestrationWorkerLifecycleService {
         creatorRunId: settledDispatch.runId,
         creatorDispatchId: settledDispatch.creatorDispatchId ?? null,
         parentPaneId: settledDispatch.parentPaneId ?? null,
-        worktreePath: settledDispatch.worktreePath ?? null,
-        branch: settledDispatch.branch ?? null,
-        baseCommit: settledDispatch.baseCommit ?? null,
-        repoRootPath: settledDispatch.repoRootPath ?? null,
-        ownsWorktree: Boolean(settledDispatch.ownsWorktree),
-        ownsBranch: Boolean(settledDispatch.ownsBranch),
+        worktreePath: wave ? wave.worktreePath : settledDispatch.worktreePath ?? null,
+        branch: wave ? wave.branch : settledDispatch.branch ?? null,
+        baseCommit: wave ? wave.baseCommit : settledDispatch.baseCommit ?? null,
+        repoRootPath: wave ? wave.repoRootPath : settledDispatch.repoRootPath ?? null,
+        ownsWorktree: wave ? wave.ownsWorktree : Boolean(settledDispatch.ownsWorktree),
+        ownsBranch: wave ? wave.ownsBranch : Boolean(settledDispatch.ownsBranch),
         reviewRound: settledDispatch.reviewRound ?? 0,
         ownsPane: spawnedNewPane ? true : Boolean(settledDispatch.ownsPane),
-        cliId: settledDispatch.cliId ?? null,
-        model: settledDispatch.model ?? null,
-        effort: settledDispatch.effort ?? null,
+        cliId: handoff ? handoff.cliId : settledDispatch.cliId ?? null,
+        model: handoff ? null : settledDispatch.model ?? null,
+        effort: handoff ? null : settledDispatch.effort ?? null,
         processGeneration: nextGeneration,
         followUpOfDispatchId: settledDispatch.id,
         retained: Boolean(settledDispatch.retained),
@@ -1920,13 +2382,13 @@ export class OrchestrationWorkerLifecycleService {
       dispatchId: nextCtx.id,
       runId: settledDispatch.runId,
       taskSpec: followUpTask.spec,
-      taskContext: reusedPane || session ? null : followUpTask.taskContext,
+      taskContext: !handoff && (reusedPane || session) ? null : followUpTask.taskContext,
       coordinatorHandle,
       workerHandle: targetPtyId,
       worktreePath: nextCtx.worktreePath,
       branch: nextCtx.branch,
       canDispatchSubWorkers: (!session || controls?.allowSubWorkers === true) && nextCtx.depth < this.host.maxDepth,
-      isFollowUp: reusedPane || Boolean(session),
+      isFollowUp: !handoff && (reusedPane || Boolean(session)),
       previousDispatchId: settledDispatch.id,
       mcpEnabled: Boolean(session) || followUpMcpEnabled,
       headless: Boolean(session),

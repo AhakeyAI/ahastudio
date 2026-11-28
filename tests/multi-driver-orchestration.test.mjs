@@ -1,8 +1,8 @@
 // Offline tests for Claude Code and Grok as session Coordinators and headless Workers.
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -54,7 +54,7 @@ function fakeChild() {
   const child = new EventEmitter();
   Object.assign(child, {
     stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
-    exitCode: null, signalCode: null, pid: 4343,
+    exitCode: null, signalCode: null, pid: 2_000_000_000, // never a live process, so write-quiescence checks see the fake as gone
   });
   child.exit = (code = 0) => {
     if (child.exitCode !== null || child.signalCode !== null) return;
@@ -554,7 +554,7 @@ async function serviceSetup(t, { allowPtySpawn = false, available = () => true }
   const app = { scenario: 'normal', approve: true };
   const service = new OrchestrationService({
     store, agentStatusStore, getDefaultCwd: () => cwd,
-    settleDelayMs: 0, turnStartObserveTimeoutMs: 250, turnStopSettleMs: 10_000,
+    settleDelayMs: 0, turnStartObserveTimeoutMs: 250, turnStopSettleMs: 10_000, handoffQuiescenceMs: 150,
     getConfirmMode: () => 'auto',
     writePty: async (id) => {
       agentStatusStore.ingestHookEvent({ ptyId: id, agentId: 'grok', state: 'working' });
@@ -592,8 +592,12 @@ async function serviceSetup(t, { allowPtySpawn = false, available = () => true }
             writeFileSync(join(workdir, `note-${env.AHA_WORKER_TOKEN}.txt`), 'x\n');
           }
           chunk(agent, `Worker finished; token ${env.AHA_WORKER_TOKEN}`);
-          if (scenario === 'report') {
+          if (scenario === 'edit-report') {
+            writeFileSync(join(workdir, `wave-${launches.indexOf(launch)}-${Date.now()}.txt`), 'work\n');
+          }
+          if (scenario === 'report' || scenario === 'edit-report') {
             launch.report = await workerHttp(workerId, 'worker-done-self', { summary: 'Reported by report_done' });
+            launch.reports = (launch.reports ?? 0) + 1;
           }
           agent.send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } });
         });
@@ -656,6 +660,206 @@ function sparseRepo(dir) {
   git('-C', repo, 'checkout', '--quiet');
   return repo;
 }
+
+/** A one-commit repository the handoff can snapshot (sparse checkouts refuse files outside their cone). */
+function plainRepo(dir) {
+  const repo = join(dir, 'plain-repo');
+  const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true });
+  execFileSync('git', ['init', '--quiet', '-b', 'main', repo], { windowsHide: true });
+  writeFileSync(join(repo, 'README.md'), 'handoff\n');
+  git('add', 'README.md');
+  git('-c', 'user.name=Aha', '-c', 'user.email=aha@example.invalid', 'commit', '--quiet', '-m', 'init');
+  return repo;
+}
+
+test('cross-CLI handoff keeps the worktree, starts the new agent from redacted context, and records both authors', async (t) => {
+  const app = await serviceSetup(t);
+  const repo = plainRepo(app.dir);
+  app.sessions.set(SESSION_A, { cwd: repo, provider: 'claude', active: true, idle: true, network: false, policy: 'full-auto' });
+  app.scenario = 'report';
+  const started = await app.call(SESSION_A, 'delegate-task', { role: 'builder', task: 'Implement it', agent: 'grok', worktree: false });
+  assert.equal(started.ok, true, started.error);
+  const source = started.result.dispatch;
+  await until(() => app.store.getDispatchContext(source.id).status === 'completed');
+  writeFileSync(join(repo, 'wip.txt'), 'half done\n');
+
+  const refusedPi = await app.call(SESSION_A, 'role-manage', { role: 'builder', action: 'handoff', agent: 'pi' });
+  assert.equal(refusedPi.ok, false);
+  assert.equal(refusedPi.data.code, 'driver_not_headless');
+  const sameCli = await app.call(SESSION_A, 'role-manage', { role: 'builder', action: 'handoff', agent: 'grok' });
+  assert.match(sameCli.error, /follow-up instead/);
+  assert.equal(app.launches.length, 1, 'refused handoffs start nothing');
+
+  const handed = await app.call(SESSION_A, 'role-manage', {
+    role: 'builder', action: 'handoff', agent: 'claude', reason: 'Grok hit its usage limit; finish wip.txt',
+  });
+  assert.equal(handed.ok, true, handed.error);
+  const next = handed.result.dispatch;
+  assert.match(next.assigneeHandle, /^claude-worker-[a-f0-9-]{36}$/);
+  assert.equal(next.cliId, 'claude');
+  assert.equal(next.followUpOfDispatchId, source.id);
+  assert.deepEqual(next.authorCliIds, ['grok', 'claude']);
+  assert.equal(next.providerCwd, repo);
+  assert.ok(existsSync(join(repo, 'wip.txt')), 'uncommitted work stays in the worktree');
+  const launch = app.launches.at(-1);
+  assert.deepEqual([launch.cliId, launch.cwd, launch.workerId], ['claude', repo, next.assigneeHandle]);
+  const prompt = launch.io.seen.find((m) => m.method === 'session/prompt').params.prompt.map((block) => block.text ?? '').join('');
+  assert.match(prompt, /### Handoff Context/);
+  assert.match(prompt, /taking over this task from Grok/);
+  assert.match(prompt, /Grok hit its usage limit/);
+  assert.match(prompt, /### Original Task/);
+  assert.doesNotMatch(prompt, new RegExp(app.launches[0].env.AHA_WORKER_TOKEN));
+
+  const [record] = app.store.listWorkerHandoffs({ runId: source.runId });
+  assert.equal(record.status, 'completed');
+  const handoffFacts = app.store.listObservationFacts({ runId: source.runId }).filter((fact) => fact.kind === 'handoff');
+  assert.deepEqual(handoffFacts.map((fact) => fact.data.status), ['pending', 'active', 'completed']);
+  assert.ok(handoffFacts.every((fact) => fact.data.handoffId === record.id && fact.data.toCli === 'claude'));
+  assert.equal(record.targetDispatchId, next.id);
+  assert.match(record.snapshotOid, /^[0-9a-f]{40}$/);
+  assert.equal(app.store.listResumeClaims().find((c) => c.workerId === next.assigneeHandle)?.status, 'active');
+  await until(() => app.store.getDispatchContext(next.id).status === 'completed');
+  // The report's HTTP reply is sent after the state is durable; let it land before teardown.
+  await until(() => launch.report);
+});
+
+function gitOut(cwdPath, ...args) {
+  return execFileSync('git', args, { cwd: cwdPath, encoding: 'utf8', windowsHide: true }).trim();
+}
+
+async function residentBuilder(t) {
+  const app = await serviceSetup(t);
+  const repo = plainRepo(app.dir);
+  app.sessions.set(SESSION_A, { cwd: repo, provider: 'claude', active: true, idle: true, network: false, policy: 'workspace-write' });
+  app.scenario = 'edit-report';
+  const started = await app.call(SESSION_A, 'delegate-task', { role: 'builder', task: 'Build wave one', agent: 'grok' });
+  assert.equal(started.ok, true, started.error);
+  const first = started.result.dispatch;
+  assert.ok(first.ownsWorktree && first.worktreePath !== repo);
+  await until(() => app.store.getDispatchContext(first.id).status === 'completed');
+  await until(() => app.launches[0].report);
+  const integrated = await app.call(SESSION_A, 'worker-integrate', { worker: 'builder', targetBranch: 'main', keepResident: true });
+  assert.equal(integrated.ok, true, integrated.error);
+  return { app, repo, first, integrated: integrated.result };
+}
+
+test('a resident Worker keeps its worktree after integration and starts its next wave on a fresh branch in place', async (t) => {
+  const { app, repo, first, integrated } = await residentBuilder(t);
+  assert.equal(integrated.resident, true);
+  assert.equal(integrated.released, false);
+  const kept = app.store.getDispatchContext(first.id);
+  assert.equal(kept.releasedAt ?? null, null);
+  assert.equal(kept.residentAfterIntegration.targetBranch, 'main');
+  assert.ok(existsSync(first.worktreePath), 'the worktree stays for the next wave');
+
+  // Work written after integration is never thrown away by the next wave.
+  const stray = join(first.worktreePath, 'not-integrated.txt');
+  writeFileSync(stray, 'keep me');
+  const refused = await app.call(SESSION_A, 'role-message', { role: 'builder', message: 'Too early' });
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /changed after it was integrated/);
+  assert.ok(existsSync(stray));
+  rmSync(stray);
+
+  const mainHead = gitOut(repo, 'rev-parse', 'main');
+  const wave = await app.call(SESSION_A, 'role-message', { role: 'builder', message: 'Wave two: add the next feature' });
+  assert.equal(wave.ok, true, wave.error);
+  const next = app.store.listDispatches({ runId: first.runId }).find((d) => d.followUpOfDispatchId === first.id);
+  assert.equal(next.worktreePath, first.worktreePath, 'same directory, so the conversation resumes natively');
+  assert.equal(next.assigneeHandle, first.assigneeHandle);
+  assert.notEqual(next.branch, first.branch);
+  assert.equal(next.baseCommit, mainHead);
+  assert.deepEqual(next.authorCliIds, ['grok'], 'a new wave starts its own author set');
+  assert.equal(gitOut(first.worktreePath, 'branch', '--show-current'), next.branch);
+  assert.equal(gitOut(repo, 'branch', '--list', first.branch), '', 'the integrated wave-one branch is gone');
+  assert.equal(app.store.getDispatchContext(first.id).residentAfterIntegration, undefined);
+  const integratedFact = app.store.listObservationFacts({ dispatchId: first.id }).find((fact) => fact.kind === 'integrated');
+  assert.equal(integratedFact.data.resident, true);
+  assert.equal(integratedFact.data.targetBranch, 'main');
+  const waveFact = app.store.listObservationFacts({ dispatchId: next.id }).find((fact) => fact.kind === 'wave_started');
+  assert.deepEqual([waveFact.data.branch, waveFact.data.inPlace, waveFact.data.previousDispatchId], [next.branch, true, first.id]);
+  const viaHttp = await app.call(SESSION_A, 'facts', { runId: first.runId, afterSeq: integratedFact.seq - 1 });
+  assert.equal(viaHttp.ok, true, viaHttp.error);
+  assert.ok(viaHttp.result.some((fact) => fact.kind === 'wave_started'));
+  assert.ok(viaHttp.result.every((fact) => fact.seq >= integratedFact.seq));
+  await until(() => app.store.getDispatchContext(next.id).status === 'completed');
+  // The same process reports both waves; let the second reply land before teardown.
+  await until(() => app.launches.at(-1).reports >= 2);
+});
+
+test('a resident Worker whose worktree is gone continues in a new worktree from portable context', async (t) => {
+  const { app, repo, first } = await residentBuilder(t);
+  await app.service.workers.codexWorkers.get(first.assigneeHandle)?.close(true);
+  await until(() => !app.service.workers.codexWorkers.has(first.assigneeHandle));
+  gitOut(repo, 'worktree', 'remove', '--force', first.worktreePath);
+  const launchesBefore = app.launches.length;
+  const wave = await app.call(SESSION_A, 'role-message', { role: 'builder', message: 'Wave two after cleanup' });
+  assert.equal(wave.ok, true, wave.error);
+  const next = app.store.listDispatches({ runId: first.runId }).find((d) => d.followUpOfDispatchId === first.id);
+  assert.notEqual(next.worktreePath, first.worktreePath);
+  assert.ok(existsSync(next.worktreePath));
+  assert.notEqual(next.assigneeHandle, first.assigneeHandle, 'a new conversation, since the old one is tied to the old directory');
+  assert.equal(next.baseCommit, gitOut(repo, 'rev-parse', 'main'));
+  assert.equal(app.launches.length, launchesBefore + 1);
+  const prompt = app.launches.at(-1).io.seen.find((m) => m.method === 'session/prompt').params.prompt.map((b) => b.text ?? '').join('');
+  assert.match(prompt, /### Handoff Context/);
+  assert.match(prompt, /previous worktree is gone/);
+  await until(() => app.store.getDispatchContext(next.id).status === 'completed');
+  await until(() => app.launches.at(-1).report);
+});
+
+test('a handoff is refused and starts nothing while the worktree keeps changing', async (t) => {
+  const app = await serviceSetup(t);
+  const repo = plainRepo(app.dir);
+  app.sessions.set(SESSION_A, { cwd: repo, provider: 'claude', active: true, idle: true, network: false, policy: 'full-auto' });
+  app.scenario = 'report';
+  const started = await app.call(SESSION_A, 'delegate-task', { role: 'builder', task: 'Implement it', agent: 'grok', worktree: false });
+  assert.equal(started.ok, true, started.error);
+  await until(() => app.store.getDispatchContext(started.result.dispatch.id).status === 'completed');
+  // A leftover background process the old agent started, still writing.
+  const writer = spawn(process.execPath, ['-e',
+    `const fs = require('fs'); let i = 0; setInterval(() => fs.writeFileSync(${JSON.stringify(join(repo, 'bg.txt'))}, String(i++)), 15);`,
+  ], { stdio: 'ignore', windowsHide: true });
+  t.after(() => writer.kill());
+  await delay(100);
+  const refused = await app.call(SESSION_A, 'role-manage', { role: 'builder', action: 'handoff', agent: 'claude' });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.data.code, 'worktree_still_changing');
+  assert.match(refused.error, /left as it is/);
+  assert.equal(app.launches.length, 1);
+  assert.deepEqual(app.store.listWorkerHandoffs(), []);
+  assert.ok(existsSync(join(repo, 'bg.txt')));
+});
+
+test('a handoff interrupted by a restart needs a person and is announced once, never resumed', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aha-handoff-recovery-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const statePath = join(dir, 'state.json');
+  const store = new OrchestrationStore({ resolveFile: () => statePath });
+  const run = store.createRun({ objective: 'Recover', coordinatorHandle: 'coordinator-pane' });
+  store.createWorkerHandoff({
+    runId: run.id, sourceDispatchId: 'd-1', sourceWorkerId: 'grok-worker-1', fromCli: 'grok', toCli: 'claude',
+    cwd: dir, targetWorkerId: 'claude-worker-1', snapshotOid: null, context: 'ctx',
+  });
+  await store.flushDurable();
+
+  const restarted = new OrchestrationStore({ resolveFile: () => statePath });
+  restarted.load();
+  const [handoff] = restarted.listWorkerHandoffs();
+  assert.equal(handoff.status, 'needs_attention');
+  const launches = [];
+  const service = new OrchestrationService({
+    store: restarted, agentStatusStore: new AgentStatusStore(), getDefaultCwd: () => dir,
+    headlessWorkers: { launch: (...args) => { launches.push(args); throw new Error('must not launch'); } },
+  });
+  t.after(() => service.dispose());
+  const announced = restarted.listMessages({ runId: run.id }).filter((m) => m.subject === 'Handoff grok -> claude needs attention');
+  assert.equal(announced.length, 1);
+  assert.match(announced[0].body, /Nothing was restarted/);
+  service.announceInterruptedHandoffs();
+  assert.equal(restarted.listMessages({ runId: run.id }).filter((m) => m.subject.startsWith('Handoff grok')).length, 1);
+  assert.deepEqual(launches, []);
+});
 
 test('service gate: non-Codex session Coordinators follow the Codex approval tiers for manage, integrate, and finalize', async (t) => {
   const app = await serviceSetup(t);
@@ -924,7 +1128,7 @@ test('headless Worker approvals record real provider/toolName, follow-up errors 
   await until(() => app.launches[0].permReply);
   assert.deepEqual(app.launches[0].permReply, { outcome: { outcome: 'selected', optionId: 'allow' } });
 
-  // 2. Exited settled Grok Worker follow-up error names "Grok Worker", not "Codex Worker".
+  // 2. An exited settled Grok Worker is woken in place: same identity, its ACP session loaded again.
   app.scenario = 'report';
   const started = await app.call(coord.id, 'delegate-task', { role: 'fixer', task: 'Fix it', agent: 'grok', worktree: false });
   assert.equal(started.ok, true, started.error);
@@ -932,8 +1136,13 @@ test('headless Worker approvals record real provider/toolName, follow-up errors 
   app.launches[1].child.exit(0);
   await delay(50);
   const followUp = await app.call(coord.id, 'role-message', { role: 'fixer', message: 'One more change' });
-  assert.equal(followUp.ok, false);
-  assert.match(followUp.error, /Grok Worker is unavailable/);
+  assert.equal(followUp.ok, true, followUp.error);
+  assert.equal(app.launches.length, 3);
+  assert.equal(app.launches[2].workerId, started.result.dispatch.assigneeHandle);
+  const reloaded = app.launches[2].io.seen.find((m) => m.method === 'session/load' || m.method === 'session/resume');
+  assert.equal(reloaded?.params.sessionId, started.result.dispatch.providerSessionId);
+  await until(() => app.store.listDispatches({ runId: started.result.run.id })
+    .some((d) => d.followUpOfDispatchId === started.result.dispatch.id && d.status === 'completed'));
 
   // 3. Real aha-mcp-server.cjs notifications/cancelled aborts in-flight HTTP gate and expires the Coordinator approval card.
   assert.equal((await manager.send(coord.id, { text: 'HOLD integrate' })).status, 'accepted');

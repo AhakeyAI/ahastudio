@@ -77,6 +77,7 @@ import {
   type OrchestrationTaskContext,
   type OrchestrationTaskKind,
   type OrchestrationTaskRecord,
+  type OrchestrationObservationFact,
   type OrchestrationTaskShowResult,
   type OrchestrationTaskStatus,
   type OrchestrationTaskWithDispatch,
@@ -288,7 +289,10 @@ export interface HeadlessWorkerControls {
 }
 
 /** How a headless Worker process is launched; sub-Worker tools are fixed for the life of the process. */
-export type HeadlessWorkerLaunchOptions = HeadlessWorkerControls;
+export type HeadlessWorkerLaunchOptions = HeadlessWorkerControls & {
+  /** Reopens this provider conversation instead of starting one (Claude needs it at launch). */
+  resumeSessionId?: string;
+};
 
 export interface OrchestrationServiceDependencies {
   store: OrchestrationStore;
@@ -345,6 +349,15 @@ export interface OrchestrationServiceDependencies {
   proposalTtlMs?: number;
   stallWatchdogIntervalMs?: number;
   stallThresholdMs?: number;
+  /**
+   * Idle time after which a settled headless Worker's process is closed so it sleeps until a
+   * follow-up resumes its conversation; 0 (the default) keeps Workers running.
+   */
+  headlessWorkerDormancyMs?: number;
+  /** How often idle headless Workers are checked for dormancy; 0 leaves it to explicit sweeps. */
+  headlessWorkerDormancySweepMs?: number;
+  /** Gap between the two worktree snapshots that must agree before a cross-CLI handoff (default 2s). */
+  handoffQuiescenceMs?: number;
   cliCommand?: string;
   briefsDir?: string | null;
   maxDepth?: number;
@@ -500,6 +513,7 @@ export class OrchestrationService {
       buildWorkerDispatchBrief: (...args) => this.buildWorkerDispatchBrief(...args),
       canHeadlessWorkerDelegate: (...args) => this.canHeadlessWorkerDelegate(...args),
       get cliCommand() { return svc.cliCommand; },
+      clock: () => this.clock(),
       get closeWorkerPty() { return svc.closeWorkerPty; },
       get codexPilot() { return svc.codexPilot; },
       createWorkerTimeline: (...args) => this.createWorkerTimeline(...args),
@@ -512,6 +526,8 @@ export class OrchestrationService {
       get exitedPanes() { return svc.exitedPanes; },
       failTaskIfReady: (...args) => this.failTaskIfReady(...args),
       get getDefaultCwd() { return svc.getDefaultCwd; },
+      handoffQuiescenceMs: Math.max(0, deps.handoffQuiescenceMs ?? 2_000),
+      headlessWorkerDormancyMs: Math.max(0, deps.headlessWorkerDormancyMs ?? 0),
       get headlessWorkers() { return svc.headlessWorkers; },
       inferRunIdOptional: (...args) => this.inferRunIdOptional(...args),
       get integration() { return svc.integration; },
@@ -580,6 +596,7 @@ export class OrchestrationService {
       workerRelease: (...args) => this.workers.workerRelease(...args),
       workerStart: (...args) => this.workers.workerStart(...args),
       workerStop: (...args) => this.workers.workerStop(...args),
+      handoffWorker: (...args) => this.handoffWorker(...args),
     });
     this.integration = new OrchestrationIntegrationService({
       assertRunCoordinator: (...args) => this.assertRunCoordinator(...args),
@@ -721,6 +738,8 @@ export class OrchestrationService {
     if ((deps.stallWatchdogIntervalMs ?? 0) > 0) {
       this.stallWatchdog.start();
     }
+    this.workers.startDormancySweep(deps.headlessWorkerDormancySweepMs ?? 0);
+    this.announceInterruptedHandoffs();
 
     this.disposeStatusListener = this.agentStatusStore.onChange((status) => {
       if (status.state === 'working' || status.state === 'waiting') {
@@ -988,6 +1007,10 @@ export class OrchestrationService {
   }
 
   private timelineNativeQuestionAnswered(payload: WorkerNativeQuestionPayload, answers: Record<string, string[]>): void {
+    this.store.appendObservationFact({
+      runId: payload.runId, dispatchId: payload.dispatchId, workerId: payload.workerHandle, kind: 'native_question',
+      data: { status: payload.status, requestId: payload.requestId, answered: Object.keys(answers).length },
+    });
     const timeline = this.workerTimelines.get(payload.workerHandle);
     if (!timeline) return;
     const text = payload.questions
@@ -1034,6 +1057,10 @@ export class OrchestrationService {
   }
 
   private timelineApproval(approval: WorkerApprovalPayload): void {
+    this.store.appendObservationFact({
+      runId: approval.runId, dispatchId: approval.dispatchId, workerId: approval.workerHandle, kind: 'approval',
+      data: { approvalId: approval.approvalId, status: approval.status, toolName: approval.toolName },
+    });
     const timeline = this.workerTimelines.get(approval.workerHandle);
     if (!timeline) return;
     timeline.upsertApproval({
@@ -4255,6 +4282,42 @@ export class OrchestrationService {
     return this.workers.workerStop(input, visitedDispatchIds);
   }
 
+  /** The append-only observation log, scoped to the caller's run when it is an orchestration caller. */
+  listObservationFacts(
+    input: { runId?: string; dispatchId?: string; workerId?: string; afterSeq?: number; limit?: number },
+    callerPaneId?: string,
+  ): OrchestrationObservationFact[] {
+    const runId = callerPaneId === undefined ? input.runId : this.authorizeRunAccess(input.runId, callerPaneId);
+    return this.store.listObservationFacts({ ...input, runId });
+  }
+
+  /** Hands a stopped or settled headless Worker's task to another Coding Agent in the same worktree. */
+  handoffWorker(
+    source: OrchestrationDispatchRecord,
+    input: { toCli: string; from: string; instructions?: string },
+  ): Promise<OrchestrationSendResult & { handoffId: string }> {
+    return this.workers.handoffWorker(source, input);
+  }
+
+  /**
+   * Tells each run's Coordinator once about handoffs AhaStation stopped in the middle of; they are
+   * never resumed automatically.
+   */
+  announceInterruptedHandoffs(): void {
+    for (const handoff of this.store.listWorkerHandoffs({ status: 'needs_attention' })) {
+      if (handoff.announcedAt || !this.store.getRun(handoff.runId)) continue;
+      const message = this.store.insertMessage({
+        runId: handoff.runId, from: 'system', to: `run:${handoff.runId}`, type: 'escalation', priority: 'high',
+        subject: `Handoff ${handoff.fromCli} -> ${handoff.toCli} needs attention`,
+        body: `${handoff.reason ?? 'This handoff did not finish.'} Worktree: ${handoff.cwd}. Previous dispatch: ${handoff.sourceDispatchId}. ` +
+          'Nothing was restarted. Check the worktree, then hand off again or follow up with the Worker.',
+        fromRole: 'system', mentions: ['coordinator'], kind: 'post',
+      });
+      this.store.updateWorkerHandoff(handoff.id, { announcedAt: message.createdAt });
+      this.notifyTargetAndAliases(`run:${handoff.runId}`, 'escalation', message);
+    }
+  }
+
   workerAbandon(input: {
     dispatchId?: string;
     worker?: string;
@@ -4607,13 +4670,10 @@ export class OrchestrationService {
     return this.delegation.messageWorkerByRole(callerPaneId, input);
   }
 
-  manageWorkerByRole(callerPaneId: string, input: {
-      role: string;
-      action: 'read' | 'approve' | 'deny' | 'release' | 'stop';
-      reason?: string;
-      force?: boolean;
-      screen?: boolean;
-    }): Promise<Record<string, unknown>> {
+  manageWorkerByRole(
+    callerPaneId: string,
+    input: Parameters<OrchestrationDelegationService['manageWorkerByRole']>[1],
+  ): Promise<Record<string, unknown>> {
     return this.delegation.manageWorkerByRole(callerPaneId, input);
   }
 
@@ -4736,7 +4796,7 @@ export class OrchestrationService {
     const session = this.workers.codexWorkers.get(dispatch.assigneeHandle);
     const alive = Boolean(session?.alive && !dispatch.releasedAt);
     const busy = alive && (session!.busy || this.workers.codexSubmitting.has(dispatch.id));
-    return { ...dispatch, headlessLive: { alive, busy } };
+    return { ...dispatch, headlessLive: { alive, busy, dormant: !alive && this.workers.isDormant(dispatch) } };
   }
 
   getSnapshot(runId?: string, callerPaneId?: string): OrchestrationSnapshot {
@@ -4830,6 +4890,7 @@ export class OrchestrationService {
     }
     this.activeCoordinator = null;
     this.stallWatchdog.dispose();
+    this.workers.stopDormancySweep();
     this.peerPingPong.clearAll();
     this.turnStopMonitor.dispose();
     this.approvals.dispose();

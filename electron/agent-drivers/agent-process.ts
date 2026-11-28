@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { win32 } from 'node:path';
 import { augmentedPath, resolveBinaryFromPath } from '../bin-resolve.js';
 import { spawnWindowsCodexJob } from '../orchestration/windows-codex-job.js';
+import { SPAWN_AGENT_PROCESS_GROUP, killProcessTree, markProcessGroupLeader } from './process-tree.js';
 
 export type AgentChild = ChildProcessWithoutNullStreams;
 
@@ -39,7 +40,8 @@ export function agentEnvironment(
 
 /**
  * Starts an agent CLI with piped stdio. On Windows the process runs in a job that closes with it,
- * so tool processes it started cannot outlive the session; npm shims run through node directly.
+ * and on POSIX in its own process group, so tool processes it started cannot outlive the session;
+ * npm shims run through node directly.
  */
 export function spawnAgentProcess(input: {
   command: string; args: readonly string[]; cwd: string; env?: Readonly<Record<string, string>>;
@@ -59,7 +61,7 @@ export function spawnAgentProcess(input: {
   const env = agentEnvironment(input.env, input.envToDelete);
   return process.platform === 'win32'
     ? spawnWindowsCodexJob(file, args, input.cwd, env)
-    : spawn(file, args, { cwd: input.cwd, env, windowsHide: true, stdio: 'pipe' });
+    : markProcessGroupLeader(spawn(file, args, { cwd: input.cwd, env, windowsHide: true, stdio: 'pipe', detached: SPAWN_AGENT_PROCESS_GROUP }));
 }
 
 const STDERR_LIMIT = 4 * 1024;
@@ -88,6 +90,10 @@ export class AgentProcessHandle {
     return this.child.exitCode;
   }
 
+  get pid(): number | null {
+    return this.child.pid ?? null;
+  }
+
   stderrTail(redact: (text: string) => string = (text) => text): string {
     return redact(this.stderr).trim();
   }
@@ -100,7 +106,7 @@ export class AgentProcessHandle {
   kill(): Promise<void> {
     this.closePromise ??= (async () => {
       try {
-        if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill('SIGKILL');
+        killProcessTree(this.child);
       } catch {
         // Still release the pipes.
       }

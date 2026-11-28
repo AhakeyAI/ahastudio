@@ -134,6 +134,10 @@ export class AcpSessionDriver implements AgentSessionDriver {
   readonly capabilities: { resume: boolean; steer: boolean; policies: readonly AgentSessionPolicy[] };
   private readonly rpc: JsonlRpc;
   private readonly proc: AgentProcessHandle;
+
+  get pid(): number | null {
+    return this.proc.pid;
+  }
   private readonly disconnect = new AbortController();
   private readonly acceptanceWindowMs: number;
   private readonly setupTimeoutMs: number;

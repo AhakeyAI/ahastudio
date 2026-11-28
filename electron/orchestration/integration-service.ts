@@ -222,6 +222,7 @@ export class OrchestrationIntegrationService {
         dispatchId: d.id,
         role: this.host.resolveRoleNameForDispatch(d) || d.id,
         cliId: d.cliId ?? null,
+        ...(d.authorCliIds?.length ? { authorCliIds: d.authorCliIds } : {}),
         taskSpec: t?.spec ?? '',
         taskContext: t?.taskContext ?? null,
         integratedCommit: d.integratedCommit ?? null,
@@ -370,6 +371,16 @@ export class OrchestrationIntegrationService {
     };
   }
 
+  private recordIntegratedFact(dispatch: OrchestrationDispatchRecord, result: WorkerIntegrationResult, resident: boolean): void {
+    this.host.store.appendObservationFact({
+      runId: dispatch.runId, dispatchId: dispatch.id, workerId: dispatch.assigneeHandle, kind: 'integrated',
+      data: {
+        mode: result.mode, integrated: result.integrated, snapshotOid: result.snapshotOid || null,
+        integratedCommit: result.integratedCommit, targetBranch: result.targetBranch, resident,
+      },
+    });
+  }
+
   async workerIntegrate(
     input: {
       dispatchId?: string;
@@ -382,6 +393,8 @@ export class OrchestrationIntegrationService {
       releaseAfter?: boolean;
       deleteBranch?: boolean;
       force?: boolean;
+      /** Keep a headless Worker and its worktree for a next wave instead of releasing them. */
+      keepResident?: boolean;
     },
     callerPaneId?: string,
   ): Promise<WorkerIntegrationResult & {
@@ -390,6 +403,7 @@ export class OrchestrationIntegrationService {
     role: string;
     usedRunIntegrationBranch: boolean;
     released: boolean;
+    resident?: boolean;
     releasedReviews: number;
     releaseSkippedReason?: string;
     cleanupWarnings?: string[];
@@ -413,6 +427,13 @@ export class OrchestrationIntegrationService {
       throw new OrchestrationError(
         'operation_rejected',
         `Dispatch ${dispatch.id} is a read-only adversarial review and cannot be integrated.`,
+      );
+    }
+    if (input.keepResident && (dispatch.executionMode !== 'codex-app-server' || !dispatch.ownsWorktree ||
+        !dispatch.worktreePath || !dispatch.ownsBranch || input.releaseAfter === false)) {
+      throw new OrchestrationError(
+        'invalid_argument',
+        'keepResident needs a headless Worker in its own worktree and branch, and cannot be combined with releaseAfter=false.',
       );
     }
 
@@ -900,6 +921,19 @@ export class OrchestrationIntegrationService {
           }
         }
 
+        if (input.keepResident && result.integrated && result.targetBranch) {
+          this.host.store.setDispatchResident(latestDispatch.id, {
+            targetBranch: result.targetBranch, integratedBranchOid: branchOidBeforeIntegrate, integratedSnapshotOid: result.snapshotOid,
+          });
+          this.recordIntegratedFact(latestDispatch, result, true);
+          this.host.emitChanged('worker:integrated', latestDispatch.runId);
+          return {
+            ...result, dispatchId: latestDispatch.id, taskId: latestDispatch.taskId, role,
+            usedRunIntegrationBranch: effectiveUsedRunBranch, released: false, resident: true, releasedReviews,
+            ...(cleanupWarnings.length > 0 ? { cleanupWarnings } : {}),
+            recommendedNextStep: `@${role} stays resident in ${latestDispatch.worktreePath}; its next follow-up starts a new wave on a fresh branch from ${result.targetBranch}.`,
+          };
+        }
         try {
           const rel = await this.host.mutateWorkerResources(latestDispatch, async () => {
             const current = this.host.store.getDispatchContext(latestDispatch.id);
@@ -928,6 +962,7 @@ export class OrchestrationIntegrationService {
         }
       }
 
+      this.recordIntegratedFact(latestDispatch, result, false);
       this.host.emitChanged('worker:integrated', latestDispatch.runId);
       return {
         ...result,
@@ -1187,6 +1222,15 @@ export class OrchestrationIntegrationService {
 
       const cleanupWarnings = [...finalized.cleanupWarnings];
       let releasedReviews = 0;
+      for (const resident of this.host.store.listDispatches({ runId: run.id })) {
+        if (!resident.residentAfterIntegration || resident.releasedAt || ACTIVE_DISPATCH_STATUSES.has(resident.status)) continue;
+        try {
+          const rel = await this.host.workerRelease({ dispatchId: resident.id });
+          if (rel.worktreeError) cleanupWarnings.push(`Resident worker ${resident.id} worktree cleanup failed: ${rel.worktreeError}`);
+        } catch (err) {
+          cleanupWarnings.push(`Resident worker ${resident.id} kept: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       for (const rev of this.host.store.listReviewDispatchesForRun(run.id)) {
         if ((!rev.releasedAt || rev.ownsWorktree) && !ACTIVE_DISPATCH_STATUSES.has(rev.status)) {
           try {

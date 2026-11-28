@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
+import { isProcessTreeAlive } from '../agent-drivers/process-tree.js';
+import { comparablePath } from './headless-workers.js';
 import {
   listWorkerBriefFiles,
   mergeTaskContext,
@@ -38,6 +40,9 @@ import {
   type OrchestrationMessageRecord,
   type OrchestrationReviewFinding,
   type OrchestrationReviewStatus,
+  type OrchestrationResumeClaim,
+  type OrchestrationWorkerHandoff,
+  type OrchestrationObservationFact,
   type OrchestrationRunIntegrationStatus,
   type OrchestrationRunRecord,
   type OrchestrationStartObservation,
@@ -56,6 +61,10 @@ import {
 } from './orchestration-state-repository.js';
 import { DISPATCH_CREDENTIAL_PREFIX } from './orchestration-security-store.js';
 import { type OrchestrationStoreContext, OrchestrationStoreSlice } from './orchestration-store-slice.js';
+
+/** Bounds on the append-only observation log. */
+const MAX_FACTS_PER_RUN = 400;
+const MAX_FACTS = 4_000;
 
 export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
   private briefsDirOverride: string | null;
@@ -698,6 +707,178 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
       .map((d) => ({ ...d }));
   }
 
+  /**
+   * Takes the single-writer claim for resuming `workerId` in `cwd`. Refuses while another claim
+   * holds the Worker or the directory; a stale claim from an earlier app run is cleared once its
+   * recorded process is gone. Callers `flushDurable()` before starting the agent process.
+   */
+  acquireResumeClaim(
+    input: {
+      workerId: string; runId: string; dispatchId: string; cwd: string; driver: string; providerSessionId: string;
+      actor?: OrchestrationResumeClaim['actor'];
+    },
+    isAlive: (pid: number) => boolean = isProcessTreeAlive,
+  ): OrchestrationResumeClaim {
+    const cwd = comparablePath(input.cwd);
+    for (const claim of [...this.state.resumeClaims.values()]) {
+      if (claim.workerId !== input.workerId && comparablePath(claim.cwd) !== cwd) continue;
+      if (claim.status === 'stale' && (claim.pid === null || !isAlive(claim.pid))) {
+        this.state.resumeClaims.delete(claim.id);
+        continue;
+      }
+      throw new OrchestrationError(
+        'operation_rejected',
+        claim.status === 'stale'
+          ? `A Worker process (pid ${claim.pid}) from an earlier AhaStation run may still be writing ${claim.cwd}. Stop it before resuming.`
+          : `Worker ${claim.workerId} already holds ${claim.cwd}; wait for it to finish or stop it first.`,
+        { claimId: claim.id, workerId: claim.workerId },
+      );
+    }
+    const now = this.now();
+    const claim: OrchestrationResumeClaim = {
+      id: `resume-${randomUUID()}`,
+      workerId: input.workerId,
+      runId: input.runId,
+      dispatchId: input.dispatchId,
+      cwd: input.cwd,
+      driver: input.driver,
+      providerSessionId: input.providerSessionId,
+      status: 'pending',
+      pid: null,
+      hostId: 'local',
+      actor: input.actor ?? 'orchestrator',
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.state.resumeClaims.set(claim.id, claim);
+    this.persist();
+    return { ...claim };
+  }
+
+  /** Records the started agent process on a pending claim. */
+  activateResumeClaim(claimId: string, pid: number | null): OrchestrationResumeClaim | undefined {
+    const claim = this.state.resumeClaims.get(claimId);
+    if (!claim || claim.status === 'stale') return undefined;
+    claim.status = 'active';
+    claim.pid = pid !== null && Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+    claim.updatedAt = this.now();
+    this.persist();
+    return { ...claim };
+  }
+
+  /** Drops the live claims for `workerId` once its process is gone; stale ones stay until verified. */
+  releaseResumeClaims(workerId: string): void {
+    let changed = false;
+    for (const [id, claim] of this.state.resumeClaims) {
+      if (claim.workerId === workerId && claim.status !== 'stale') {
+        this.state.resumeClaims.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) this.persist();
+  }
+
+  /** Forgets every claim for `workerId`, e.g. when its run is pruned. */
+  dropResumeClaimsForWorker(workerId: string): void {
+    for (const [id, claim] of this.state.resumeClaims) {
+      if (claim.workerId === workerId) this.state.resumeClaims.delete(id);
+    }
+  }
+
+  createWorkerHandoff(
+    input: Pick<OrchestrationWorkerHandoff,
+      'runId' | 'sourceDispatchId' | 'sourceWorkerId' | 'fromCli' | 'toCli' | 'cwd' | 'targetWorkerId' | 'snapshotOid' | 'context'>
+      & { actor?: OrchestrationWorkerHandoff['actor'] },
+  ): OrchestrationWorkerHandoff {
+    const now = this.now();
+    const handoff: OrchestrationWorkerHandoff = {
+      id: `handoff-${randomUUID()}`,
+      ...input,
+      status: 'pending',
+      targetDispatchId: null,
+      providerSessionId: null,
+      reason: null,
+      announcedAt: null,
+      hostId: 'local',
+      actor: input.actor ?? 'orchestrator',
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.state.workerHandoffs.set(handoff.id, handoff);
+    this.recordHandoffFact(handoff);
+    this.persist();
+    return { ...handoff };
+  }
+
+  private recordHandoffFact(handoff: OrchestrationWorkerHandoff): void {
+    this.appendObservationFact({
+      runId: handoff.runId, dispatchId: handoff.targetDispatchId ?? handoff.sourceDispatchId, workerId: handoff.targetWorkerId,
+      kind: 'handoff',
+      data: {
+        handoffId: handoff.id, status: handoff.status, fromCli: handoff.fromCli, toCli: handoff.toCli,
+        snapshotOid: handoff.snapshotOid, sourceDispatchId: handoff.sourceDispatchId,
+      },
+    });
+  }
+
+  /**
+   * Appends a fact; facts are never changed afterwards. Each run keeps its newest
+   * `MAX_FACTS_PER_RUN`, and the whole log its newest `MAX_FACTS`.
+   */
+  appendObservationFact(input: Omit<OrchestrationObservationFact, 'seq' | 'at'>): OrchestrationObservationFact {
+    const fact: OrchestrationObservationFact = {
+      ...input,
+      data: Object.fromEntries(Object.entries(input.data).map(([key, value]) => [
+        key, typeof value === 'string' ? this.security.redactDispatchCredentials(value).slice(0, 500) : value,
+      ])),
+      seq: this.state.nextObservationFactSeq++,
+      at: this.now(),
+    };
+    const facts = this.state.observationFacts;
+    facts.push(fact);
+    const forRun = facts.filter((entry) => entry.runId === fact.runId);
+    if (forRun.length > MAX_FACTS_PER_RUN) {
+      const drop = new Set(forRun.slice(0, forRun.length - MAX_FACTS_PER_RUN).map((entry) => entry.seq));
+      this.state.observationFacts = facts.filter((entry) => !drop.has(entry.seq));
+    }
+    if (this.state.observationFacts.length > MAX_FACTS) this.state.observationFacts.splice(0, this.state.observationFacts.length - MAX_FACTS);
+    this.persist();
+    return { ...fact, data: { ...fact.data } };
+  }
+
+  listObservationFacts(filter: { runId?: string; dispatchId?: string; workerId?: string; afterSeq?: number; limit?: number } = {}): OrchestrationObservationFact[] {
+    const matched = this.state.observationFacts.filter((fact) =>
+      (!filter.runId || fact.runId === filter.runId) &&
+      (!filter.dispatchId || fact.dispatchId === filter.dispatchId) &&
+      (!filter.workerId || fact.workerId === filter.workerId) &&
+      (filter.afterSeq === undefined || fact.seq > filter.afterSeq));
+    const limit = Math.max(1, Math.min(filter.limit ?? 200, 1_000));
+    return matched.slice(-limit).map((fact) => ({ ...fact, data: { ...fact.data } }));
+  }
+
+  updateWorkerHandoff(
+    id: string,
+    patch: Partial<Pick<OrchestrationWorkerHandoff, 'status' | 'targetDispatchId' | 'providerSessionId' | 'reason' | 'announcedAt'>>,
+  ): OrchestrationWorkerHandoff | undefined {
+    const handoff = this.state.workerHandoffs.get(id);
+    if (!handoff) return undefined;
+    const statusChanged = patch.status !== undefined && patch.status !== handoff.status;
+    Object.assign(handoff, patch, { updatedAt: this.now() });
+    if (statusChanged) this.recordHandoffFact(handoff);
+    this.persist();
+    return { ...handoff };
+  }
+
+  listWorkerHandoffs(filter: { runId?: string; status?: OrchestrationWorkerHandoff['status'] } = {}): OrchestrationWorkerHandoff[] {
+    return [...this.state.workerHandoffs.values()]
+      .filter((handoff) => (!filter.runId || handoff.runId === filter.runId) && (!filter.status || handoff.status === filter.status))
+      .map((handoff) => ({ ...handoff }));
+  }
+
+  listResumeClaims(): OrchestrationResumeClaim[] {
+    return [...this.state.resumeClaims.values()].map((claim) => ({ ...claim }));
+  }
+
   getActiveDispatchForIdentity(
     handle: string,
     paneId?: string | null
@@ -745,6 +926,8 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
     taskId: string;
     approvedQueueLaunch?: boolean;
     providerSessionId?: string;
+    providerCwd?: string;
+    authorCliIds?: readonly string[];
     workerPolicy?: AgentSessionPolicy;
     workerNetwork?: boolean;
     allowSubWorkers?: boolean;
@@ -887,6 +1070,8 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
       ...(input.providerSessionId ? {
         executionMode: 'codex-app-server' as const,
         providerSessionId: input.providerSessionId,
+        ...(input.providerCwd ? { providerCwd: input.providerCwd } : {}),
+        ...(input.authorCliIds && input.authorCliIds.length > 0 ? { authorCliIds: [...new Set(input.authorCliIds)] } : {}),
         ...(input.workerPolicy !== undefined ? { workerPolicy: input.workerPolicy } : {}),
         ...(typeof input.workerNetwork === 'boolean' ? { workerNetwork: input.workerNetwork } : {}),
         ...(input.allowSubWorkers ? { allowSubWorkers: true } : {}),
@@ -971,6 +1156,20 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
     if (!ctx) return null;
     if (ctx.stage === stage) return { ...ctx };
     ctx.stage = stage;
+    ctx.updatedAt = this.now();
+    this.persist();
+    return { ...ctx };
+  }
+
+  /** Keeps an integrated Worker resident for a next wave, or clears that once the wave starts. */
+  setDispatchResident(
+    dispatchId: string,
+    resident: NonNullable<OrchestrationDispatchRecord['residentAfterIntegration']> | null,
+  ): OrchestrationDispatchRecord | null {
+    const ctx = this.state.dispatches.get(dispatchId);
+    if (!ctx) return null;
+    if (resident) ctx.residentAfterIntegration = { ...resident };
+    else delete ctx.residentAfterIntegration;
     ctx.updatedAt = this.now();
     this.persist();
     return { ...ctx };
@@ -1147,6 +1346,7 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
     ctx.ownsPane = true;
     delete ctx.executionMode;
     delete ctx.providerSessionId;
+    delete ctx.providerCwd;
     delete ctx.workerPolicy;
     delete ctx.workerNetwork;
     delete ctx.allowSubWorkers;

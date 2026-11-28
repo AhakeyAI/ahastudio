@@ -2,6 +2,7 @@ import { AGENT_SESSION_ID } from './agent-session-manager.js';
 import { HEADLESS_SUB_WORKER_ACTIONS, HEADLESS_WORKER_ID } from './headless-workers.js';
 import { z } from 'zod';
 import { OrchestrationService } from './orchestration-service.js';
+import { IDEMPOTENT_ORCHESTRATION_ACTIONS, RequestReceipts, parseRequestId } from './request-idempotency.js';
 import { taskContextFields } from './task-context-schema.js';
 import {
   ORCHESTRATION_BOARD_POST_KINDS,
@@ -328,6 +329,15 @@ const workerIntegrateSchema = z.object({
   releaseAfter: z.boolean().optional(),
   deleteBranch: z.boolean().optional(),
   force: z.boolean().optional(),
+  keepResident: z.boolean().optional(),
+});
+
+const factsSchema = z.object({
+  runId: z.string().trim().min(1).optional(),
+  dispatchId: z.string().trim().min(1).optional(),
+  workerId: z.string().trim().min(1).optional(),
+  afterSeq: z.number().int().nonnegative().optional(),
+  limit: z.number().int().positive().max(1_000).optional(),
 });
 
 const runDiffSchema = z.object({
@@ -426,8 +436,9 @@ const roleMessageSchema = z.object({
 const roleManageSchema = z.object({
   from: z.string().trim().min(1).optional(),
   role: z.string().trim().min(1),
-  action: z.enum(['read', 'approve', 'deny', 'release', 'stop']),
+  action: z.enum(['read', 'approve', 'deny', 'release', 'stop', 'handoff']),
   reason: z.string().max(4_000).optional(),
+  agent: z.string().trim().min(1).max(64).optional(),
   force: z.boolean().optional(),
   screen: z.boolean().optional(),
 });
@@ -509,6 +520,7 @@ const CODEX_WORKER_ACTIONS = new Set([
 // run binding stay closed so every new Worker passes through delegate-task and its user-confirmation gate.
 const AGENT_SESSION_COORDINATOR_ACTIONS = new Set([
   'mcp-context',
+  'facts',
   'agents',
   'delegate-task',
   'role-message',
@@ -534,6 +546,7 @@ const AGENT_SESSION_COORDINATOR_ACTIONS = new Set([
 ]);
 
 const READ_ONLY_ORCHESTRATION_ACTIONS = new Set([
+  'facts',
   'run-current',
   'run-list',
   'run-show',
@@ -553,11 +566,64 @@ const READ_ONLY_ORCHESTRATION_ACTIONS = new Set([
   'mcp-context',
 ]);
 
+type OrchestrationHttpContext = { signal: AbortSignal; callerPaneId?: string | null };
+
+const requestReceiptsByService = new WeakMap<OrchestrationService, RequestReceipts<OrchestrationHttpDispatchResult>>();
+
+/** A response that must not be kept as a receipt, so a retry runs the action again. */
+class UnsuccessfulResponse extends Error {
+  constructor(readonly response: OrchestrationHttpDispatchResult) {
+    super('unsuccessful orchestration response');
+  }
+}
+
+/**
+ * Runs an orchestration action. Write actions in `IDEMPOTENT_ORCHESTRATION_ACTIONS` that carry a
+ * `requestId` run once per (action, caller, requestId): a retry gets the first successful result
+ * with `replayed: true`, and reusing the id for a different payload fails with `request_mismatch`.
+ */
 export async function dispatchOrchestrationHttpAction(
   service: OrchestrationService,
   action: string,
   rawPayload: unknown,
-  context: { signal: AbortSignal; callerPaneId?: string | null }
+  context: OrchestrationHttpContext
+): Promise<OrchestrationHttpDispatchResult> {
+  const payload =
+    typeof rawPayload === 'object' && rawPayload !== null && !Array.isArray(rawPayload)
+      ? (rawPayload as Record<string, unknown>)
+      : {};
+  if (!IDEMPOTENT_ORCHESTRATION_ACTIONS.has(action) || payload.requestId === undefined) {
+    return runOrchestrationHttpAction(service, action, rawPayload, context);
+  }
+  try {
+    const requestId = parseRequestId(payload);
+    const { requestId: _requestId, ...actionPayload } = payload;
+    if (!requestId) return await runOrchestrationHttpAction(service, action, actionPayload, context);
+    let receipts = requestReceiptsByService.get(service);
+    if (!receipts) {
+      receipts = new RequestReceipts<OrchestrationHttpDispatchResult>();
+      requestReceiptsByService.set(service, receipts);
+    }
+    const { value, replayed } = await receipts.run(
+      { action, caller: context.callerPaneId ?? 'anonymous', requestId },
+      actionPayload,
+      async () => {
+        const response = await runOrchestrationHttpAction(service, action, actionPayload, context);
+        if (response.status !== 200) throw new UnsuccessfulResponse(response);
+        return response;
+      },
+    );
+    return replayed ? { status: value.status, body: { ...value.body, replayed: true } } : value;
+  } catch (error) {
+    return error instanceof UnsuccessfulResponse ? error.response : orchestrationErrorResponse(error);
+  }
+}
+
+async function runOrchestrationHttpAction(
+  service: OrchestrationService,
+  action: string,
+  rawPayload: unknown,
+  context: OrchestrationHttpContext
 ): Promise<OrchestrationHttpDispatchResult> {
   const payload =
     typeof rawPayload === 'object' && rawPayload !== null && !Array.isArray(rawPayload)
@@ -781,6 +847,9 @@ export async function dispatchOrchestrationHttpAction(
       }
       case 'worker-show':
         result = service.workerShow(workerTargetSchema.parse(payload), httpCallerPane());
+        break;
+      case 'facts':
+        result = service.listObservationFacts(factsSchema.parse(payload), httpCallerPane());
         break;
       case 'worker-read':
         result = service.workerRead(workerReadSchema.parse(payload), httpCallerPane());
@@ -1022,6 +1091,7 @@ export async function dispatchOrchestrationHttpAction(
           role: parsed.role,
           action: parsed.action,
           reason: parsed.reason,
+          agent: parsed.agent,
           force: parsed.force,
           screen: parsed.screen,
         });
@@ -1111,56 +1181,61 @@ export async function dispatchOrchestrationHttpAction(
       },
     };
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      return {
-        status: 400,
-        body: {
-          ok: false,
-          code: 'invalid_argument',
-          error: error.issues.map((i) => `${i.path.join('.') || 'input'}: ${i.message}`).join('; '),
-        },
-      };
-    }
-    if (error instanceof OrchestrationError) {
-      const status =
-        error.code === 'not_found' ||
-        error.code === 'run_not_found' ||
-        error.code === 'task_not_found' ||
-        error.code === 'dispatch_not_found' ||
-        error.code === 'delivery_not_found' ||
-        error.code === 'gate_not_found' ||
-        error.code === 'approval_not_found' ||
-        error.code === 'proposal_not_found'
-          ? 404
-          : error.code === 'answer_conflict' ||
-              error.code === 'gate_already_resolved' ||
-              error.code === 'approval_already_resolved' ||
-              error.code === 'proposal_already_resolved' ||
-              error.code === 'worker_busy' ||
-              error.code === 'duplicate_run' ||
-              error.code === 'duplicate_task' ||
-              error.code === 'coordinator_already_running'
-            ? 409
-            : error.code === 'terminal_unavailable' || error.code === 'prompt_delivery_failed'
-              ? 503
-              : 400;
-      return {
-        status,
-        body: {
-          ok: false,
-          code: error.code,
-          error: error.message,
-          ...(error.data ? { data: error.data } : {}),
-        },
-      };
-    }
+    return orchestrationErrorResponse(error);
+  }
+}
+
+function orchestrationErrorResponse(error: unknown): OrchestrationHttpDispatchResult {
+  if (error instanceof z.ZodError) {
     return {
-      status: 500,
+      status: 400,
       body: {
         ok: false,
-        code: 'internal_error',
-        error: error instanceof Error ? error.message : String(error),
+        code: 'invalid_argument',
+        error: error.issues.map((i) => `${i.path.join('.') || 'input'}: ${i.message}`).join('; '),
       },
     };
   }
+  if (error instanceof OrchestrationError) {
+    const status =
+      error.code === 'not_found' ||
+      error.code === 'run_not_found' ||
+      error.code === 'task_not_found' ||
+      error.code === 'dispatch_not_found' ||
+      error.code === 'delivery_not_found' ||
+      error.code === 'gate_not_found' ||
+      error.code === 'approval_not_found' ||
+      error.code === 'proposal_not_found'
+        ? 404
+        : error.code === 'answer_conflict' ||
+            error.code === 'gate_already_resolved' ||
+            error.code === 'approval_already_resolved' ||
+            error.code === 'proposal_already_resolved' ||
+            error.code === 'worker_busy' ||
+            error.code === 'duplicate_run' ||
+            error.code === 'duplicate_task' ||
+            error.code === 'coordinator_already_running' ||
+            error.code === 'request_mismatch'
+          ? 409
+          : error.code === 'terminal_unavailable' || error.code === 'prompt_delivery_failed'
+            ? 503
+            : 400;
+    return {
+      status,
+      body: {
+        ok: false,
+        code: error.code,
+        error: error.message,
+        ...(error.data ? { data: error.data } : {}),
+      },
+    };
+  }
+  return {
+    status: 500,
+    body: {
+      ok: false,
+      code: 'internal_error',
+      error: error instanceof Error ? error.message : String(error),
+    },
+  };
 }

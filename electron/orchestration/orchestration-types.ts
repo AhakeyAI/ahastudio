@@ -265,6 +265,7 @@ export type OrchestrationErrorCode =
   | 'duplicate_run'
   | 'task_not_found'
   | 'duplicate_task'
+  | 'request_mismatch'
   | 'task_not_ready'
   | 'task_cycle'
   | 'cyclic_dependency'
@@ -394,12 +395,27 @@ export interface CodexPilotTurnRecord {
 export interface OrchestrationDispatchRecord {
   executionMode?: 'codex-app-server';
   providerSessionId?: string;
+  /** Headless Workers only: the directory the provider conversation was opened in, where it resumes. */
+  providerCwd?: string;
+  /**
+   * Every Coding Agent that wrote this wave of the task, accumulated across cross-CLI handoffs.
+   * Reviews avoid all of them; absent means only `cliId` wrote it.
+   */
+  authorCliIds?: string[];
+  /**
+   * Set when integration kept this Worker resident instead of releasing it: its worktree stays,
+   * and the next follow-up starts a new wave on a fresh branch from `targetBranch`.
+   */
+  residentAfterIntegration?: { targetBranch: string; integratedBranchOid: string | null; integratedSnapshotOid: string } | null;
   /** Headless Workers only. Records without them are read-only exactly when the timeline says so, with network off. */
   workerPolicy?: AgentSessionPolicy;
   workerNetwork?: boolean;
   allowSubWorkers?: boolean;
-  /** Snapshot only, never stored: whether a headless Worker's process is alive and a turn is running. */
-  headlessLive?: { alive: boolean; busy: boolean };
+  /**
+   * Snapshot only, never stored: whether a headless Worker's process is alive and a turn is running,
+   * and whether a Worker without a process can be woken in place from its provider conversation.
+   */
+  headlessLive?: { alive: boolean; busy: boolean; dormant: boolean };
   codexTurn?: CodexPilotTurnRecord;
   codexDeliveryFailure?: 'unknown_acceptance' | 'not_accepted';
   id: string;
@@ -612,6 +628,79 @@ export type OrchestrationCoordinatorStatusResult = {
   pendingGates: number;
 };
 
+/**
+ * Single-writer lock on a headless Worker identity and the directory it writes, taken before
+ * AhaStation reopens the Worker's provider conversation. A claim left over from an earlier app
+ * process is `stale` until its recorded process is gone, so a resume never races a survivor.
+ */
+export interface OrchestrationResumeClaim {
+  id: string;
+  workerId: string;
+  runId: string;
+  /** The settled dispatch whose conversation is being resumed. */
+  dispatchId: string;
+  cwd: string;
+  driver: string;
+  providerSessionId: string;
+  status: 'pending' | 'active' | 'stale';
+  /** The agent process (Windows: its job launcher; POSIX: its process group leader), once started. */
+  pid: number | null;
+  /** Reserved for remote control: which host and who took the claim. */
+  hostId: string;
+  actor: 'orchestrator' | 'person';
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * A cross-CLI handoff of a headless Worker's task to another Coding Agent in the same worktree.
+ * Recorded `pending` and made durable before the new agent starts, `active` once it has a
+ * conversation, and `completed` when the follow-up dispatch exists. One found `pending` or
+ * `active` after a restart becomes `needs_attention` and is never resumed automatically.
+ */
+export interface OrchestrationWorkerHandoff {
+  id: string;
+  runId: string;
+  sourceDispatchId: string;
+  sourceWorkerId: string;
+  fromCli: string;
+  toCli: string;
+  cwd: string;
+  status: 'pending' | 'active' | 'completed' | 'failed' | 'needs_attention';
+  targetWorkerId: string;
+  targetDispatchId: string | null;
+  providerSessionId: string | null;
+  /** The worktree snapshot both quiescence checks agreed on. */
+  snapshotOid: string | null;
+  /** The redacted, size-capped context the new agent started from. */
+  context: string;
+  reason: string | null;
+  /** When the Coordinator was told an interrupted handoff needs a person. */
+  announcedAt: string | null;
+  hostId: string;
+  actor: 'orchestrator' | 'person';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type OrchestrationObservationFactKind =
+  | 'turn_started' | 'turn_completed' | 'approval' | 'native_question' | 'snapshot'
+  | 'dormant' | 'resumed' | 'handoff' | 'integrated' | 'wave_started';
+
+/**
+ * Append-only record of something that happened to a Worker attempt, for audit and recovery.
+ * Facts are never edited; `data` holds small, already-redacted values only.
+ */
+export interface OrchestrationObservationFact {
+  seq: number;
+  runId: string;
+  dispatchId: string | null;
+  workerId: string | null;
+  kind: OrchestrationObservationFactKind;
+  at: string;
+  data: Record<string, string | number | boolean | null>;
+}
+
 export interface OrchestrationPersistedState {
   version: 1;
   nextSequence: number;
@@ -632,6 +721,10 @@ export interface OrchestrationPersistedState {
   deferredDispatchPrompts?: Record<string, { ptyId: string; prompt: string; submit: boolean }>;
   nextBoardSeqByRun?: Record<string, number>;
   memberCursorsByRun?: Record<string, Record<string, OrchestrationMemberCursor>>;
+  resumeClaims?: OrchestrationResumeClaim[];
+  workerHandoffs?: OrchestrationWorkerHandoff[];
+  observationFacts?: OrchestrationObservationFact[];
+  nextObservationFactSeq?: number;
 }
 
 export interface OrchestrationSnapshot {
