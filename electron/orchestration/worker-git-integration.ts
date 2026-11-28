@@ -1979,6 +1979,7 @@ export async function finalizeRunIntegrationBranch(opts: {
         const cleaned = await opts.cleanup(runBranchOidBefore);
         removedWorktree = cleaned.removed;
         removedBranch = cleaned.removedBranch;
+        if (opts.deleteBranch !== false && !removedBranch) cleanupWarnings.push(`Run integration branch ${branchName} was not CAS-deleted.`);
       } catch (error) { cleanupWarnings.push(`Run cleanup incomplete: ${String(error)}`); }
     } else if (!opts.keepWorktree) {
       const removed = await removeGitWorktree({

@@ -38,6 +38,11 @@ export class CleanupAttention extends OrchestrationError {
   constructor(message = 'Cleanup needs attention') { super('operation_rejected', message); }
 }
 export class CleanupLocked extends CleanupAttention {}
+// Git can remove the worktree and still decline the branch deletion. The caller
+// gets that partial result; the durable intent does not become done.
+export class CleanupBranchRetained extends Error {
+  constructor(readonly reason: unknown) { super(String(reason)); }
+}
 export class CleanupDeferred extends Error {}
 export interface CleanupResult { removed: boolean; removedBranch: boolean }
 export interface CleanupHost {
@@ -77,7 +82,12 @@ export class CleanupOutbox {
     };
     if (entry.status === 'needs_attention') throw new CleanupAttention(entry.lastError);
     store.runMutation(() => store.saveCleanupEntry(entry));
-    return this.attempt(entry, force && (!previous || previous.status === 'done' || !!unlock));
+    try {
+      return await this.attempt(entry, force && (!previous || previous.status === 'done' || !!unlock));
+    } catch (error) {
+      if (error instanceof CleanupBranchRetained) return { removed: true, removedBranch: false };
+      throw error;
+    }
   }
 
   private async attempt(entry: OrchestrationCleanupOutboxEntry, force: boolean) {
@@ -94,7 +104,8 @@ export class CleanupOutbox {
       } catch (err) {
         if (err instanceof CleanupDeferred) throw err;
         const attempts = entry.attempts + 1;
-        const attention = err instanceof CleanupAttention || attempts >= 6;
+        const reason = err instanceof CleanupBranchRetained ? err.reason : err;
+        const attention = reason instanceof CleanupAttention || attempts >= 6;
         store.saveCleanupEntry({ ...entry, attempts, status: attention ? 'needs_attention' : 'pending',
           locked: err instanceof CleanupLocked, lastError: String(err), updatedAt: this.host.now(), nextAttemptAt: attention ? undefined : this.host.now() + 1000 * 2 ** (attempts - 1) });
         await store.flushDurable();

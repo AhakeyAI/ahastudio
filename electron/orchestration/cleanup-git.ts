@@ -1,7 +1,7 @@
 import { basename, dirname, join } from 'node:path';
 import { runGitCommand, validateGitRefName } from '../git/git-exec.js';
 import { getGitStatus, listGitWorktrees, removeGitWorktree } from '../git/git-service.js';
-import { assertCleanupKind, CleanupAttention, CleanupDeferred, CleanupLocked, pathKey, type CleanupIntent } from './cleanup-outbox.js';
+import { assertCleanupKind, CleanupAttention, CleanupBranchRetained, CleanupDeferred, CleanupLocked, pathKey, type CleanupIntent } from './cleanup-outbox.js';
 import { ACTIVE_DISPATCH_STATUSES } from './orchestration-lifecycle-graph.js';
 import type { OrchestrationStore } from './orchestration-store.js';
 import { resolveRunIntegrationWorktreePath } from './worker-git-integration.js';
@@ -61,8 +61,9 @@ export async function executeCleanup(e: CleanupIntent, force: boolean, guard: ()
     } });
     if (!removed.ok) throw new Error(removed.error);
   }
-  let removedBranch = false;
-  if (branch && e.deleteBranch && await cleanupBranchOid(cwd, branch)) {
+  if (!branch || !e.deleteBranch) return { removed: true, removedBranch: false };
+  try {
+    if (!await cleanupBranchOid(cwd, branch)) return { removed: true, removedBranch: false };
     if (!e.expectedBranchOid) throw new CleanupAttention('Missing branch CAS evidence');
     if (!e.allowUnmerged) {
       const ancestor = await runGitCommand(['merge-base', '--is-ancestor', e.expectedBranchOid, 'HEAD'], { cwd, readOnly: true });
@@ -70,8 +71,11 @@ export async function executeCleanup(e: CleanupIntent, force: boolean, guard: ()
     }
     guard();
     const remove = e.kind === 'run_branch.cleanup' ? deleteRunIntegrationBranch : deleteOwnedWorkerBranch;
-    removedBranch = await remove(cwd, branch, e.expectedBranchOid, { allowSquashCasDelete: true, beforeDelete: guard });
+    const removedBranch = await remove(cwd, branch, e.expectedBranchOid, { allowSquashCasDelete: true, beforeDelete: guard });
     if (!removedBranch && await cleanupBranchOid(cwd, branch)) throw new Error('Git could not safely CAS-delete branch');
+    return { removed: true, removedBranch };
+  } catch (error) {
+    if (error instanceof CleanupDeferred) throw error;
+    throw new CleanupBranchRetained(error);
   }
-  return { removed: true, removedBranch };
 }
