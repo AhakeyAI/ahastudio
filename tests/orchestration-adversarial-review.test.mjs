@@ -732,7 +732,7 @@ test('failed detached review worktree cleanup does not mark releasedAt and remai
   // Point review dispatch's repoRootPath temporarily to a non-repo dir so detached removal fails.
   const badRoot = join(root, 'not-a-repo');
   mkdirSync(badRoot, { recursive: true });
-  const revRecord = store.dispatches.get(rev.dispatch.id);
+  const revRecord = store.repository.state.dispatches.get(rev.dispatch.id);
   const origRepoRoot = revRecord.repoRootPath;
   revRecord.repoRootPath = badRoot;
 
@@ -837,7 +837,7 @@ test('L0 exemption evaluates the full merge-base..snapshot range even when dispa
 
   await service.workerDoneByPane(impl.ptyId, { outcome: 'completed', summary: 'done' });
   // Simulate a legacy dispatch record lacking baseCommit.
-  store.dispatches.get(impl.dispatch.id).baseCommit = null;
+  store.repository.state.dispatches.get(impl.dispatch.id).baseCommit = null;
 
   await assert.rejects(
     () => service.workerIntegrate({ dispatchId: impl.dispatch.id, mode: 'squash' }, 'local-coord'),
