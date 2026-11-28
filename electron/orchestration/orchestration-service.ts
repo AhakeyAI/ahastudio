@@ -1058,7 +1058,7 @@ export class OrchestrationService {
         this.store.getRemainingDispatchCapacity() < 1) return;
     this.store.setQueuedLaunch(task.id, { ...q, state: 'claimed' });
     try {
-      await this.store.waitForPendingWrite();
+      await this.store.flushDurable();
       if (this.disposed || !this.isCallerSurface(q.from) || !this.isPaneAlive(q.from) ||
           this.store.requireRun(run.id).consumerGeneration !== q.coordinatorGeneration) {
         this.store.setQueuedLaunch(task.id, q);
@@ -5787,7 +5787,7 @@ export class OrchestrationService {
     let preamble = makePreamble();
     if (task.queuedLaunch || task.codeDeps?.length) {
       try {
-        await this.store.waitForPendingWrite();
+        await this.store.flushDurable();
         await this.verifyCodeInputs(task, placement.cwd);
       } catch (error) {
         if (pilot) await pilot.session.close();
@@ -6171,7 +6171,7 @@ export class OrchestrationService {
           this.store.recordReconciliationDiff(dispatch.id, diff?.exitCode === 0
             ? session.redactText([diff.stdout, files?.stdout].filter(Boolean).join('\n')) : null);
         }
-        await this.store.waitForPendingWrite();
+        await this.store.flushDurable();
         this.publishCodexStatus(dispatch, '接单结果需核对', result.reason, { acceptance: result.status });
       }
       if (result.status === 'accepted' && !session.alive) {
@@ -7749,7 +7749,7 @@ export class OrchestrationService {
 
       const beforePublish: NonNullable<Parameters<typeof integrateWorkerChanges>[0]['beforePublish']> = async evidence => {
         this.store.updateRunIntegrationState(run.id, { integrationIntent: { ...evidence, repo: mainRepoRoot, dispatchId: latestDispatch.id } });
-        await this.store.waitForPendingWrite();
+        await this.store.flushDurable();
       };
       let result: WorkerIntegrationResult;
       let runBranchResult: Awaited<ReturnType<typeof integrateWorkerIntoRunBranch>> | null = null;
@@ -8208,7 +8208,7 @@ export class OrchestrationService {
             }
           }
           this.store.updateRunIntegrationState(run.id, { integrationIntent: { ...evidence, repo: run.integrationRepoRootPath!, members } });
-          await this.store.waitForPendingWrite();
+          await this.store.flushDurable();
         },
         mainRepoRoot: run.integrationRepoRootPath,
         integrationBranch: run.integrationBranch,
@@ -10628,7 +10628,7 @@ export class OrchestrationService {
         continue;
       }
       this.store.deleteDeferredDispatchPrompt(dispatchId);
-      void this.store.waitForPendingWrite().then(() => {
+      void this.store.flushDurable().then(() => {
         const latest = this.store.getDispatchContext(dispatchId);
         if (!latest || !ACTIVE_DISPATCH_STATUSES.has(latest.status)) return null;
         const prompt = this.store.restoreDeferredDispatchPrompt(dispatchId, deferred.prompt);
@@ -10740,7 +10740,7 @@ export class OrchestrationService {
 
   /** Resolve after every queued snapshot write (temp-file fsync + rename) has completed. */
   async waitForPendingWrites(): Promise<void> {
-    await this.store.waitForPendingWrite();
+    await this.store.flushDurable();
   }
 
   private isDispatchDeliberatelyWaiting(dispatch: OrchestrationDispatchRecord): boolean {

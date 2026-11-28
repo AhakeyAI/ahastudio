@@ -83,7 +83,7 @@ test('an unknown delivery and an interrupted queue claim survive snapshot recove
   const dispatch = first.createDispatchContext({ taskId: a.id, assigneeHandle: 'worker' });
   first.recordCodexDeliveryFailure(dispatch.id, 'unknown_acceptance');
   const b = first.createTask({ runId: run.id, spec: 'B', queuedLaunch: { state: 'claimed', from: 'coord', coordinatorGeneration: 1, role: 'other', agent: 'codex', worktree: true, authorizeReviews: false } });
-  await first.waitForPendingWrite();
+  await first.flushDurable();
   first.close();
   const restored = new OrchestrationStore({ resolveFile: file });
   restored.load();

@@ -75,6 +75,11 @@ node --import ./tests/register-electron-stub.mjs --test --test-concurrency=2 tes
 
 - `electron/orchestration/` — orchestration core (`orchestration-service.ts`, store, coordinator,
   MCP server `aha-mcp-server.cjs`, Codex app-server pilot, worker timeline).
+- `electron/orchestration/orchestration-store.ts` is a Facade over `orchestration-lifecycle-store.ts`,
+  `orchestration-mailbox-store.ts` and `orchestration-security-store.ts`, which share one state and
+  writer via `orchestration-state-repository.ts`. Group multi-entity writes in `store.runMutation(fn)`
+  (synchronous, validate before mutating, no rollback) and `await store.flushDurable()` before
+  crash-sensitive side effects (queue claims, integration intent, reconciliation evidence).
 - `src/components/AgentSessionView.tsx` + `src/components/agent-session/` — headless Worker
   session UI; pure logic lives in `src/lib/worker-timeline-model.ts` and
   `src/lib/timeline-scroll-anchoring.ts`.
