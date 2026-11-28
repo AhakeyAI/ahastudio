@@ -890,6 +890,23 @@ test('BoardStallWatchdog surfaces coordinator-read unanswered questions', async 
   );
 });
 
+test('BoardStallWatchdog surfaces unanswered questions seen only through a broad board read', async (t) => {
+  const scenario = await createStallQuestionScenario(t);
+  const { coordPaneId, service, store, worker, asked } = scenario;
+  // Broad reads advance the coordinator cursor but never record exact per-post reads.
+  const board = service.boardRead({ from: coordPaneId });
+  assert.ok(board.posts.some((post) => post.id === asked.messageId));
+  assert.equal(store.wasBoardPostRead(asked.messageId, 'coordinator'), false);
+
+  scenario.advanceMs(30_000);
+  const events = service.stallWatchdog.sweep();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].runId, worker.run.id);
+  const stallPosts = store.listBoardPosts(worker.run.id).filter((post) => post.kind === 'stall');
+  assert.equal(stallPosts.length, 1);
+  assert.match(stallPosts[0].body, /questionId/);
+});
+
 test('BoardStallWatchdog stays silent while a coordinator question is unread', async (t) => {
   const scenario = await createStallQuestionScenario(t);
   const { service, store, worker, asked } = scenario;

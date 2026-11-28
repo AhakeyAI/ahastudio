@@ -10044,11 +10044,15 @@ export class OrchestrationService {
   ): OrchestrationQuestionRecord[] {
     const pending = pendingQuestions ?? this.store.listQuestions({ runId, status: 'pending' });
     const runMailbox = `run:${runId}`;
-    return pending.filter(
-      (question) =>
-        question.toHandle === runMailbox &&
-        this.store.wasBoardPostRead(question.messageId, 'coordinator')
-    );
+    // Broad read_board calls advance the cursor without recording exact reads, so a post counts
+    // as seen when it was either read exactly or lies within the coordinator's broad-read cursor.
+    const coordinatorCursor = this.store.getMemberCursor(runId, 'coordinator');
+    return pending.filter((question) => {
+      if (question.toHandle !== runMailbox) return false;
+      if (this.store.wasBoardPostRead(question.messageId, 'coordinator')) return true;
+      const boardSeq = this.store.getMessageById(question.messageId)?.boardSeq;
+      return typeof boardSeq === 'number' && boardSeq <= coordinatorCursor.lastReadSeq;
+    });
   }
 
   private inspectRunsForStallWatchdog(): BoardStallRunState[] {
