@@ -265,6 +265,7 @@ export type OrchestrationErrorCode =
   | 'duplicate_run'
   | 'task_not_found'
   | 'duplicate_task'
+  | 'request_mismatch'
   | 'task_not_ready'
   | 'task_cycle'
   | 'cyclic_dependency'
