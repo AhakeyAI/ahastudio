@@ -1,10 +1,11 @@
 import type { AgentStatusStore } from '../agent/agent-status-store.js';
+import type { AgentGoalStatus } from './agent-session-driver.js';
 import { HEADLESS_WORKER_ID } from './headless-workers.js';
 import type { WorkerNativeQuestionManager } from './worker-native-questions.js';
 import type { MailboxPointerDelivery } from './mailbox-pointer-delivery.js';
 import type { MessageWake, RuntimeMessageWaiters } from './mailbox-waiters.js';
 import { ACTIVE_DISPATCH_STATUSES } from './orchestration-lifecycle-graph.js';
-import { exposeMessage, exposeMessages } from './orchestration-messaging.js';
+import { completionReportDispatchId, exposeMessage, exposeMessages } from './orchestration-messaging.js';
 import type { OrchestrationStore } from './orchestration-store.js';
 import {
   ORCHESTRATION_MESSAGE_WAIT_DEFAULT_TIMEOUT_MS,
@@ -22,6 +23,7 @@ import {
 import {
   DEFAULT_PEER_PING_PONG_LIMIT,
   PeerPingPongTracker,
+  RunWakeBudget,
   formatBoardPostForAgent,
   boardLookupCommands,
   formatBoardTeamSummary,
@@ -60,6 +62,8 @@ export interface OrchestrationBoardHost {
   readonly emitChanged: (reason: string, runId?: string) => void;
   readonly followUpSettledWorker: (settledDispatch: OrchestrationDispatchRecord, input: SettledWorkerFollowUpInput) => Promise<OrchestrationSendResult>;
   readonly getPeerMessagingModeDep: (() => OrchestrationPeerMessagingMode) | undefined;
+  readonly getWorkerGoalLimit: (workerId: string) => AgentGoalStatus | undefined;
+  readonly isPaneAlive: (paneId: string) => boolean;
   readonly getReviewFirewallContext: (callerHandle?: string | null) => ReviewFirewallContext | null;
   readonly inferRunIdOptional: (from?: string) => string | undefined;
   readonly isPostHiddenByReviewFirewall: (post: OrchestrationMessageRecord, firewall: ReviewFirewallContext) => boolean;
@@ -75,10 +79,26 @@ export interface OrchestrationBoardHost {
   readonly waiters: RuntimeMessageWaiters;
 }
 
+const STALL_BOARD_SCAN_LIMIT = 500; // Store's maximum listBoardPosts window.
+const isSystemStall = (post: OrchestrationMessageRecord) => post.kind === 'stall' && post.fromHandle === 'system';
+const isDispatchBrief = (post: OrchestrationMessageRecord) => post.kind === 'brief' && post.type === 'dispatch';
+const boardSeqOf = (post?: Pick<OrchestrationMessageRecord, 'boardSeq'>) => post?.boardSeq ?? 0;
+const seqLabel = (post: OrchestrationMessageRecord) => `#${boardSeqOf(post) || '?'}`;
+
+function findLast<T>(entries: readonly T[], matches: (entry: T) => unknown): T | undefined {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry !== undefined && matches(entry)) return entry;
+  }
+  return undefined;
+}
+
 /** Board posts, cursors, exact reads, board_wait, mid-turn injection and stall detection. */
 export class OrchestrationBoardService {
-  constructor(private readonly host: OrchestrationBoardHost) {}
+  private readonly stallWakeBudget = new RunWakeBudget();
+  private readonly rePingedMentionByRun = new Map<string, Map<string, number>>();
 
+  constructor(private readonly host: OrchestrationBoardHost) {}
 
   resolveBoardMemberForPane(
     ptyId: string
@@ -148,6 +168,8 @@ export class OrchestrationBoardService {
     if (activeDispatchId && msg.fromHandle === `dispatch:${activeDispatchId}`) return false;
 
     const mentions = msg.mentions ?? [];
+    // Targeted watchdog retries are not generic coordinator escalations.
+    if (isSystemStall(msg)) return mentions.includes(normMember);
     if (mentions.includes(normMember)) {
       return true;
     }
@@ -585,11 +607,9 @@ export class OrchestrationBoardService {
         woke.add('coordinator');
       }
 
-      const toHandle = woke.has('all')
-        ? '@all'
-        : singleActiveWorkerDispatch
-          ? `dispatch:${singleActiveWorkerDispatch.id}`
-          : `run:${runId}`;
+      let toHandle = `run:${runId}`;
+      if (woke.has('all')) toHandle = '@all';
+      else if (singleActiveWorkerDispatch) toHandle = `dispatch:${singleActiveWorkerDispatch.id}`;
 
       const msg = this.host.store.insertMessage({
         runId,
@@ -879,11 +899,11 @@ export class OrchestrationBoardService {
             lastDeliveredSeq: maxSeq,
           });
         }
-        this.host.store.recordBoardReceipt(posts.map(p => p.id), caller.memberKey, 'delivered');
-        this.host.store.markAsReadAndDeliveredForConsumer(
-          posts.map((p) => p.id),
-          caller.fromHandle
-        );
+        const ids = posts.map(post => post.id);
+        // A targeted wait returns full posts but does not advance the broad-read cursor.
+        if (mentionsOnly) this.host.store.recordBoardRead(runId, caller.memberKey, ids);
+        this.host.store.recordBoardReceipt(ids, caller.memberKey, 'delivered');
+        this.host.store.markAsReadAndDeliveredForConsumer(ids, caller.fromHandle);
         this.host.emitChanged('board:read', runId);
       }
       const nextCursor = this.host.store.getMemberCursor(runId, caller.memberKey);
@@ -990,37 +1010,44 @@ export class OrchestrationBoardService {
     return `${full.slice(0, budget).trimEnd()}${suffix}`;
   }
 
+  private isSeenByCoordinator(post: Pick<OrchestrationMessageRecord, 'id' | 'runId' | 'boardSeq'>): boolean {
+    return this.host.store.wasBoardPostRead(post.id, 'coordinator') ||
+      (post.boardSeq !== undefined && post.boardSeq <= this.host.store.getMemberCursor(post.runId, 'coordinator').lastReadSeq);
+  }
+
   private listCoordinatorReadUnansweredQuestions(
     runId: string,
     pendingQuestions?: readonly OrchestrationQuestionRecord[]
   ): OrchestrationQuestionRecord[] {
     const pending = pendingQuestions ?? this.host.store.listQuestions({ runId, status: 'pending' });
     const runMailbox = `run:${runId}`;
-    // Broad read_board calls advance the cursor without recording exact reads, so a post counts
-    // as seen when it was either read exactly or lies within the coordinator's broad-read cursor.
-    const coordinatorCursor = this.host.store.getMemberCursor(runId, 'coordinator');
-    return pending.filter((question) => {
-      if (question.toHandle !== runMailbox) return false;
-      if (this.host.store.wasBoardPostRead(question.messageId, 'coordinator')) return true;
-      const boardSeq = this.host.store.getMessageById(question.messageId)?.boardSeq;
-      return typeof boardSeq === 'number' && boardSeq <= coordinatorCursor.lastReadSeq;
-    });
+    return pending.filter((question) => question.toHandle === runMailbox && this.isSeenByCoordinator({
+      id: question.messageId,
+      runId,
+      boardSeq: this.host.store.getMessageById(question.messageId)?.boardSeq,
+    }));
   }
 
   inspectRunsForStallWatchdog(): BoardStallRunState[] {
     const states: BoardStallRunState[] = [];
-    for (const run of this.host.store.listRuns({ status: 'active' })) {
+    const activeRuns = this.host.store.listRuns({ status: 'active' });
+    const runIds = new Set(activeRuns.map(run => run.id));
+    this.stallWakeBudget.retainRuns(runIds);
+    for (const runId of this.rePingedMentionByRun.keys()) {
+      if (!runIds.has(runId)) this.rePingedMentionByRun.delete(runId);
+    }
+    for (const run of activeRuns) {
       const dispatches = this.host.store.listDispatches({ runId: run.id });
       const headDispatches = new Map<string, OrchestrationDispatchRecord>();
       for (const d of dispatches) {
         const head = this.host.store.resolveDispatchLineage(d.id) ?? d;
         headDispatches.set(head.id, head);
       }
-      const heads = [...headDispatches.values()];
+      const liveStages = new Map(dispatches.map(d => [d.id, this.host.deriveLiveStage(d)]));
       let hasActiveWorkers = false;
       let hasSettledOrWaitingWorkers = false;
-      for (const d of heads) {
-        const stage = this.host.deriveLiveStage(d);
+      for (const d of headDispatches.values()) {
+        const stage = liveStages.get(d.id);
         if (ACTIVE_DISPATCH_STATUSES.has(d.status) && (stage === 'starting' || stage === 'working')) {
           hasActiveWorkers = true;
         } else {
@@ -1043,28 +1070,40 @@ export class OrchestrationBoardService {
         this.host.proposals.listPendingProposals({ runId: run.id }).length > 0;
 
       const coordPaneId = run.coordinatorPaneId;
-      const coordStatus = coordPaneId ? this.host.agentStatusStore.get(coordPaneId) : null;
-      const coordSession = coordPaneId ? this.host.sessionCoordinator(coordPaneId) : null;
+      const coordHandle = coordPaneId ?? run.coordinatorHandle;
+      const coordStatus = this.host.agentStatusStore.get(coordHandle);
+      const coordSession = this.host.sessionCoordinator(coordHandle);
       const coordinatorIdle = coordSession?.active
         ? coordSession.idle === true
         : !coordStatus || coordStatus.state === 'idle' || coordStatus.state === 'done';
       const coordinatorHasWaiter = Boolean(
-        (coordPaneId &&
-          (this.host.waiters.hasActiveWaiterFor(coordPaneId) ||
-            this.host.waiters.hasActiveWaiterFor(`board-pane:${coordPaneId}`))) ||
+        this.host.waiters.hasActiveWaiterFor(coordHandle) ||
+          this.host.waiters.hasActiveWaiterFor(`board-pane:${coordHandle}`) ||
           this.host.waiters.hasActiveWaiterFor(`run:${run.id}`) ||
           this.host.waiters.hasActiveWaiterFor(`board:${run.id}:role:coordinator`)
       );
 
-      const latestPosts = this.host.store.listBoardPosts(run.id, { limit: 1 });
-      const lastPost = latestPosts[latestPosts.length - 1];
+      const posts = this.host.store.listBoardPosts(run.id, { limit: STALL_BOARD_SCAN_LIMIT });
+      const lastPost = posts.at(-1);
+      const workerForPost = this.workerPostResolver(dispatches);
+      // Dispatch briefs are generated on the coordinator's behalf and quote the [done] protocol.
+      const lastCoordinatorPost = findLast(posts, post => post.fromRole === 'coordinator' && !isDispatchBrief(post) && !workerForPost(post));
+      const lastWorkerPost = findLast(posts, workerForPost);
+      const lastInput = findLast(posts, post => post.fromHandle === 'user' || workerForPost(post));
       const headSeq = this.host.store.getHeadBoardSeq(run.id);
       const lastPostAtMs = lastPost ? Date.parse(lastPost.createdAt) : Date.parse(run.updatedAt);
-      const lastPostIsDone = Boolean(
-        lastPost &&
-          (/\[\s*done\s*\]/i.test(lastPost.body) ||
-            lastPost.kind === 'stall')
-      );
+      const lastPostIsDone = lastPost?.kind === 'stall' || Boolean(lastCoordinatorPost &&
+        /\[\s*done\s*\]/i.test(lastCoordinatorPost.body) &&
+        (!lastWorkerPost || boardSeqOf(lastWorkerPost) < boardSeqOf(lastCoordinatorPost)));
+
+      const byId = (a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id);
+      const fingerprint = JSON.stringify([
+        [run.runReviewStatus, run.runReviewBatchId, run.integrationStatus, run.integrationHeadCommit, run.finalizedCommit],
+        dispatches.sort(byId).map(d => [d.id, d.status, liveStages.get(d.id), d.reviewStatus, d.reviewBatchId,
+          d.integrationStatus, d.integratedCommit]),
+        this.host.store.listTasks({ runId: run.id }).sort(byId).map(task => [task.id, task.status]),
+      ]);
+      const hasWakeBudget = this.stallWakeBudget.observeProgress(run.id, fingerprint, lastInput && boardSeqOf(lastInput));
 
       states.push({
         runId: run.id,
@@ -1077,9 +1116,83 @@ export class OrchestrationBoardService {
         headSeq,
         lastPostAtMs: Number.isFinite(lastPostAtMs) ? lastPostAtMs : this.host.clock(),
         lastPostIsDone,
+        hasWakeBudget,
       });
     }
     return states;
+  }
+
+  private workerPostResolver(dispatches: readonly OrchestrationDispatchRecord[]) {
+    const byId = new Map(dispatches.map(d => [d.id, d]));
+    const byHandle = new Map<string, OrchestrationDispatchRecord[]>();
+    for (const d of dispatches) {
+      for (const handle of new Set([d.assigneeHandle, d.assigneePaneId ?? d.assigneeHandle])) {
+        const matches = byHandle.get(handle) ?? [];
+        matches.push(d);
+        byHandle.set(handle, matches);
+      }
+    }
+    return (post: OrchestrationMessageRecord): OrchestrationDispatchRecord | undefined => {
+      if (post.fromHandle === 'system' || post.fromHandle === 'user' || isDispatchBrief(post)) return undefined;
+      const id = completionReportDispatchId(this.host.store, post);
+      // Runtime status notices and turn-stop escalations are not Worker-authored posts.
+      if (id) {
+        if (post.kind === 'stall' && post.type === 'escalation') return undefined;
+        return post.fromRole || post.type === 'worker_done' || post.kind === 'report' ? byId.get(id) : undefined;
+      }
+      if (post.fromRole === 'coordinator') return undefined;
+      return findLast(byHandle.get(post.fromHandle) ?? [], d => d.createdAt <= post.createdAt);
+    };
+  }
+
+  private isReportHandled(
+    report: OrchestrationMessageRecord,
+    worker: OrchestrationDispatchRecord,
+    dispatches: readonly OrchestrationDispatchRecord[],
+    posts: readonly OrchestrationMessageRecord[],
+    coordinatorPosts: readonly OrchestrationMessageRecord[],
+  ): boolean {
+    const reportSeq = boardSeqOf(report);
+    if (report.receipts?.coordinator === 'replied' || coordinatorPosts.some(post =>
+      boardSeqOf(post) > reportSeq && (post.refs?.includes(reportSeq) || post.threadId === report.id))) {
+      return true;
+    }
+    // The report's own settlement (including a reviewer's verdict) is not subsequent progress.
+    const after = report.type === 'worker_done' && worker.completedAt && worker.completedAt > report.createdAt
+      ? worker.completedAt : report.createdAt;
+    const laterDispatch = dispatches.some(d => {
+      if (d.id === worker.id) return false;
+      const followsReport = d.followUpOfDispatchId === worker.id;
+      if (d.taskId !== worker.taskId && !followsReport && d.reviewOfDispatchId !== worker.id) return false;
+      if (d.createdAt > after) return true;
+      // Board ordering breaks ties when the new dispatch and the report share a timestamp.
+      if (d.createdAt < after) return false;
+      const followUp = d.followUpMessageId && this.host.store.getMessageById(d.followUpMessageId);
+      return Boolean(followsReport && followUp && boardSeqOf(followUp) > reportSeq) ||
+        posts.some(post => boardSeqOf(post) > reportSeq && isDispatchBrief(post) && post.toHandle === `dispatch:${d.id}`);
+    });
+    if (laterDispatch || (worker.releasedAt && worker.releasedAt > after)) return true;
+    if (worker.integrationStatus === 'merged') {
+      const role = this.host.resolveRoleNameForDispatch(worker).toLowerCase() || worker.id;
+      const audit = findLast(coordinatorPosts, post => post.kind === 'update' && post.artifacts && post.mentions?.includes(role) &&
+        (post.subject.toLowerCase() === `integrated @${role}` || post.subject.toLowerCase().startsWith(`integrated @${role} -> `)));
+      if (audit ? boardSeqOf(audit) > reportSeq : report.type === 'worker_done' && worker.updatedAt > after) return true;
+    }
+    const task = this.host.store.getTask(worker.taskId);
+    return Boolean(task && task.updatedAt > after && (task.status === 'completed' || task.status === 'failed'));
+  }
+
+  private workerStallProblem(dispatch: OrchestrationDispatchRecord): string | undefined {
+    const paneId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
+    const limit = this.host.getWorkerGoalLimit(paneId);
+    if (limit) return `limited (${limit})`;
+    if (dispatch.status === 'failed' || dispatch.status === 'circuit_broken' || dispatch.stage === 'failed' ||
+        dispatch.codexTurn?.error || dispatch.codexTurn?.stopReason === 'failed' ||
+        this.host.agentStatusStore.get(paneId)?.state === 'error') return 'failed';
+    if (dispatch.stage === 'needs_reconciliation') return 'delivery needs reconciliation';
+    if (!this.host.isPaneAlive(paneId)) return 'process exited or unavailable';
+    if (!ACTIVE_DISPATCH_STATUSES.has(dispatch.status) || dispatch.releasedAt) return 'no active assignment';
+    return undefined;
   }
 
   handleBoardStallDetected(runId: string, headSeq: number, idleMs: number): void {
@@ -1094,23 +1207,99 @@ export class OrchestrationBoardService {
         return `${seqLabel} (questionId ${question.messageId})`;
       })
       .join(', ');
-    const body = readUnansweredQuestions.length > 0
-      ? `@coordinator You already read ${readUnansweredQuestions.length} unanswered question(s): ${readUnansweredSummary}. Answer each with message_worker using its questionId. No active workers and board quiet for ${secs}s since #${headSeq} — review reports, follow up, or wrap up the run.`
-      : `@coordinator No active workers and board has been quiet for ${secs}s since #${headSeq}. Review reports, follow up, or wrap up the run.`;
+    const posts = this.host.store.listBoardPosts(runId, { limit: STALL_BOARD_SCAN_LIMIT });
+    const dispatches = this.host.store.listDispatches({ runId });
+    const workerForPost = this.workerPostResolver(dispatches);
+    const coordinatorPosts = posts.filter(post => post.fromRole === 'coordinator' && !workerForPost(post));
+    const coordinatorPostIds = new Set(coordinatorPosts.map(post => post.id));
+    const diagnostics: string[] = [];
+    const refs = new Set<number>();
+    const addCoordinatorDiagnostic = (text: string, posts: readonly OrchestrationMessageRecord[]) => {
+      diagnostics.push(text);
+      for (const post of posts) refs.add(boardSeqOf(post));
+    };
+    const reports = posts.filter(post => {
+      if (post.kind !== 'report' && post.type !== 'worker_done') return false;
+      const worker = workerForPost(post);
+      return worker && !this.isReportHandled(post, worker, dispatches, posts, coordinatorPosts);
+    });
+    if (reports.length) {
+      addCoordinatorDiagnostic(`@coordinator Unhandled Worker reports: ${reports.map(seqLabel).join(', ')}. Review or follow up.`, reports);
+    }
+    const unread = posts.filter(post => !coordinatorPostIds.has(post.id) && !isSystemStall(post) &&
+      (post.mentions?.includes('coordinator') || post.toHandle === `run:${runId}`) && !this.isSeenByCoordinator(post));
+    if (unread.length) {
+      addCoordinatorDiagnostic(`@coordinator Unread board posts: ${unread.map(seqLabel).join(', ')}. Read the referenced posts.`, unread);
+    }
+    if (readUnansweredQuestions.length) {
+      diagnostics.push(`@coordinator You already read ${readUnansweredQuestions.length} unanswered question(s): ${readUnansweredSummary}. Answer each with message_worker using its questionId. No active workers and board quiet for ${secs}s since #${headSeq} — review reports, follow up, or wrap up the run.`);
+    }
+
+    const roles = new Set(dispatches.map(d => this.host.resolveRoleNameForDispatch(d).toLowerCase() || d.id));
+    const rePinged = this.rePingedMentionByRun.get(runId) ?? new Map<string, number>();
+    let retry: { role: string; mention: OrchestrationMessageRecord; worker: OrchestrationDispatchRecord } | undefined;
+    for (const role of roles) {
+      const worker = this.findRunWorkerByRole(runId, role);
+      if (!worker || worker.releasedAt || ['coordinator', 'all', 'user', 'system'].includes(role)) continue;
+      const paneId = worker.assigneePaneId ?? worker.assigneeHandle;
+      const firewall = this.host.getReviewFirewallContext(paneId);
+      const mention = findLast(posts, post => !isSystemStall(post) && !isDispatchBrief(post) &&
+        post.fromRole !== role && post.mentions?.includes(role) &&
+        !(firewall && this.host.isPostHiddenByReviewFirewall(post, firewall)));
+      if (!mention || boardSeqOf(mention) <= this.host.store.getMemberCursor(runId, role).lastPostSeq) continue;
+      const problem = this.workerStallProblem(worker);
+      if (problem || (rePinged.get(role) ?? 0) >= boardSeqOf(mention)) {
+        const action = problem ? 'Consider switching CLIs or handling it manually.' : 'Follow up or handle it manually.';
+        addCoordinatorDiagnostic(`@coordinator Unanswered mention for @${role} at ${seqLabel(mention)}: ${problem ?? 'no reply after one re-ping'}. ${action}`, [mention]);
+      } else {
+        retry ??= { role, mention, worker };
+      }
+    }
+
+    let subject = `Board stall detected at #${headSeq}`;
+    let target = 'coordinator';
+    let to = `run:${runId}`;
+    // Keep the reminder single-audience. Coordinator findings take precedence over a retry.
+    if (!diagnostics.length && retry) {
+      const { role, mention, worker } = retry;
+      target = role;
+      to = `dispatch:${worker.id}`;
+      refs.add(boardSeqOf(mention));
+      diagnostics.push(`@${role} Unanswered mention at ${seqLabel(mention)}. Please respond on the board.`);
+      rePinged.set(role, boardSeqOf(mention));
+      this.rePingedMentionByRun.set(runId, rePinged);
+    } else if (!diagnostics.length) {
+      const lastPosts = ['coordinator', ...roles].flatMap(role => {
+        const latest = findLast(posts, post => {
+          if (isSystemStall(post)) return false;
+          const worker = workerForPost(post);
+          if (worker) return (this.host.resolveRoleNameForDispatch(worker).toLowerCase() || worker.id) === role;
+          return role === 'coordinator' && (coordinatorPostIds.has(post.id) || post.fromHandle === run.coordinatorHandle);
+        });
+        const seq = Math.max(boardSeqOf(latest), this.host.store.getMemberCursor(runId, role).lastPostSeq);
+        if (!seq) return [];
+        refs.add(seq);
+        return [`@${role} #${seq}`];
+      });
+      if (lastPosts.length) subject += ` — last posts: ${lastPosts.join(', ')}`;
+      diagnostics.push(`@coordinator No active workers and board has been quiet for ${secs}s since #${headSeq}. Review reports, follow up, or wrap up the run.`);
+    }
+    if (headSeq > 0 && refs.size === 0) refs.add(headSeq);
     const msg = this.host.store.insertMessage({
       runId,
       from: 'system',
-      to: `run:${runId}`,
+      to,
       type: 'escalation',
       priority: 'normal',
-      subject: `Board stall detected at #${headSeq}`,
-      body,
+      subject,
+      body: diagnostics.join('\n'),
       fromRole: 'system',
-      mentions: ['coordinator'],
-      refs: headSeq > 0 ? [headSeq] : undefined,
+      mentions: [target],
+      refs: [...refs],
       kind: 'stall',
     });
-    this.notifyBoardPost(runId, msg, ['coordinator']);
+    this.stallWakeBudget.recordWake(runId);
+    this.notifyBoardPost(runId, msg, [target]);
     this.host.emitChanged('board:stalled', runId);
   }
 }

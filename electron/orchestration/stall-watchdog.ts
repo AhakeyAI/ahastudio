@@ -12,6 +12,7 @@ export interface BoardStallRunState {
   headSeq: number;
   lastPostAtMs: number;
   lastPostIsDone: boolean;
+  hasWakeBudget?: boolean;
 }
 
 export interface BoardStallWatchdogOptions {
@@ -87,6 +88,7 @@ export class BoardStallWatchdog {
         run.coordinatorIdle &&
         !run.coordinatorHasWaiter &&
         !run.lastPostIsDone &&
+        run.hasWakeBudget !== false &&
         idleMs >= this.stallThresholdMs;
 
       if (!isStalled) continue;

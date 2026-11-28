@@ -611,6 +611,8 @@ export class OrchestrationService {
       deriveLiveStage: (...args) => this.workers.deriveLiveStage(...args),
       emitChanged: (...args) => this.emitChanged(...args),
       followUpSettledWorker: (...args) => this.workers.followUpSettledWorker(...args),
+      getWorkerGoalLimit: (...args) => this.workers.getWorkerGoalLimit(...args),
+      isPaneAlive: (...args) => this.isPaneAlive(...args),
       get getPeerMessagingModeDep() { return svc.getPeerMessagingModeDep; },
       getReviewFirewallContext: (...args) => this.review.getReviewFirewallContext(...args),
       inferRunIdOptional: (...args) => this.inferRunIdOptional(...args),

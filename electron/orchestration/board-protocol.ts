@@ -142,6 +142,33 @@ export class PeerPingPongTracker {
   }
 }
 
+const MAX_STALL_WAKES_PER_RUN = 3;
+
+export class RunWakeBudget {
+  private readonly runs = new Map<string, { fingerprint: string; inputSeq: number; wakes: number }>();
+
+  observeProgress(runId: string, fingerprint: string, inputSeq = 0): boolean {
+    let budget = this.runs.get(runId);
+    // Retention can drop old input posts; only a new high-water mark is progress.
+    if (!budget || budget.fingerprint !== fingerprint || inputSeq > budget.inputSeq) {
+      budget = { fingerprint, inputSeq: Math.max(inputSeq, budget?.inputSeq ?? 0), wakes: 0 };
+      this.runs.set(runId, budget);
+    }
+    return budget.wakes < MAX_STALL_WAKES_PER_RUN;
+  }
+
+  recordWake(runId: string): void {
+    const budget = this.runs.get(runId);
+    if (budget) budget.wakes += 1;
+  }
+
+  retainRuns(runIds: ReadonlySet<string>): void {
+    for (const runId of this.runs.keys()) {
+      if (!runIds.has(runId)) this.runs.delete(runId);
+    }
+  }
+}
+
 export async function collectWorkerReportArtifacts(
   worktreePath?: string | null,
   branch?: string | null,
