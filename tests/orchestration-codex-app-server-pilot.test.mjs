@@ -262,6 +262,11 @@ test('an idle settled Worker goes dormant and a follow-up resumes its conversati
   assert.equal(claim.status, 'active');
   assert.equal(typeof claim.pid, 'number');
   await until(() => app.store.getDispatchContext(second.id)?.codexTurn);
+  const kinds = app.service.listObservationFacts({ workerId: id }).map((fact) => fact.kind);
+  assert.deepEqual(kinds, ['turn_started', 'turn_completed', 'dormant', 'resumed', 'turn_started', 'turn_completed']);
+  const resumedFact = app.store.listObservationFacts({ workerId: id }).find((fact) => fact.kind === 'resumed');
+  assert.equal(resumedFact.data.providerSessionId, first.dispatch.providerSessionId);
+  assert.equal(resumedFact.data.claimId, claim.id);
 
   assert.match(app.service.workers.dormantResumeRefusal({ ...first.dispatch, reviewOfDispatchId: 'd' }), /one-shot/);
   assert.match(app.service.workers.dormantResumeRefusal({ ...first.dispatch, providerCwd: join(cwd, 'missing-dir') }), /no longer exists/);

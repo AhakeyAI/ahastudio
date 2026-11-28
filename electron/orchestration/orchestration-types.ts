@@ -683,6 +683,24 @@ export interface OrchestrationWorkerHandoff {
   updatedAt: string;
 }
 
+export type OrchestrationObservationFactKind =
+  | 'turn_started' | 'turn_completed' | 'approval' | 'native_question' | 'snapshot'
+  | 'dormant' | 'resumed' | 'handoff' | 'integrated' | 'wave_started';
+
+/**
+ * Append-only record of something that happened to a Worker attempt, for audit and recovery.
+ * Facts are never edited; `data` holds small, already-redacted values only.
+ */
+export interface OrchestrationObservationFact {
+  seq: number;
+  runId: string;
+  dispatchId: string | null;
+  workerId: string | null;
+  kind: OrchestrationObservationFactKind;
+  at: string;
+  data: Record<string, string | number | boolean | null>;
+}
+
 export interface OrchestrationPersistedState {
   version: 1;
   nextSequence: number;
@@ -705,6 +723,8 @@ export interface OrchestrationPersistedState {
   memberCursorsByRun?: Record<string, Record<string, OrchestrationMemberCursor>>;
   resumeClaims?: OrchestrationResumeClaim[];
   workerHandoffs?: OrchestrationWorkerHandoff[];
+  observationFacts?: OrchestrationObservationFact[];
+  nextObservationFactSeq?: number;
 }
 
 export interface OrchestrationSnapshot {

@@ -227,6 +227,7 @@ flowchart LR
 #### PR 3C：CLI / 远程 `requestId` 幂等与观测事实补齐（未来远程控制前置护栏；拆 3C-a / 3C-b）
 - **拆分（已决策）**：3C-a（写入口 `requestId` 幂等）不依赖 3B，与 3A / 3B-1 并行先做；3C-b（`AttemptObservationFact` 事实补齐，含 dormant/resume、handoff）依赖 3B 的事件，排在 3B-2 之后。
 - **3C-a — 已完成**：`request-idempotency.ts` 的 `RequestReceipts` 按 `(action, callerPaneId, requestId)` 记账，`worker-start / worker-integrate / run-finalize / worker-release / approve / deny` 带 `requestId` 时只执行一次：重试（含并发重复）返回首个成功结果并带 `replayed: true`，同 ID 异载荷返回 409 `request_mismatch`，失败结果不入账（重试会重新执行）。收据仅在内存保留（24h / 500 条），应用重启后不重放。CLI 对上述动作自动生成 `requestId`，断线时提示 `--retry-request <id>`。
+- **3C-b — 已完成**：新增只增不改的 `OrchestrationObservationFact` 日志（持久化，单 Run 保留最新 400 条、总计 4000 条，字符串值脱敏并截断），覆盖 `turn_started / turn_completed / approval / native_question / snapshot`（评审快照）/ `dormant / resumed / handoff`（每次状态变化）/ `integrated / wave_started`；`seq` 跨重启单调递增。读取走只读 HTTP `facts`（按调用方 Run 鉴权，支持 `afterSeq` 游标增量拉取，供未来远程端续读）。
 - **定位说明**：单机模式下主要服务 CLI/HTTP 断线重试与防连点，但**面向未来的远程控制（手机/弱网重连、重复点击审批/派发/合入）属于必经防双写护栏**，在 3B-2 之后独立收口。
 - **内容**：
   1. 在已有 `startObservation` 与 `IntegrationIntent / finalizedBatches` 基础上，补齐只增不改的 `AttemptObservationFact` 关键事件覆盖（turn、approval、native question、snapshot、dormant/resume、handoff、integration）。

@@ -332,6 +332,14 @@ const workerIntegrateSchema = z.object({
   keepResident: z.boolean().optional(),
 });
 
+const factsSchema = z.object({
+  runId: z.string().trim().min(1).optional(),
+  dispatchId: z.string().trim().min(1).optional(),
+  workerId: z.string().trim().min(1).optional(),
+  afterSeq: z.number().int().nonnegative().optional(),
+  limit: z.number().int().positive().max(1_000).optional(),
+});
+
 const runDiffSchema = z.object({
   runId: z.string().trim().min(1).optional(),
   files: z.array(z.string().trim().min(1).max(400)).max(30).optional(),
@@ -512,6 +520,7 @@ const CODEX_WORKER_ACTIONS = new Set([
 // run binding stay closed so every new Worker passes through delegate-task and its user-confirmation gate.
 const AGENT_SESSION_COORDINATOR_ACTIONS = new Set([
   'mcp-context',
+  'facts',
   'agents',
   'delegate-task',
   'role-message',
@@ -537,6 +546,7 @@ const AGENT_SESSION_COORDINATOR_ACTIONS = new Set([
 ]);
 
 const READ_ONLY_ORCHESTRATION_ACTIONS = new Set([
+  'facts',
   'run-current',
   'run-list',
   'run-show',
@@ -837,6 +847,9 @@ async function runOrchestrationHttpAction(
       }
       case 'worker-show':
         result = service.workerShow(workerTargetSchema.parse(payload), httpCallerPane());
+        break;
+      case 'facts':
+        result = service.listObservationFacts(factsSchema.parse(payload), httpCallerPane());
         break;
       case 'worker-read':
         result = service.workerRead(workerReadSchema.parse(payload), httpCallerPane());

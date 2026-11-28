@@ -309,6 +309,10 @@ export class OrchestrationWorkerLifecycleService {
       });
       if (!opened) throw new OrchestrationError('dispatch_inactive', `${label} could not reopen the Worker's conversation.`);
       this.host.store.activateResumeClaim(claim.id, opened.session.pid ?? null);
+      this.host.store.appendObservationFact({
+        runId: dispatch.runId, dispatchId: dispatch.id, workerId: dispatch.assigneeHandle, kind: 'resumed',
+        data: { providerSessionId: opened.sessionId, cwd, pid: opened.session.pid ?? null, claimId: claim.id },
+      });
       this.host.emitChanged('worker:resumed', dispatch.runId);
       return opened.session;
     } catch (error) {
@@ -777,6 +781,12 @@ export class OrchestrationWorkerLifecycleService {
         );
       }
 
+      if (reviewSnapshotOid) {
+        this.host.store.appendObservationFact({
+          runId: target.runId, dispatchId: target.id, workerId: target.assigneeHandle, kind: 'snapshot',
+          data: { purpose: 'review', snapshotOid: reviewSnapshotOid },
+        });
+      }
       const effectiveReviewBase = await this.host.integration.resolveEffectiveWorkerDiffBase(
         run,
         target,
@@ -1550,6 +1560,12 @@ export class OrchestrationWorkerLifecycleService {
             promptSent: true, refreshHeartbeat: true,
           });
           if (updated && !waiting && !asking) this.host.store.updateDispatchStage(dispatchId, 'working');
+          if (updated) {
+            this.host.store.appendObservationFact({
+              runId: updated.runId, dispatchId, workerId: id, kind: 'turn_started',
+              data: { providerSessionId: session?.sessionId ?? null, waitingForPermission: waiting },
+            });
+          }
           if (updated) this.host.emitChanged('worker:turn-started', updated.runId);
         },
         onTurnCompleted: (dispatchId, result) => {
@@ -1560,6 +1576,10 @@ export class OrchestrationWorkerLifecycleService {
           const dispatch = this.host.store.getDispatchContext(dispatchId);
           if (!dispatch || dispatch.assigneeHandle !== id) return { decision: 'decline' };
           if (request.kind === 'question') {
+            this.host.store.appendObservationFact({
+              runId: dispatch.runId, dispatchId, workerId: id, kind: 'native_question',
+              data: { status: 'requested', method: request.method, questions: request.questions?.length ?? 0 },
+            });
             return this.host.nativeQuestions.holdQuestion(dispatch, {
               provider: headlessWorkerDriver(id) ?? dispatch.cliId ?? 'codex',
               method: request.method,
@@ -1592,6 +1612,12 @@ export class OrchestrationWorkerLifecycleService {
           const announced = Boolean(dispatchId && !this.codexSubmitting.has(dispatchId) &&
             this.handleCodexExit(dispatchId, reason, exitCode));
           const exited = !announced && dispatchId ? this.host.store.getDispatchContext(dispatchId) : undefined;
+          if (exited && wentDormant) {
+            this.host.store.appendObservationFact({
+              runId: exited.runId, dispatchId: exited.id, workerId: id, kind: 'dormant',
+              data: { providerSessionId: exited.providerSessionId ?? null, cwd: exited.providerCwd ?? exited.worktreePath ?? null },
+            });
+          }
           if (exited) this.host.emitChanged(wentDormant ? 'worker:dormant' : 'worker:exited', exited.runId);
         },
       });
@@ -1650,6 +1676,13 @@ export class OrchestrationWorkerLifecycleService {
       turnId: result.turnId, status, stopReason: result.stopReason, usage: result.usage, error: result.error,
     });
     this.host.store.recordCodexTurn(dispatchId, result);
+    const turnRunId = this.host.store.getDispatchContext(dispatchId)?.runId;
+    if (turnRunId) {
+      this.host.store.appendObservationFact({
+        runId: turnRunId, dispatchId, workerId, kind: 'turn_completed',
+        data: { turnId: result.turnId, stopReason: result.stopReason, error: result.error },
+      });
+    }
     this.host.archiveWorkerTimeline(workerId, dispatchId);
     const dispatch = this.host.store.getDispatchContext(dispatchId);
     if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
@@ -1871,6 +1904,16 @@ export class OrchestrationWorkerLifecycleService {
       try {
         const result = await this.startFollowUp(settledDispatch, input, next.replacement, next.wave);
         this.host.store.setDispatchResident(settledDispatch.id, null);
+        const started = result.followUp?.dispatch;
+        if (started) {
+          this.host.store.appendObservationFact({
+            runId: started.runId, dispatchId: started.id, workerId: started.assigneeHandle, kind: 'wave_started',
+            data: {
+              branch: next.wave.branch, baseCommit: next.wave.baseCommit, worktreePath: next.wave.worktreePath,
+              inPlace: !next.replacement, previousDispatchId: settledDispatch.id,
+            },
+          });
+        }
         return result;
       } catch (error) {
         if (next.replacement?.session.alive) await next.replacement.session.close(true);
