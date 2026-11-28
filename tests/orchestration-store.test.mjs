@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -508,6 +508,43 @@ test('hydrate settles active runs on restart and coordinatorStart can resume sto
     assert.ok(loadedAllDone?.endedAt);
     store2.close();
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('flushDurable surfaces and retries failed snapshot writes; runMutation is synchronous-only', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aha-durable-'));
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const blocker = join(dir, 'blocker');
+    writeFileSync(blocker, '');
+    let file = join(blocker, 'orchestration-state.json');
+    const store = new OrchestrationStore({ resolveFile: () => file });
+    const run = store.runMutation((tx) => {
+      const created = tx.createRun({ coordinatorHandle: 'coord', objective: 'durable' });
+      tx.createTask({ runId: created.id, spec: 'persist me' });
+      return created;
+    });
+    // Let the un-awaited async write fail on its own before anyone asks for durability.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.deepEqual(unhandled, []);
+    await assert.rejects(store.flushDurable());
+
+    file = join(dir, 'orchestration-state.json');
+    await store.flushDurable();
+    const persisted = JSON.parse(readFileSync(file, 'utf8'));
+    assert.ok(persisted.runs.some((r) => r.id === run.id));
+    assert.equal(persisted.tasks.filter((t) => t.runId === run.id).length, 1);
+
+    assert.throws(() => store.runMutation(async () => {}), /synchronous/);
+    let nested;
+    store.runMutation(() => { nested = store.flushDurable(); });
+    await assert.rejects(nested, /inside runMutation/);
+    store.close();
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
     rmSync(dir, { recursive: true, force: true });
   }
 });

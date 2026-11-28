@@ -102,7 +102,8 @@ flowchart LR
 
 > **核心原则**：Stage 2 **严格零行为变更**，禁止夹带新特性；验收以**职责边界清晰、无循环依赖、持久化确认契约明确**为准，不设死板行数指标。
 
-#### 2A：为 Store 定义统一变更边界与持久化确认契约，再按职责拆分
+#### 2A：为 Store 定义统一变更边界与持久化确认契约，再按职责拆分 — **已完成**
+- 落地：`orchestration-store.ts` 为 Facade；`orchestration-state-repository.ts`（共享状态、hydrate/export、写盘、`runMutation` / `flushDurable`）+ `orchestration-store-slice.ts`（共享上下文）+ lifecycle / mailbox / security 三个子 store；service 中 5 处 `waitForPendingWrite()` 改为 `flushDurable()`；`persist()` 不再泄漏 unhandled rejection。
 - **关键设计**：当前 `AtomicSnapshotWriter` 默认异步写盘（`cd1b3df` 已在关键边界使用 `store.waitForPendingWrite()`），单纯同步 `runTransaction()` 返回并不代表数据已落盘；且 JSONL 不提供 SQL `BEGIN` / `SAVEPOINT`。因此 2A 明确区分两层能力：
   ```ts
   interface OrchestrationUnitOfWork {
