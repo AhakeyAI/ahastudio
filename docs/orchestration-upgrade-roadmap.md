@@ -93,7 +93,7 @@ flowchart LR
 ### 前置修复：已读未答问题导致停摆永久静默（Stage 2 前合入）
 
 - **问题链**（代码核验确认）：PR #17 后问题只能经 `questionId` 显式回答且无过期机制；等待答复的 Worker 推导为 `waiting_input`（非 `working`）；`hasPendingAttention` 把**所有** pending 问答计入静默保护 → 若协调者**已读**问题却未用 `questionId` 回答（崩溃、误用 `post_message @role`、LLM 遗漏），Run 永久停摆且零提示。
-- **修复设计**：`inspectRunsForStallWatchdog` 中，`toHandle === 'run:<runId>'` 且 `wasBoardPostRead(q.messageId, 'coordinator')` 为真的已读未答问题**不再计入** `hasPendingAttention`；`handleBoardStallDetected` 在存在此类问题时于停摆帖中点名 `#seq` + `questionId` 并提示用 `message_worker` 回答。未读问题与子 Worker 提问（`toHandle = dispatch:<id>`）维持原静默保护。
+- **修复设计**：`inspectRunsForStallWatchdog` 中，`toHandle === 'run:<runId>'` 且协调者**已见过**的未答问题**不再计入** `hasPendingAttention`。"已见过"的判定为两者之一：`wasBoardPostRead(q.messageId, 'coordinator')`（精确已读），**或** `post.boardSeq <= coordinatorCursor.lastReadSeq`（宽泛 `read_board` 只推进游标、不记录精确已读，游标覆盖即算见过）。`handleBoardStallDetected` 在存在此类问题时于停摆帖中点名 `#seq` + `questionId` 并提示用 `message_worker` 回答。未读问题与子 Worker 提问（`toHandle = dispatch:<id>`）维持原静默保护。
 - **验收**：已读未答→超阈值发提醒（点名 questionId）；未读→保持静默；已回答→保持静默。
 
 ---
@@ -143,7 +143,7 @@ flowchart LR
   - **严格遵守红线 10**：所有 4 类停摆诊断**仅在 Run 内所有活跃 Worker 均非 `working`、无 `hasPendingAttention`（审批、原生提问、未读问答、Gate、提案）且协调者 idle 且无活跃 waiter 时才触发**。
   - **收紧 `lastPostIsDone`**：仅当发帖者是 `coordinator` 且包含 `[done]` 时才视为 Run 已收尾，防止 Worker 误写 `[done]` 静默监测；**必须保留 `kind === 'stall'` 条件**——否则 watchdog 会被自己发出的停摆帖再次触发，形成循环。
 - **"已读 / 已处理"判定（PR #17 后大幅简化，以精确已读为准）**：
-  - **首选精确已读**：`wasBoardPostRead(postId, 'coordinator')` 直接回答"协调者是否读过此帖"，不再依赖 `lastReadSeq` 比较——`read_board(seqs)` 不推进游标、且发帖/回复自 PR #17 起不再推进 `lastReadSeq`，游标比较已不可靠。
+  - **已读证据取两者的并集**：`wasBoardPostRead(postId, 'coordinator')`（精确已读）**或** `post.boardSeq <= coordinatorCursor.lastReadSeq`（宽泛读覆盖）。单独用任何一个都会漏：宽泛 `read_board` 只推进游标不记精确已读，而 `read_board(seqs)` 点读只记精确已读不推进游标。注意发帖/回复自 PR #17 起不再推进 `lastReadSeq`，`mentionsOnly` 等待推进的是 `lastMentionReadSeq`（其内联投递已记精确已读，无需再查该游标）。
   - **"读而未处理"仍需业务事实补判**：已读不等于已处理。报告帖满足以下任一即视为已处理：`post.receipts['coordinator'] === 'replied'`、协调者对其发过引用回复/认领帖、或对应任务/dispatch 已推进（开评审、已集成、已 follow-up、已重派或关闭）。
   - **"协调者未读停驻"诊断重写**：`mentionsOnly` 等待推进的是 `lastMentionReadSeq` 而非 `lastReadSeq`，**禁止**用 `headSeq > lastReadSeq` 判未读（会大量误报）；改为遍历发给协调者的帖子、用精确已读集合筛出未读项。
 - **状态优先 + 零浪费 4 类诊断**：
