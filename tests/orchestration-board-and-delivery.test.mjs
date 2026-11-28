@@ -812,11 +812,110 @@ test('workerDoneByPane attaches real git artifacts & BoardStallWatchdog posts on
   const stallPosts = posts.filter((p) => p.kind === 'stall');
   assert.equal(stallPosts.length, 1);
   assert.deepEqual(stallPosts[0].mentions, ['coordinator']);
+  assert.equal(
+    stallPosts[0].body,
+    `@coordinator No active workers and board has been quiet for 30s since #${events1[0].headSeq}. Review reports, follow up, or wrap up the run.`
+  );
 
   // Second sweep at same state does NOT emit a duplicate stall post.
   fakeNow += 30_000;
   assert.deepEqual(service.stallWatchdog.sweep(), []);
   assert.equal(store.listBoardPosts(builder.run.id).filter((p) => p.kind === 'stall').length, 1);
+});
+
+async function createStallQuestionScenario(t) {
+  let fakeNow = Date.parse('2026-01-01T00:00:00.000Z');
+  const { coordPaneId, service, store, agentStatusStore } = createHarness(t, {
+    now: () => fakeNow,
+    stallThresholdMs: 25_000,
+  });
+
+  const worker = await service.delegateTask({
+    from: coordPaneId,
+    role: 'questioner',
+    task: 'Implement the API contract',
+    agent: 'claude',
+    worktree: false,
+  });
+  const asked = await service.askCoordinatorByPane(worker.ptyId, {
+    question: 'Should the API use REST or GraphQL?',
+    options: ['REST', 'GraphQL'],
+    wait: false,
+  });
+  assert.equal(asked.pending, true);
+  const questionPost = store.getMessageById(asked.messageId);
+  assert.ok(questionPost);
+  assert.equal(questionPost.kind, 'question');
+  assert.equal(questionPost.toHandle, `run:${worker.run.id}`);
+  assert.equal(store.getQuestion(asked.messageId)?.status, 'pending');
+
+  agentStatusStore.ingestHookEvent({ ptyId: coordPaneId, agentId: 'claude', state: 'idle' });
+
+  return {
+    coordPaneId,
+    service,
+    store,
+    worker,
+    asked,
+    questionPost,
+    advanceMs: (ms) => {
+      fakeNow += ms;
+    },
+    readQuestionAsCoordinator: () => {
+      const board = service.boardRead({ from: coordPaneId });
+      assert.ok(board.posts.some((post) => post.id === asked.messageId));
+      service.boardRead({ from: coordPaneId, seqs: [questionPost.boardSeq] });
+      assert.equal(store.wasBoardPostRead(asked.messageId, 'coordinator'), true);
+    },
+  };
+}
+
+test('BoardStallWatchdog surfaces coordinator-read unanswered questions', async (t) => {
+  const scenario = await createStallQuestionScenario(t);
+  const { service, store, asked, questionPost, worker } = scenario;
+  scenario.readQuestionAsCoordinator();
+
+  scenario.advanceMs(30_000);
+  const events = service.stallWatchdog.sweep();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].runId, worker.run.id);
+
+  const stallPosts = store.listBoardPosts(worker.run.id).filter((post) => post.kind === 'stall');
+  assert.equal(stallPosts.length, 1);
+  assert.equal(stallPosts[0].subject, `Board stall detected at #${events[0].headSeq}`);
+  assert.deepEqual(stallPosts[0].mentions, ['coordinator']);
+  assert.equal(
+    stallPosts[0].body,
+    `@coordinator You already read 1 unanswered question(s): #${questionPost.boardSeq} (questionId ${asked.messageId}). Answer each with message_worker using its questionId. No active workers and board quiet for 30s since #${events[0].headSeq} — review reports, follow up, or wrap up the run.`
+  );
+});
+
+test('BoardStallWatchdog stays silent while a coordinator question is unread', async (t) => {
+  const scenario = await createStallQuestionScenario(t);
+  const { service, store, worker, asked } = scenario;
+  assert.equal(store.wasBoardPostRead(asked.messageId, 'coordinator'), false);
+
+  scenario.advanceMs(30_000);
+  assert.deepEqual(service.stallWatchdog.sweep(), []);
+  assert.equal(store.listBoardPosts(worker.run.id).filter((post) => post.kind === 'stall').length, 0);
+});
+
+test('BoardStallWatchdog stays silent after a read question is answered by questionId', async (t) => {
+  const scenario = await createStallQuestionScenario(t);
+  const { coordPaneId, service, store, worker, asked } = scenario;
+  scenario.readQuestionAsCoordinator();
+
+  const answer = await service.messageWorkerByRole(coordPaneId, {
+    role: 'questioner',
+    questionId: asked.messageId,
+    message: 'Use REST for the API contract.',
+  });
+  assert.equal(answer.mode, 'replied');
+  assert.equal(store.getQuestion(asked.messageId)?.status, 'answered');
+
+  scenario.advanceMs(30_000);
+  assert.deepEqual(service.stallWatchdog.sweep(), []);
+  assert.equal(store.listBoardPosts(worker.run.id).filter((post) => post.kind === 'stall').length, 0);
 });
 
 test('Stdio MCP server (aha-mcp-server.cjs): end-to-end post_message, read_board & board_wait across coordinator and sibling workers', async (t) => {
