@@ -29,13 +29,13 @@ import {
   parseBoardRefs,
 } from './board-protocol.js';
 import type { BoardStallRunState } from './stall-watchdog.js';
+import type { ReviewFirewallContext } from './review-service.js';
 import type { DispatchProposalManager } from './dispatch-proposals.js';
 import type { PermissionApprovalManager } from './permission-approvals.js';
 import type {
   OrchestrationSendResult,
   OrchestrationWorkerSummary,
   OrchestrationSessionCoordinators,
-  ReviewFirewallContext,
   SettledWorkerFollowUpInput,
 } from './orchestration-service.js';
 
