@@ -14,6 +14,7 @@ import { driverCapabilities } from '../agent-drivers/driver-capabilities.js';
 import { WorkerNativeQuestionManager } from './worker-native-questions.js';
 import { formatActionReceiptText } from './orchestration-text-views.js';
 import { OrchestrationBoardService, type BoardPostInput } from './board-service.js';
+import { OrchestrationDelegationService } from './delegation-service.js';
 import { OrchestrationIntegrationService } from './integration-service.js';
 import { OrchestrationReviewService } from './review-service.js';
 import {
@@ -400,6 +401,7 @@ export class OrchestrationService {
   readonly stallWatchdog: BoardStallWatchdog;
   private readonly turnStopMonitor: WorkerTurnStopMonitor;
   private readonly board: OrchestrationBoardService;
+  private readonly delegation: OrchestrationDelegationService;
   private readonly integration: OrchestrationIntegrationService;
   private readonly review: OrchestrationReviewService;
 
@@ -419,8 +421,6 @@ export class OrchestrationService {
   private readonly workerTimelines = new Map<string, WorkerTimeline>();
   private readonly timelineListeners = new Set<(change: WorkerTimelineChange) => void>();
   private disposed = false;
-  private queueSweepScheduled = false;
-  private readonly claimedLaunches = new Map<string, symbol>();
   private readonly closeWorkerPty?: OrchestrationServiceDependencies['closeWorkerPty'];
   private readonly externalIsPtyAlive?: (ptyId: string) => boolean;
   private readonly isAgentCliId?: (cliId: string) => boolean;
@@ -504,6 +504,45 @@ export class OrchestrationService {
     }
 
     const svc = this;
+    this.delegation = new OrchestrationDelegationService({
+      get agentStatusStore() { return svc.agentStatusStore; },
+      get approvals() { return svc.approvals; },
+      approve: (...args) => this.approve(...args),
+      assertCanDelegateFrom: (...args) => this.assertCanDelegateFrom(...args),
+      assertCanReply: (...args) => this.assertCanReply(...args),
+      assertRunCoordinator: (...args) => this.assertRunCoordinator(...args),
+      assertWorkerController: (...args) => this.assertWorkerController(...args),
+      authorizeRunAccess: (...args) => this.authorizeRunAccess(...args),
+      get board() { return svc.board; },
+      deny: (...args) => this.deny(...args),
+      get disposed() { return svc.disposed; },
+      effectiveConfirmMode: (...args) => this.effectiveConfirmMode(...args),
+      emitChanged: (...args) => this.emitChanged(...args),
+      get getDefaultCwd() { return svc.getDefaultCwd; },
+      get getDefaultWorktreeDep() { return svc.getDefaultWorktreeDep; },
+      inferRunIdOptional: (...args) => this.inferRunIdOptional(...args),
+      get integration() { return svc.integration; },
+      isCallerSurface: (...args) => this.isCallerSurface(...args),
+      get isMcpEnabledForCliDep() { return svc.isMcpEnabledForCliDep; },
+      isPaneAlive: (...args) => this.isPaneAlive(...args),
+      isPaneOrchestrationMode: (...args) => this.isPaneOrchestrationMode(...args),
+      listCodingAgents: (...args) => this.listCodingAgents(...args),
+      get maxDepth() { return svc.maxDepth; },
+      get peerPingPong() { return svc.peerPingPong; },
+      get proposals() { return svc.proposals; },
+      redactTaskContext: (...args) => this.redactTaskContext(...args),
+      reply: (...args) => this.reply(...args),
+      resolveCallerDepth: (...args) => this.resolveCallerDepth(...args),
+      get selectAgentForTaskDep() { return svc.selectAgentForTaskDep; },
+      send: (...args) => this.send(...args),
+      sessionCoordinator: (...args) => this.sessionCoordinator(...args),
+      get store() { return svc.store; },
+      get terminalTracker() { return svc.terminalTracker; },
+      workerRead: (...args) => this.workerRead(...args),
+      workerRelease: (...args) => this.workerRelease(...args),
+      workerStart: (...args) => this.workerStart(...args),
+      workerStop: (...args) => this.workerStop(...args),
+    });
     this.integration = new OrchestrationIntegrationService({
       assertRunCoordinator: (...args) => this.assertRunCoordinator(...args),
       assertWorkerController: (...args) => this.assertWorkerController(...args),
@@ -513,8 +552,8 @@ export class OrchestrationService {
       inferRunIdOptional: (...args) => this.inferRunIdOptional(...args),
       mutateWorkerResources: (...args) => this.mutateWorkerResources(...args),
       releaseWorker: (...args) => this.releaseWorker(...args),
-      resolveDispatchByRoleOrTarget: (...args) => this.resolveDispatchByRoleOrTarget(...args),
-      resolveRoleNameForDispatch: (...args) => this.resolveRoleNameForDispatch(...args),
+      resolveDispatchByRoleOrTarget: (...args) => this.delegation.resolveDispatchByRoleOrTarget(...args),
+      resolveRoleNameForDispatch: (...args) => this.delegation.resolveRoleNameForDispatch(...args),
       resolveTargetDispatch: (...args) => this.resolveTargetDispatch(...args),
       get store() { return svc.store; },
       get terminalTracker() { return svc.terminalTracker; },
@@ -523,7 +562,7 @@ export class OrchestrationService {
     this.review = new OrchestrationReviewService({
       emitChanged: (...args) => this.emitChanged(...args),
       failTaskIfReady: (...args) => this.failTaskIfReady(...args),
-      resolveRoleNameForDispatch: (...args) => this.resolveRoleNameForDispatch(...args),
+      resolveRoleNameForDispatch: (...args) => this.delegation.resolveRoleNameForDispatch(...args),
       get store() { return svc.store; },
     });
     this.board = new OrchestrationBoardService({
@@ -543,7 +582,7 @@ export class OrchestrationService {
       get pointerDelivery() { return svc.pointerDelivery; },
       get proposals() { return svc.proposals; },
       queueCodexMail: (...args) => this.queueCodexMail(...args),
-      resolveRoleNameForDispatch: (...args) => this.resolveRoleNameForDispatch(...args),
+      resolveRoleNameForDispatch: (...args) => this.delegation.resolveRoleNameForDispatch(...args),
       sessionCoordinator: (...args) => this.sessionCoordinator(...args),
       get store() { return svc.store; },
       toWorkerSummary: (...args) => this.toWorkerSummary(...args),
@@ -590,7 +629,7 @@ export class OrchestrationService {
       notifyMailbox: (mailbox, type) => this.notifyTargetAndAliases(mailbox, type),
       onChanged: (reason, runId) => this.emitChanged(reason, runId),
       onApprovalChanged: (approval) => this.timelineApproval(approval),
-      resolveRoleName: (dispatch) => this.resolveRoleNameForDispatch(dispatch) || null,
+      resolveRoleName: (dispatch) => this.delegation.resolveRoleNameForDispatch(dispatch) || null,
       cliCommand: this.cliCommand,
       holdTimeoutMs: deps.approvalHoldTimeoutMs,
       now: this.clock,
@@ -621,7 +660,7 @@ export class OrchestrationService {
       capturePaneTail: (ptyId, maxChars) => this.terminalTracker?.captureTail(ptyId, maxChars) ?? '',
       hasOpenApprovalForDispatch: (dispatchId) => this.approvals.hasOpenApprovalForDispatch(dispatchId),
       isDeliveryInFlight: (dispatchId) => this.inFlightObservationDispatches.has(dispatchId),
-      resolveRoleName: (dispatch) => this.resolveRoleNameForDispatch(dispatch) || null,
+      resolveRoleName: (dispatch) => this.delegation.resolveRoleNameForDispatch(dispatch) || null,
       notifyMailbox: (mailbox, type) => this.notifyTargetAndAliases(mailbox, type),
       onTurnStopEscalated: (_dispatchId, runId, stopReason) => {
         if (stopReason === 'exited') this.review.settleUnreportedReviewDispatches();
@@ -692,7 +731,7 @@ export class OrchestrationService {
       }
     });
 
-    void this.integration.recoverGitPublications().catch(error => console.warn('[orchestration] Git recovery:', error)).finally(() => this.scheduleQueuedLaunches());
+    void this.integration.recoverGitPublications().catch(error => console.warn('[orchestration] Git recovery:', error)).finally(() => this.delegation.scheduleQueuedLaunches());
     const staleSweepIntervalMs = deps.staleSweepIntervalMs ?? 0;
     if (staleSweepIntervalMs > 0) {
       this.staleSweepTimer = setInterval(() => {
@@ -746,7 +785,7 @@ export class OrchestrationService {
 
   setSessionCoordinators(registry: OrchestrationSessionCoordinators | null): void {
     this.sessionCoordinators = registry;
-    this.scheduleQueuedLaunches();
+    this.delegation.scheduleQueuedLaunches();
   }
 
   /** An Agent session left orchestration mode or closed: drop what was waiting on it as Coordinator. */
@@ -762,7 +801,7 @@ export class OrchestrationService {
 
   /** An orchestrating session finished a turn: deliver what arrived for it meanwhile. */
   sessionCoordinatorIdle(sessionId: string): void {
-    this.scheduleQueuedLaunches();
+    this.delegation.scheduleQueuedLaunches();
     if (this.isActiveSessionCoordinator(sessionId)) this.pointerDelivery.scheduleRedriveForPane(sessionId);
   }
 
@@ -1026,66 +1065,8 @@ export class OrchestrationService {
     return this.integration.reconcilePublication(input);
   }
 
-  private scheduleQueuedLaunches(): void {
-    if (this.disposed || this.queueSweepScheduled || !this.store.hasQueuedWork()) return;
-    this.queueSweepScheduled = true;
-    queueMicrotask(() => {
-      this.queueSweepScheduled = false;
-      if (this.disposed) return;
-      for (const task of this.store.listTasks()) {
-        if (!task.queuedLaunch || task.queuedLaunch.state !== 'waiting' || this.claimedLaunches.has(task.id)) continue;
-        this.store.promoteReadyTasks(task.runId);
-        if (this.store.getTask(task.id)?.status !== 'ready' || this.store.hasPendingGates(task.id) || task.codeDeps?.some(dep => !this.store.codeReady(dep))) continue;
-        this.claimedLaunches.set(task.id, Symbol(task.id));
-        void this.launchQueuedTask(task).catch(error => console.warn('[orchestration] queued launch:', error))
-          .finally(() => this.claimedLaunches.delete(task.id));
-      }
-    });
-  }
-
-  private async launchQueuedTask(task: OrchestrationTaskRecord): Promise<void> {
-    const q = task.queuedLaunch!;
-    const run = this.store.requireRun(task.runId);
-    if (run.integrationIntent || run.status !== 'active' || run.consumerGeneration !== q.coordinatorGeneration ||
-        !this.isCallerSurface(q.from) || !this.isPaneAlive(q.from) || (run.coordinatorPaneId ?? run.coordinatorHandle) !== q.from ||
-        this.store.getRemainingDispatchCapacity() < 1) return;
-    this.store.setQueuedLaunch(task.id, { ...q, state: 'claimed' });
-    try {
-      await this.store.flushDurable();
-      if (this.disposed || !this.isCallerSurface(q.from) || !this.isPaneAlive(q.from) ||
-          this.store.requireRun(run.id).consumerGeneration !== q.coordinatorGeneration) {
-        this.store.setQueuedLaunch(task.id, q);
-        return;
-      }
-      this.assertRunCoordinator(run.id, q.from);
-      if ((q.requiresPaneMode && !this.isPaneOrchestrationMode(q.from)) ||
-          (q.authorizedNetwork !== undefined && q.authorizedNetwork !== Boolean(this.sessionCoordinator(q.from)?.network))) {
-        throw new OrchestrationError('operation_rejected', '原协调者的编排或联网权限已改变，请恢复原设置再核对派发。');
-      }
-      await this.workerStart({
-        taskId: task.id, runId: run.id, from: q.from, callerPaneId: q.callerPaneId,
-        callerCwd: q.callerCwd, baseBranch: q.baseBranch, agent: q.agent, role: q.role, name: q.role,
-        terminal: q.terminal, model: q.model, effort: q.effort, noWorktree: !q.worktree,
-        taskKind: q.taskKind, mcpEnabled: this.isMcpEnabledForCliDep?.(q.agent),
-        ...((q.taskKind === 'review' || q.taskKind === 'research') && q.policy === undefined ? { readOnly: true } : {}),
-        ...(q.policy !== undefined ? { policy: q.policy } : {}),
-        ...(q.network !== undefined ? { network: q.network } : {}),
-        ...(q.allowSubWorkers ? { allowSubWorkers: true } : {}),
-        ...(q.userInitiated ? { userInitiated: true } : {}),
-      }, this.claimedLaunches.get(task.id));
-      if (q.authorizeReviews) this.store.setRunAutoReviewAuthorized(run.id, true);
-      this.store.setQueuedLaunch(task.id);
-    } catch (error) {
-      if (this.store.getLatestDispatchForTask(task.id)) this.store.setQueuedLaunch(task.id);
-      else if (error instanceof OrchestrationError && error.code === 'worker_limit_reached') this.store.setQueuedLaunch(task.id, q);
-      else this.store.setQueuedLaunch(task.id, { ...q, state: 'needs_reconciliation',
-        reason: this.store.redactDispatchCredentials(error instanceof Error ? error.message : String(error)) });
-    }
-    this.emitChanged('task:queue-updated', run.id);
-  }
-
   private emitChanged(reason: string, runId?: string): void {
-    this.scheduleQueuedLaunches();
+    this.delegation.scheduleQueuedLaunches();
     if (this.eventListeners.size === 0) {
       return;
     }
@@ -1568,7 +1549,7 @@ export class OrchestrationService {
       if (d.id === excludeDispatchId) continue;
       if (!ACTIVE_DISPATCH_STATUSES.has(d.status)) continue;
       const peerTask = this.store.getTask(d.taskId);
-      const role = this.resolveRoleNameForDispatch(d) || d.id;
+      const role = this.delegation.resolveRoleNameForDispatch(d) || d.id;
       activePeers.push({
         role: this.store.redactDispatchCredentials(role),
         taskTitle: this.store.redactDispatchCredentials(peerTask?.taskTitle || d.taskId),
@@ -1714,7 +1695,7 @@ export class OrchestrationService {
   }): { task: OrchestrationTaskRecord } {
     if (input.queueDecision) {
       const task = this.store.requireTask(input.id);
-      if (!task.queuedLaunch || task.queuedLaunch.state === 'claimed' || this.claimedLaunches.has(task.id) ||
+      if (!task.queuedLaunch || task.queuedLaunch.state === 'claimed' || this.delegation.claimedLaunches.has(task.id) ||
           this.store.getActiveDispatchesForTask(task.id).length) throw new OrchestrationError('worker_busy', '派发已经领取，请处理当前 Worker。');
       if (input.queueDecision === 'resume') {
         if (this.store.getLatestDispatchForTask(task.id) || task.queuedLaunch.state !== 'needs_reconciliation') throw new OrchestrationError('task_not_ready', '请先处理已有派发。');
@@ -2420,7 +2401,7 @@ export class OrchestrationService {
       const dispatchId = toHandle.slice('dispatch:'.length);
       const dispatch = this.store.getDispatchContext(dispatchId);
       if (dispatch) {
-        const role = this.resolveRoleNameForDispatch(dispatch).toLowerCase() || dispatch.id;
+        const role = this.delegation.resolveRoleNameForDispatch(dispatch).toLowerCase() || dispatch.id;
         this.waiters.notify(`board:${dispatch.runId}:role:${role}`, messageType);
         this.waiters.notify(`board:${dispatch.runId}:all`, messageType);
         if (dispatch.assigneePaneId) {
@@ -2437,7 +2418,7 @@ export class OrchestrationService {
         if (activeDispatch) {
           this.waiters.notify(`dispatch:${activeDispatch.id}`, messageType);
           const role =
-            this.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || activeDispatch.id;
+            this.delegation.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || activeDispatch.id;
           this.waiters.notify(`board:${activeDispatch.runId}:role:${role}`, messageType);
           this.waiters.notify(`board:${activeDispatch.runId}:all`, messageType);
         }
@@ -2463,7 +2444,7 @@ export class OrchestrationService {
         this.waiters.notify(dispatchAddr, messageType);
         this.pointerDelivery.notifyMessageArrived(dispatchAddr);
         const role =
-          this.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || activeDispatch.id;
+          this.delegation.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || activeDispatch.id;
         this.waiters.notify(`board:${activeDispatch.runId}:role:${role}`, messageType);
         this.waiters.notify(`board:${activeDispatch.runId}:all`, messageType);
       }
@@ -2943,7 +2924,7 @@ export class OrchestrationService {
     const to = this.resolveActiveParentMailbox(resolvedDispatch);
     const workerRole =
       input.fromRole?.trim().replace(/^@+/, '').toLowerCase() ||
-      this.resolveRoleNameForDispatch(resolvedDispatch).toLowerCase() ||
+      this.delegation.resolveRoleNameForDispatch(resolvedDispatch).toLowerCase() ||
       undefined;
 
     let effectiveArtifacts: OrchestrationReportArtifacts | null | undefined = input.artifacts;
@@ -3026,7 +3007,7 @@ export class OrchestrationService {
         const targetRole = isRunReview
           ? (resolvedDispatch.reviewOfRunId ?? resolvedDispatch.runId)
           : targetDispatch
-            ? this.resolveRoleNameForDispatch(targetDispatch) || targetDispatch.id
+            ? this.delegation.resolveRoleNameForDispatch(targetDispatch) || targetDispatch.id
             : (resolvedDispatch.reviewOfDispatchId ?? resolvedDispatch.id);
         summary = formatReviewVerdictForBoard({
           targetRole,
@@ -3105,7 +3086,7 @@ export class OrchestrationService {
     if (resolvedDispatch.reviewOfDispatchId) {
       const reviewedTarget = this.store.getDispatchContext(resolvedDispatch.reviewOfDispatchId);
       const reviewedRole = reviewedTarget
-        ? this.resolveRoleNameForDispatch(reviewedTarget).trim().replace(/^@+/, '').toLowerCase()
+        ? this.delegation.resolveRoleNameForDispatch(reviewedTarget).trim().replace(/^@+/, '').toLowerCase()
         : '';
       if (reviewedRole && !reportMentions.includes(reviewedRole)) {
         reportMentions.push(reviewedRole);
@@ -3230,7 +3211,7 @@ export class OrchestrationService {
             });
             if (diffSummary.isGitRepo) {
               enrichedFromDiff = true;
-              const cleanRole = this.resolveRoleNameForDispatch(resolvedDispatch) || resolvedDispatch.id;
+              const cleanRole = this.delegation.resolveRoleNameForDispatch(resolvedDispatch) || resolvedDispatch.id;
               const autoAuthNote = runForWorker?.reviewAutoAuthorized
                 ? ' (review pre-authorized for this Run)'
                 : '';
@@ -3809,7 +3790,7 @@ export class OrchestrationService {
             : normalizedExplicitTo;
 
         const askerRole =
-          this.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || undefined;
+          this.delegation.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || undefined;
         const msg = this.store.insertMessage({
           runId: input.runId ?? activeDispatch.runId,
           from: `dispatch:${activeDispatch.id}`,
@@ -3901,7 +3882,7 @@ export class OrchestrationService {
         if (current.status === 'answered') {
           if (current.answerMessageId) {
             const asker = this.store.getDispatchContext(current.dispatchId);
-            if (asker) this.store.recordBoardRead(current.runId, this.resolveRoleNameForDispatch(asker).toLowerCase() || asker.id, [current.answerMessageId]);
+            if (asker) this.store.recordBoardRead(current.runId, this.delegation.resolveRoleNameForDispatch(asker).toLowerCase() || asker.id, [current.answerMessageId]);
             this.store.markAsReadAndDelivered([current.answerMessageId]);
             this.store.acknowledgeDeliveriesForMessages([current.answerMessageId]);
           }
@@ -3976,14 +3957,14 @@ export class OrchestrationService {
       const answeredBy = input.from?.trim() || original.toHandle;
       const targetDispatch = this.store.getDispatchContext(question.dispatchId);
       const targetRole = targetDispatch
-        ? this.resolveRoleNameForDispatch(targetDispatch).toLowerCase() || undefined
+        ? this.delegation.resolveRoleNameForDispatch(targetDispatch).toLowerCase() || undefined
         : undefined;
       const replierDispatch = this.store.getActiveDispatchForIdentity(answeredBy, answeredBy);
       const replierRole =
         answeredBy === 'user'
           ? 'user'
           : replierDispatch
-            ? this.resolveRoleNameForDispatch(replierDispatch).toLowerCase() || 'worker'
+            ? this.delegation.resolveRoleNameForDispatch(replierDispatch).toLowerCase() || 'worker'
             : 'coordinator';
       const answered = this.store.answerQuestion({
         messageId: question.messageId,
@@ -4340,7 +4321,7 @@ export class OrchestrationService {
     this.assertWorkerStartControls(input, from);
     this.store.assertDispatchCapacity();
 
-    if (input.taskId && this.store.getTask(input.taskId)?.queuedLaunch && (!queueClaim || this.claimedLaunches.get(input.taskId) !== queueClaim)) throw new OrchestrationError('task_not_ready', '任务由已批准的队列管理。');
+    if (input.taskId && this.store.getTask(input.taskId)?.queuedLaunch && (!queueClaim || this.delegation.claimedLaunches.get(input.taskId) !== queueClaim)) throw new OrchestrationError('task_not_ready', '任务由已批准的队列管理。');
     const reusingTerminal = input.terminal?.trim() || undefined;
     const isReviewRunRequest =
       input.reviewRun === true ||
@@ -4422,7 +4403,7 @@ export class OrchestrationService {
     // Serialize concurrent adversarial review starts with per-Run integration locks and track
     // in-flight starts so an earlier peer's PASS cannot finalize or merge while a parallel peer is still booting.
     if (input.reviewOf?.trim()) {
-      const targetPreview = this.resolveDispatchByRoleOrTarget(
+      const targetPreview = this.delegation.resolveDispatchByRoleOrTarget(
         input.reviewOf.trim(),
         input.callerPaneId ?? from,
         input.runId,
@@ -4493,7 +4474,7 @@ export class OrchestrationService {
       (typeof input.reviewRun === 'string' && input.reviewRun.trim().length > 0);
 
     if (input.reviewOf?.trim()) {
-      const target = this.resolveDispatchByRoleOrTarget(
+      const target = this.delegation.resolveDispatchByRoleOrTarget(
         input.reviewOf.trim(),
         input.callerPaneId ?? from,
         input.runId,
@@ -4605,7 +4586,7 @@ export class OrchestrationService {
 
       const effectiveMcpForReview =
         input.mcpEnabled ?? this.isMcpEnabledForCliDep?.(launchConfig.cliId) ?? false;
-      const targetRole = this.resolveRoleNameForDispatch(target) || target.id;
+      const targetRole = this.delegation.resolveRoleNameForDispatch(target) || target.id;
       const builtReview = buildAdversarialReviewTask({
         targetRole,
         targetDispatchId: target.id,
@@ -5030,7 +5011,7 @@ export class OrchestrationService {
     let ctx: OrchestrationDispatchRecord;
     try {
       ctx = this.store.createDispatchContext({
-        approvedQueueLaunch: task.queuedLaunch?.state === 'claimed' && this.claimedLaunches.has(task.id),
+        approvedQueueLaunch: task.queuedLaunch?.state === 'claimed' && this.delegation.claimedLaunches.has(task.id),
         taskId: task.id,
         assigneeHandle: pilot?.id ?? ptyId!,
         assigneePaneId: ptyId,
@@ -5246,11 +5227,11 @@ export class OrchestrationService {
       : this.store.updateDispatchObservation(ctx.id, 'observed', { refreshHeartbeat: true, promptSent: true }) ?? ctx;
 
     const briefFromRole = callerDispatch
-      ? this.resolveRoleNameForDispatch(callerDispatch).toLowerCase() || 'worker'
+      ? this.delegation.resolveRoleNameForDispatch(callerDispatch).toLowerCase() || 'worker'
       : 'coordinator';
     const briefWorkerRole =
       (input.role ?? input.displayName)?.trim().replace(/^@+/, '').toLowerCase() ||
-      this.resolveRoleNameForDispatch(ctx).toLowerCase() ||
+      this.delegation.resolveRoleNameForDispatch(ctx).toLowerCase() ||
       ctx.id;
     const auditMsg = this.store.insertMessage({
       runId: run.id,
@@ -5785,7 +5766,7 @@ export class OrchestrationService {
           ? input.payload
           : JSON.stringify(input.payload);
 
-    const followUpRole = this.resolveRoleNameForDispatch(settledDispatch) || null;
+    const followUpRole = this.delegation.resolveRoleNameForDispatch(settledDispatch) || null;
     const followUpFromRole =
       input.fromRole?.trim().replace(/^@+/, '').toLowerCase() ||
       (from === 'user' ? 'user' : 'coordinator');
@@ -6610,113 +6591,12 @@ export class OrchestrationService {
     }).map(entry => ({ ...entry, idlePanes: entry.idlePanes.filter(pane => !this.paneMismatch(pane.ptyId, cwd, entry.cliId)) }));
   }
 
-  approveDispatchProposal(
-    id: string,
-    overrides?: DispatchProposalOverrides
-  ): { proposal: OrchestrationDispatchProposal } {
-    return this.proposals.approveProposal(id, overrides);
+  approveDispatchProposal(id: string, overrides?: DispatchProposalOverrides): { proposal: OrchestrationDispatchProposal } {
+    return this.delegation.approveDispatchProposal(id, overrides);
   }
 
-  rejectDispatchProposal(
-    id: string,
-    reason?: string
-  ): { proposal: OrchestrationDispatchProposal } {
-    return this.proposals.rejectProposal(id, reason);
-  }
-
-  private resolveRoleNameForDispatch(dispatch: OrchestrationDispatchRecord): string {
-    const visited = new Set<string>();
-    let current: OrchestrationDispatchRecord | undefined = dispatch;
-    let fallbackName = '';
-    while (current && !visited.has(current.id)) {
-      visited.add(current.id);
-      const task = this.store.getTask(current.taskId);
-      const rawDisplay = task?.displayName?.trim().replace(/^@+/, '') ?? '';
-      if (rawDisplay) {
-        if (!current.followUpOfDispatchId) {
-          return rawDisplay;
-        }
-        if (!fallbackName && !rawDisplay.startsWith('Follow-up:')) {
-          fallbackName = rawDisplay;
-        }
-      }
-      current = current.followUpOfDispatchId
-        ? this.store.getDispatchContext(current.followUpOfDispatchId)
-        : undefined;
-    }
-    return fallbackName;
-  }
-
-  private listManagedDispatchesForCaller(callerPaneId: string): OrchestrationDispatchRecord[] {
-    const cleanCaller = callerPaneId.trim();
-    const callerActive = this.store.getActiveDispatchForIdentity(cleanCaller, cleanCaller);
-    const callerBoundRun = this.store.getCurrentRunForConsumer(cleanCaller);
-    const all = this.store.listDispatches();
-    const byHeadId = new Map<string, OrchestrationDispatchRecord>();
-
-    const ownDispatchIds = new Set<string>();
-    if (callerActive) {
-      let cur: OrchestrationDispatchRecord | undefined = callerActive;
-      while (cur && !ownDispatchIds.has(cur.id)) {
-        ownDispatchIds.add(cur.id);
-        cur = cur.followUpOfDispatchId
-          ? this.store.getDispatchContext(cur.followUpOfDispatchId)
-          : undefined;
-      }
-    }
-
-    for (const d of all) {
-      const isManaged = callerActive
-        ? Boolean(d.creatorDispatchId && ownDispatchIds.has(d.creatorDispatchId))
-        : d.parentPaneId === cleanCaller ||
-          d.creator === cleanCaller ||
-          Boolean(
-            callerBoundRun &&
-              d.runId === callerBoundRun.id &&
-              (callerBoundRun.coordinatorPaneId === cleanCaller ||
-                callerBoundRun.coordinatorHandle === cleanCaller)
-          );
-      if (!isManaged) continue;
-      const head = this.store.resolveDispatchLineage(d.id) ?? d;
-      if (head.assigneePaneId === cleanCaller || head.assigneeHandle === cleanCaller) continue;
-      byHeadId.set(head.id, head);
-    }
-
-    return [...byHeadId.values()];
-  }
-
-  private resolveDispatchByRoleOrTarget(
-    rawTarget: string,
-    callerHint?: string,
-    runIdHint?: string,
-  ): OrchestrationDispatchRecord {
-    const cleaned = rawTarget.trim();
-    if (!cleaned) {
-      throw new OrchestrationError('invalid_argument', 'Missing target worker role or dispatch id.');
-    }
-    const idCandidate = cleaned.startsWith('dispatch:')
-      ? cleaned.slice('dispatch:'.length).trim()
-      : cleaned;
-    const direct = this.store.resolveDispatchLineage(idCandidate) ?? this.store.getDispatchContext(idCandidate);
-    if (direct) return direct;
-
-    const byTask = this.store.getLatestDispatchForTask(idCandidate);
-    if (byTask) return this.store.resolveDispatchLineage(byTask.id) ?? byTask;
-
-    const cleanRole = cleaned.replace(/^@+/, '').toLowerCase();
-    const scopedRunId =
-      runIdHint?.trim() ||
-      (callerHint ? this.inferRunIdOptional(callerHint) : undefined);
-    const candidates = this.store
-      .listDispatches(scopedRunId ? { runId: scopedRunId } : undefined)
-      .reverse();
-    for (const d of candidates) {
-      const role = this.resolveRoleNameForDispatch(d).toLowerCase();
-      if (role === cleanRole || d.assigneePaneId === cleaned || d.assigneeHandle === cleaned) {
-        return this.store.resolveDispatchLineage(d.id) ?? d;
-      }
-    }
-    throw new OrchestrationError('dispatch_not_found', `Worker not found: ${rawTarget}`);
+  rejectDispatchProposal(id: string, reason?: string): { proposal: OrchestrationDispatchProposal } {
+    return this.delegation.rejectDispatchProposal(id, reason);
   }
 
   workerDiff(input: {
@@ -6809,8 +6689,7 @@ export class OrchestrationService {
     return this.review.setRunAutoReview(input);
   }
 
-  async delegateTask(
-    input: {
+  delegateTask(input: {
       from?: string;
       role?: string;
       task?: string;
@@ -6843,451 +6722,8 @@ export class OrchestrationService {
       planSummary?: string;
       runId?: string;
       callerCwd?: string;
-    },
-    signal?: AbortSignal
-  ): Promise<OrchestrationDelegateTaskResult> {
-    const reviewOfRaw = input.reviewOf?.trim() || '';
-    const isReviewRunRequest =
-      input.reviewRun === true ||
-      (typeof input.reviewRun === 'string' && input.reviewRun.trim().length > 0);
-    const reviewFocus = input.reviewFocus?.trim() || '';
-    if (reviewOfRaw && isReviewRunRequest) {
-      throw new OrchestrationError(
-        'invalid_argument',
-        'Cannot combine reviewOf and reviewRun in the same delegate_task call.',
-      );
-    }
-    if ((reviewOfRaw || isReviewRunRequest) && input.terminal?.trim()) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        'Adversarial review cannot reuse an existing terminal. Spawn a fresh reviewer in an isolated detached worktree.',
-      );
-    }
-    const from = input.from?.trim() || 'coordinator';
-    const reviewTargetDispatch = reviewOfRaw
-      ? this.resolveDispatchByRoleOrTarget(reviewOfRaw, input.callerPaneId ?? from, input.runId)
-      : null;
-    if (reviewTargetDispatch && input.callerPaneId !== undefined) {
-      this.authorizeRunAccess(reviewTargetDispatch.runId, input.callerPaneId);
-    }
-    if (
-      typeof input.reviewRun === 'string' &&
-      input.reviewRun.trim() &&
-      input.runId?.trim() &&
-      input.reviewRun.trim() !== input.runId.trim()
-    ) {
-      throw new OrchestrationError(
-        'invalid_argument',
-        `Conflicting runId (${input.runId.trim()}) and reviewRun (${input.reviewRun.trim()}).`,
-      );
-    }
-    const reviewRunTarget = isReviewRunRequest
-      ? this.integration.resolveTargetRunForOperation(
-          typeof input.reviewRun === 'string' ? input.reviewRun.trim() : input.runId,
-          input.callerPaneId,
-          from,
-        )
-      : null;
-    const isAdversarialReview = Boolean(reviewTargetDispatch || reviewRunTarget);
-
-    const reviewTargetRole = reviewTargetDispatch
-      ? this.resolveRoleNameForDispatch(reviewTargetDispatch) || reviewTargetDispatch.id
-      : '';
-    const fallbackReviewTask = reviewTargetDispatch
-      ? `Adversarial review of @${reviewTargetRole}${reviewFocus ? ` (${reviewFocus})` : ''}`
-      : reviewRunTarget
-        ? `Run-level adversarial review of ${reviewRunTarget.id}${reviewFocus ? ` (${reviewFocus})` : ''}`
-        : '';
-    const taskText = this.store.redactDispatchCredentials(input.task?.trim() || fallbackReviewTask);
-    if (!taskText) {
-      throw new OrchestrationError('invalid_argument', 'Missing task specification.');
-    }
-    let normalizedTaskContext = this.redactTaskContext(normalizeTaskContext(input));
-
-    this.assertCanDelegateFrom(from);
-    const defaultReviewRole = reviewTargetDispatch
-      ? `review-${reviewTargetRole.replace(/^@+/, '')}`
-      : reviewRunTarget
-        ? 'review-run'
-        : '';
-    const role = this.store.redactDispatchCredentials(
-      (input.role ?? defaultReviewRole).trim().replace(/^@+/, ''),
-    );
-    const firstLine =
-      taskText
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find(Boolean) ?? taskText;
-    const displayName = role || undefined;
-    const taskTitle = role ? `@${role}: ${firstLine}` : firstLine;
-
-    const effectiveTaskKind = input.taskKind ?? (isAdversarialReview ? 'review' : undefined);
-    let workerPolicy: AgentSessionPolicy | undefined = input.policy;
-    let workerNetwork: boolean | undefined = input.network;
-    let allowSubWorkers = input.allowSubWorkers === true;
-    if (effectiveTaskKind === 'review' && ((workerPolicy !== undefined && workerPolicy !== 'read-only') ||
-        workerNetwork === true || allowSubWorkers)) {
-      throw new OrchestrationError('operation_rejected', 'Review Workers stay read-only, without network access or sub-Workers.');
-    }
-    if (allowSubWorkers && this.resolveCallerDepth(from) + 1 >= this.maxDepth) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        `A Worker at depth ${this.resolveCallerDepth(from) + 1} cannot start sub-Workers (max depth ${this.maxDepth}).`,
-        { maxDepth: this.maxDepth },
-      );
-    }
-    let worktree = isAdversarialReview
-      ? false
-      : (input.worktree ?? this.getDefaultWorktreeDep?.() ?? true);
-    const requestedAgent = input.agent?.trim() || 'auto';
-    const roster = this.listCodingAgents(from);
-    const coordinatorCliId =
-      this.agentStatusStore.get(from)?.agentId ??
-      this.terminalTracker?.getTerminal(from)?.cliId ??
-      this.sessionCoordinator(from)?.provider ??
-      null;
-    const authorCliId = reviewTargetDispatch?.cliId ?? null;
-    const authorCliIds = reviewRunTarget
-      ? [
-          ...new Set(
-            this.store
-              .listIntegratedDispatchesForRun(reviewRunTarget.id)
-              .map((d) => d.cliId)
-              .filter((c): c is string => Boolean(c)),
-          ),
-        ]
-      : undefined;
-
-    let resolvedAgent: string;
-    let selectionReason: string;
-    let resolvedModel: string | undefined = input.model?.trim() || undefined;
-    let resolvedEffort: string | undefined = input.effort?.trim() || undefined;
-    let fallbacks: string[] = [];
-
-    if (this.selectAgentForTaskDep && roster.length > 0) {
-      let selection: OrchestrationAgentSelectionResult;
-      try {
-        selection = this.selectAgentForTaskDep({
-          roster,
-          requestedAgent,
-          taskKind: effectiveTaskKind ?? null,
-          coordinatorCliId,
-          authorCliId,
-          ...(authorCliIds && authorCliIds.length > 0 ? { authorCliIds } : {}),
-          preferIdle: Boolean(input.terminal),
-        });
-      } catch (err) {
-        if (err instanceof OrchestrationError) throw err;
-        throw new OrchestrationError(
-          'invalid_argument',
-          err instanceof Error ? err.message : String(err)
-        );
-      }
-      resolvedAgent = selection.cliId;
-      selectionReason = selection.reason;
-      if (!resolvedModel && selection.model) {
-        resolvedModel = selection.model;
-      }
-      if (!resolvedEffort && resolvedModel && selection.effort) {
-        resolvedEffort = selection.effort;
-      }
-      fallbacks = selection.fallbacks;
-    } else if (requestedAgent && requestedAgent.toLowerCase() !== 'auto') {
-      resolvedAgent = normalizeWorkerCliId(requestedAgent);
-      selectionReason = 'explicit';
-    } else {
-      const firstAvailable = roster.find((entry) => entry.available);
-      resolvedAgent = firstAvailable?.cliId ?? coordinatorCliId ?? 'claude';
-      selectionReason = firstAvailable ? 'roster-default' : 'default';
-      if (!resolvedModel && firstAvailable?.defaultModel) {
-        resolvedModel = firstAvailable.defaultModel;
-      }
-      if (!resolvedEffort && resolvedModel && firstAvailable?.defaultEffort) {
-        resolvedEffort = firstAvailable.defaultEffort;
-      }
-      fallbacks = roster
-        .filter((entry) => entry.available && entry.cliId !== resolvedAgent)
-        .map((entry) => entry.cliId);
-    }
-
-    if (!resolvedModel) {
-      resolvedEffort = undefined;
-    }
-
-    const planSummary =
-      input.planSummary?.trim() ||
-      (role ? `@${role} (${resolvedAgent}): ${firstLine}` : `${resolvedAgent}: ${firstLine}`);
-    const explicitRunId = input.runId?.trim();
-    const inferredRunId =
-      explicitRunId ||
-      reviewRunTarget?.id ||
-      reviewTargetDispatch?.runId ||
-      (input.callerPaneId === undefined
-        ? this.inferRunIdOptional(from)
-        : this.board.resolveBoardMemberForPane(from)?.runId) ||
-      null;
-    let dispatchRunId = explicitRunId ?? reviewRunTarget?.id ?? reviewTargetDispatch?.runId;
-    if (explicitRunId && input.callerPaneId !== undefined) {
-      this.board.resolveBoardCallerContext({ from: input.callerPaneId, runId: explicitRunId });
-    }
-    const isReviewDispatch = Boolean(reviewTargetDispatch || reviewRunTarget);
-    const targetRunForAuth = inferredRunId ? this.store.getRun(inferredRunId) : null;
-    const requestedAuthorizeReviews =
-      typeof input.authorizeReviews === 'boolean' ? input.authorizeReviews : undefined;
-    const proposalInput = {
-      coordinatorPaneId: from,
-      runId: inferredRunId,
-      role,
-      task: taskText,
-      deps: [...new Set(input.deps ?? [])].sort(),
-      codeDeps: [...new Set(input.codeDeps ?? [])].sort(),
-      baseBranch: input.baseBranch,
-      ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
-      planSummary: this.store.redactDispatchCredentials(planSummary),
-      requestedAgent,
-      resolvedAgent,
-      taskKind: effectiveTaskKind ?? null,
-      worktree,
-      model: resolvedModel ?? null,
-      effort: resolvedEffort ?? null,
-      terminal: input.terminal?.trim() || null,
-      ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
-      ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
-      ...(allowSubWorkers ? { allowSubWorkers: true } : {}),
-      ...(requestedAuthorizeReviews !== undefined
-        ? { authorizeReviews: requestedAuthorizeReviews }
-        : {}),
-    };
-    // A headless Worker has no chat turn with the person, so chat confirmation becomes a UI card.
-    const confirmMode = this.effectiveConfirmMode(from);
-    // A Coordinator can ask for full-auto only through a proposal the person approves in the UI.
-    if (workerPolicy === 'full-auto' && input.userInitiated !== true && confirmMode !== 'always-ui') {
-      throw new OrchestrationError(
-        'operation_rejected',
-        'A Coordinator cannot start a full-auto Worker on its own. Use workspace-write, or ask the person to start or approve a full-auto Worker in AhaStation.',
-      );
-    }
-    let approvedByPerson = input.userInitiated === true;
-    // Review dispatches bypass repeated confirmation ONLY when the user explicitly pre-authorized
-    // review execution for this Run (via a prior confirmed proposal or UI toggle).
-    const autoReviewBypass = Boolean(isReviewDispatch && targetRunForAuth?.reviewAutoAuthorized);
-    const bypassGate =
-      input.userInitiated === true ||
-      confirmMode === 'auto' ||
-      autoReviewBypass;
-
-    let grantRunAutoReview = Boolean(input.userInitiated === true && requestedAuthorizeReviews === true);
-
-    if (!bypassGate) {
-      if (confirmMode === 'chat-and-guard') {
-        const guard = this.proposals.evaluateChatGuard(
-          proposalInput,
-          Boolean(input.confirmed),
-          input.proposalId,
-          explicitRunId,
-        );
-        if (!guard.allowed) {
-          return {
-            status: 'confirmation_required',
-            proposal: guard.proposal,
-            message: guard.changed
-              ? '派发内容与待确认方案不一致，请让用户重新确认后再派发。'
-              : '尚未经用户确认派发。请先向用户确认拟派角色、Agent、任务、约束与 worktree，待用户回复后带 confirmed=true 和 proposalId 调用 delegate_task。',
-          };
-        }
-        normalizedTaskContext = guard.taskContext;
-        dispatchRunId = guard.proposal.runId ?? undefined;
-        if (isReviewDispatch || guard.proposal.authorizeReviews === true) {
-          grantRunAutoReview = true;
-        }
-      } else if (confirmMode === 'always-ui') {
-        const held = await this.proposals.createHeldProposal(proposalInput, signal);
-        if (held.decision !== 'approved') {
-          return {
-            status: 'rejected',
-            proposal: held.proposal,
-            message:
-              held.reason ||
-              (held.decision === 'expired' ? '派发确认已超时。' : '用户已取消本次派发。'),
-          };
-        }
-        if (typeof held.overrides?.authorizeReviews === 'boolean') {
-          grantRunAutoReview = held.overrides.authorizeReviews;
-        } else if (isReviewDispatch || held.proposal.authorizeReviews === true) {
-          grantRunAutoReview = true;
-        }
-        approvedByPerson = true;
-        if (held.overrides) {
-          if (held.overrides.policy !== undefined) workerPolicy = held.overrides.policy ?? undefined;
-          if (held.overrides.network !== undefined) workerNetwork = held.overrides.network ?? undefined;
-          if (typeof held.overrides.allowSubWorkers === 'boolean') allowSubWorkers = held.overrides.allowSubWorkers;
-          const prevAgent = resolvedAgent;
-          if (held.overrides.agent?.trim()) {
-            resolvedAgent = normalizeWorkerCliId(held.overrides.agent);
-            selectionReason = 'user-override';
-            fallbacks = [];
-          }
-          if (typeof held.overrides.worktree === 'boolean') {
-            worktree = held.overrides.worktree;
-          }
-          if (held.overrides.model !== undefined) {
-            resolvedModel = held.overrides.model?.trim() || undefined;
-          } else if (resolvedAgent !== prevAgent) {
-            const newProfile = roster.find((entry) => entry.cliId === resolvedAgent);
-            resolvedModel = newProfile?.defaultModel ?? undefined;
-          }
-          if (held.overrides.effort !== undefined) {
-            resolvedEffort = held.overrides.effort?.trim() || undefined;
-          } else if (resolvedAgent !== prevAgent) {
-            const newProfile = roster.find((entry) => entry.cliId === resolvedAgent);
-            resolvedEffort = resolvedModel ? (newProfile?.defaultEffort ?? undefined) : undefined;
-          }
-          if (!resolvedModel) {
-            resolvedEffort = undefined;
-          }
-          if (isHeadlessWorkerDriver(resolvedAgent)) {
-            // Switching to a driver without network access drops the Coordinator's request; an explicit override still fails.
-            if (workerNetwork === true && held.overrides.network === undefined && !driverCapabilities(resolvedAgent).network) {
-              workerNetwork = false;
-            }
-            const unsupported = headlessWorkerControlsError(resolvedAgent, {
-              ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
-              ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
-            });
-            if (unsupported) throw new OrchestrationError('operation_rejected', unsupported, { proposalId: held.proposal.id });
-          }
-          if (allowSubWorkers && this.resolveCallerDepth(from) + 1 >= this.maxDepth) allowSubWorkers = false;
-        }
-      }
-    }
-
-    if (proposalInput.deps.length || proposalInput.codeDeps.length) {
-      const run = this.store.requireRun(dispatchRunId ?? inferredRunId ?? '');
-      if (isReviewDispatch) throw new OrchestrationError('invalid_argument', 'Review dispatches already target an immutable snapshot.');
-      if (input.callerPaneId) this.assertRunCoordinator(run.id, input.callerPaneId);
-      const task = this.store.createTask({
-        runId: run.id, spec: taskText, taskTitle, displayName, taskContext: normalizedTaskContext,
-        deps: proposalInput.deps, codeDeps: proposalInput.codeDeps, singleShot: true,
-        queuedLaunch: {
-          from, callerPaneId: input.callerPaneId, callerCwd: input.callerCwd ?? this.sessionCoordinator(from)?.cwd ?? this.terminalTracker?.getTerminal(from)?.cwd ?? this.getDefaultCwd?.(),
-          authorizedNetwork: Boolean(this.sessionCoordinator(from)?.network), requiresPaneMode: this.isPaneOrchestrationMode(from),
-          coordinatorGeneration: run.consumerGeneration, baseBranch: input.baseBranch, agent: resolvedAgent,
-          role, terminal: input.terminal, model: resolvedModel, effort: resolvedEffort, taskKind: effectiveTaskKind,
-          ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
-          ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
-          ...(allowSubWorkers ? { allowSubWorkers: true } : {}),
-          ...(approvedByPerson ? { userInitiated: true } : {}),
-          worktree, authorizeReviews: grantRunAutoReview, state: 'waiting',
-        },
-      });
-      this.emitChanged('task:queued', run.id);
-      return { status: 'queued', task, message: '依赖和派发条件满足后启动。' };
-    }
-
-    const candidates = input.terminal?.trim()
-      ? [resolvedAgent]
-      : [resolvedAgent, ...fallbacks.filter((cli) => cli !== resolvedAgent)];
-    let fallbackFrom: string | null = null;
-    let reusableTaskId: string | undefined;
-
-    for (let i = 0; i < candidates.length; i += 1) {
-      const candidateCli = candidates[i]!;
-      const isFallback = i > 0;
-      const candidateProfile = isFallback
-        ? roster.find((entry) => entry.cliId === candidateCli)
-        : undefined;
-      const candidateModel = isFallback
-        ? (candidateProfile?.defaultModel ?? undefined)
-        : resolvedModel;
-      const candidateEffort = isFallback
-        ? candidateModel
-          ? (candidateProfile?.defaultEffort ?? undefined)
-          : undefined
-        : resolvedEffort;
-      const mcpEnabled = this.isMcpEnabledForCliDep?.(candidateCli) ?? false;
-
-      const existingTask = reusableTaskId ? this.store.getTask(reusableTaskId) : null;
-      if (existingTask && existingTask.status !== 'ready') {
-        this.store.requeueTaskForRetry(reusableTaskId!);
-      }
-
-      try {
-        const started = await this.workerStart({
-          from,
-          runId: dispatchRunId,
-          callerPaneId: input.callerPaneId,
-          ...(reusableTaskId
-            ? { taskId: reusableTaskId }
-            : isReviewDispatch && !input.task?.trim()
-              ? {}
-              : { spec: taskText }),
-          taskKind: effectiveTaskKind,
-          ...(reviewTargetDispatch ? { reviewOf: reviewTargetDispatch.id } : {}),
-          ...(reviewRunTarget ? { reviewRun: reviewRunTarget.id } : {}),
-          ...(reviewFocus ? { reviewFocus } : {}),
-          ...((effectiveTaskKind === 'review' || effectiveTaskKind === 'research') && workerPolicy === undefined
-            ? { readOnly: true } : {}),
-          ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
-          ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
-          ...(allowSubWorkers ? { allowSubWorkers: true } : {}),
-          userInitiated: approvedByPerson,
-          ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
-          taskTitle,
-          displayName,
-          name: role || undefined,
-          agent: candidateCli,
-          model: candidateModel,
-          effort: candidateEffort,
-          terminal: input.terminal?.trim() || undefined,
-          noWorktree: !worktree,
-          callerCwd: input.callerCwd,
-          baseBranch: input.baseBranch,
-          mcpEnabled,
-          role: role || undefined,
-        });
-        if (grantRunAutoReview && !started.run.reviewAutoAuthorized) {
-          const updatedRun = this.store.setRunAutoReviewAuthorized(started.run.id, true);
-          if (updatedRun) {
-            started.run = updatedRun;
-            this.emitChanged('run:auto-review-updated', updatedRun.id);
-          }
-        }
-        return {
-          status: 'started',
-          role,
-          agent: started.cliId,
-          selectionReason,
-          fallbackFrom,
-          dispatch: started.dispatch,
-          task: started.task,
-          run: started.run,
-          ptyId: started.ptyId,
-          worktreePath: started.worktreePath,
-          branch: started.branch,
-          ...(started.briefBoardSeq !== undefined ? { briefBoardSeq: started.briefBoardSeq } : {}),
-        };
-      } catch (err) {
-        const canRetryFallback =
-          err instanceof OrchestrationError &&
-          err.code === 'terminal_unavailable' &&
-          !input.terminal?.trim() &&
-          i + 1 < candidates.length;
-        if (!canRetryFallback) {
-          throw err;
-        }
-        if (fallbackFrom === null) {
-          fallbackFrom = resolvedAgent;
-        }
-        if (!isReviewDispatch && typeof err.data?.taskId === 'string' && err.data.taskId) {
-          reusableTaskId = err.data.taskId;
-        }
-      }
-    }
-
-    throw new OrchestrationError(
-      'terminal_unavailable',
-      `Failed to start worker with any candidate CLI (${candidates.join(', ')}).`
-    );
+    }, signal?: AbortSignal): Promise<OrchestrationDelegateTaskResult> {
+    return this.delegation.delegateTask(input, signal);
   }
 
   async workerDoneByPane(
@@ -7311,7 +6747,7 @@ export class OrchestrationService {
       );
     }
     const capability = this.store.getDispatchCapability(active.id);
-    const fromRole = this.resolveRoleNameForDispatch(active).toLowerCase() || undefined;
+    const fromRole = this.delegation.resolveRoleNameForDispatch(active).toLowerCase() || undefined;
     return this.workerDoneWithArtifacts({
       from: cleanCaller,
       dispatchId: active.id,
@@ -7357,189 +6793,26 @@ export class OrchestrationService {
   }
 
   resolveWorkerByRoleOrId(callerPaneId: string, target: string): OrchestrationDispatchRecord {
-    const cleanCaller = callerPaneId.trim();
-    const rawTarget = target.trim();
-    if (!rawTarget) {
-      throw new OrchestrationError('invalid_argument', 'Missing target worker role or dispatch id.');
-    }
-
-    if (rawTarget.startsWith('dispatch:')) {
-      const id = rawTarget.slice('dispatch:'.length).trim();
-      const ctx = this.store.resolveDispatchLineage(id) ?? this.store.getDispatchContext(id);
-      if (ctx) {
-        this.assertWorkerController({ dispatchId: ctx.id }, cleanCaller);
-        return ctx;
-      }
-    }
-
-    const direct = this.store.getDispatchContext(rawTarget);
-    if (direct) {
-      const resolved = this.store.resolveDispatchLineage(direct.id) ?? direct;
-      this.assertWorkerController({ dispatchId: resolved.id }, cleanCaller);
-      return resolved;
-    }
-
-    const cleanRole = rawTarget.replace(/^@+/, '').trim().toLowerCase();
-    const managed = this.listManagedDispatchesForCaller(callerPaneId);
-    const matching = managed.filter((d) => {
-      const roleName = this.resolveRoleNameForDispatch(d).toLowerCase();
-      if (roleName && roleName === cleanRole) return true;
-      const task = this.store.getTask(d.taskId);
-      const taskDisplay = task?.displayName?.trim().replace(/^@+/, '').toLowerCase() ?? '';
-      if (taskDisplay && taskDisplay === cleanRole) return true;
-      return d.assigneePaneId === rawTarget || d.assigneeHandle === rawTarget;
-    });
-
-    if (matching.length > 0) {
-      matching.sort((a, b) => {
-        const aActive = ACTIVE_DISPATCH_STATUSES.has(a.status) ? 1 : 0;
-        const bActive = ACTIVE_DISPATCH_STATUSES.has(b.status) ? 1 : 0;
-        if (aActive !== bActive) return bActive - aActive;
-        return b.createdAt.localeCompare(a.createdAt);
-      });
-      return matching[0]!;
-    }
-
-    throw new OrchestrationError('dispatch_not_found', `Worker not found: ${rawTarget}`);
+    return this.delegation.resolveWorkerByRoleOrId(callerPaneId, target);
   }
 
-  async messageWorkerByRole(
-    callerPaneId: string,
-    input: { role: string; message: string; subject?: string; questionId?: string }
-  ): Promise<
+  messageWorkerByRole(callerPaneId: string, input: { role: string; message: string; subject?: string; questionId?: string }): Promise<
     | ({ mode: 'replied'; dispatch: OrchestrationDispatchRecord } & ReturnType<
         OrchestrationService['reply']
       >)
     | ({ mode: 'sent' | 'reactivated'; dispatch: OrchestrationDispatchRecord } & OrchestrationSendResult)
   > {
-    const cleanMessage = input.message?.trim() ?? '';
-    if (!cleanMessage) {
-      throw new OrchestrationError('invalid_argument', 'Missing message body.');
-    }
-    const dispatch = this.resolveWorkerByRoleOrId(callerPaneId, input.role);
-    this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
-    const questionId = input.questionId?.trim();
-    if (questionId) {
-      const targetQuestion = this.store.getQuestion(questionId);
-      if (!targetQuestion || targetQuestion.dispatchId !== dispatch.id) {
-        throw new OrchestrationError('invalid_argument', 'The question does not belong to the selected worker.');
-      }
-      this.assertCanReply(targetQuestion.messageId, callerPaneId);
-      const replied = this.reply({
-        id: targetQuestion.messageId,
-        body: cleanMessage,
-        from: callerPaneId,
-      });
-      return { mode: 'replied', dispatch, ...replied };
-    }
-    const callerDispatch = this.store.getActiveDispatchForIdentity(callerPaneId, callerPaneId);
-    const senderRole = callerDispatch
-      ? this.resolveRoleNameForDispatch(callerDispatch).toLowerCase() || 'worker'
-      : 'coordinator';
-    const targetRole = this.resolveRoleNameForDispatch(dispatch).toLowerCase() || dispatch.id;
-    const refs = parseBoardRefs(cleanMessage);
-    const sent = await this.send({
-      from: callerPaneId,
-      to: `dispatch:${dispatch.id}`,
-      runId: dispatch.runId,
-      subject: input.subject?.trim() || 'Coordinator message',
-      body: cleanMessage,
-      fromRole: senderRole,
-      mentions: [targetRole],
-      refs: refs.length > 0 ? refs : undefined,
-      kind: 'post',
-    });
-    if (senderRole === 'coordinator') {
-      this.peerPingPong.recordCoordinatorOrUserActivity(dispatch.runId);
-    }
-    if (typeof sent.message.boardSeq === 'number') {
-      this.store.advanceMemberCursor(dispatch.runId, senderRole, {
-        lastPostSeq: sent.message.boardSeq,
-      });
-    }
-    return {
-      mode: sent.followUp ? 'reactivated' : 'sent',
-      dispatch: sent.followUp?.dispatch ?? dispatch,
-      ...sent,
-    };
+    return this.delegation.messageWorkerByRole(callerPaneId, input);
   }
 
-  async manageWorkerByRole(
-    callerPaneId: string,
-    input: {
+  manageWorkerByRole(callerPaneId: string, input: {
       role: string;
       action: 'read' | 'approve' | 'deny' | 'release' | 'stop';
       reason?: string;
       force?: boolean;
       screen?: boolean;
-    }
-  ): Promise<Record<string, unknown>> {
-    const dispatch = this.resolveWorkerByRoleOrId(callerPaneId, input.role);
-    this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
-    switch (input.action) {
-      case 'read': {
-        const output = this.workerRead({
-          dispatchId: dispatch.id,
-          screen: input.screen ?? true,
-        });
-        return { action: 'read', dispatch, output };
-      }
-      case 'approve': {
-        const open = this.approvals.listOpenApprovals({ dispatchId: dispatch.id });
-        if (open.length === 0) {
-          throw new OrchestrationError(
-            'approval_not_found',
-            `No pending permission approval for worker "${input.role}".`
-          );
-        }
-        const res = this.approve(
-          {
-            id: open[0]!.approvalId,
-            dispatchId: dispatch.id,
-            from: callerPaneId,
-            reason: input.reason,
-          },
-          callerPaneId
-        );
-        return { action: 'approve', dispatch, ...res };
-      }
-      case 'deny': {
-        const open = this.approvals.listOpenApprovals({ dispatchId: dispatch.id });
-        if (open.length === 0) {
-          throw new OrchestrationError(
-            'approval_not_found',
-            `No pending permission approval for worker "${input.role}".`
-          );
-        }
-        const res = this.deny(
-          {
-            id: open[0]!.approvalId,
-            dispatchId: dispatch.id,
-            from: callerPaneId,
-            reason: input.reason,
-          },
-          callerPaneId
-        );
-        return { action: 'deny', dispatch, ...res };
-      }
-      case 'release': {
-        this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
-        const res = await this.workerRelease({
-          dispatchId: dispatch.id,
-          force: input.force,
-        });
-        return { action: 'release', ...res };
-      }
-      case 'stop': {
-        this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
-        const res = await this.workerStop({
-          dispatchId: dispatch.id,
-          reason: input.reason,
-          force: input.force,
-        });
-        return { action: 'stop', ...res };
-      }
-    }
+    }): Promise<Record<string, unknown>> {
+    return this.delegation.manageWorkerByRole(callerPaneId, input);
   }
 
   getMcpContextForPane(callerPaneId: string): OrchestrationMcpContext {
@@ -7552,11 +6825,11 @@ export class OrchestrationService {
       ? this.canHeadlessWorkerDelegate(cleanCaller)
       : this.resolveCallerDepth(cleanCaller) < this.maxDepth;
     const roster = this.listCodingAgents(cleanCaller);
-    const managed = this.listManagedDispatchesForCaller(cleanCaller);
+    const managed = this.delegation.listManagedDispatchesForCaller(cleanCaller);
     const workers: OrchestrationMcpWorkerBrief[] = managed.map((d) => {
       const summary = this.toWorkerSummary(d);
       const roleName =
-        this.resolveRoleNameForDispatch(d) ||
+        this.delegation.resolveRoleNameForDispatch(d) ||
         summary.task?.displayName?.trim().replace(/^@+/, '') ||
         d.id;
       return {
