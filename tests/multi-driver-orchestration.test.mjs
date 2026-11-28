@@ -592,8 +592,12 @@ async function serviceSetup(t, { allowPtySpawn = false, available = () => true }
             writeFileSync(join(workdir, `note-${env.AHA_WORKER_TOKEN}.txt`), 'x\n');
           }
           chunk(agent, `Worker finished; token ${env.AHA_WORKER_TOKEN}`);
-          if (scenario === 'report') {
+          if (scenario === 'edit-report') {
+            writeFileSync(join(workdir, `wave-${launches.indexOf(launch)}-${Date.now()}.txt`), 'work\n');
+          }
+          if (scenario === 'report' || scenario === 'edit-report') {
             launch.report = await workerHttp(workerId, 'worker-done-self', { summary: 'Reported by report_done' });
+            launch.reports = (launch.reports ?? 0) + 1;
           }
           agent.send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } });
         });
@@ -661,7 +665,7 @@ function sparseRepo(dir) {
 function plainRepo(dir) {
   const repo = join(dir, 'plain-repo');
   const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true });
-  execFileSync('git', ['init', '--quiet', repo], { windowsHide: true });
+  execFileSync('git', ['init', '--quiet', '-b', 'main', repo], { windowsHide: true });
   writeFileSync(join(repo, 'README.md'), 'handoff\n');
   git('add', 'README.md');
   git('-c', 'user.name=Aha', '-c', 'user.email=aha@example.invalid', 'commit', '--quiet', '-m', 'init');
@@ -714,6 +718,82 @@ test('cross-CLI handoff keeps the worktree, starts the new agent from redacted c
   await until(() => app.store.getDispatchContext(next.id).status === 'completed');
   // The report's HTTP reply is sent after the state is durable; let it land before teardown.
   await until(() => launch.report);
+});
+
+function gitOut(cwdPath, ...args) {
+  return execFileSync('git', args, { cwd: cwdPath, encoding: 'utf8', windowsHide: true }).trim();
+}
+
+async function residentBuilder(t) {
+  const app = await serviceSetup(t);
+  const repo = plainRepo(app.dir);
+  app.sessions.set(SESSION_A, { cwd: repo, provider: 'claude', active: true, idle: true, network: false, policy: 'workspace-write' });
+  app.scenario = 'edit-report';
+  const started = await app.call(SESSION_A, 'delegate-task', { role: 'builder', task: 'Build wave one', agent: 'grok' });
+  assert.equal(started.ok, true, started.error);
+  const first = started.result.dispatch;
+  assert.ok(first.ownsWorktree && first.worktreePath !== repo);
+  await until(() => app.store.getDispatchContext(first.id).status === 'completed');
+  await until(() => app.launches[0].report);
+  const integrated = await app.call(SESSION_A, 'worker-integrate', { worker: 'builder', targetBranch: 'main', keepResident: true });
+  assert.equal(integrated.ok, true, integrated.error);
+  return { app, repo, first, integrated: integrated.result };
+}
+
+test('a resident Worker keeps its worktree after integration and starts its next wave on a fresh branch in place', async (t) => {
+  const { app, repo, first, integrated } = await residentBuilder(t);
+  assert.equal(integrated.resident, true);
+  assert.equal(integrated.released, false);
+  const kept = app.store.getDispatchContext(first.id);
+  assert.equal(kept.releasedAt ?? null, null);
+  assert.equal(kept.residentAfterIntegration.targetBranch, 'main');
+  assert.ok(existsSync(first.worktreePath), 'the worktree stays for the next wave');
+
+  // Work written after integration is never thrown away by the next wave.
+  const stray = join(first.worktreePath, 'not-integrated.txt');
+  writeFileSync(stray, 'keep me');
+  const refused = await app.call(SESSION_A, 'role-message', { role: 'builder', message: 'Too early' });
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /changed after it was integrated/);
+  assert.ok(existsSync(stray));
+  rmSync(stray);
+
+  const mainHead = gitOut(repo, 'rev-parse', 'main');
+  const wave = await app.call(SESSION_A, 'role-message', { role: 'builder', message: 'Wave two: add the next feature' });
+  assert.equal(wave.ok, true, wave.error);
+  const next = app.store.listDispatches({ runId: first.runId }).find((d) => d.followUpOfDispatchId === first.id);
+  assert.equal(next.worktreePath, first.worktreePath, 'same directory, so the conversation resumes natively');
+  assert.equal(next.assigneeHandle, first.assigneeHandle);
+  assert.notEqual(next.branch, first.branch);
+  assert.equal(next.baseCommit, mainHead);
+  assert.deepEqual(next.authorCliIds, ['grok'], 'a new wave starts its own author set');
+  assert.equal(gitOut(first.worktreePath, 'branch', '--show-current'), next.branch);
+  assert.equal(gitOut(repo, 'branch', '--list', first.branch), '', 'the integrated wave-one branch is gone');
+  assert.equal(app.store.getDispatchContext(first.id).residentAfterIntegration, undefined);
+  await until(() => app.store.getDispatchContext(next.id).status === 'completed');
+  // The same process reports both waves; let the second reply land before teardown.
+  await until(() => app.launches.at(-1).reports >= 2);
+});
+
+test('a resident Worker whose worktree is gone continues in a new worktree from portable context', async (t) => {
+  const { app, repo, first } = await residentBuilder(t);
+  await app.service.workers.codexWorkers.get(first.assigneeHandle)?.close(true);
+  await until(() => !app.service.workers.codexWorkers.has(first.assigneeHandle));
+  gitOut(repo, 'worktree', 'remove', '--force', first.worktreePath);
+  const launchesBefore = app.launches.length;
+  const wave = await app.call(SESSION_A, 'role-message', { role: 'builder', message: 'Wave two after cleanup' });
+  assert.equal(wave.ok, true, wave.error);
+  const next = app.store.listDispatches({ runId: first.runId }).find((d) => d.followUpOfDispatchId === first.id);
+  assert.notEqual(next.worktreePath, first.worktreePath);
+  assert.ok(existsSync(next.worktreePath));
+  assert.notEqual(next.assigneeHandle, first.assigneeHandle, 'a new conversation, since the old one is tied to the old directory');
+  assert.equal(next.baseCommit, gitOut(repo, 'rev-parse', 'main'));
+  assert.equal(app.launches.length, launchesBefore + 1);
+  const prompt = app.launches.at(-1).io.seen.find((m) => m.method === 'session/prompt').params.prompt.map((b) => b.text ?? '').join('');
+  assert.match(prompt, /### Handoff Context/);
+  assert.match(prompt, /previous worktree is gone/);
+  await until(() => app.store.getDispatchContext(next.id).status === 'completed');
+  await until(() => app.launches.at(-1).report);
 });
 
 test('a handoff is refused and starts nothing while the worktree keeps changing', async (t) => {

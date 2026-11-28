@@ -516,6 +516,12 @@ export class OrchestrationStore implements OrchestrationUnitOfWork {
   }
 
   /** Records a headless Worker's permission tier and network access for its next turns. */
+  setDispatchResident(
+    ...args: Parameters<OrchestrationLifecycleStore['setDispatchResident']>
+  ): OrchestrationDispatchRecord | null {
+    return this.lifecycle.setDispatchResident(...args);
+  }
+
   updateDispatchWorkerControls(dispatchId: string, patch: { workerPolicy?: AgentSessionPolicy; workerNetwork?: boolean }): OrchestrationDispatchRecord | null {
     return this.lifecycle.updateDispatchWorkerControls(dispatchId, patch);
   }

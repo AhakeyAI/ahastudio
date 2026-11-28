@@ -669,6 +669,10 @@ function buildToolsForContext(ctx) {
             type: 'boolean',
             description: 'Delete the owned aha/worker/* branch on release (default: true).',
           },
+          keepResident: {
+            type: 'boolean',
+            description: 'Keep this headless @role and its worktree after integrating, so a later message_worker starts its next wave of work on a fresh branch from the latest base instead of a new worker (default: false).',
+          },
           force: {
             type: 'boolean',
             description: 'Skip automatic reviewed-snapshot OID check if intentionally integrating an updated snapshot.',
@@ -1181,6 +1185,7 @@ async function handleToolCall(name, rawArgs, activeRequests) {
         ...(typeof args.releaseAfter === 'boolean' ? { releaseAfter: args.releaseAfter } : {}),
         ...(typeof args.deleteBranch === 'boolean' ? { deleteBranch: args.deleteBranch } : {}),
         ...(typeof args.force === 'boolean' ? { force: args.force } : {}),
+        ...(typeof (args.keepResident ?? args.keep_resident) === 'boolean' ? { keepResident: args.keepResident ?? args.keep_resident } : {}),
       });
       if (!res.ok) return toolText(res.errorText, true);
       const r = res.result || {};

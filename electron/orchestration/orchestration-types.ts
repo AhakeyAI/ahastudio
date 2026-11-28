@@ -402,6 +402,11 @@ export interface OrchestrationDispatchRecord {
    * Reviews avoid all of them; absent means only `cliId` wrote it.
    */
   authorCliIds?: string[];
+  /**
+   * Set when integration kept this Worker resident instead of releasing it: its worktree stays,
+   * and the next follow-up starts a new wave on a fresh branch from `targetBranch`.
+   */
+  residentAfterIntegration?: { targetBranch: string; integratedBranchOid: string | null; integratedSnapshotOid: string } | null;
   /** Headless Workers only. Records without them are read-only exactly when the timeline says so, with network off. */
   workerPolicy?: AgentSessionPolicy;
   workerNetwork?: boolean;

@@ -329,6 +329,7 @@ const workerIntegrateSchema = z.object({
   releaseAfter: z.boolean().optional(),
   deleteBranch: z.boolean().optional(),
   force: z.boolean().optional(),
+  keepResident: z.boolean().optional(),
 });
 
 const runDiffSchema = z.object({
