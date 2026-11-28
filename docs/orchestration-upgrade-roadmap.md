@@ -147,26 +147,28 @@ flowchart LR
 
 ---
 
-### Stage 1B：在拆分后的 `board-service.ts` 升级语义停摆监测（独立 PR）
+### Stage 1B：在拆分后的 `board-service.ts` 升级语义停摆监测 — **已完成**
 
+- **落地**：同一停摆帖按优先级提示未处理报告、协调者未读、未回复点名或全局静默；保留既有门控及已读未答问题提示，重试也计入每 Run 三次的唤醒预算。
+- **与原规划的偏差**：从帖子现算最新 mention seq，不新增 `lastMentionedSeq`；预算仅存在内存；peer 计数仍随协调者或用户活动清零，停摆计数只随实质进展清零。若 re-ping 仍在看板末尾，保持 `stall` 自抑制；看板推进到下一次满足门控的静默才可升级。
 - **改动范围**：[`electron/orchestration/stall-watchdog.ts`](../electron/orchestration/stall-watchdog.ts)、拆分后的 `board-service.ts`、[`electron/orchestration/board-protocol.ts`](../electron/orchestration/board-protocol.ts)。
 - **与红线 10 及 `[done]` 的精确边界**：
   - **严格遵守红线 10**：所有 4 类停摆诊断**仅在 Run 内所有活跃 Worker 均非 `working`、无 `hasPendingAttention`（审批、原生提问、未读问答、Gate、提案）且协调者 idle 且无活跃 waiter 时才触发**。
-  - **收紧 `lastPostIsDone`**：仅当发帖者是 `coordinator` 且包含 `[done]` 时才视为 Run 已收尾，防止 Worker 误写 `[done]` 静默监测；**必须保留 `kind === 'stall'` 条件**——否则 watchdog 会被自己发出的停摆帖再次触发，形成循环。
+  - **收紧 `lastPostIsDone`**：仅当协调者最后一条实际发帖含 `[done]` 且之后没有 Worker 新帖时才视为 Run 已收尾；**保留 `kind === 'stall'` 抑制**，防止 watchdog 被自己发出的停摆帖再次触发。
 - **"已读 / 已处理"判定（PR #17 后大幅简化，以精确已读为准）**：
   - **已读证据取两者的并集**：`wasBoardPostRead(postId, 'coordinator')`（精确已读）**或** `post.boardSeq <= coordinatorCursor.lastReadSeq`（宽泛读覆盖）。单独用任何一个都会漏：宽泛 `read_board` 只推进游标不记精确已读，而 `read_board(seqs)` 点读只记精确已读不推进游标。注意发帖/回复自 PR #17 起不再推进 `lastReadSeq`，`mentionsOnly` 等待推进的是 `lastMentionReadSeq`（其内联投递已记精确已读，无需再查该游标）。
   - **"读而未处理"仍需业务事实补判**：已读不等于已处理。报告帖满足以下任一即视为已处理：`post.receipts['coordinator'] === 'replied'`、协调者对其发过引用回复/认领帖、或对应任务/dispatch 已推进（开评审、已集成、已 follow-up、已重派或关闭）。
   - **"协调者未读停驻"诊断重写**：`mentionsOnly` 等待推进的是 `lastMentionReadSeq` 而非 `lastReadSeq`，**禁止**用 `headSeq > lastReadSeq` 判未读（会大量误报）；改为遍历发给协调者的帖子、用精确已读集合筛出未读项。
 - **状态优先 + 零浪费 4 类诊断**：
-  1. **报告未处理**：已读或未读但无"已处理"业务依据且未 `@coordinator` 的报告帖 → 点名 `#seq` 提醒 `@coordinator`。
-  2. **协调者未读停驻**：按精确已读集合存在未读的 `@coordinator` 消息 → 列出 `#seq` 提醒。
-  3. **`@mention` 未获回复（先查状态再决定动作）**：某等待态 Worker 的 `lastMentionedSeq > lastPostSeq` 时：
-     - **先检查 driver / session 诊断状态**（错误码、进程退出或 `usageLimits` 限额信号）：若已确认报错或限额，**绝不浪费 Token 发 re-ping turn**，直接一步升级 `@coordinator` 建议换 CLI 接力或人工处理；
+  1. **报告未处理**：不论是否已读或已 `@coordinator`，没有处理证据的 Worker 报告帖 → 点名 `#seq` 提醒 `@coordinator`。
+  2. **协调者未读停驻**：按精确已读与宽泛游标的并集，找出未读的 `@coordinator` 或发给 Run 的帖子 → 列出 `#seq` 提醒。
+  3. **`@mention` 未获回复（先查状态再决定动作）**：当现算的最新点名 seq 大于等待态 Worker 的 `lastPostSeq` 时：
+     - **先检查 driver / session 诊断状态**（错误码、进程退出、`dormant` 休眠态或 `usageLimits` 限额信号）：若已确认报错或限额，**绝不浪费 Token 发 re-ping turn**，直接一步升级 `@coordinator` 建议换 CLI 接力或人工处理；若为 Stage 3B-1 正常休眠态（`dormant`），同样不发空转 re-ping，直接提醒 `@coordinator` follow-up 原位唤醒或人工处理；
      - 仅当 Worker 存活、无报错、无限额信号时，才定向 re-ping 该 `@role` **至多 1 次**；若下个周期仍无新发帖，立刻升级 `@coordinator`。
   4. **兜底全局静默**：未发协调者 `[done]` → 带各成员最后 `#seq` 提醒 `@coordinator`。
-- **统一计数与防空转重置**：
-  - 将停摆提醒退避计数与现有 `PeerPingPongTracker` 收口到同一 Run 级唤醒预算管理器，同一停摆上限 3 次即静默。
-  - **关键约束**：只有**实质进展**（新任务/评审派发、任务/集成状态推进、人工输入、或非系统触发的有效业务回复）才重置 3 次上限；**系统停摆提醒唤醒协调者后，若协调者结束 turn 但任务没有任何进展，绝不能重置 3 次上限**。
+- **停摆预算与防空转重置**：
+  - 内存 `RunWakeBudget` 与 `PeerPingPongTracker` 分开维护；同一 Run 最多提醒 3 次（含 re-ping）。
+  - **关键约束**：仅派发集合、派发状态或 live stage、任务/评审/集成状态变化，或人工/Worker 新帖重置预算；协调者只发帖或结束 turn 不重置预算。
 - **验收用例清单**：
   1. 覆盖 4 类诊断；
   2. 有 `working` 成员或 `nativeQuestions` 未答时不误报；

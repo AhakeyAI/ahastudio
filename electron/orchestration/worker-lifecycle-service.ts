@@ -6,6 +6,7 @@ import { driverCapabilities } from '../agent-drivers/driver-capabilities.js';
 import type { AgentPaneStatus, AgentStatusStore } from '../agent/agent-status-store.js';
 import type { TerminalReadResult, TerminalRuntimeTracker } from '../terminal-runtime-tracker.js';
 import type {
+  AgentGoalStatus,
   AgentSessionDriver,
   AgentSessionEvents,
   AgentSessionPolicy,
@@ -170,6 +171,7 @@ export class OrchestrationWorkerLifecycleService {
   constructor(private readonly host: OrchestrationWorkerLifecycleHost) {}
 
   readonly codexWorkers = new Map<string, AgentSessionDriver>();
+  private readonly workerGoalLimits = new Map<string, Extract<AgentGoalStatus, 'usageLimited' | 'budgetLimited'>>();
   /** Live per-Worker controls; the next turn of that Worker runs with them. */
   private readonly codexWorkerControls = new Map<string, HeadlessWorkerControls>();
   private readonly pendingCodexTurnDiffs = new Set<Promise<void>>();
@@ -184,6 +186,10 @@ export class OrchestrationWorkerLifecycleService {
   private dormancyTimer: ReturnType<typeof setInterval> | null = null;
   /** The last agent process of each headless Worker, kept after exit to verify nothing it started still runs. */
   private readonly lastWorkerPid = new Map<string, number>();
+
+  getWorkerGoalLimit(workerId: string) {
+    return this.workerGoalLimits.get(workerId);
+  }
 
   async workerInterrupt(input: { dispatchId?: string; worker?: string; taskId?: string }): Promise<{
     dispatch: OrchestrationDispatchRecord; interrupted: boolean;
@@ -1550,6 +1556,13 @@ export class OrchestrationWorkerLifecycleService {
         ? codexPilot!.launch(id, cwd, events, launchOptions)
         : headlessWorkers!.launch(cliId, id, cwd, events, launchOptions);
       session = launch({
+        onGoalChanged: (goal) => {
+          if (goal?.status === 'usageLimited' || goal?.status === 'budgetLimited') {
+            this.workerGoalLimits.set(id, goal.status);
+          } else {
+            this.workerGoalLimits.delete(id);
+          }
+        },
         onTimeline: (dispatchId, event) => {
           if (timeline.activeTurn?.dispatchId === dispatchId) timeline.apply(event);
         },
@@ -1600,6 +1613,7 @@ export class OrchestrationWorkerLifecycleService {
           this.host.archiveWorkerTimeline(id, dispatchId);
           this.host.workerTimelines.delete(id);
           this.codexWorkers.delete(id);
+          this.workerGoalLimits.delete(id);
           this.codexMailbox.delete(id);
           this.codexWorkerControls.delete(id);
           this.codexWorkerActivity.delete(id);
@@ -1636,6 +1650,7 @@ export class OrchestrationWorkerLifecycleService {
       const reason = error instanceof Error ? error.message : String(error);
       console.warn(`[orchestration] ${HEADLESS_DRIVER_LABELS[cliId]} headless Worker startup failed:`, session ? session.redactText(reason) : reason);
       this.codexWorkers.delete(id);
+      this.workerGoalLimits.delete(id);
       this.codexWorkerControls.delete(id);
       this.codexWorkerActivity.delete(id);
       await session?.close();

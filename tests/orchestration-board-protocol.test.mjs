@@ -14,6 +14,7 @@ import { buildOrchestrationSettingsUpdate } from '../dist-electron/ipc/settings.
 import {
   DEFAULT_PEER_PING_PONG_LIMIT,
   PeerPingPongTracker,
+  RunWakeBudget,
   collectWorkerReportArtifacts,
   formatBoardPostForAgent,
   formatBoardTeamSummary,
@@ -91,6 +92,40 @@ test('PeerPingPongTracker escalates at limit (default 3) and resets on coordinat
   assert.equal(tracker.getExchangeCount('run-2', 'api', 'verifier'), 0);
   tracker.clearAll();
   assert.equal(tracker.getExchangeCount('run-1', 'api', 'verifier'), 0);
+});
+
+test('RunWakeBudget caps each run at three, resets on progress, and ignores old input', () => {
+  const budget = new RunWakeBudget();
+  for (let i = 0; i < 3; i++) {
+    assert.equal(budget.observeProgress('run-1', 'waiting', 6), true);
+    budget.recordWake('run-1');
+  }
+  assert.equal(budget.observeProgress('run-1', 'waiting', 6), false);
+  assert.equal(budget.observeProgress('run-1', 'waiting', 0), false, 'retention is not progress');
+  assert.equal(budget.observeProgress('run-2', 'waiting', 0), true);
+  assert.equal(budget.observeProgress('run-1', 'waiting', 7), true, 'new user or Worker input resets');
+  for (let i = 0; i < 3; i++) budget.recordWake('run-1');
+  assert.equal(budget.observeProgress('run-1', 'settled', 0), true, 'business state resets');
+  for (let i = 0; i < 3; i++) budget.recordWake('run-1');
+  assert.equal(budget.observeProgress('run-1', 'settled', 7), false, 'high-water mark survives state resets');
+  budget.retainRuns(new Set(['run-2']));
+  assert.equal(budget.observeProgress('run-1', 'settled', 7), true, 'inactive run is evicted');
+});
+
+test('BoardStallWatchdog does not claim a stalled head while its injected budget is exhausted', () => {
+  const run = {
+    runId: 'run-1', coordinatorIdle: true, coordinatorHasWaiter: false, hasActiveWorkers: false,
+    hasSettledOrWaitingWorkers: true, hasPendingAttention: false, headSeq: 9,
+    lastPostAtMs: 70_000, lastPostIsDone: false, hasWakeBudget: false,
+  };
+  const detected = [];
+  const watchdog = new BoardStallWatchdog({
+    now: () => 100_000, inspectRuns: () => [run], onStallDetected: (...args) => detected.push(args),
+  });
+  assert.deepEqual(watchdog.sweep(), []);
+  run.hasWakeBudget = true;
+  assert.deepEqual(watchdog.sweep(), [{ runId: 'run-1', headSeq: 9, idleMs: 30_000 }]);
+  assert.deepEqual(detected, [['run-1', 9, 30_000]]);
 });
 
 test('collectWorkerReportArtifacts inspects a real temp git repo and never throws on missing paths', async (t) => {

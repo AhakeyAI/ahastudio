@@ -137,6 +137,8 @@ function createHarness(t, opts = {}) {
     now: opts.now,
     stallThresholdMs: opts.stallThresholdMs,
     stallWatchdogIntervalMs: 0,
+    headlessWorkerDormancyMs: opts.headlessWorkerDormancyMs,
+    codexPilot: opts.codexPilot,
     settleDelayMs: 0,
   });
 
@@ -797,6 +799,10 @@ test('workerDoneByPane attaches real git artifacts & BoardStallWatchdog posts on
   assert.equal(doneRes.message.artifacts.changedFiles.includes('README.md'), true);
   assert.equal(doneRes.message.artifacts.changedFiles.includes('feature.ts'), true);
 
+  // Process the report first so this still exercises the global quiet fallback.
+  await service.boardPost({ from: coordPaneId, text: `Accepted report #${doneRes.message.boardSeq}` });
+  service.boardRead({ from: coordPaneId });
+
   // Coordinator is idle, no waiter, all workers settled; before threshold -> no stall.
   agentStatusStore.ingestHookEvent({ ptyId: coordPaneId, agentId: 'claude', state: 'idle' });
   fakeNow += 10_000;
@@ -933,6 +939,369 @@ test('BoardStallWatchdog stays silent after a read question is answered by quest
   scenario.advanceMs(30_000);
   assert.deepEqual(service.stallWatchdog.sweep(), []);
   assert.equal(store.listBoardPosts(worker.run.id).filter((post) => post.kind === 'stall').length, 0);
+});
+
+async function createSemanticStallScenario(t, opts = {}) {
+  let now = Date.parse('2026-02-01T00:00:00Z');
+  const harness = createHarness(t, { ...opts, now: () => now });
+  const { service, store, coordPaneId, agentStatusStore } = harness;
+  if (opts.codexPilot) service.setSessionCoordinators({
+    get: (id) => id === coordPaneId ? { cwd: process.cwd(), provider: 'codex', active: true, idle: true } : null,
+  });
+  const launch = (role) => service.delegateTask({
+    from: coordPaneId, role, task: 'Verify the API', agent: opts.codexPilot ? 'codex' : 'claude', worktree: false,
+    ...(opts.codexPilot ? { taskKind: 'research' } : {}),
+  });
+  const worker = await launch('api');
+  const dispatchId = worker.dispatch.id;
+  const workerHandle = worker.ptyId ?? worker.dispatch.assigneeHandle;
+  const quietWorker = () => {
+    if (worker.ptyId) agentStatusStore.ingestHookEvent({ ptyId: worker.ptyId, agentId: 'claude', state: 'idle' });
+    store.markTurnStopReported(dispatchId, 1, 'finished');
+  };
+  const runId = worker.run.id;
+  const coordinatorPost = (text) => service.boardPost({ from: coordPaneId, runId, text });
+  const workerPost = (text, kind) => service.boardPost({ from: workerHandle, runId, text, kind });
+  const latestStall = () => store.listBoardPosts(runId, { limit: 500 }).filter(p => p.kind === 'stall').at(-1);
+  return { ...harness, worker, workerHandle, runId, launch, quietWorker, coordinatorPost, workerPost, latestStall,
+    advance: (ms = 30_000) => { now += ms; },
+    sweep: () => service.stallWatchdog.sweep(),
+    read: (seqs) => service.boardRead({ from: coordPaneId, runId, seqs }),
+  };
+}
+
+test('semantic stall merges unhandled report and unread signals in priority order', async (t) => {
+  const s = await createSemanticStallScenario(t);
+  const done = await s.service.workerDoneByPane(s.worker.ptyId, { summary: 'Verified compatibility' });
+  assert.equal(done.message.boardSeq, 2);
+  const unread = await s.workerPost('@coordinator One more observation');
+  assert.equal(unread.boardSeq, 3);
+  s.advance();
+  assert.deepEqual(s.sweep(), [{ runId: s.runId, headSeq: 3, idleMs: 30_000 }]);
+  const stall = s.latestStall();
+  assert.deepEqual(stall.refs, [2, 3]);
+  assert.deepEqual(stall.mentions, ['coordinator']);
+  assert.equal(stall.fromHandle, 'system');
+  assert.equal(stall.body, '@coordinator Unhandled Worker reports: #2. Review or follow up.\n@coordinator Unread board posts: #2, #3. Read the referenced posts.');
+  assert.equal(s.store.getDispatchContext(s.worker.dispatch.id).status, 'completed');
+  s.advance();
+  assert.deepEqual(s.sweep(), [], 'a stall at the head cannot generate another stall');
+});
+
+for (const action of ['read only', 'explicit reply', 'coordinator ref', 'coordinator thread', 'review started', 'integrated', 'already integrated']) {
+  test(`semantic stall distinguishes point-read reports from handling via ${action}`, async (t) => {
+    const s = await createSemanticStallScenario(t);
+    let report;
+    if (['review started', 'integrated', 'already integrated'].includes(action)) {
+      const result = await s.service.workerDoneByPane(s.worker.ptyId, { summary: 'Verified API' });
+      report = result.message;
+      if (action === 'already integrated') {
+        s.store.updateDispatchIntegrationState(s.worker.dispatch.id, { integrationStatus: 'merged' });
+        await s.coordinatorPost('Accepted #2');
+        s.read();
+        s.advance(1);
+        report = (await s.workerPost('@coordinator New report after integration', 'report')).post;
+      }
+    } else {
+      report = (await s.workerPost('@coordinator Verified API', 'report')).post;
+      s.quietWorker();
+    }
+    const reportSeq = action === 'already integrated' ? 4 : 2;
+    assert.equal(report.boardSeq, reportSeq);
+    s.read([reportSeq]);
+    assert.equal(s.store.wasBoardPostRead(report.id, 'coordinator'), true);
+    if (action !== 'review started') s.advance(1);
+    if (action === 'explicit reply') {
+      s.service.reply({ id: report.id, from: s.coordPaneId, body: 'Accepted' });
+      assert.equal(s.store.getMessageById(report.id).receipts.coordinator, 'replied');
+    } else if (action === 'coordinator ref') {
+      await s.coordinatorPost('Accepted #2');
+      assert.equal(s.store.getMessageById(report.id).receipts.coordinator, 'delivered');
+    } else if (action === 'coordinator thread') {
+      s.store.insertMessage({ runId: s.runId, from: s.coordPaneId, fromRole: 'coordinator',
+        to: `run:${s.runId}`, subject: 'Accepted', threadId: report.id });
+    } else if (action === 'review started') {
+      // Seed the record written by the review launch; a working reviewer would gate the whole watchdog.
+      const review = s.store.createTask({ runId: s.runId, spec: 'Review the API', displayName: 'reviewer' });
+      const d = s.store.createDispatchContext({ taskId: review.id, assigneeHandle: 'review-pane', reviewOfDispatchId: s.worker.dispatch.id });
+      s.store.insertMessage({ runId: s.runId, from: s.coordPaneId, fromRole: 'coordinator', to: `dispatch:${d.id}`,
+        kind: 'brief', type: 'dispatch', mentions: ['reviewer'], subject: 'Review assignment' });
+      s.store.markTurnStopReported(d.id, 1, 'finished');
+    } else if (action === 'integrated') {
+      s.store.updateDispatchIntegrationState(s.worker.dispatch.id, { integrationStatus: 'merged' });
+    }
+    s.advance();
+    assert.equal(s.sweep().length, 1);
+    const body = s.latestStall().body;
+    if (action === 'read only') {
+      assert.equal(body, '@coordinator Unhandled Worker reports: #2. Review or follow up.');
+    } else if (action === 'already integrated') {
+      assert.equal(body, '@coordinator Unhandled Worker reports: #4. Review or follow up.');
+    } else {
+      assert.doesNotMatch(body, /Unhandled Worker reports|Unread board posts/);
+    }
+  });
+}
+
+for (const readMode of ['unread', 'broad read', 'mentionsOnly wait']) {
+  test(`semantic stall diagnoses coordinator unread messages with ${readMode}`, async (t) => {
+    const s = await createSemanticStallScenario(t);
+    const post = await s.workerPost('@coordinator Clarified the test plan');
+    assert.equal(post.boardSeq, 2);
+    s.quietWorker();
+    if (readMode === 'broad read') {
+      assert.equal(s.read().lastReadSeq, 2);
+      assert.equal(s.store.wasBoardPostRead(post.post.id, 'coordinator'), false);
+    } else if (readMode === 'mentionsOnly wait') {
+      const wait = await s.service.boardWait({ from: s.coordPaneId, mentionsOnly: true, timeoutMs: 0 });
+      assert.deepEqual(wait.posts.map(p => p.boardSeq), [2]);
+      assert.equal(s.store.getMemberCursor(s.runId, 'coordinator').lastReadSeq, 0);
+      assert.equal(s.store.wasBoardPostRead(post.post.id, 'coordinator'), true);
+    }
+    s.advance();
+    assert.equal(s.sweep().length, 1);
+    if (readMode === 'unread') {
+      assert.equal(s.latestStall().body, '@coordinator Unread board posts: #2. Read the referenced posts.');
+    } else {
+      assert.equal(s.latestStall().subject, 'Board stall detected at #2 — last posts: @coordinator #1, @api #2');
+      assert.deepEqual(s.latestStall().refs, [1, 2]);
+      assert.doesNotMatch(s.latestStall().body, /Unread board posts/);
+    }
+    assert.equal(s.store.getDispatchContext(s.worker.dispatch.id).status, 'dispatched');
+  });
+}
+
+test('semantic stall never emits diagnostics with a working member or a native question pending', async (t) => {
+  const s = await createSemanticStallScenario(t);
+  const older = await s.launch('older');
+  await s.service.workerDoneByPane(older.ptyId, { summary: 'Report still unhandled' });
+  s.agentStatusStore.ingestHookEvent({ ptyId: s.worker.ptyId, agentId: 'claude', state: 'working' });
+  s.advance();
+  assert.deepEqual(s.sweep(), []);
+  s.quietWorker();
+  const abort = new AbortController();
+  const question = s.service.nativeQuestions.holdQuestion(s.worker.dispatch, {
+    provider: 'claude', method: 'AskUserQuestion', signal: abort.signal,
+    questions: [{ id: 'scope', header: 'Scope', prompt: 'Which scope?', allowOther: true, options: [] }],
+  });
+  assert.equal(s.service.nativeQuestions.listOpenQuestions({ runId: s.runId }).length, 1);
+  assert.equal(s.service.board.inspectRunsForStallWatchdog()[0].hasActiveWorkers, false);
+  assert.deepEqual(s.sweep(), []);
+  assert.equal(s.latestStall(), undefined);
+  abort.abort();
+  await question;
+  assert.equal(s.sweep().length, 1);
+});
+
+test('semantic stall retries an unanswered mention once, then escalates on the next eligible head', async (t) => {
+  const s = await createSemanticStallScenario(t);
+  assert.equal((await s.coordinatorPost('@api please acknowledge')).boardSeq, 2);
+  s.quietWorker();
+  await s.service.pointerDelivery.flushPane(s.worker.ptyId);
+  const originalWrites = s.writtenPty.length;
+  const mentionWrites = () => s.writtenPty.slice(originalWrites).filter(w => w.data.includes('Unanswered mention')).map(w => w.ptyId);
+  s.advance();
+  assert.equal(s.sweep().length, 1);
+  assert.equal(s.latestStall().body, '@api Unanswered mention at #2. Please respond on the board.');
+  assert.deepEqual(s.latestStall().mentions, ['api']);
+  assert.equal(s.latestStall().toHandle, `dispatch:${s.worker.dispatch.id}`);
+  assert.equal((await s.service.boardWait({ from: s.coordPaneId, mentionsOnly: true, peek: true })).posts.length, 0);
+  await s.service.pointerDelivery.flushPane(s.worker.ptyId);
+  assert.deepEqual(mentionWrites(), [s.worker.ptyId]);
+  s.advance();
+  assert.deepEqual(s.sweep(), [], 'the watchdog cannot react to its own retry post');
+  assert.equal((await s.coordinatorPost('Checking in without a new mention')).boardSeq, 4);
+  s.advance();
+  assert.equal(s.sweep().length, 1);
+  assert.equal(s.latestStall().body, '@coordinator Unanswered mention for @api at #2: no reply after one re-ping. Follow up or handle it manually.');
+  assert.deepEqual(s.latestStall().refs, [2]);
+  await s.service.pointerDelivery.flushPane(s.worker.ptyId);
+  assert.deepEqual(mentionWrites(), [s.worker.ptyId]);
+  assert.equal(s.store.getDispatchContext(s.worker.dispatch.id).status, 'dispatched');
+});
+
+for (const problem of ['failed', 'process exited or unavailable']) {
+  test(`semantic stall escalates a ${problem} Worker without a retry`, async (t) => {
+    const s = await createSemanticStallScenario(t);
+    await s.coordinatorPost('@api please acknowledge');
+    s.quietWorker();
+    if (problem === 'failed') {
+      s.agentStatusStore.ingestHookEvent({ ptyId: s.worker.ptyId, agentId: 'claude', state: 'error' });
+    } else {
+      s.tracker.markExited(s.worker.ptyId, 1);
+    }
+    s.advance();
+    const wakes = [];
+    const schedule = s.service.pointerDelivery.scheduleRedriveForPane.bind(s.service.pointerDelivery);
+    s.service.pointerDelivery.scheduleRedriveForPane = (pane) => { wakes.push(pane); schedule(pane); };
+    const writesBefore = s.writtenPty.filter(w => w.ptyId === s.worker.ptyId).length;
+    assert.equal(s.sweep().length, 1);
+    assert.equal(s.latestStall().body, `@coordinator Unanswered mention for @api at #2: ${problem}. Consider switching CLIs or handling it manually.`);
+    assert.deepEqual(wakes, [s.coordPaneId]);
+    const peek = await s.service.boardWait({ from: s.worker.ptyId, since: 2, mentionsOnly: false, peek: true });
+    assert.deepEqual(peek.posts, [], 'a full-board Worker wait does not deliver coordinator-only stalls');
+    assert.equal(s.writtenPty.filter(w => w.ptyId === s.worker.ptyId).length, writesBefore);
+  });
+}
+
+test('semantic stall uses the headless goal status and sends no Worker turn on quota exhaustion', async (t) => {
+  let events;
+  const sent = [];
+  const sessionId = 'agent-session-00000000-0000-0000-0000-00000000000b';
+  const s = await createSemanticStallScenario(t, {
+    coordPaneId: sessionId,
+    codexPilot: { enabled: () => true, launch(_id, _cwd, callbacks) {
+      events = callbacks;
+      return { alive: true, busy: false, latestTurnKey: null, open: async () => 'scout-thread', close: async () => {},
+        read: () => null, redactText: text => text,
+        async startTurn(input) { sent.push(input); return { status: 'accepted' }; },
+      };
+    } },
+  });
+  const workerId = s.worker.dispatch.id;
+  assert.equal(s.worker.dispatch.executionMode, 'codex-app-server');
+  assert.equal(sent.length, 1);
+  const mention = s.store.insertMessage({ runId: s.runId, from: sessionId, fromRole: 'coordinator',
+    to: `dispatch:${workerId}`, mentions: ['api'], kind: 'post', subject: 'Please acknowledge' });
+  assert.equal(mention.boardSeq, 2);
+  s.store.recordCodexTurn(workerId, { turnId: 'worker-turn', stopReason: 'completed', finalText: '', diff: null, error: null, usage: null });
+  events.onGoalChanged({ objective: 'Verify API', status: 'usageLimited', tokensUsed: 0, timeUsedSeconds: 0, updatedAt: 1 });
+  s.advance();
+  assert.equal(s.sweep().length, 1);
+  assert.equal(s.latestStall().body, '@coordinator Unanswered mention for @api at #2: limited (usageLimited). Consider switching CLIs or handling it manually.');
+  assert.equal(sent.length, 1);
+  assert.equal(s.service.workers.codexMailbox.has(s.worker.dispatch.assigneeHandle), false);
+  assert.equal(s.store.getDispatchContext(workerId).status, 'dispatched');
+});
+
+test('semantic stall distinguishes a dormant headless Worker from a crashed process without sending a retry turn', async (t) => {
+  const sent = [];
+  const sessionId = 'agent-session-00000000-0000-0000-0000-00000000000c';
+  const s = await createSemanticStallScenario(t, {
+    coordPaneId: sessionId,
+    headlessWorkerDormancyMs: 1_000,
+    codexPilot: {
+      enabled: () => true,
+      launch(_id, _cwd, callbacks) {
+        const driver = {
+          alive: true,
+          busy: false,
+          closing: false,
+          latestTurnKey: null,
+          open: async () => 'dormant-thread',
+          async close(quiet) {
+            driver.alive = false;
+            if (quiet) callbacks.onExit('closed', 0);
+          },
+          read: () => null,
+          redactText: (text) => String(text ?? ''),
+          async startTurn(input) {
+            driver.latestTurnKey = input.turnKey;
+            sent.push(input);
+            return { status: 'accepted' };
+          },
+        };
+        return driver;
+      },
+    },
+  });
+  t.after(() => s.service.stopCodexWorkers());
+  const workerId = s.worker.dispatch.id;
+  const workerHandle = s.worker.dispatch.assigneeHandle;
+  const peer = await s.launch('peer');
+  assert.equal(sent.length, 2);
+
+  s.store.recordCodexTurn(workerId, { turnId: 'api-turn', stopReason: 'completed', finalText: 'Schema ready', diff: null, error: null, usage: null });
+  const done = await s.service.workerDoneByPane(workerHandle, {
+    outcome: 'completed',
+    summary: 'Schema ready',
+  });
+  await s.coordinatorPost(`Reviewed #${done.message.boardSeq}`);
+  s.read();
+
+  s.advance(2_000);
+  assert.deepEqual(s.service.workers.sleepIdleHeadlessWorkers(), [workerHandle]);
+  assert.equal(s.service.workers.isDormant(s.store.getDispatchContext(workerId)), true);
+  assert.equal(s.service.isPaneAlive(workerHandle), false);
+
+  const mention = await s.service.boardPost({
+    from: peer.dispatch.assigneeHandle,
+    runId: s.runId,
+    text: '@api can you confirm field types?',
+  });
+  s.read();
+  s.store.recordCodexTurn(peer.dispatch.id, { turnId: 'peer-turn', stopReason: 'completed', finalText: '', diff: null, error: null, usage: null });
+  s.advance();
+  assert.equal(s.sweep().length, 1);
+  assert.equal(
+    s.latestStall().body,
+    `@coordinator Unanswered mention for @api at #${mention.boardSeq}: dormant. Follow up to wake it in place or handle it manually.`,
+  );
+  assert.equal(sent.length, 2);
+});
+
+test('semantic stall spends three actual coordinator wakes; chatter cannot reset the budget', async (t) => {
+  const s = await createSemanticStallScenario(t);
+  await s.workerPost('Checks are ready');
+  s.read();
+  s.quietWorker();
+  const stallWakes = () => s.writtenPty.filter(w => w.ptyId === s.coordPaneId && w.data.includes('Board stall detected'));
+  assert.equal(stallWakes().length, 0);
+  for (const expectedHead of [2, 4, 6]) {
+    s.advance();
+    assert.deepEqual(s.sweep(), [{ runId: s.runId, headSeq: expectedHead, idleMs: 30_000 }]);
+    assert.equal(await s.service.pointerDelivery.flushPane(s.coordPaneId), true);
+    await s.coordinatorPost('Idle system turn chatter, no task progress');
+  }
+  for (let i = 0; i < 2; i++) {
+    s.advance();
+    assert.deepEqual(s.sweep(), []);
+    await s.coordinatorPost('Still idle');
+  }
+  assert.equal(stallWakes().length, 3);
+  const next = await s.launch('next');
+  s.store.markTurnStopReported(next.dispatch.id, 1, 'finished');
+  s.advance();
+  assert.deepEqual(s.sweep(), [{ runId: s.runId, headSeq: 11, idleMs: 30_000 }]);
+  assert.deepEqual(s.latestStall().mentions, ['coordinator']);
+});
+
+for (const author of ['user', 'Worker']) {
+  test(`semantic stall replenishes the wake budget after a new ${author} post`, async (t) => {
+    const s = await createSemanticStallScenario(t);
+    s.quietWorker();
+    for (const head of [1, 3, 5]) {
+      s.advance();
+      assert.deepEqual(s.sweep(), [{ runId: s.runId, headSeq: head, idleMs: 30_000 }]);
+      await s.coordinatorPost('Waiting');
+    }
+    s.advance();
+    assert.deepEqual(s.sweep(), []);
+    if (author === 'user') {
+      await s.service.boardPost({ runId: s.runId, from: s.coordPaneId, text: 'Human guidance', isUser: true });
+    } else {
+      await s.workerPost('New evidence');
+    }
+    s.advance();
+    assert.deepEqual(s.sweep(), [{ runId: s.runId, headSeq: 8, idleMs: 30_000 }]);
+  });
+}
+
+test('semantic stall honors coordinator [done] across system posts but not across new Worker posts', async (t) => {
+  const s = await createSemanticStallScenario(t);
+  assert.equal((await s.workerPost('[done] from the Worker')).boardSeq, 2);
+  s.quietWorker();
+  s.advance();
+  assert.equal(s.sweep().length, 1);
+  assert.deepEqual(s.latestStall().refs, [2]);
+  assert.equal((await s.coordinatorPost('[DONE] all done')).boardSeq, 4);
+  s.store.insertMessage({ runId: s.runId, from: 'system', fromRole: 'system', to: `run:${s.runId}`, subject: 'Audit notice' });
+  s.advance();
+  assert.deepEqual(s.sweep(), []);
+  assert.equal((await s.workerPost('New finding')).boardSeq, 6);
+  s.advance();
+  assert.equal(s.sweep().length, 1);
+  assert.equal(s.latestStall().body, '@coordinator Unread board posts: #2, #5, #6. Read the referenced posts.');
 });
 
 test('Stdio MCP server (aha-mcp-server.cjs): end-to-end post_message, read_board & board_wait across coordinator and sibling workers', async (t) => {
@@ -1211,7 +1580,7 @@ test('Regression: multi-mention boardPost leaves questions pending and reactivat
     agent: 'claude',
     worktree: false,
   });
-  const verifier = await service.delegateTask({
+  await service.delegateTask({
     from: coordPaneId,
     role: 'verifier',
     task: 'Verifier work',
