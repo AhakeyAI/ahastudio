@@ -126,7 +126,8 @@ flowchart LR
   - `orchestration-security-store.ts`（Capability 校验、脱敏与容量裁剪）
   - `orchestration-store.ts` 保留为统一 Facade。
 
-#### 2B：将 `orchestration-service.ts`（10,761 行）拆为薄 Facade + 内聚子服务
+#### 2B：将 `orchestration-service.ts`（10,761 行）拆为薄 Facade + 内聚子服务 — **已完成**
+- 落地：6 个子模块全部外提（service 约 10,800 → 5,000 行）；每个子服务只经显式 `*Host` 接口依赖 service（仅类型导入，无运行时循环），对外 API 由 service 委托保持不变。service 仍保留鉴权、Run/Task、消息收发（send/check/ask/reply）与 Coordinator 循环，后续按需再拆。
 - **外提顺序按耦合低→高**（每外提 1–2 个子服务即运行 `npm run typecheck` + 定向单测；review / integration / worker-lifecycle 三步合并前必须加跑 `npm run test:e2e`）：
   1. `orchestration-text-views.ts`（`team_status`、看板摘要与快照文本视图——纯格式化、耦合最低，先做）
   2. `board-service.ts`（看板发帖、游标、`receipts`、精确已读、`board_wait`、中场注入、停摆监测——符号锚点 `boardPost` / `boardRead` / `boardWait` / `inspectRunsForStallWatchdog` / `handleBoardStallDetected`）

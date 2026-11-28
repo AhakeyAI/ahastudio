@@ -1,24 +1,33 @@
-import { randomUUID } from 'node:crypto';
-import { existsSync, realpathSync } from 'node:fs';
-import { resolve as resolveFsPath } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { runGitCommand } from '../git/git-exec.js';
 import type {
-  AgentSessionDriver, AgentSessionEvents, AgentSessionPolicy, AgentTurnResult, TurnDelivery,
+  AgentSessionDriver,
+  AgentSessionEvents,
+  AgentSessionPolicy,
+  TurnDelivery,
 } from './agent-session-driver.js';
 import { SESSION_WAKE_HEADER } from './coordinator-prompt.js';
 import { AGENT_SESSION_ID } from './agent-session-manager.js';
 import {
-  HEADLESS_DRIVER_LABELS, HEADLESS_WORKER_ID, SESSION_GATED_COORDINATOR_ACTIONS, headlessWorkerControlsError,
-  headlessWorkerDriver, headlessWorkerSupports, isHeadlessWorkerDriver, sessionGateDecision, type HeadlessWorkerDriver,
+  HEADLESS_WORKER_ID,
+  SESSION_GATED_COORDINATOR_ACTIONS,
+  sessionGateDecision,
+  type HeadlessWorkerDriver,
 } from './headless-workers.js';
-import { driverCapabilities } from '../agent-drivers/driver-capabilities.js';
 import { WorkerNativeQuestionManager } from './worker-native-questions.js';
+import { formatActionReceiptText } from './orchestration-text-views.js';
+import { OrchestrationBoardService, type BoardPostInput } from './board-service.js';
+import { OrchestrationWorkerLifecycleService } from './worker-lifecycle-service.js';
+import { OrchestrationDelegationService } from './delegation-service.js';
+import { OrchestrationIntegrationService } from './integration-service.js';
+import { OrchestrationReviewService } from './review-service.js';
 import {
-  WorkerTimeline, type WorkerTimelineChange, type WorkerTimelineSnapshot, type WorkerTimelineTurnStatus,
+  WorkerTimeline,
+  type WorkerTimelineChange,
+  type WorkerTimelineSnapshot,
 } from './worker-timeline.js';
 import type { PtyWriteFn } from '../agent/agent-prompt-delivery.js';
 import type { AgentPaneStatus, AgentStatusStore } from '../agent/agent-status-store.js';
-import { getGitStatus } from '../git/git-service.js';
 import type { TerminalReadResult, TerminalRuntimeTracker, TerminalSummary } from '../terminal-runtime-tracker.js';
 import {
   Coordinator,
@@ -35,7 +44,6 @@ import {
   completionReportDispatchId,
   exposeMessage,
   exposeMessages,
-  formatAgentFieldsText,
   formatMessageBanner,
   reportFollowUpAction,
 } from './orchestration-messaging.js';
@@ -61,7 +69,6 @@ import {
   type OrchestrationMessageType,
   type OrchestrationPeerMessagingMode,
   type OrchestrationQuestionRecord,
-  type OrchestrationMemberCursor,
   type OrchestrationReportArtifacts,
   type OrchestrationReviewFinding,
   type OrchestrationReviewVerdict,
@@ -78,19 +85,12 @@ import {
   type WorkerNativeQuestionPayload,
 } from './orchestration-types.js';
 import {
-  DEFAULT_PEER_PING_PONG_LIMIT,
   PeerPingPongTracker,
   collectWorkerReportArtifacts,
   formatBoardPostForAgent,
-  boardLookupCommands,
-  formatBoardTeamSummary,
-  parseBoardMentions,
   parseBoardRefs,
 } from './board-protocol.js';
-import {
-  BoardStallWatchdog,
-  type BoardStallRunState,
-} from './stall-watchdog.js';
+import { BoardStallWatchdog } from './stall-watchdog.js';
 import {
   DispatchProposalManager,
   type DispatchProposalOverrides,
@@ -106,52 +106,32 @@ import {
   type BuildDispatchPreambleInput,
 } from './worker-dispatch-preamble.js';
 import {
-  mergeTaskContext,
   normalizeTaskContext,
   type SharedRunBoardPostSummary,
   type SharedRunContext,
   type SharedRunPeerSummary,
 } from './worker-brief-context.js';
-import { normalizeWorkerCliId, resolveWorkerLaunchConfig } from './worker-launch-catalog.js';
+import { normalizeWorkerCliId } from './worker-launch-catalog.js';
 import { WorkerTurnStopMonitor } from './worker-turn-stops.js';
 import {
-  buildAdversarialReviewTask,
-  buildRunAdversarialReviewTask,
   evaluateAdversarialVerdict,
   formatReviewVerdictForBoard,
   MAX_ADVERSARIAL_REVIEW_ROUNDS,
   normalizeReviewFindings,
-  type RunIntegratedWorkerSummaryForReview,
 } from './adversarial-review.js';
 import {
-  captureWorkerSnapshotOid,
-  createDetachedReviewWorktree,
   detectReviewWorktreeMutation,
-  finalizeRunIntegrationBranch,
-  inspectCommitRangeDiff,
   inspectWorkerDiff,
-  integrateWorkerChanges,
-  integrateWorkerIntoRunBranch,
   isGitCommitAncestor,
   isSameGitRepo,
-  removeDetachedReviewWorktree,
   resolveBranchRefOid,
-  resolveIntegrationMergeBase,
   resolveMainRepoRoot,
-  resolveTargetSymbolicRef,
   type RunCommitRangeDiffInspection,
-  type RunFinalizeIntegrationResult,
   type WorkerDiffInspection,
   type WorkerIntegrateMode,
   type WorkerIntegrateTargetBranch,
   type WorkerIntegrationResult,
 } from './worker-git-integration.js';
-import {
-  assertWorkerWorktreeClean,
-  prepareWorkerWorktreePlacement,
-  removeOwnedWorkerWorktree,
-  WORKER_BRANCH_PREFIX,
-} from './worker-worktree-placement.js';
 import {
   deliverAndObserveAgentTurn,
   type DeliverAndObserveAgentTurnResult,
@@ -385,15 +365,21 @@ export interface OrchestrationServiceDependencies {
   now?: () => number;
 }
 
-interface BoardPostInput {
+export interface SettledWorkerFollowUpInput {
+  from?: string;
+  to: string;
+  type?: OrchestrationMessageType;
+  priority?: OrchestrationMessagePriority;
+  subject: string;
+  body?: string;
+  payload?: string | Record<string, unknown> | null;
   runId?: string;
-  from: string;
+  threadId?: string;
   fromRole?: string;
-  text: string;
+  mentions?: readonly string[];
+  refs?: readonly number[];
   kind?: OrchestrationBoardPostKind;
-  subject?: string;
-  isUser?: boolean;
-  replyTo?: string | number;
+  existingMessage?: OrchestrationMessageRecord;
 }
 
 export class OrchestrationService {
@@ -406,25 +392,21 @@ export class OrchestrationService {
   readonly peerPingPong = new PeerPingPongTracker();
   readonly stallWatchdog: BoardStallWatchdog;
   private readonly turnStopMonitor: WorkerTurnStopMonitor;
+  private readonly board: OrchestrationBoardService;
+  private readonly workers: OrchestrationWorkerLifecycleService;
+  private readonly delegation: OrchestrationDelegationService;
+  private readonly integration: OrchestrationIntegrationService;
+  private readonly review: OrchestrationReviewService;
 
   private readonly agentStatusStore: AgentStatusStore;
   private readonly writePty: PtyWriteFn;
   private readonly spawnWorkerPty?: OrchestrationServiceDependencies['spawnWorkerPty'];
   private readonly codexPilot?: OrchestrationServiceDependencies['codexPilot'];
   private readonly headlessWorkers?: OrchestrationServiceDependencies['headlessWorkers'];
-  private readonly codexWorkers = new Map<string, AgentSessionDriver>();
-  /** Live per-Worker controls; the next turn of that Worker runs with them. */
-  private readonly codexWorkerControls = new Map<string, HeadlessWorkerControls>();
-  private readonly pendingCodexTurnDiffs = new Set<Promise<void>>();
   private sessionCoordinators: OrchestrationSessionCoordinators | null = null;
-  private readonly codexSubmitting = new Set<string>();
-  /** Pending wake-ups per headless Worker; `opaque` means at least one wake carried no message record. */
-  private readonly codexMailbox = new Map<string, { messages: OrchestrationMessageRecord[]; opaque: boolean }>();
   private readonly workerTimelines = new Map<string, WorkerTimeline>();
   private readonly timelineListeners = new Set<(change: WorkerTimelineChange) => void>();
   private disposed = false;
-  private queueSweepScheduled = false;
-  private readonly claimedLaunches = new Map<string, symbol>();
   private readonly closeWorkerPty?: OrchestrationServiceDependencies['closeWorkerPty'];
   private readonly externalIsPtyAlive?: (ptyId: string) => boolean;
   private readonly isAgentCliId?: (cliId: string) => boolean;
@@ -459,10 +441,6 @@ export class OrchestrationService {
   >();
   private readonly exitedPanes = new Set<string>();
   private readonly inFlightObservationDispatches = new Set<string>();
-  private readonly workerMutations = new Set<string>();
-  private readonly reviewStartLocks = new Map<string, Promise<void>>();
-  private readonly runIntegrationLocks = new Map<string, Promise<void>>();
-  private readonly inFlightReviewStarts = new Map<string, number>();
   private readonly retiringPanes = new Set<string>();
   private readonly disposeStatusListener: () => void;
   private readonly disposeActivityListener: () => void;
@@ -510,6 +488,144 @@ export class OrchestrationService {
       this.clock = () => Date.now();
     }
 
+    const svc = this;
+    this.workers = new OrchestrationWorkerLifecycleService({
+      get agentStatusStore() { return svc.agentStatusStore; },
+      get approvals() { return svc.approvals; },
+      archiveWorkerTimeline: (...args) => this.archiveWorkerTimeline(...args),
+      assertCanDelegateFrom: (...args) => this.assertCanDelegateFrom(...args),
+      assertWorkerStartControls: (...args) => this.assertWorkerStartControls(...args),
+      authorizeRunAccess: (...args) => this.authorizeRunAccess(...args),
+      get board() { return svc.board; },
+      buildWorkerDispatchBrief: (...args) => this.buildWorkerDispatchBrief(...args),
+      canHeadlessWorkerDelegate: (...args) => this.canHeadlessWorkerDelegate(...args),
+      get cliCommand() { return svc.cliCommand; },
+      get closeWorkerPty() { return svc.closeWorkerPty; },
+      get codexPilot() { return svc.codexPilot; },
+      createWorkerTimeline: (...args) => this.createWorkerTimeline(...args),
+      get delegation() { return svc.delegation; },
+      deliverAndObserveDispatchTurn: (...args) => this.deliverAndObserveDispatchTurn(...args),
+      get disposed() { return svc.disposed; },
+      emitChanged: (...args) => this.emitChanged(...args),
+      emitPaneClosed: (...args) => this.emitPaneClosed(...args),
+      emitPaneSpawned: (...args) => this.emitPaneSpawned(...args),
+      get exitedPanes() { return svc.exitedPanes; },
+      failTaskIfReady: (...args) => this.failTaskIfReady(...args),
+      get getDefaultCwd() { return svc.getDefaultCwd; },
+      get headlessWorkers() { return svc.headlessWorkers; },
+      inferRunIdOptional: (...args) => this.inferRunIdOptional(...args),
+      get integration() { return svc.integration; },
+      isActiveSessionCoordinator: (...args) => this.isActiveSessionCoordinator(...args),
+      get isMcpEnabledForCliDep() { return svc.isMcpEnabledForCliDep; },
+      isPaneAlive: (...args) => this.isPaneAlive(...args),
+      listCodingAgents: (...args) => this.listCodingAgents(...args),
+      get listCodingAgentsDep() { return svc.listCodingAgentsDep; },
+      markPtyExited: (...args) => this.markPtyExited(...args),
+      get maxDepth() { return svc.maxDepth; },
+      get nativeQuestions() { return svc.nativeQuestions; },
+      notifyTargetAndAliases: (...args) => this.notifyTargetAndAliases(...args),
+      paneMismatch: (...args) => this.paneMismatch(...args),
+      redactTaskContext: (...args) => this.redactTaskContext(...args),
+      resolveActiveParentMailbox: (...args) => this.resolveActiveParentMailbox(...args),
+      resolveCallerDepth: (...args) => this.resolveCallerDepth(...args),
+      get retiringPanes() { return svc.retiringPanes; },
+      get review() { return svc.review; },
+      runCreate: (...args) => this.runCreate(...args),
+      sessionCoordinator: (...args) => this.sessionCoordinator(...args),
+      get spawnWorkerPty() { return svc.spawnWorkerPty; },
+      get spawnedWorkerMeta() { return svc.spawnedWorkerMeta; },
+      get spawnedWorkerPanes() { return svc.spawnedWorkerPanes; },
+      get store() { return svc.store; },
+      get terminalTracker() { return svc.terminalTracker; },
+      get turnStopMonitor() { return svc.turnStopMonitor; },
+      verifyCodeInputs: (...args) => this.verifyCodeInputs(...args),
+      get waiters() { return svc.waiters; },
+      get workerTimelines() { return svc.workerTimelines; },
+    });
+    this.delegation = new OrchestrationDelegationService({
+      get agentStatusStore() { return svc.agentStatusStore; },
+      get approvals() { return svc.approvals; },
+      approve: (...args) => this.approve(...args),
+      assertCanDelegateFrom: (...args) => this.assertCanDelegateFrom(...args),
+      assertCanReply: (...args) => this.assertCanReply(...args),
+      assertRunCoordinator: (...args) => this.assertRunCoordinator(...args),
+      assertWorkerController: (...args) => this.assertWorkerController(...args),
+      authorizeRunAccess: (...args) => this.authorizeRunAccess(...args),
+      get board() { return svc.board; },
+      deny: (...args) => this.deny(...args),
+      get disposed() { return svc.disposed; },
+      effectiveConfirmMode: (...args) => this.effectiveConfirmMode(...args),
+      emitChanged: (...args) => this.emitChanged(...args),
+      get getDefaultCwd() { return svc.getDefaultCwd; },
+      get getDefaultWorktreeDep() { return svc.getDefaultWorktreeDep; },
+      inferRunIdOptional: (...args) => this.inferRunIdOptional(...args),
+      get integration() { return svc.integration; },
+      isCallerSurface: (...args) => this.isCallerSurface(...args),
+      get isMcpEnabledForCliDep() { return svc.isMcpEnabledForCliDep; },
+      isPaneAlive: (...args) => this.isPaneAlive(...args),
+      isPaneOrchestrationMode: (...args) => this.isPaneOrchestrationMode(...args),
+      listCodingAgents: (...args) => this.listCodingAgents(...args),
+      get maxDepth() { return svc.maxDepth; },
+      get peerPingPong() { return svc.peerPingPong; },
+      get proposals() { return svc.proposals; },
+      redactTaskContext: (...args) => this.redactTaskContext(...args),
+      reply: (...args) => this.reply(...args),
+      resolveCallerDepth: (...args) => this.resolveCallerDepth(...args),
+      get selectAgentForTaskDep() { return svc.selectAgentForTaskDep; },
+      send: (...args) => this.send(...args),
+      sessionCoordinator: (...args) => this.sessionCoordinator(...args),
+      get store() { return svc.store; },
+      get terminalTracker() { return svc.terminalTracker; },
+      workerRead: (...args) => this.workers.workerRead(...args),
+      workerRelease: (...args) => this.workers.workerRelease(...args),
+      workerStart: (...args) => this.workers.workerStart(...args),
+      workerStop: (...args) => this.workers.workerStop(...args),
+    });
+    this.integration = new OrchestrationIntegrationService({
+      assertRunCoordinator: (...args) => this.assertRunCoordinator(...args),
+      assertWorkerController: (...args) => this.assertWorkerController(...args),
+      authorizeRunAccess: (...args) => this.authorizeRunAccess(...args),
+      emitChanged: (...args) => this.emitChanged(...args),
+      get getDefaultCwd() { return svc.getDefaultCwd; },
+      inferRunIdOptional: (...args) => this.inferRunIdOptional(...args),
+      mutateWorkerResources: (...args) => this.workers.mutateWorkerResources(...args),
+      releaseWorker: (...args) => this.workers.releaseWorker(...args),
+      resolveDispatchByRoleOrTarget: (...args) => this.delegation.resolveDispatchByRoleOrTarget(...args),
+      resolveRoleNameForDispatch: (...args) => this.delegation.resolveRoleNameForDispatch(...args),
+      resolveTargetDispatch: (...args) => this.workers.resolveTargetDispatch(...args),
+      get store() { return svc.store; },
+      get terminalTracker() { return svc.terminalTracker; },
+      workerRelease: (...args) => this.workers.workerRelease(...args),
+    });
+    this.review = new OrchestrationReviewService({
+      emitChanged: (...args) => this.emitChanged(...args),
+      failTaskIfReady: (...args) => this.failTaskIfReady(...args),
+      resolveRoleNameForDispatch: (...args) => this.delegation.resolveRoleNameForDispatch(...args),
+      get store() { return svc.store; },
+    });
+    this.board = new OrchestrationBoardService({
+      get agentStatusStore() { return svc.agentStatusStore; },
+      get approvals() { return svc.approvals; },
+      get clock() { return svc.clock; },
+      deliverCodexMailbox: (...args) => this.workers.deliverCodexMailbox(...args),
+      deriveLiveStage: (...args) => this.workers.deriveLiveStage(...args),
+      emitChanged: (...args) => this.emitChanged(...args),
+      followUpSettledWorker: (...args) => this.workers.followUpSettledWorker(...args),
+      get getPeerMessagingModeDep() { return svc.getPeerMessagingModeDep; },
+      getReviewFirewallContext: (...args) => this.review.getReviewFirewallContext(...args),
+      inferRunIdOptional: (...args) => this.inferRunIdOptional(...args),
+      isPostHiddenByReviewFirewall: (...args) => this.review.isPostHiddenByReviewFirewall(...args),
+      get nativeQuestions() { return svc.nativeQuestions; },
+      get peerPingPong() { return svc.peerPingPong; },
+      get pointerDelivery() { return svc.pointerDelivery; },
+      get proposals() { return svc.proposals; },
+      queueCodexMail: (...args) => this.workers.queueCodexMail(...args),
+      resolveRoleNameForDispatch: (...args) => this.delegation.resolveRoleNameForDispatch(...args),
+      sessionCoordinator: (...args) => this.sessionCoordinator(...args),
+      get store() { return svc.store; },
+      toWorkerSummary: (...args) => this.workers.toWorkerSummary(...args),
+      get waiters() { return svc.waiters; },
+    });
     this.waiters = new RuntimeMessageWaiters();
     this.pointerDelivery = new MailboxPointerDelivery({
       onReceipt: runId => this.emitChanged('board:delivery', runId),
@@ -519,16 +635,16 @@ export class OrchestrationService {
       writePty: this.writePty,
       isPaneAlive: (ptyId) => this.isPaneAlive(ptyId),
       isMcpEnabledForPane: (ptyId) => this.isMcpEnabledForPane(ptyId),
-      resolveMemberKeyForPane: (ptyId) => this.resolveBoardMemberForPane(ptyId),
-      findPendingBoardPostsForPane: (ptyId) => this.findUndeliveredBoardPostsForPane(ptyId),
+      resolveMemberKeyForPane: (ptyId) => this.board.resolveBoardMemberForPane(ptyId),
+      findPendingBoardPostsForPane: (ptyId) => this.board.findUndeliveredBoardPostsForPane(ptyId),
       shouldDeliverMessageToPane: (msg, ptyId) => {
-        const member = this.resolveBoardMemberForPane(ptyId);
+        const member = this.board.resolveBoardMemberForPane(ptyId);
         if (!member || member.runId !== msg.runId) return true;
-        const firewall = this.getReviewFirewallContext(ptyId);
-        if (firewall && this.isPostHiddenByReviewFirewall(msg, firewall)) return false;
+        const firewall = this.review.getReviewFirewallContext(ptyId);
+        if (firewall && this.review.isPostHiddenByReviewFirewall(msg, firewall)) return false;
         if (this.store.wasBoardPostRead(msg.id, member.memberKey)) return false;
         if (!msg.kind) return true;
-        return this.doesBoardPostWakeMember(
+        return this.board.doesBoardPostWakeMember(
           msg,
           member.role,
           ptyId,
@@ -551,7 +667,7 @@ export class OrchestrationService {
       notifyMailbox: (mailbox, type) => this.notifyTargetAndAliases(mailbox, type),
       onChanged: (reason, runId) => this.emitChanged(reason, runId),
       onApprovalChanged: (approval) => this.timelineApproval(approval),
-      resolveRoleName: (dispatch) => this.resolveRoleNameForDispatch(dispatch) || null,
+      resolveRoleName: (dispatch) => this.delegation.resolveRoleNameForDispatch(dispatch) || null,
       cliCommand: this.cliCommand,
       holdTimeoutMs: deps.approvalHoldTimeoutMs,
       now: this.clock,
@@ -582,10 +698,10 @@ export class OrchestrationService {
       capturePaneTail: (ptyId, maxChars) => this.terminalTracker?.captureTail(ptyId, maxChars) ?? '',
       hasOpenApprovalForDispatch: (dispatchId) => this.approvals.hasOpenApprovalForDispatch(dispatchId),
       isDeliveryInFlight: (dispatchId) => this.inFlightObservationDispatches.has(dispatchId),
-      resolveRoleName: (dispatch) => this.resolveRoleNameForDispatch(dispatch) || null,
+      resolveRoleName: (dispatch) => this.delegation.resolveRoleNameForDispatch(dispatch) || null,
       notifyMailbox: (mailbox, type) => this.notifyTargetAndAliases(mailbox, type),
       onTurnStopEscalated: (_dispatchId, runId, stopReason) => {
-        if (stopReason === 'exited') this.settleUnreportedReviewDispatches();
+        if (stopReason === 'exited') this.review.settleUnreportedReviewDispatches();
         this.emitChanged('worker:turn-stopped', runId);
       },
       cliCommand: this.cliCommand,
@@ -596,9 +712,9 @@ export class OrchestrationService {
       intervalMs: deps.stallWatchdogIntervalMs ?? 0,
       stallThresholdMs: deps.stallThresholdMs,
       now: this.clock,
-      inspectRuns: () => this.inspectRunsForStallWatchdog(),
+      inspectRuns: () => this.board.inspectRunsForStallWatchdog(),
       onStallDetected: (runId, headSeq, idleMs) =>
-        this.handleBoardStallDetected(runId, headSeq, idleMs),
+        this.board.handleBoardStallDetected(runId, headSeq, idleMs),
     });
     if ((deps.stallWatchdogIntervalMs ?? 0) > 0) {
       this.stallWatchdog.start();
@@ -653,7 +769,7 @@ export class OrchestrationService {
       }
     });
 
-    void this.recoverGitPublications().catch(error => console.warn('[orchestration] Git recovery:', error)).finally(() => this.scheduleQueuedLaunches());
+    void this.integration.recoverGitPublications().catch(error => console.warn('[orchestration] Git recovery:', error)).finally(() => this.delegation.scheduleQueuedLaunches());
     const staleSweepIntervalMs = deps.staleSweepIntervalMs ?? 0;
     if (staleSweepIntervalMs > 0) {
       this.staleSweepTimer = setInterval(() => {
@@ -707,7 +823,7 @@ export class OrchestrationService {
 
   setSessionCoordinators(registry: OrchestrationSessionCoordinators | null): void {
     this.sessionCoordinators = registry;
-    this.scheduleQueuedLaunches();
+    this.delegation.scheduleQueuedLaunches();
   }
 
   /** An Agent session left orchestration mode or closed: drop what was waiting on it as Coordinator. */
@@ -723,7 +839,7 @@ export class OrchestrationService {
 
   /** An orchestrating session finished a turn: deliver what arrived for it meanwhile. */
   sessionCoordinatorIdle(sessionId: string): void {
-    this.scheduleQueuedLaunches();
+    this.delegation.scheduleQueuedLaunches();
     if (this.isActiveSessionCoordinator(sessionId)) this.pointerDelivery.scheduleRedriveForPane(sessionId);
   }
 
@@ -784,7 +900,7 @@ export class OrchestrationService {
   }
 
   isPaneAlive(ptyId: string): boolean {
-    if (HEADLESS_WORKER_ID.test(ptyId)) return this.codexWorkers.get(ptyId)?.alive ?? false;
+    if (HEADLESS_WORKER_ID.test(ptyId)) return this.workers.codexWorkers.get(ptyId)?.alive ?? false;
     if (AGENT_SESSION_ID.test(ptyId)) return this.isActiveSessionCoordinator(ptyId);
     if (this.exitedPanes.has(ptyId)) {
       return false;
@@ -831,17 +947,10 @@ export class OrchestrationService {
     return archived ? this.store.getArchivedTimeline(archived.id) : null;
   }
 
-  async workerInterrupt(input: { dispatchId?: string; worker?: string; taskId?: string }): Promise<{
+  workerInterrupt(input: { dispatchId?: string; worker?: string; taskId?: string }): Promise<{
     dispatch: OrchestrationDispatchRecord; interrupted: boolean;
   }> {
-    const dispatch = this.resolveTargetDispatch(input);
-    const session = dispatch.executionMode === 'codex-app-server'
-      ? this.codexWorkers.get(dispatch.assigneeHandle) : undefined;
-    if (!session?.alive) {
-      throw new OrchestrationError('dispatch_inactive', 'Only a live headless Worker turn can be interrupted.');
-    }
-    const interrupted = await session.interrupt();
-    return { dispatch: this.store.getDispatchContext(dispatch.id) ?? dispatch, interrupted };
+    return this.workers.workerInterrupt(input);
   }
 
   /**
@@ -856,49 +965,7 @@ export class OrchestrationService {
     policy?: AgentSessionPolicy;
     network?: boolean;
   }): { dispatch: OrchestrationDispatchRecord; policy: AgentSessionPolicy; network: boolean } {
-    if (input.policy === undefined && input.network === undefined) {
-      throw new OrchestrationError('invalid_argument', 'Specify policy and/or network to update Worker controls.');
-    }
-    const target = this.resolveTargetDispatch(input);
-    const dispatch = this.store.resolveDispatchLineage(target.id) ?? target;
-    const driver = headlessWorkerDriver(dispatch.assigneeHandle);
-    const session = dispatch.executionMode === 'codex-app-server' ? this.codexWorkers.get(dispatch.assigneeHandle) : undefined;
-    if (!driver || !session?.alive || dispatch.releasedAt) {
-      throw new OrchestrationError('dispatch_inactive', 'Only a live headless Worker can change its permission or network controls.');
-    }
-    if (session.busy || this.codexSubmitting.has(dispatch.id)) {
-      throw new OrchestrationError('worker_busy', 'Wait for the current turn to finish before changing Worker controls.');
-    }
-    if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
-      throw new OrchestrationError('operation_rejected', 'Review Workers stay read-only without network access.');
-    }
-    const unsupported = headlessWorkerControlsError(driver, input);
-    if (unsupported) throw new OrchestrationError('operation_rejected', unsupported);
-    const current = this.headlessControls(dispatch);
-    const next: HeadlessWorkerControls = {
-      ...current,
-      policy: input.policy ?? current.policy,
-      network: driverCapabilities(driver).network ? input.network ?? current.network : false,
-    };
-    this.codexWorkerControls.set(dispatch.assigneeHandle, next);
-    const updated = this.store.updateDispatchWorkerControls(dispatch.id, {
-      workerPolicy: next.policy, workerNetwork: next.network,
-    }) ?? dispatch;
-    this.workerTimelines.get(dispatch.assigneeHandle)?.setMeta({ policy: next.policy, network: next.network });
-    this.emitChanged('worker:controls-updated', updated.runId);
-    return { dispatch: updated, policy: next.policy, network: next.network };
-  }
-
-  /** A headless Worker's controls: live ones, else the dispatch record, else what legacy records imply. */
-  private headlessControls(dispatch: OrchestrationDispatchRecord): HeadlessWorkerControls {
-    const live = this.codexWorkerControls.get(dispatch.assigneeHandle);
-    if (live) return live;
-    const header = this.workerTimelines.get(dispatch.assigneeHandle)?.getHeader();
-    return {
-      policy: dispatch.workerPolicy ?? (header?.readOnly ? 'read-only' : 'workspace-write'),
-      network: dispatch.workerNetwork ?? header?.network ?? false,
-      allowSubWorkers: dispatch.allowSubWorkers === true,
-    };
+    return this.workers.workerUpdateControls(input);
   }
 
   /** How `caller`'s dispatches are confirmed; headless Workers cannot confirm in chat, so they use UI cards. */
@@ -983,116 +1050,12 @@ export class OrchestrationService {
     return () => this.paneClosedListeners.delete(listener);
   }
 
-  private async recoverGitPublications(onlyRunId?: string): Promise<void> {
-    for (const run of this.store.listRuns()) {
-      if (onlyRunId && run.id !== onlyRunId) continue;
-      const intent = run.integrationIntent;
-      if (!intent) continue;
-      await this.withRunIntegrationLock(run.id, async () => {
-        const current = this.store.requireRun(run.id).integrationIntent;
-        if (current?.commit !== intent.commit) return;
-        const head = await resolveBranchRefOid(intent.repo, intent.target);
-        if (!head || !await isGitCommitAncestor(intent.repo, intent.commit, head)) return;
-        if (intent.dispatchId) {
-          this.store.updateDispatchIntegrationState(intent.dispatchId, { integrationStatus: 'merged',
-            integratedCommit: intent.commit, integratedTargetBranch: intent.target, noChanges: intent.commit === intent.before });
-          this.store.updateRunIntegrationState(run.id, {
-            ...(intent.baseBranch ? { integrationStatus: 'active', integrationBranch: intent.target,
-              integrationWorktreePath: intent.worktree, integrationBaseBranch: intent.baseBranch,
-              integrationBaseCommit: intent.baseCommit, integrationRepoRootPath: intent.repo } : {}),
-            integrationHeadCommit: intent.commit, integrationIntent: null,
-          });
-        } else if (intent.members) {
-          this.store.updateRunIntegrationState(run.id, { integrationStatus: 'finalized', finalizedCommit: intent.commit,
-            integrationHeadCommit: intent.commit, integrationIntent: null, finalizedBatch: {
-              branch: intent.target, sourceHead: intent.sourceHead, targetCommit: intent.commit, members: intent.members,
-            },
-            integrationBranch: await resolveBranchRefOid(intent.repo, run.integrationBranch) ? run.integrationBranch : null,
-            integrationWorktreePath: run.integrationWorktreePath && existsSync(run.integrationWorktreePath) ? run.integrationWorktreePath : null,
-          });
-        }
-        this.emitChanged('run:integration-recovered', run.id);
-      });
-    }
-  }
-
-  async reconcilePublication(input: { runId: string; expectedCommit: string; acceptUnpublished?: boolean }): Promise<{ message: string }> {
-    await this.recoverGitPublications(input.runId);
-    return this.withRunIntegrationLock(input.runId, async () => {
-      const run = this.store.requireRun(input.runId);
-      const intent = run.integrationIntent;
-      if (!intent) return { message: '已核对 Git 交付位置。' };
-      if (intent.commit !== input.expectedCommit) throw new OrchestrationError('operation_rejected', '交付记录已更新，请重新查看。');
-      const head = await resolveBranchRefOid(intent.repo, intent.target);
-      if (input.acceptUnpublished && head === intent.before) {
-        this.store.updateRunIntegrationState(run.id, { integrationIntent: null });
-        this.emitChanged('run:publication-unapplied', run.id);
-        return { message: '已确认目标分支仍在原提交；本次操作未标记为合入。' };
-      }
-      throw new OrchestrationError('operation_rejected', `需核对 ${intent.target}：当前 ${head ?? '无此分支'}，预期 ${intent.commit}，写入前 ${intent.before}。`);
-    });
-  }
-
-  private scheduleQueuedLaunches(): void {
-    if (this.disposed || this.queueSweepScheduled || !this.store.hasQueuedWork()) return;
-    this.queueSweepScheduled = true;
-    queueMicrotask(() => {
-      this.queueSweepScheduled = false;
-      if (this.disposed) return;
-      for (const task of this.store.listTasks()) {
-        if (!task.queuedLaunch || task.queuedLaunch.state !== 'waiting' || this.claimedLaunches.has(task.id)) continue;
-        this.store.promoteReadyTasks(task.runId);
-        if (this.store.getTask(task.id)?.status !== 'ready' || this.store.hasPendingGates(task.id) || task.codeDeps?.some(dep => !this.store.codeReady(dep))) continue;
-        this.claimedLaunches.set(task.id, Symbol(task.id));
-        void this.launchQueuedTask(task).catch(error => console.warn('[orchestration] queued launch:', error))
-          .finally(() => this.claimedLaunches.delete(task.id));
-      }
-    });
-  }
-
-  private async launchQueuedTask(task: OrchestrationTaskRecord): Promise<void> {
-    const q = task.queuedLaunch!;
-    const run = this.store.requireRun(task.runId);
-    if (run.integrationIntent || run.status !== 'active' || run.consumerGeneration !== q.coordinatorGeneration ||
-        !this.isCallerSurface(q.from) || !this.isPaneAlive(q.from) || (run.coordinatorPaneId ?? run.coordinatorHandle) !== q.from ||
-        this.store.getRemainingDispatchCapacity() < 1) return;
-    this.store.setQueuedLaunch(task.id, { ...q, state: 'claimed' });
-    try {
-      await this.store.flushDurable();
-      if (this.disposed || !this.isCallerSurface(q.from) || !this.isPaneAlive(q.from) ||
-          this.store.requireRun(run.id).consumerGeneration !== q.coordinatorGeneration) {
-        this.store.setQueuedLaunch(task.id, q);
-        return;
-      }
-      this.assertRunCoordinator(run.id, q.from);
-      if ((q.requiresPaneMode && !this.isPaneOrchestrationMode(q.from)) ||
-          (q.authorizedNetwork !== undefined && q.authorizedNetwork !== Boolean(this.sessionCoordinator(q.from)?.network))) {
-        throw new OrchestrationError('operation_rejected', '原协调者的编排或联网权限已改变，请恢复原设置再核对派发。');
-      }
-      await this.workerStart({
-        taskId: task.id, runId: run.id, from: q.from, callerPaneId: q.callerPaneId,
-        callerCwd: q.callerCwd, baseBranch: q.baseBranch, agent: q.agent, role: q.role, name: q.role,
-        terminal: q.terminal, model: q.model, effort: q.effort, noWorktree: !q.worktree,
-        taskKind: q.taskKind, mcpEnabled: this.isMcpEnabledForCliDep?.(q.agent),
-        ...((q.taskKind === 'review' || q.taskKind === 'research') && q.policy === undefined ? { readOnly: true } : {}),
-        ...(q.policy !== undefined ? { policy: q.policy } : {}),
-        ...(q.network !== undefined ? { network: q.network } : {}),
-        ...(q.allowSubWorkers ? { allowSubWorkers: true } : {}),
-        ...(q.userInitiated ? { userInitiated: true } : {}),
-      }, this.claimedLaunches.get(task.id));
-      if (q.authorizeReviews) this.store.setRunAutoReviewAuthorized(run.id, true);
-      this.store.setQueuedLaunch(task.id);
-    } catch (error) {
-      if (this.store.getLatestDispatchForTask(task.id)) this.store.setQueuedLaunch(task.id);
-      else if (error instanceof OrchestrationError && error.code === 'worker_limit_reached') this.store.setQueuedLaunch(task.id, q);
-      else this.store.setQueuedLaunch(task.id, { ...q, state: 'needs_reconciliation',
-        reason: this.store.redactDispatchCredentials(error instanceof Error ? error.message : String(error)) });
-    }
-    this.emitChanged('task:queue-updated', run.id);
+  reconcilePublication(input: { runId: string; expectedCommit: string; acceptUnpublished?: boolean }): Promise<{ message: string }> {
+    return this.integration.reconcilePublication(input);
   }
 
   private emitChanged(reason: string, runId?: string): void {
-    this.scheduleQueuedLaunches();
+    this.delegation.scheduleQueuedLaunches();
     if (this.eventListeners.size === 0) {
       return;
     }
@@ -1131,21 +1094,8 @@ export class OrchestrationService {
     }
   }
 
-  private retireFinishedCodexWorkers(runId?: string): void {
-    for (const [workerId, codex] of this.codexWorkers) {
-      if (!codex.alive || !codex.latestTurnKey || this.store.getActiveDispatchForIdentity(workerId, null)) continue;
-      const dispatch = this.store.getDispatchContext(codex.latestTurnKey);
-      if (!dispatch || dispatch.retained || (runId && dispatch.runId !== runId)) continue;
-      const run = this.store.getRun(dispatch.runId);
-      if (run?.status === 'active') continue;
-      this.archiveCodexOutput(codex, dispatch.id);
-      this.archiveWorkerTimeline(workerId, dispatch.id);
-      void codex.close(true);
-    }
-  }
-
   private retireFinishedSpawnedWorkers(runId?: string): void {
-    this.retireFinishedCodexWorkers(runId);
+    this.workers.retireFinishedCodexWorkers(runId);
     if (this.spawnedWorkerPanes.size === 0) {
       return;
     }
@@ -1161,7 +1111,7 @@ export class OrchestrationService {
       }
       const meta = this.spawnedWorkerMeta.get(ptyId);
       this.retiringPanes.add(ptyId);
-      void this.confirmWorkerPaneClosed(ptyId)
+      void this.workers.confirmWorkerPaneClosed(ptyId)
         .then(() => {
           this.spawnedWorkerPanes.delete(ptyId);
           this.spawnedWorkerMeta.delete(ptyId);
@@ -1247,7 +1197,7 @@ export class OrchestrationService {
   }
 
   authorizeRunAccess(runId: string | undefined, callerPaneId: string): string {
-    return this.resolveBoardCallerContext({ from: callerPaneId, runId }).runId;
+    return this.board.resolveBoardCallerContext({ from: callerPaneId, runId }).runId;
   }
 
   assertRunCoordinator(runId: string, callerPaneId: string): void {
@@ -1280,641 +1230,12 @@ export class OrchestrationService {
     }
   }
 
-  private async withReviewStartLock<T>(targetDispatchId: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.reviewStartLocks.get(targetDispatchId) ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolveLock) => {
-      release = resolveLock;
-    });
-    const tail = previous.then(() => current);
-    this.reviewStartLocks.set(targetDispatchId, tail);
-    await previous;
-    try {
-      return await fn();
-    } finally {
-      release();
-      if (this.reviewStartLocks.get(targetDispatchId) === tail) {
-        this.reviewStartLocks.delete(targetDispatchId);
-      }
-    }
-  }
-
-  private async withRunIntegrationLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.runIntegrationLocks.get(runId) ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolveLock) => {
-      release = resolveLock;
-    });
-    const tail = previous.then(() => current);
-    this.runIntegrationLocks.set(runId, tail);
-    await previous;
-    try {
-      return await fn();
-    } finally {
-      release();
-      if (this.runIntegrationLocks.get(runId) === tail) {
-        this.runIntegrationLocks.delete(runId);
-      }
-    }
-  }
-
-  private isRunIntegrationBranchLive(run: OrchestrationRunRecord): boolean {
-    return Boolean(
-      (run.integrationStatus === 'active' || run.integrationStatus === 'conflict') &&
-      run.integrationBranch &&
-      run.integrationWorktreePath,
-    );
-  }
-
-  private async resolveLiveTargetRepoForDispatch(
-    run: OrchestrationRunRecord,
-    mainRepoRoot: string,
-  ): Promise<string> {
-    if (
-      this.isRunIntegrationBranchLive(run) &&
-      run.integrationWorktreePath &&
-      run.integrationRepoRootPath &&
-      (await isSameGitRepo(mainRepoRoot, run.integrationRepoRootPath))
-    ) {
-      return run.integrationWorktreePath;
-    }
-    return mainRepoRoot;
-  }
-
-  private async resolveEffectiveWorkerDiffBase(
-    run: OrchestrationRunRecord,
-    dispatch: OrchestrationDispatchRecord,
-    worktreePath: string,
-    mainRepoRoot: string | null,
-    snapshotOid: string | null,
-  ): Promise<string | null> {
-    const recordedBase = dispatch.baseCommit?.trim() || null;
-    if (!mainRepoRoot || !snapshotOid) return recordedBase;
-    const targetRepo = await this.resolveLiveTargetRepoForDispatch(run, mainRepoRoot);
-    const normPath = (p: string) => {
-      const r = resolveFsPath(p);
-      return process.platform === 'win32' ? r.toLowerCase() : r;
-    };
-    const isIsolatedWorktree =
-      Boolean(dispatch.ownsWorktree) || normPath(worktreePath) !== normPath(targetRepo);
-    if (!isIsolatedWorktree) return recordedBase;
-    const liveMergeBase = await resolveIntegrationMergeBase(targetRepo, snapshotOid);
-    return liveMergeBase ?? recordedBase;
-  }
-
-  private getReviewFirewallContext(callerHandle?: string | null): {
-    reviewDispatch: OrchestrationDispatchRecord;
-    targetDispatchIds: Set<string>;
-    targetTaskIds: Set<string>;
-    targetPaneIds: Set<string>;
-    targetRoles: Set<string>;
-  } | null {
-    const clean = callerHandle?.trim();
-    if (!clean) return null;
-    const rawId = clean.startsWith('dispatch:') ? clean.slice('dispatch:'.length).trim() : clean;
-    const direct =
-      this.store.getDispatchContext(rawId) ??
-      this.store.getActiveDispatchForIdentity(clean, clean);
-    if (!direct || (!direct.reviewOfDispatchId && !direct.reviewOfRunId)) return null;
-
-    const targetDispatchIds = new Set<string>();
-    const targetTaskIds = new Set<string>();
-    const targetPaneIds = new Set<string>();
-    const targetRoles = new Set<string>();
-
-    const collectTargetDispatch = (d: OrchestrationDispatchRecord) => {
-      targetDispatchIds.add(d.id);
-      targetTaskIds.add(d.taskId);
-      if (d.assigneePaneId) targetPaneIds.add(d.assigneePaneId);
-      if (d.assigneeHandle) targetPaneIds.add(d.assigneeHandle);
-      const role = this.resolveRoleNameForDispatch(d).toLowerCase();
-      if (role) targetRoles.add(role);
-    };
-
-    if (direct.reviewOfDispatchId) {
-      const lineageHead =
-        this.store.resolveDispatchLineage(direct.reviewOfDispatchId) ??
-        this.store.getDispatchContext(direct.reviewOfDispatchId);
-      const ids = lineageHead
-        ? this.store.listDispatchAncestorIds(lineageHead.id)
-        : [direct.reviewOfDispatchId];
-      for (const id of ids) {
-        targetDispatchIds.add(id);
-        const d = this.store.getDispatchContext(id);
-        if (d) collectTargetDispatch(d);
-      }
-    } else if (direct.reviewOfRunId) {
-      for (const d of this.store.listDispatches({ runId: direct.reviewOfRunId })) {
-        if (d.id === direct.id || d.reviewOfDispatchId || d.reviewOfRunId) continue;
-        collectTargetDispatch(d);
-      }
-    }
-
-    return {
-      reviewDispatch: direct,
-      targetDispatchIds,
-      targetTaskIds,
-      targetPaneIds,
-      targetRoles,
-    };
-  }
-
-  private isPostHiddenByReviewFirewall(
-    post: OrchestrationMessageRecord,
-    firewall: NonNullable<ReturnType<OrchestrationService['getReviewFirewallContext']>>,
-  ): boolean {
-    const fromRole = post.fromRole?.trim().replace(/^@+/, '').toLowerCase() ?? '';
-    const fromDispatchId = post.fromHandle.startsWith('dispatch:')
-      ? post.fromHandle.slice('dispatch:'.length)
-      : null;
-    const payloadDispatchId = completionReportDispatchId(this.store, post);
-    const isFromTargetAuthor =
-      Boolean(fromDispatchId && firewall.targetDispatchIds.has(fromDispatchId)) ||
-      Boolean(payloadDispatchId && firewall.targetDispatchIds.has(payloadDispatchId)) ||
-      firewall.targetPaneIds.has(post.fromHandle) ||
-      Boolean(fromRole && firewall.targetRoles.has(fromRole));
-    if (!isFromTargetAuthor) return false;
-    // Block the author's completion reports, verbal summaries, and status self-assessments.
-    return (
-      post.kind === 'report' ||
-      post.type === 'worker_done' ||
-      post.kind === 'handoff' ||
-      post.kind === 'update'
-    );
-  }
-
-  private assertNotFirewalledReviewRead(
-    callerPaneId: string | undefined,
-    targetDispatch: OrchestrationDispatchRecord,
-    operationLabel: string,
-  ): void {
-    if (!callerPaneId) return;
-    const firewall = this.getReviewFirewallContext(callerPaneId);
-    if (!firewall) return;
-    if (
-      firewall.targetDispatchIds.has(targetDispatch.id) ||
-      firewall.targetTaskIds.has(targetDispatch.taskId)
-    ) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        `Information firewall: adversarial reviewer ${firewall.reviewDispatch.id} cannot call ${operationLabel} on target author ${targetDispatch.id}. Verify directly from the isolated review worktree and original requirements.`,
-      );
-    }
-  }
-
-  /**
-   * Reconciles a review target's aggregate status for a specific review batch.
-   * - Never lets stale/older batches overwrite a newer active batch on the target.
-   * - Uses the batch's own reviewRound (not the target's current round) for escalation checks.
-   * - Only marks `passed` when ALL reviewers in the batch completed with explicit `passed`
-   *   and intact read-only workspace. Stopped/failed/abandoned reviewers reject the batch.
-   */
-  private reconcileTargetReviewBatch(
-    reviewDispatchId: string,
-    opts?: {
-      overrideFindings?: OrchestrationReviewFinding[];
-      overrideVerdict?: OrchestrationReviewVerdict;
-      failedReason?: string;
-    },
-  ): { escalated: boolean; reviewRound: number; staleBatch: boolean } {
-    const reviewDispatch = this.store.getDispatchContext(reviewDispatchId);
-    if (!reviewDispatch?.reviewOfDispatchId) {
-      return { escalated: false, reviewRound: 1, staleBatch: false };
-    }
-    const targetDispatch = this.store.getDispatchContext(reviewDispatch.reviewOfDispatchId);
-    const batchRound = reviewDispatch.reviewRound ?? targetDispatch?.reviewRound ?? 1;
-    if (!targetDispatch) {
-      return { escalated: false, reviewRound: batchRound, staleBatch: false };
-    }
-
-    const batchId = reviewDispatch.reviewBatchId ?? null;
-    const isCurrentBatch = Boolean(
-      batchId
-        ? targetDispatch.reviewBatchId === batchId
-        : !targetDispatch.reviewBatchId &&
-            (!reviewDispatch.reviewSnapshotOid ||
-              targetDispatch.reviewSnapshotOid === reviewDispatch.reviewSnapshotOid),
-    );
-    if (!isCurrentBatch) {
-      // Stale batch report: keep reviewer's own record/history without mutating the newer batch on target.
-      return { escalated: false, reviewRound: batchRound, staleBatch: true };
-    }
-
-    const batchReviews = batchId
-      ? this.store.listReviewDispatchesForBatch(targetDispatch.id, batchId)
-      : this.store
-          .listReviewDispatchesForTarget(targetDispatch.id)
-          .filter(
-            (d) =>
-              !reviewDispatch.reviewSnapshotOid ||
-              d.reviewSnapshotOid === reviewDispatch.reviewSnapshotOid,
-          );
-    if (batchReviews.length === 0) {
-      return { escalated: false, reviewRound: batchRound, staleBatch: false };
-    }
-
-    const isEffectiveReject = (d: OrchestrationDispatchRecord): boolean => {
-      if (d.id === reviewDispatch.id && opts?.overrideVerdict) {
-        return opts.overrideVerdict === 'reject';
-      }
-      if (d.reviewStatus === 'rejected' || d.reviewMutatedWorkspace) return true;
-      if (!ACTIVE_DISPATCH_STATUSES.has(d.status) && (d.status !== 'completed' || d.reviewStatus !== 'passed')) {
-        return true;
-      }
-      return false;
-    };
-
-    const isEffectivePass = (d: OrchestrationDispatchRecord): boolean => {
-      if (d.id === reviewDispatch.id && opts?.overrideVerdict) {
-        return opts.overrideVerdict === 'pass' && !d.reviewMutatedWorkspace;
-      }
-      return (
-        d.status === 'completed' &&
-        d.reviewStatus === 'passed' &&
-        !d.reviewMutatedWorkspace
-      );
-    };
-
-    const hasInFlightPeerStart = (this.inFlightReviewStarts.get(`dispatch:${targetDispatch.id}`) ?? 0) > 0;
-    const anyRejected = batchReviews.some(isEffectiveReject);
-    const allSettled = batchReviews.every((d) =>
-      d.id === reviewDispatch.id ? true : !ACTIVE_DISPATCH_STATUSES.has(d.status),
-    );
-    const allExplicitlyPassed = !hasInFlightPeerStart && allSettled && batchReviews.every(isEffectivePass);
-    const mergedFindings = batchReviews.flatMap((d) =>
-      d.id === reviewDispatch.id && opts?.overrideFindings
-        ? opts.overrideFindings
-        : (d.reviewFindings ?? []),
-    );
-    if (opts?.failedReason && !mergedFindings.some((f) => f.title === opts.failedReason)) {
-      mergedFindings.push({
-        severity: 'P1',
-        location: '(review-lifecycle)',
-        title: opts.failedReason,
-        evidence: `Reviewer ${reviewDispatch.id} terminated without an explicit PASS verdict.`,
-      });
-    }
-
-    if (anyRejected) {
-      const escalated = batchRound >= MAX_ADVERSARIAL_REVIEW_ROUNDS;
-      this.store.updateDispatchReviewState(targetDispatch.id, {
-        reviewStatus: escalated ? 'escalated' : 'rejected',
-        reviewFindings: mergedFindings,
-      });
-      return { escalated, reviewRound: batchRound, staleBatch: false };
-    }
-
-    if (allExplicitlyPassed) {
-      this.store.updateDispatchReviewState(targetDispatch.id, {
-        reviewStatus: 'passed',
-        reviewFindings: mergedFindings,
-      });
-      return { escalated: false, reviewRound: batchRound, staleBatch: false };
-    }
-
-    this.store.updateDispatchReviewState(targetDispatch.id, {
-      reviewStatus: 'pending',
-      reviewFindings: mergedFindings,
-    });
-    return { escalated: false, reviewRound: batchRound, staleBatch: false };
-  }
-
-  /**
-   * Reconciles a Run-level secondary adversarial review batch.
-   * Mirrors `reconcileTargetReviewBatch` for `run.runReviewBatchId` / `run.runReviewStatus`.
-   */
-  private reconcileRunReviewBatch(
-    reviewDispatchId: string,
-    opts?: {
-      overrideFindings?: OrchestrationReviewFinding[];
-      overrideVerdict?: OrchestrationReviewVerdict;
-      failedReason?: string;
-    },
-  ): { escalated: boolean; reviewRound: number; staleBatch: boolean } {
-    const reviewDispatch = this.store.getDispatchContext(reviewDispatchId);
-    if (!reviewDispatch?.reviewOfRunId) {
-      return { escalated: false, reviewRound: 1, staleBatch: false };
-    }
-    const targetRun = this.store.getRun(reviewDispatch.reviewOfRunId);
-    const batchRound = reviewDispatch.reviewRound ?? targetRun?.runReviewRound ?? 1;
-    if (!targetRun) {
-      return { escalated: false, reviewRound: batchRound, staleBatch: false };
-    }
-
-    const batchId = reviewDispatch.reviewBatchId ?? null;
-    const isCurrentBatch = Boolean(
-      batchId
-        ? targetRun.runReviewBatchId === batchId
-        : !targetRun.runReviewBatchId &&
-            (!reviewDispatch.reviewSnapshotOid ||
-              targetRun.runReviewSnapshotOid === reviewDispatch.reviewSnapshotOid),
-    );
-    if (!isCurrentBatch) {
-      return { escalated: false, reviewRound: batchRound, staleBatch: true };
-    }
-
-    const batchReviews = batchId
-      ? this.store.listReviewDispatchesForRunBatch(targetRun.id, batchId)
-      : this.store
-          .listReviewDispatchesForRun(targetRun.id)
-          .filter(
-            (d) =>
-              !reviewDispatch.reviewSnapshotOid ||
-              d.reviewSnapshotOid === reviewDispatch.reviewSnapshotOid,
-          );
-    if (batchReviews.length === 0) {
-      return { escalated: false, reviewRound: batchRound, staleBatch: false };
-    }
-
-    const isEffectiveReject = (d: OrchestrationDispatchRecord): boolean => {
-      if (d.id === reviewDispatch.id && opts?.overrideVerdict) {
-        return opts.overrideVerdict === 'reject';
-      }
-      if (d.reviewStatus === 'rejected' || d.reviewMutatedWorkspace) return true;
-      if (!ACTIVE_DISPATCH_STATUSES.has(d.status) && (d.status !== 'completed' || d.reviewStatus !== 'passed')) {
-        return true;
-      }
-      return false;
-    };
-
-    const isEffectivePass = (d: OrchestrationDispatchRecord): boolean => {
-      if (d.id === reviewDispatch.id && opts?.overrideVerdict) {
-        return opts.overrideVerdict === 'pass' && !d.reviewMutatedWorkspace;
-      }
-      return (
-        d.status === 'completed' &&
-        d.reviewStatus === 'passed' &&
-        !d.reviewMutatedWorkspace
-      );
-    };
-
-    const hasInFlightPeerStart = (this.inFlightReviewStarts.get(`run:${targetRun.id}`) ?? 0) > 0;
-    const anyRejected = batchReviews.some(isEffectiveReject);
-    const allSettled = batchReviews.every((d) =>
-      d.id === reviewDispatch.id ? true : !ACTIVE_DISPATCH_STATUSES.has(d.status),
-    );
-    const allExplicitlyPassed = !hasInFlightPeerStart && allSettled && batchReviews.every(isEffectivePass);
-    const mergedFindings = batchReviews.flatMap((d) =>
-      d.id === reviewDispatch.id && opts?.overrideFindings
-        ? opts.overrideFindings
-        : (d.reviewFindings ?? []),
-    );
-    if (opts?.failedReason && !mergedFindings.some((f) => f.title === opts.failedReason)) {
-      mergedFindings.push({
-        severity: 'P1',
-        location: '(review-lifecycle)',
-        title: opts.failedReason,
-        evidence: `Run reviewer ${reviewDispatch.id} terminated without an explicit PASS verdict.`,
-      });
-    }
-
-    if (anyRejected) {
-      const escalated = batchRound >= MAX_ADVERSARIAL_REVIEW_ROUNDS;
-      this.store.updateRunReviewState(targetRun.id, {
-        runReviewStatus: escalated ? 'escalated' : 'rejected',
-        runReviewFindings: mergedFindings,
-      });
-      return { escalated, reviewRound: batchRound, staleBatch: false };
-    }
-
-    if (allExplicitlyPassed) {
-      this.store.updateRunReviewState(targetRun.id, {
-        runReviewStatus: 'passed',
-        runReviewFindings: mergedFindings,
-      });
-      return { escalated: false, reviewRound: batchRound, staleBatch: false };
-    }
-
-    this.store.updateRunReviewState(targetRun.id, {
-      runReviewStatus: 'pending',
-      runReviewFindings: mergedFindings,
-    });
-    return { escalated: false, reviewRound: batchRound, staleBatch: false };
-  }
-
-  private async withInFlightReviewStart<T>(
-    targetKey: `dispatch:${string}` | `run:${string}`,
-    fn: () => Promise<T>,
-  ): Promise<T> {
-    this.inFlightReviewStarts.set(targetKey, (this.inFlightReviewStarts.get(targetKey) ?? 0) + 1);
-    try {
-      return await fn();
-    } finally {
-      const nextCount = (this.inFlightReviewStarts.get(targetKey) ?? 1) - 1;
-      if (nextCount <= 0) {
-        this.inFlightReviewStarts.delete(targetKey);
-      } else {
-        this.inFlightReviewStarts.set(targetKey, nextCount);
-      }
-      if (nextCount <= 0) {
-        // Reconcile whenever the last in-flight start exits (whether it failed OR a fast reviewer
-        // already submitted a PASS verdict before workerStart returned), so batches never strand in pending.
-        if (targetKey.startsWith('dispatch:')) {
-          const targetId = targetKey.slice('dispatch:'.length);
-          const target = this.store.getDispatchContext(targetId);
-          if (target?.reviewBatchId && target.reviewStatus === 'pending') {
-            const peers = this.store.listReviewDispatchesForBatch(targetId, target.reviewBatchId);
-            const settledPeer = peers.find((d) => !ACTIVE_DISPATCH_STATUSES.has(d.status));
-            if (settledPeer) {
-              this.reconcileTargetReviewBatch(settledPeer.id);
-              const updated = this.store.getDispatchContext(targetId);
-              if (updated && updated.reviewStatus !== target.reviewStatus) {
-                this.emitChanged('worker:review-reconciled', updated.runId);
-              }
-            }
-          }
-        } else if (targetKey.startsWith('run:')) {
-          const runId = targetKey.slice('run:'.length);
-          const run = this.store.getRun(runId);
-          if (run?.runReviewBatchId && run.runReviewStatus === 'pending') {
-            const peers = this.store.listReviewDispatchesForRunBatch(runId, run.runReviewBatchId);
-            const settledPeer = peers.find((d) => !ACTIVE_DISPATCH_STATUSES.has(d.status));
-            if (settledPeer) {
-              this.reconcileRunReviewBatch(settledPeer.id);
-              const updated = this.store.getRun(runId);
-              if (updated && updated.runReviewStatus !== run.runReviewStatus) {
-                this.emitChanged('run:review-reconciled', updated.id);
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  private reconcileAnyReviewBatch(
-    reviewDispatchId: string,
-    opts?: {
-      overrideFindings?: OrchestrationReviewFinding[];
-      overrideVerdict?: OrchestrationReviewVerdict;
-      failedReason?: string;
-    },
-  ): { escalated: boolean; reviewRound: number; staleBatch: boolean } {
-    const d = this.store.getDispatchContext(reviewDispatchId);
-    if (d?.reviewOfRunId) {
-      return this.reconcileRunReviewBatch(reviewDispatchId, opts);
-    }
-    return this.reconcileTargetReviewBatch(reviewDispatchId, opts);
-  }
-
   private failTaskIfReady(taskId: string): void {
     // A task created for a worker that never started has nobody to run it; left `ready`, the
     // coordinator loop would later dispatch it as ordinary work (and a review outside its worktree).
     if (this.store.getTask(taskId)?.status === 'ready') {
       this.store.updateTaskStatus(taskId, 'failed');
     }
-  }
-
-  /**
-   * Rejects the batch of every review dispatch that settled without a verdict. Reviewers can be
-   * failed straight through the store (pane exit, coordinator loop, restart recovery), so this is
-   * the one place that guarantees their target never stays `pending`.
-   */
-  private settleUnreportedReviewDispatches(): void {
-    for (const dispatch of this.store.listDispatches()) {
-      if (!dispatch.reviewOfDispatchId && !dispatch.reviewOfRunId) continue;
-      if (ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) continue;
-      if (dispatch.reviewStatus && dispatch.reviewStatus !== 'none' && dispatch.reviewStatus !== 'pending') {
-        continue;
-      }
-      this.store.updateDispatchReviewState(dispatch.id, { reviewStatus: 'rejected' });
-      this.failTaskIfReady(dispatch.taskId);
-      this.reconcileAnyReviewBatch(dispatch.id, {
-        failedReason: `Reviewer exited or timed out (${dispatch.lastFailureReason || dispatch.status})`,
-      });
-      this.emitChanged('worker:review-reconciled', dispatch.runId);
-    }
-  }
-
-  private resolveTargetRunForOperation(
-    explicitRunId?: string | null,
-    callerPaneId?: string,
-    fallbackFrom?: string,
-  ): OrchestrationRunRecord {
-    const cleanRunId = explicitRunId?.trim() || undefined;
-    if (callerPaneId !== undefined) {
-      const runId = this.authorizeRunAccess(cleanRunId, callerPaneId);
-      this.assertRunCoordinator(runId, callerPaneId);
-      return this.store.requireRun(runId);
-    }
-    if (cleanRunId) {
-      return this.store.requireRun(cleanRunId);
-    }
-    const inferred = this.inferRunIdOptional(fallbackFrom || 'coordinator');
-    if (inferred) {
-      return this.store.requireRun(inferred);
-    }
-    const activeRuns = this.store.listRuns({ status: 'active' });
-    if (activeRuns.length === 1) {
-      return activeRuns[0]!;
-    }
-    throw new OrchestrationError(
-      'run_not_found',
-      'No active run could be resolved. Specify runId explicitly.',
-    );
-  }
-
-  private async resolveRunCombinedDiffTarget(
-    run: OrchestrationRunRecord,
-    opts?: { requireCleanIntegrationWorktree?: boolean },
-  ): Promise<{
-    hasChanges: boolean;
-    mainRepoRoot: string | null;
-    repoPath: string | null;
-    branch: string | null;
-    baseCommit: string | null;
-    targetCommit: string | null;
-    isActiveIntegrationBranch: boolean;
-    integratedWorkers: RunIntegratedWorkerSummaryForReview[];
-  }> {
-    const integratedDispatches = this.store.listIntegratedDispatchesForRun(run.id);
-    const integratedWorkers: RunIntegratedWorkerSummaryForReview[] = integratedDispatches.map((d) => {
-      const t = this.store.getTask(d.taskId);
-      return {
-        dispatchId: d.id,
-        role: this.resolveRoleNameForDispatch(d) || d.id,
-        cliId: d.cliId ?? null,
-        taskSpec: t?.spec ?? '',
-        taskContext: t?.taskContext ?? null,
-        integratedCommit: d.integratedCommit ?? null,
-      };
-    });
-
-    const isActiveIntegrationBranch = this.isRunIntegrationBranchLive(run);
-
-    if (isActiveIntegrationBranch) {
-      const wtPath = run.integrationWorktreePath!;
-      const branch = run.integrationBranch!;
-      const mainRepoRoot =
-        run.integrationRepoRootPath ??
-        (await resolveMainRepoRoot(wtPath, this.getDefaultCwd?.() ?? null));
-      if (opts?.requireCleanIntegrationWorktree) {
-        const [status, ref] = await Promise.all([
-          getGitStatus(wtPath),
-          resolveTargetSymbolicRef(wtPath),
-        ]);
-        if (!status.ok || !status.isGitRepo) {
-          throw new OrchestrationError(
-            'worktree_failed',
-            `Run integration worktree at ${wtPath} is missing or invalid.`,
-          );
-        }
-        if (ref !== `refs/heads/${branch}`) {
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Run integration worktree is on ${ref ?? 'detached HEAD'} instead of refs/heads/${branch}.`,
-          );
-        }
-        const dirty = status.entries.map((e) => e.path).filter((p): p is string => Boolean(p));
-        if (dirty.length > 0) {
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Run integration worktree has ${dirty.length} uncommitted file(s): ${dirty.join(', ')}. Clean or commit them before reviewing.`,
-            { dirtyFiles: dirty },
-          );
-        }
-      }
-      const headOid =
-        (mainRepoRoot ? await resolveBranchRefOid(mainRepoRoot, branch) : null) ??
-        run.integrationHeadCommit ??
-        null;
-      const baseCommit = run.integrationBaseCommit ?? null;
-      return {
-        hasChanges: Boolean(baseCommit && headOid && baseCommit !== headOid),
-        mainRepoRoot,
-        repoPath: mainRepoRoot ?? wtPath,
-        branch,
-        baseCommit,
-        targetCommit: headOid,
-        isActiveIntegrationBranch: true,
-        integratedWorkers,
-      };
-    }
-
-    const fallbackRepoCandidate =
-      run.integrationRepoRootPath ??
-      integratedDispatches[0]?.repoRootPath ??
-      integratedDispatches[0]?.worktreePath ??
-      this.getDefaultCwd?.() ??
-      null;
-    const mainRepoRoot = fallbackRepoCandidate
-      ? await resolveMainRepoRoot(fallbackRepoCandidate, run.integrationRepoRootPath ?? this.getDefaultCwd?.() ?? null)
-      : null;
-    const baseCommit = run.integrationBaseCommit ?? null;
-    const targetCommit =
-      run.integrationHeadCommit ??
-      (run.integrationStatus === 'finalized' ? run.finalizedCommit : null) ??
-      null;
-    return {
-      hasChanges: Boolean(mainRepoRoot && baseCommit && targetCommit && baseCommit !== targetCommit),
-      mainRepoRoot,
-      repoPath: mainRepoRoot,
-      branch: run.integrationBaseBranch ?? null,
-      baseCommit,
-      targetCommit,
-      isActiveIntegrationBranch: false,
-      integratedWorkers,
-    };
   }
 
   assertTaskCoordinator(taskId: string, callerPaneId: string): void {
@@ -1952,7 +1273,7 @@ export class OrchestrationService {
     targetInput: { dispatchId?: string; worker?: string; taskId?: string },
     callerPaneId: string
   ): void {
-    const rawTarget = this.resolveTargetDispatch(targetInput);
+    const rawTarget = this.workers.resolveTargetDispatch(targetInput);
     const dispatch = this.store.resolveDispatchLineage(rawTarget.id) ?? rawTarget;
     const assignee = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
     if (callerPaneId === assignee) {
@@ -2132,7 +1453,7 @@ export class OrchestrationService {
   } {
     if (callerPaneId !== undefined) this.authorizeRunAccess(id, callerPaneId);
     const run = this.store.requireRun(id);
-    const firewall = callerPaneId !== undefined ? this.getReviewFirewallContext(callerPaneId) : null;
+    const firewall = callerPaneId !== undefined ? this.review.getReviewFirewallContext(callerPaneId) : null;
     const rawTasks = this.store.listTasksWithDispatch({ runId: run.id });
     const tasks = firewall
       ? rawTasks.filter((t) => !firewall.targetTaskIds.has(t.id))
@@ -2204,7 +1525,7 @@ export class OrchestrationService {
       if (d.id === excludeDispatchId) continue;
       if (!ACTIVE_DISPATCH_STATUSES.has(d.status)) continue;
       const peerTask = this.store.getTask(d.taskId);
-      const role = this.resolveRoleNameForDispatch(d) || d.id;
+      const role = this.delegation.resolveRoleNameForDispatch(d) || d.id;
       activePeers.push({
         role: this.store.redactDispatchCredentials(role),
         taskTitle: this.store.redactDispatchCredentials(peerTask?.taskTitle || d.taskId),
@@ -2212,7 +1533,7 @@ export class OrchestrationService {
       if (activePeers.length >= 6) break;
     }
 
-    const firewall = excludeDispatchId ? this.getReviewFirewallContext(excludeDispatchId) : null;
+    const firewall = excludeDispatchId ? this.review.getReviewFirewallContext(excludeDispatchId) : null;
     const redact = (text: string) => this.store.redactDispatchCredentials(text);
     const messages = this.store.listBoardPosts(run.id, { limit: 80 });
     const latestBoardSeq = this.store.getHeadBoardSeq(run.id);
@@ -2220,7 +1541,7 @@ export class OrchestrationService {
     for (const m of messages) {
       if (typeof m.boardSeq !== 'number') continue;
       if (excludeDispatchId && m.toHandle === `dispatch:${excludeDispatchId}`) continue;
-      if (firewall && this.isPostHiddenByReviewFirewall(m, firewall)) continue;
+      if (firewall && this.review.isPostHiddenByReviewFirewall(m, firewall)) continue;
       if (m.kind !== 'handoff' && m.kind !== 'answer' && m.kind !== 'brief') continue;
       const summary =
         redact(m.body || '')
@@ -2322,7 +1643,7 @@ export class OrchestrationService {
     priority?: OrchestrationMessagePriority;
   } = {}, callerPaneId?: string): { tasks: OrchestrationTaskWithDispatch[]; count: number } {
     const runId = input.runId?.trim() || undefined;
-    const firewall = callerPaneId !== undefined ? this.getReviewFirewallContext(callerPaneId) : null;
+    const firewall = callerPaneId !== undefined ? this.review.getReviewFirewallContext(callerPaneId) : null;
     const tasks = this.store
       .listTasksWithDispatch({ runId, status: input.status })
       .filter((t) => !input.priority || t.priority === input.priority)
@@ -2336,7 +1657,7 @@ export class OrchestrationService {
     if (callerPaneId !== undefined) this.authorizeRunAccess(task.runId, callerPaneId);
     const latestDispatch = this.store.getLatestDispatchForTask(task.id) ?? null;
     if (latestDispatch && callerPaneId !== undefined) {
-      this.assertNotFirewalledReviewRead(callerPaneId, latestDispatch, 'task-show');
+      this.review.assertNotFirewalledReviewRead(callerPaneId, latestDispatch, 'task-show');
     }
     const dispatches = this.store.listDispatches({ taskId: task.id });
     const gates = this.store.listGates({ taskId: task.id });
@@ -2350,7 +1671,7 @@ export class OrchestrationService {
   }): { task: OrchestrationTaskRecord } {
     if (input.queueDecision) {
       const task = this.store.requireTask(input.id);
-      if (!task.queuedLaunch || task.queuedLaunch.state === 'claimed' || this.claimedLaunches.has(task.id) ||
+      if (!task.queuedLaunch || task.queuedLaunch.state === 'claimed' || this.delegation.claimedLaunches.has(task.id) ||
           this.store.getActiveDispatchesForTask(task.id).length) throw new OrchestrationError('worker_busy', '派发已经领取，请处理当前 Worker。');
       if (input.queueDecision === 'resume') {
         if (this.store.getLatestDispatchForTask(task.id) || task.queuedLaunch.state !== 'needs_reconciliation') throw new OrchestrationError('task_not_ready', '请先处理已有派发。');
@@ -2580,7 +1901,7 @@ export class OrchestrationService {
     if (input.callerPaneId !== undefined) this.authorizeRunAccess(task.runId, input.callerPaneId);
     const ctx = this.store.getLatestDispatchForTask(task.id) ?? null;
     if (ctx && input.callerPaneId !== undefined) {
-      this.assertNotFirewalledReviewRead(input.callerPaneId, ctx, 'dispatch-show');
+      this.review.assertNotFirewalledReviewRead(input.callerPaneId, ctx, 'dispatch-show');
     }
     if (!input.preamble) {
       return { dispatch: ctx };
@@ -2679,7 +2000,7 @@ export class OrchestrationService {
       maxDepth: this.maxDepth,
       launchDependent: async (task, cliId) => {
         const run = this.store.requireRun(task.runId);
-        await this.workerStart({ runId: run.id, taskId: task.id, agent: cliId, from: run.coordinatorHandle, worktree: true });
+        await this.workers.workerStart({ runId: run.id, taskId: task.id, agent: cliId, from: run.coordinatorHandle, worktree: true });
       },
       verifyCodeInputs: (task, cwd) => this.verifyCodeInputs(task, cwd),
       listWorkerCandidates: (excludePaneIds, cwd, cliId) => {
@@ -3036,9 +2357,9 @@ export class OrchestrationService {
     const codexTarget = toHandle.startsWith('dispatch:')
       ? this.store.getDispatchContext(toHandle.slice('dispatch:'.length))?.assigneeHandle : toHandle;
     if (codexTarget && HEADLESS_WORKER_ID.test(codexTarget)) {
-      if (this.codexWorkers.has(codexTarget)) {
-        this.queueCodexMail(codexTarget, message);
-        this.deliverCodexMailbox(codexTarget);
+      if (this.workers.codexWorkers.has(codexTarget)) {
+        this.workers.queueCodexMail(codexTarget, message);
+        this.workers.deliverCodexMailbox(codexTarget);
       }
     } else {
       this.pointerDelivery.notifyMessageArrived(toHandle);
@@ -3056,7 +2377,7 @@ export class OrchestrationService {
       const dispatchId = toHandle.slice('dispatch:'.length);
       const dispatch = this.store.getDispatchContext(dispatchId);
       if (dispatch) {
-        const role = this.resolveRoleNameForDispatch(dispatch).toLowerCase() || dispatch.id;
+        const role = this.delegation.resolveRoleNameForDispatch(dispatch).toLowerCase() || dispatch.id;
         this.waiters.notify(`board:${dispatch.runId}:role:${role}`, messageType);
         this.waiters.notify(`board:${dispatch.runId}:all`, messageType);
         if (dispatch.assigneePaneId) {
@@ -3073,7 +2394,7 @@ export class OrchestrationService {
         if (activeDispatch) {
           this.waiters.notify(`dispatch:${activeDispatch.id}`, messageType);
           const role =
-            this.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || activeDispatch.id;
+            this.delegation.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || activeDispatch.id;
           this.waiters.notify(`board:${activeDispatch.runId}:role:${role}`, messageType);
           this.waiters.notify(`board:${activeDispatch.runId}:all`, messageType);
         }
@@ -3099,7 +2420,7 @@ export class OrchestrationService {
         this.waiters.notify(dispatchAddr, messageType);
         this.pointerDelivery.notifyMessageArrived(dispatchAddr);
         const role =
-          this.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || activeDispatch.id;
+          this.delegation.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || activeDispatch.id;
         this.waiters.notify(`board:${activeDispatch.runId}:role:${role}`, messageType);
         this.waiters.notify(`board:${activeDispatch.runId}:all`, messageType);
       }
@@ -3276,7 +2597,7 @@ export class OrchestrationService {
         const requestedDispatchId = rawTo.slice('dispatch:'.length).trim();
         const latestInLineage = this.store.resolveDispatchLineage(requestedDispatchId);
         if (latestInLineage && !ACTIVE_DISPATCH_STATUSES.has(latestInLineage.status)) {
-          return this.followUpSettledWorker(latestInLineage, { ...input, to: rawTo });
+          return this.workers.followUpSettledWorker(latestInLineage, { ...input, to: rawTo });
         }
         if (latestInLineage && latestInLineage.id !== requestedDispatchId) {
           return this.sendMailSync({ ...input, to: `dispatch:${latestInLineage.id}` });
@@ -3302,7 +2623,7 @@ export class OrchestrationService {
             this.store.resolveDispatchLineage(supervisedMatch.id) ?? supervisedMatch;
           if (!latestInLineage.releasedAt) {
             if (!ACTIVE_DISPATCH_STATUSES.has(latestInLineage.status)) {
-              return this.followUpSettledWorker(latestInLineage, {
+              return this.workers.followUpSettledWorker(latestInLineage, {
                 ...input,
                 to: `dispatch:${latestInLineage.id}`,
               });
@@ -3498,7 +2819,7 @@ export class OrchestrationService {
             (!settledDispatch.reviewStatus || settledDispatch.reviewStatus === 'pending' || settledDispatch.reviewStatus === 'none')
           ) {
             this.store.updateDispatchReviewState(settledDispatch.id, { reviewStatus: 'rejected' });
-            this.reconcileAnyReviewBatch(settledDispatch.id, {
+            this.review.reconcileAnyReviewBatch(settledDispatch.id, {
               failedReason: 'Review dispatch settled without a structured verdict',
             });
           }
@@ -3579,7 +2900,7 @@ export class OrchestrationService {
     const to = this.resolveActiveParentMailbox(resolvedDispatch);
     const workerRole =
       input.fromRole?.trim().replace(/^@+/, '').toLowerCase() ||
-      this.resolveRoleNameForDispatch(resolvedDispatch).toLowerCase() ||
+      this.delegation.resolveRoleNameForDispatch(resolvedDispatch).toLowerCase() ||
       undefined;
 
     let effectiveArtifacts: OrchestrationReportArtifacts | null | undefined = input.artifacts;
@@ -3652,7 +2973,7 @@ export class OrchestrationService {
             reviewFindings: evaluation.findings,
             ...(workspaceCompromised ? { reviewMutatedWorkspace: true } : {}),
           });
-          this.reconcileAnyReviewBatch(resolvedDispatch.id);
+          this.review.reconcileAnyReviewBatch(resolvedDispatch.id);
         };
         const reviewRound =
           resolvedDispatch.reviewRound ??
@@ -3662,7 +2983,7 @@ export class OrchestrationService {
         const targetRole = isRunReview
           ? (resolvedDispatch.reviewOfRunId ?? resolvedDispatch.runId)
           : targetDispatch
-            ? this.resolveRoleNameForDispatch(targetDispatch) || targetDispatch.id
+            ? this.delegation.resolveRoleNameForDispatch(targetDispatch) || targetDispatch.id
             : (resolvedDispatch.reviewOfDispatchId ?? resolvedDispatch.id);
         summary = formatReviewVerdictForBoard({
           targetRole,
@@ -3700,7 +3021,7 @@ export class OrchestrationService {
               ? 'Waiting for remaining parallel Run reviewer(s) in this batch before finalizing.'
               : `Waiting for remaining parallel reviewer(s) for @${targetRole} before integrating.`;
           } else if (isRunReview) {
-            reviewNextStep = targetRun && this.isRunIntegrationBranchLive(targetRun)
+            reviewNextStep = targetRun && this.integration.isRunIntegrationBranchLive(targetRun)
               ? 'Run-level review passed — call finalize_run_integration() once main workspace is clean.'
               : 'Run-level review passed on main — ready to run final verification and report to the user.';
           } else {
@@ -3730,7 +3051,7 @@ export class OrchestrationService {
               ? { reviewMutatedWorkspace: true }
               : {}),
           });
-          this.reconcileAnyReviewBatch(resolvedDispatch.id, {
+          this.review.reconcileAnyReviewBatch(resolvedDispatch.id, {
             failedReason: 'Reviewer reported ' + outcome,
           });
         };
@@ -3741,7 +3062,7 @@ export class OrchestrationService {
     if (resolvedDispatch.reviewOfDispatchId) {
       const reviewedTarget = this.store.getDispatchContext(resolvedDispatch.reviewOfDispatchId);
       const reviewedRole = reviewedTarget
-        ? this.resolveRoleNameForDispatch(reviewedTarget).trim().replace(/^@+/, '').toLowerCase()
+        ? this.delegation.resolveRoleNameForDispatch(reviewedTarget).trim().replace(/^@+/, '').toLowerCase()
         : '';
       if (reviewedRole && !reportMentions.includes(reviewedRole)) {
         reportMentions.push(reviewedRole);
@@ -3851,7 +3172,7 @@ export class OrchestrationService {
               : null;
             const effectiveBase =
               runForWorker && mainRepoRoot && wtHead
-                ? await this.resolveEffectiveWorkerDiffBase(
+                ? await this.integration.resolveEffectiveWorkerDiffBase(
                     runForWorker,
                     resolvedDispatch,
                     repoPath,
@@ -3866,7 +3187,7 @@ export class OrchestrationService {
             });
             if (diffSummary.isGitRepo) {
               enrichedFromDiff = true;
-              const cleanRole = this.resolveRoleNameForDispatch(resolvedDispatch) || resolvedDispatch.id;
+              const cleanRole = this.delegation.resolveRoleNameForDispatch(resolvedDispatch) || resolvedDispatch.id;
               const autoAuthNote = runForWorker?.reviewAutoAuthorized
                 ? ' (review pre-authorized for this Run)'
                 : '';
@@ -4056,7 +3377,7 @@ export class OrchestrationService {
     connectionLost: boolean;
     formatted?: string;
   }> {
-    const firewall = this.getReviewFirewallContext(input.callerPaneId);
+    const firewall = this.review.getReviewFirewallContext(input.callerPaneId);
     const from = firewall ? input.callerPaneId! : input.from?.trim() || 'coordinator';
     const scope = this.resolveCallerMailbox({ from, runId: firewall ? undefined : input.runId });
     this.routeDirectMailIntoScope(scope, from);
@@ -4116,9 +3437,9 @@ export class OrchestrationService {
         connectionLost?: boolean;
       } = {}
     ) => {
-      const visible = firewall ? msgs.filter((message) => !this.isPostHiddenByReviewFirewall(message, firewall)) : msgs;
+      const visible = firewall ? msgs.filter((message) => !this.review.isPostHiddenByReviewFirewall(message, firewall)) : msgs;
       if (!input.peek && !showAll && opts.deliveryId && visible.length) {
-        const member = this.resolveBoardMemberForPane(from);
+        const member = this.board.resolveBoardMemberForPane(from);
         if (member) this.store.recordBoardRead(member.runId, member.memberKey, visible.map(message => message.id));
       }
       const exposed = exposeMessages(this.store, visible);
@@ -4337,7 +3658,7 @@ export class OrchestrationService {
     messages: OrchestrationExposedMessage[];
     count: number;
   } {
-    const firewall = this.getReviewFirewallContext(input.callerPaneId);
+    const firewall = this.review.getReviewFirewallContext(input.callerPaneId);
     const from = firewall ? input.callerPaneId! : input.from?.trim() || 'coordinator';
     const scope = this.resolveCallerMailbox({ from, runId: firewall ? undefined : input.runId });
     const msgs = input.unreadOnly
@@ -4350,7 +3671,7 @@ export class OrchestrationService {
           types: input.types,
           limit: input.limit ?? 100,
         });
-    const visible = firewall ? msgs.filter((message) => !this.isPostHiddenByReviewFirewall(message, firewall)) : msgs;
+    const visible = firewall ? msgs.filter((message) => !this.review.isPostHiddenByReviewFirewall(message, firewall)) : msgs;
     return {
       mailbox: scope.mailboxHandle,
       messages: exposeMessages(this.store, visible),
@@ -4445,7 +3766,7 @@ export class OrchestrationService {
             : normalizedExplicitTo;
 
         const askerRole =
-          this.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || undefined;
+          this.delegation.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || undefined;
         const msg = this.store.insertMessage({
           runId: input.runId ?? activeDispatch.runId,
           from: `dispatch:${activeDispatch.id}`,
@@ -4537,7 +3858,7 @@ export class OrchestrationService {
         if (current.status === 'answered') {
           if (current.answerMessageId) {
             const asker = this.store.getDispatchContext(current.dispatchId);
-            if (asker) this.store.recordBoardRead(current.runId, this.resolveRoleNameForDispatch(asker).toLowerCase() || asker.id, [current.answerMessageId]);
+            if (asker) this.store.recordBoardRead(current.runId, this.delegation.resolveRoleNameForDispatch(asker).toLowerCase() || asker.id, [current.answerMessageId]);
             this.store.markAsReadAndDelivered([current.answerMessageId]);
             this.store.acknowledgeDeliveriesForMessages([current.answerMessageId]);
           }
@@ -4612,14 +3933,14 @@ export class OrchestrationService {
       const answeredBy = input.from?.trim() || original.toHandle;
       const targetDispatch = this.store.getDispatchContext(question.dispatchId);
       const targetRole = targetDispatch
-        ? this.resolveRoleNameForDispatch(targetDispatch).toLowerCase() || undefined
+        ? this.delegation.resolveRoleNameForDispatch(targetDispatch).toLowerCase() || undefined
         : undefined;
       const replierDispatch = this.store.getActiveDispatchForIdentity(answeredBy, answeredBy);
       const replierRole =
         answeredBy === 'user'
           ? 'user'
           : replierDispatch
-            ? this.resolveRoleNameForDispatch(replierDispatch).toLowerCase() || 'worker'
+            ? this.delegation.resolveRoleNameForDispatch(replierDispatch).toLowerCase() || 'worker'
             : 'coordinator';
       const answered = this.store.answerQuestion({
         messageId: question.messageId,
@@ -4666,7 +3987,7 @@ export class OrchestrationService {
     }
 
     this.store.markAsRead([original.id]);
-    const member = input.from && this.resolveBoardMemberForPane(input.from);
+    const member = input.from && this.board.resolveBoardMemberForPane(input.from);
     const senderRole = member && member.runId === original.runId ? member.role : undefined;
     const replyMsg = this.store.insertMessage({
       runId: original.runId,
@@ -4796,119 +4117,7 @@ export class OrchestrationService {
     return { gates, count: gates.length };
   }
 
-  // ==================== Autonomous Worker Lifecycle (Phases 7–9) ====================
-
-  private deriveLiveStage(dispatch: OrchestrationDispatchRecord): OrchestrationDispatchStage {
-    if (dispatch.releasedAt) return 'released';
-    if (dispatch.status === 'completed') return 'done';
-    if (dispatch.status === 'failed' || dispatch.status === 'circuit_broken') {
-      return dispatch.lastFailureReason === 'worker_stopped' ? 'stopped' : 'failed';
-    }
-    if (dispatch.stage === 'needs_reconciliation') return dispatch.stage;
-    if (this.approvals.hasOpenApprovalForDispatch(dispatch.id)) {
-      return 'waiting_permission';
-    }
-    const paneId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
-    const status = this.agentStatusStore.get(paneId);
-    if (status?.state === 'waiting') {
-      return status.waitKind === 'permission' ? 'waiting_permission' : 'waiting_input';
-    }
-    if (
-      this.nativeQuestions.hasOpenQuestionForDispatch(dispatch.id) ||
-      this.store.listQuestions({ dispatchId: dispatch.id, status: 'pending' }).length > 0
-    ) {
-      return 'waiting_input';
-    }
-    if (dispatch.executionMode === 'codex-app-server') return dispatch.stage ?? 'starting';
-    const gen = dispatch.processGeneration ?? 1;
-    if (dispatch.turnStopReportedGeneration === gen && status?.state !== 'working') {
-      return 'awaiting_review';
-    }
-    if (status?.state === 'working' || dispatch.startObservation === 'observed') {
-      return 'working';
-    }
-    if (dispatch.startObservation === 'permission') {
-      return 'waiting_permission';
-    }
-    return dispatch.stage ?? 'starting';
-  }
-
-  private resolveTargetDispatch(input: {
-    dispatchId?: string;
-    worker?: string;
-    taskId?: string;
-  }): OrchestrationDispatchRecord {
-    if (input.dispatchId?.trim()) {
-      const clean = input.dispatchId.trim().startsWith('dispatch:')
-        ? input.dispatchId.trim().slice('dispatch:'.length)
-        : input.dispatchId.trim();
-      const ctx = this.store.getDispatchContext(clean);
-      if (!ctx) {
-        throw new OrchestrationError('dispatch_not_found', `Dispatch not found: ${clean}`);
-      }
-      return ctx;
-    }
-    if (input.taskId?.trim()) {
-      const latest = this.store.getLatestDispatchForTask(input.taskId.trim());
-      if (!latest) {
-        throw new OrchestrationError(
-          'dispatch_not_found',
-          `No dispatch found for task ${input.taskId.trim()}`
-        );
-      }
-      return latest;
-    }
-    if (input.worker?.trim()) {
-      const target = input.worker.trim();
-      if (target.startsWith('dispatch:')) {
-        const ctx = this.store.getDispatchContext(target.slice('dispatch:'.length));
-        if (ctx) return ctx;
-      }
-      const active = this.store.getActiveDispatchForIdentity(target, target);
-      if (active) return active;
-      const allMatching = this.store
-        .listDispatches()
-        .filter((d) => d.assigneeHandle === target || d.assigneePaneId === target);
-      const last = allMatching[allMatching.length - 1];
-      if (last) return last;
-      throw new OrchestrationError('dispatch_not_found', `Worker not found: ${target}`);
-    }
-    throw new OrchestrationError(
-      'invalid_argument',
-      'Specify --dispatch <dispatchId>, --worker <ptyId>, or --task <taskId>.'
-    );
-  }
-
-  private toWorkerSummary(dispatch: OrchestrationDispatchRecord): OrchestrationWorkerSummary {
-    const task = this.store.getTask(dispatch.taskId) ?? null;
-    const paneId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
-    const paneAlive = paneId ? this.isPaneAlive(paneId) : false;
-    const agentStatus = paneId ? this.agentStatusStore.get(paneId) : null;
-    const stage = this.deriveLiveStage(dispatch);
-    const followUpChild = this.store.getFollowUpChildDispatch(dispatch.id);
-    const openApprovals = this.approvals.listOpenApprovals({ dispatchId: dispatch.id });
-    const openQuestions = this.store.listQuestions({
-      dispatchId: dispatch.id,
-      status: 'pending',
-    });
-    const openNativeQuestions = this.nativeQuestions.listOpenQuestions({ dispatchId: dispatch.id });
-    const terminal = dispatch.executionMode !== 'codex-app-server' && paneId
-      ? this.terminalTracker?.getTerminal(paneId) ?? null : null;
-    return {
-      dispatch: { ...dispatch, stage },
-      task,
-      paneAlive,
-      agentStatus,
-      stage,
-      followUpChildDispatchId: followUpChild?.id ?? null,
-      openApprovals,
-      openQuestions,
-      openNativeQuestions,
-      terminal,
-    };
-  }
-
-  async workerStart(input: {
+  workerStart(input: {
     from?: string;
     callerPaneId?: string;
     runId?: string;
@@ -4967,1598 +4176,7 @@ export class OrchestrationService {
     injected: boolean;
     briefBoardSeq?: number;
   }> {
-    const from = input.from?.trim() || 'coordinator';
-    if (HEADLESS_WORKER_ID.test(from) && !this.canHeadlessWorkerDelegate(from)) {
-      throw new OrchestrationError('operation_rejected', 'Headless Workers cannot start other Workers.');
-    }
-    const callerDispatch = this.store.getActiveDispatchForIdentity(from, from);
-    this.assertCanDelegateFrom(from);
-    this.assertWorkerStartControls(input, from);
-    this.store.assertDispatchCapacity();
-
-    if (input.taskId && this.store.getTask(input.taskId)?.queuedLaunch && (!queueClaim || this.claimedLaunches.get(input.taskId) !== queueClaim)) throw new OrchestrationError('task_not_ready', '任务由已批准的队列管理。');
-    const reusingTerminal = input.terminal?.trim() || undefined;
-    const isReviewRunRequest =
-      input.reviewRun === true ||
-      (typeof input.reviewRun === 'string' && input.reviewRun.trim().length > 0);
-    if (input.reviewOf?.trim() && isReviewRunRequest) {
-      throw new OrchestrationError(
-        'invalid_argument',
-        'Cannot combine reviewOf and reviewRun in the same dispatch.',
-      );
-    }
-    if (
-      typeof input.reviewRun === 'string' &&
-      input.reviewRun.trim() &&
-      input.runId?.trim() &&
-      input.reviewRun.trim() !== input.runId.trim()
-    ) {
-      throw new OrchestrationError(
-        'invalid_argument',
-        `Conflicting runId (${input.runId.trim()}) and reviewRun (${input.reviewRun.trim()}).`,
-      );
-    }
-    if ((input.reviewOf?.trim() || isReviewRunRequest) && reusingTerminal) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        'Adversarial review cannot reuse an existing terminal. Spawn a fresh reviewer in an isolated detached worktree.',
-      );
-    }
-    if (reusingTerminal && reusingTerminal === from) {
-      throw new OrchestrationError(
-        'terminal_is_coordinator',
-        `Terminal ${reusingTerminal} is the caller's own terminal. Choose a different worker terminal.`
-      );
-    }
-    if (reusingTerminal && AGENT_SESSION_ID.test(reusingTerminal)) {
-      throw new OrchestrationError(
-        'terminal_is_coordinator',
-        `${reusingTerminal} is an Agent session, not a worker terminal.`
-      );
-    }
-    if (reusingTerminal && (HEADLESS_WORKER_ID.test(reusingTerminal) || !this.isPaneAlive(reusingTerminal))) {
-      throw new OrchestrationError(
-        'terminal_unavailable',
-        `Target terminal ${reusingTerminal} is not alive.`
-      );
-    }
-    if (reusingTerminal) {
-      const existingActive = this.store.getActiveDispatchForIdentity(reusingTerminal, reusingTerminal);
-      if (existingActive) {
-        throw new OrchestrationError(
-          'worker_busy',
-          `Terminal ${reusingTerminal} already holds active dispatch ${existingActive.id}.`
-        );
-      }
-    }
-
-    const callerStatus = this.agentStatusStore.get(from);
-    const inferredCli =
-      input.cliId?.trim() ||
-      input.agent?.trim() ||
-      (reusingTerminal ? this.agentStatusStore.get(reusingTerminal)?.agentId : undefined) ||
-      callerDispatch?.cliId ||
-      callerStatus?.agentId ||
-      'claude';
-
-    const launchConfig = resolveWorkerLaunchConfig({
-      cliId: inferredCli,
-      model: input.model,
-      effort: input.effort,
-      reusingTerminal: Boolean(reusingTerminal),
-    });
-
-    if (!reusingTerminal && !this.spawnWorkerPty) {
-      throw new OrchestrationError(
-        'terminal_unavailable',
-        'Autonomous worker spawning is not configured on this OrchestrationService instance.'
-      );
-    }
-
-    // Serialize concurrent adversarial review starts with per-Run integration locks and track
-    // in-flight starts so an earlier peer's PASS cannot finalize or merge while a parallel peer is still booting.
-    if (input.reviewOf?.trim()) {
-      const targetPreview = this.resolveDispatchByRoleOrTarget(
-        input.reviewOf.trim(),
-        input.callerPaneId ?? from,
-        input.runId,
-      );
-      return this.withInFlightReviewStart(`dispatch:${targetPreview.id}`, () =>
-        this.withRunIntegrationLock(targetPreview.runId, () =>
-          this.withReviewStartLock(targetPreview.id, () =>
-            this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig),
-          ),
-        ),
-      );
-    }
-    if (isReviewRunRequest) {
-      const explicitRunTarget =
-        typeof input.reviewRun === 'string' ? input.reviewRun.trim() : input.runId;
-      const runPreview = this.resolveTargetRunForOperation(
-        explicitRunTarget,
-        input.callerPaneId,
-        from,
-      );
-      // Share the per-Run integration lock so runFinalizeIntegration / workerIntegrate cannot
-      // race ahead while a Run-level review terminal is booting and before runReviewStatus="pending" is persisted.
-      return this.withInFlightReviewStart(`run:${runPreview.id}`, () =>
-        this.withRunIntegrationLock(runPreview.id, () =>
-          this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig),
-        ),
-      );
-    }
-    if (input.retryOfDispatchId) {
-      const previous = this.store.getDispatchContext(input.retryOfDispatchId);
-      if (previous?.codexDeliveryFailure === 'unknown_acceptance') {
-        return this.mutateWorkerResources(previous, () => {
-          if (this.store.getLatestDispatchForTask(previous.taskId)?.id !== previous.id || previous.lastFailureReason !== 'worker_stopped') {
-            throw new OrchestrationError('operation_rejected', '请先停止旧派发。每次待核对派发只能重试一次。');
-          }
-          return this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig);
-        });
-      }
-    }
-    return this.executeWorkerStartCore(input, from, callerDispatch, callerStatus, reusingTerminal, launchConfig);
-  }
-
-  private async executeWorkerStartCore(
-    input: Parameters<OrchestrationService['workerStart']>[0],
-    from: string,
-    callerDispatch: OrchestrationDispatchRecord | undefined,
-    callerStatus: AgentPaneStatus | null,
-    reusingTerminal: string | undefined,
-    launchConfig: ReturnType<typeof resolveWorkerLaunchConfig>,
-  ): ReturnType<OrchestrationService['workerStart']> {
-    // Resolve or create Run and Task.
-    const normalizedInputContext = this.redactTaskContext(normalizeTaskContext(input));
-    let task: OrchestrationTaskRecord;
-    // Only a task made by this call may be failed when its worker never starts.
-    let createdTask = false;
-    let run: OrchestrationRunRecord;
-    let reviewTarget: OrchestrationDispatchRecord | null = null;
-    let reviewRunTarget: OrchestrationRunRecord | null = null;
-    let reviewBatchId: string | null = null;
-    let reviewSnapshotOid: string | null = null;
-    let reviewBaseCommit: string | null = null;
-    let reviewRunBaseCommit: string | null = null;
-    let reviewDetachedWorktree: { worktreePath: string; mainRepoRoot: string } | null = null;
-    let reviewRoundForTarget = 0;
-
-    const isReviewRunRequest =
-      input.reviewRun === true ||
-      (typeof input.reviewRun === 'string' && input.reviewRun.trim().length > 0);
-
-    if (input.reviewOf?.trim()) {
-      const target = this.resolveDispatchByRoleOrTarget(
-        input.reviewOf.trim(),
-        input.callerPaneId ?? from,
-        input.runId,
-      );
-      if (input.callerPaneId !== undefined) {
-        this.authorizeRunAccess(target.runId, input.callerPaneId);
-      }
-      if (ACTIVE_DISPATCH_STATUSES.has(target.status)) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          `Target worker ${target.id} is still active (${target.status}). Wait for it to report done before starting an adversarial review.`,
-        );
-      }
-      if (target.cliId && this.listCodingAgentsDep) {
-        const authorCli = normalizeWorkerCliId(target.cliId);
-        const reviewerCli = normalizeWorkerCliId(launchConfig.cliId);
-        if (authorCli && reviewerCli === authorCli) {
-          const available = this.listCodingAgents(from).filter((entry) => entry.available);
-          const heterogeneous = available.filter((entry) => entry.cliId !== authorCli);
-          if (heterogeneous.length > 0) {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Heterogeneous review must avoid the author's Coding Agent (${authorCli}); available alternative(s): ${heterogeneous.map((e) => e.cliId).join(', ')}.`,
-              { authorCliId: authorCli, requestedCliId: reviewerCli },
-            );
-          }
-        }
-      }
-      reviewTarget = target;
-      run = this.store.requireRun(target.runId);
-      if (run.status !== 'active') {
-        run = this.store.updateRunStatus(run.id, 'active');
-      }
-      const targetTask = this.store.requireTask(target.taskId);
-      const targetPath = target.worktreePath ?? this.getDefaultCwd?.() ?? process.cwd();
-
-      // Strictly require a clean, unambiguous Git snapshot (no staged/unstaged divergence)
-      // and an isolated detached worktree; never fall back to the author's workspace.
-      const snap = await captureWorkerSnapshotOid(targetPath, { rejectStagedDivergence: true });
-      if (!snap.snapshotOid) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          `Adversarial review requires a valid Git snapshot for ${target.id}; cannot fall back to the author workspace.`,
-        );
-      }
-      reviewSnapshotOid = snap.snapshotOid;
-
-      const mainRepoRoot = await resolveMainRepoRoot(
-        targetPath,
-        target.repoRootPath ?? this.getDefaultCwd?.() ?? null,
-      );
-      if (!mainRepoRoot) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          `Could not resolve Git repository root for ${target.id}; isolated detached review worktree is required.`,
-        );
-      }
-
-      const effectiveReviewBase = await this.resolveEffectiveWorkerDiffBase(
-        run,
-        target,
-        targetPath,
-        mainRepoRoot,
-        reviewSnapshotOid,
-      );
-      const diff = await inspectWorkerDiff({
-        worktreePath: targetPath,
-        baseCommit: effectiveReviewBase,
-        maxDiffBytes: 16 * 1024,
-        pinnedSnapshot: {
-          headCommit: snap.headCommit,
-          snapshotOid: snap.snapshotOid,
-          dirtyFiles: snap.dirtyFiles,
-          stagedDivergentFiles: snap.stagedDivergentFiles,
-        },
-      });
-      reviewBaseCommit = diff.baseCommit ?? effectiveReviewBase ?? null;
-
-      // Parallel L2 perspectives targeting the same snapshot join the current pending batch;
-      // a new snapshot or a previously settled batch starts a brand new batch and bumps reviewRound.
-      const canJoinCurrentBatch =
-        Boolean(target.reviewBatchId) &&
-        target.reviewStatus === 'pending' &&
-        target.reviewSnapshotOid === reviewSnapshotOid &&
-        (!target.reviewBaseCommit || !reviewBaseCommit || target.reviewBaseCommit === reviewBaseCommit) &&
-        (target.reviewRound ?? 0) > 0;
-      if (canJoinCurrentBatch) {
-        reviewBatchId = target.reviewBatchId!;
-        reviewRoundForTarget = target.reviewRound!;
-      } else {
-        reviewRoundForTarget = (target.reviewRound ?? 0) + 1;
-        if (reviewRoundForTarget > MAX_ADVERSARIAL_REVIEW_ROUNDS) {
-          if (target.reviewStatus === 'passed' && target.reviewSnapshotOid === reviewSnapshotOid) {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Adversarial review limit reached (${MAX_ADVERSARIAL_REVIEW_ROUNDS} rounds) for ${target.id}, and this exact snapshot already passed. Integrate it instead of requesting another review.`,
-              { targetDispatchId: target.id, maxRounds: MAX_ADVERSARIAL_REVIEW_ROUNDS },
-            );
-          }
-          this.store.updateDispatchReviewState(target.id, { reviewStatus: 'escalated' });
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Adversarial review limit reached (${MAX_ADVERSARIAL_REVIEW_ROUNDS} rounds) for ${target.id}. Escalate the remaining disagreement to the user.`,
-            { targetDispatchId: target.id, maxRounds: MAX_ADVERSARIAL_REVIEW_ROUNDS },
-          );
-        }
-        reviewBatchId = `rbat_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
-      }
-
-      const effectiveMcpForReview =
-        input.mcpEnabled ?? this.isMcpEnabledForCliDep?.(launchConfig.cliId) ?? false;
-      const targetRole = this.resolveRoleNameForDispatch(target) || target.id;
-      const builtReview = buildAdversarialReviewTask({
-        targetRole,
-        targetDispatchId: target.id,
-        targetTaskSpec: targetTask.spec,
-        targetTaskContext: targetTask.taskContext,
-        diff,
-        reviewFocus: input.reviewFocus ?? (input.spec?.trim() || undefined),
-        reviewRound: reviewRoundForTarget,
-        maxRounds: MAX_ADVERSARIAL_REVIEW_ROUNDS,
-        mcpEnabled: effectiveMcpForReview,
-        cliCommand: this.cliCommand,
-      });
-      // Do NOT merge arbitrary caller-provided context into adversarial review tasks (prevents
-      // smuggling author summaries or weakening read-only constraints).
-      const detached = await createDetachedReviewWorktree({
-        mainRepoRoot,
-        snapshotOid: reviewSnapshotOid,
-        reviewSlug: `${targetRole}-r${reviewRoundForTarget}`,
-      });
-      reviewDetachedWorktree = { worktreePath: detached.worktreePath, mainRepoRoot };
-
-      const reviewLabel = input.role?.trim() || input.displayName?.trim() || `review-${targetRole}`;
-      createdTask = true;
-      task = this.store.createTask({
-        singleShot: true,
-        runId: run.id,
-        spec: builtReview.taskSpec,
-        taskContext: builtReview.taskContext,
-        taskTitle: input.taskTitle ?? `Adversarial review of @${targetRole}`,
-        displayName: reviewLabel,
-        priority: input.priority ?? 'high',
-      });
-    } else if (isReviewRunRequest) {
-      const explicitRunTarget =
-        typeof input.reviewRun === 'string' ? input.reviewRun.trim() : input.runId;
-      let targetRun = this.resolveTargetRunForOperation(
-        explicitRunTarget,
-        input.callerPaneId,
-        from,
-      );
-      if (targetRun.status !== 'active') {
-        targetRun = this.store.updateRunStatus(targetRun.id, 'active');
-      }
-      run = targetRun;
-      reviewRunTarget = targetRun;
-
-      const resolvedTarget = await this.resolveRunCombinedDiffTarget(targetRun, {
-        requireCleanIntegrationWorktree: true,
-      });
-      if (this.listCodingAgentsDep) {
-        const integratedAuthorClis = new Set<string>(
-          resolvedTarget.integratedWorkers
-            .map((w) => (w.cliId ? normalizeWorkerCliId(w.cliId) : ''))
-            .filter(Boolean),
-        );
-        const reviewerCli = normalizeWorkerCliId(launchConfig.cliId);
-        if (integratedAuthorClis.has(reviewerCli)) {
-          const available = this.listCodingAgents(from).filter((entry) => entry.available);
-          const heterogeneous = available.filter((entry) => !integratedAuthorClis.has(entry.cliId));
-          if (heterogeneous.length > 0) {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Heterogeneous Run-level review must avoid integrated author Coding Agent(s) (${[...integratedAuthorClis].join(', ')}); available alternative(s): ${heterogeneous.map((e) => e.cliId).join(', ')}.`,
-              { authorCliIds: [...integratedAuthorClis], requestedCliId: reviewerCli },
-            );
-          }
-        }
-      }
-      if (!resolvedTarget.hasChanges || !resolvedTarget.mainRepoRoot || !resolvedTarget.baseCommit || !resolvedTarget.targetCommit) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          `No integrated changes found for run ${targetRun.id}. Integrate at least one worker before launching a Run-level adversarial review.`,
-          { runId: targetRun.id },
-        );
-      }
-
-      const combinedDiff = await inspectCommitRangeDiff({
-        repoPath: resolvedTarget.repoPath ?? resolvedTarget.mainRepoRoot,
-        baseCommit: resolvedTarget.baseCommit,
-        targetCommit: resolvedTarget.targetCommit,
-        branch: resolvedTarget.branch,
-        maxDiffBytes: 16 * 1024,
-      });
-      if (combinedDiff.diffError || combinedDiff.changedFiles.length === 0) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          combinedDiff.diffError
-            ? `Could not inspect combined Run diff for ${targetRun.id}: ${combinedDiff.diffError}`
-            : `Combined Run diff for ${targetRun.id} has no file changes to review.`,
-          { runId: targetRun.id },
-        );
-      }
-
-      reviewSnapshotOid = resolvedTarget.targetCommit;
-      reviewRunBaseCommit = resolvedTarget.baseCommit;
-
-      const canJoinCurrentBatch =
-        Boolean(targetRun.runReviewBatchId) &&
-        targetRun.runReviewStatus === 'pending' &&
-        targetRun.runReviewSnapshotOid === reviewSnapshotOid &&
-        (targetRun.runReviewRound ?? 0) > 0;
-      if (canJoinCurrentBatch) {
-        reviewBatchId = targetRun.runReviewBatchId!;
-        reviewRoundForTarget = targetRun.runReviewRound!;
-      } else {
-        const isFreshPostPassSnapshot =
-          targetRun.runReviewStatus === 'passed' &&
-          Boolean(targetRun.runReviewSnapshotOid) &&
-          targetRun.runReviewSnapshotOid !== reviewSnapshotOid;
-        reviewRoundForTarget = isFreshPostPassSnapshot ? 1 : (targetRun.runReviewRound ?? 0) + 1;
-        if (reviewRoundForTarget > MAX_ADVERSARIAL_REVIEW_ROUNDS) {
-          if (targetRun.runReviewStatus === 'passed' && targetRun.runReviewSnapshotOid === reviewSnapshotOid) {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Run-level adversarial review limit reached (${MAX_ADVERSARIAL_REVIEW_ROUNDS} rounds) for ${targetRun.id}, and this exact snapshot already passed. Finalize it instead of requesting another review.`,
-              { runId: targetRun.id, maxRounds: MAX_ADVERSARIAL_REVIEW_ROUNDS },
-            );
-          }
-          this.store.updateRunReviewState(targetRun.id, { runReviewStatus: 'escalated' });
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Run-level adversarial review limit reached (${MAX_ADVERSARIAL_REVIEW_ROUNDS} rounds) for ${targetRun.id}. Escalate the remaining disagreement to the user.`,
-            { runId: targetRun.id, maxRounds: MAX_ADVERSARIAL_REVIEW_ROUNDS },
-          );
-        }
-        reviewBatchId = `rrbat_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
-      }
-
-      const effectiveMcpForReview =
-        input.mcpEnabled ?? this.isMcpEnabledForCliDep?.(launchConfig.cliId) ?? false;
-      const builtRunReview = buildRunAdversarialReviewTask({
-        runId: targetRun.id,
-        runObjective: targetRun.objective,
-        diff: combinedDiff,
-        integratedWorkers: resolvedTarget.integratedWorkers,
-        reviewFocus: input.reviewFocus ?? (input.spec?.trim() || undefined),
-        reviewRound: reviewRoundForTarget,
-        maxRounds: MAX_ADVERSARIAL_REVIEW_ROUNDS,
-        mcpEnabled: effectiveMcpForReview,
-        cliCommand: this.cliCommand,
-      });
-
-      const detached = await createDetachedReviewWorktree({
-        mainRepoRoot: resolvedTarget.mainRepoRoot,
-        snapshotOid: reviewSnapshotOid,
-        reviewSlug: `run-${targetRun.id}-r${reviewRoundForTarget}`,
-      });
-      reviewDetachedWorktree = {
-        worktreePath: detached.worktreePath,
-        mainRepoRoot: resolvedTarget.mainRepoRoot,
-      };
-
-      const reviewLabel = input.role?.trim() || input.displayName?.trim() || 'review-run';
-      createdTask = true;
-      task = this.store.createTask({
-        singleShot: true,
-        runId: run.id,
-        spec: builtRunReview.taskSpec,
-        taskContext: builtRunReview.taskContext,
-        taskTitle: input.taskTitle ?? `Run-level adversarial review (${targetRun.id})`,
-        displayName: reviewLabel,
-        priority: input.priority ?? 'high',
-      });
-    } else if (input.retryOfDispatchId?.trim()) {
-      const prior = this.store.getDispatchContext(input.retryOfDispatchId.trim());
-      if (!prior) {
-        throw new OrchestrationError(
-          'dispatch_not_found',
-          `Prior dispatch not found: ${input.retryOfDispatchId}`
-        );
-      }
-      run = this.store.requireRun(prior.runId);
-      if (input.callerPaneId !== undefined) this.resolveBoardCallerContext({ from: input.callerPaneId, runId: run.id });
-      const priorTask = this.store.requireTask(prior.taskId);
-      if (prior.codexDeliveryFailure === 'unknown_acceptance' && (ACTIVE_DISPATCH_STATUSES.has(prior.status) || this.codexWorkers.get(prior.assigneeHandle)?.alive)) {
-        throw new OrchestrationError('operation_rejected', '请先核对结果并停止原执行者，再从已核实的基线重新派发。');
-      }
-      if (prior.codexDeliveryFailure === 'unknown_acceptance') {
-        if (!prior.repoRootPath || !prior.baseCommit || input.terminal || input.noWorktree) {
-          throw new OrchestrationError('operation_rejected', '无法确认独立工作树的基线，请先人工核对。');
-        }
-        input = { ...input, cwd: prior.repoRootPath, baseBranch: prior.baseCommit, worktree: true, branch: undefined,
-          readOnly: prior.taskKind === 'research' || prior.taskKind === 'review', taskKind: prior.taskKind };
-      }
-      if (priorTask.status === 'completed') {
-        const retryContext = mergeTaskContext(priorTask.taskContext, normalizedInputContext);
-        createdTask = true;
-        task = this.store.createTask({
-          singleShot: true,
-          runId: run.id,
-          spec: input.spec?.trim() || priorTask.spec,
-          ...(retryContext ? { taskContext: retryContext } : {}),
-          taskTitle: input.taskTitle ?? `Retry: ${priorTask.taskTitle}`,
-          displayName: input.displayName,
-          priority: input.priority ?? priorTask.priority,
-        });
-      } else {
-        task = this.store.requeueTaskForRetry(priorTask.id);
-      }
-    } else if (input.taskId?.trim()) {
-      const existingTask = this.store.requireTask(input.taskId.trim());
-      run = this.store.requireRun(existingTask.runId);
-      if (input.callerPaneId !== undefined) this.resolveBoardCallerContext({ from: input.callerPaneId, runId: run.id });
-      this.store.promoteReadyTasks(run.id);
-      task = this.store.requireTask(existingTask.id);
-
-    } else if (input.spec?.trim()) {
-      const explicitRunId = input.runId?.trim();
-      if (explicitRunId && input.callerPaneId !== undefined) {
-        this.resolveBoardCallerContext({ from: input.callerPaneId, runId: explicitRunId });
-      }
-      let inferredRunId = explicitRunId || (input.callerPaneId === undefined
-        ? this.inferRunIdOptional(from)
-        : this.resolveBoardMemberForPane(from)?.runId);
-      if (!explicitRunId && inferredRunId && !callerDispatch && from !== 'coordinator') {
-        const candidateRun = this.store.getRun(inferredRunId);
-        if (
-          candidateRun?.coordinatorPaneId &&
-          candidateRun.coordinatorPaneId !== from &&
-          candidateRun.coordinatorHandle !== from
-        ) {
-          inferredRunId = undefined;
-        }
-      }
-      if (inferredRunId) {
-        run = this.store.requireRun(inferredRunId);
-        if (run.status !== 'active') {
-          run = this.store.updateRunStatus(run.id, 'active');
-        }
-      } else {
-        const callerPane = callerStatus || this.isActiveSessionCoordinator(from) ? from : undefined;
-        run = this.runCreate({
-          objective: input.taskTitle?.trim() || input.spec.trim().slice(0, 120),
-          from,
-          paneId: callerPane,
-        }).run;
-      }
-      createdTask = true;
-      task = this.store.createTask({
-        singleShot: true,
-        runId: run.id,
-        spec: input.spec.trim(),
-        ...(normalizedInputContext ? { taskContext: normalizedInputContext } : {}),
-        taskTitle: input.taskTitle,
-        displayName: input.displayName,
-        deps: input.deps,
-      codeDeps: input.codeDeps,
-        priority: input.priority,
-      });
-    } else {
-      throw new OrchestrationError(
-        'invalid_argument',
-        'worker-start requires either --task <taskId>, --spec "<spec>", or --retry-of <dispatchId>.'
-      );
-    }
-
-    if (task.status !== 'ready') {
-      throw new OrchestrationError(
-        'task_not_ready',
-        `Task ${task.id} is ${task.status}; only ready tasks can be started.`
-      );
-    }
-
-    const parentPaneId = callerStatus || this.isActiveSessionCoordinator(from)
-      ? from
-      : (callerDispatch?.assigneePaneId ?? run.coordinatorPaneId ?? null);
-    const parentTerminal = parentPaneId ? this.terminalTracker?.getTerminal(parentPaneId) : null;
-    const baseCwd =
-      input.cwd?.trim() ||
-      task.worktreePath ||
-      callerDispatch?.worktreePath ||
-      input.callerCwd?.trim() ||
-      parentTerminal?.cwd ||
-      (parentPaneId ? this.sessionCoordinator(parentPaneId)?.cwd : undefined) ||
-      this.getDefaultCwd?.() ||
-      process.cwd();
-
-    if (reusingTerminal) {
-      const mismatch = this.paneMismatch(reusingTerminal, task.worktreePath ?? baseCwd, launchConfig.cliId);
-      if (mismatch) {
-        if (createdTask) this.failTaskIfReady(task.id);
-        throw new OrchestrationError('terminal_unavailable', mismatch);
-      }
-    }
-    const reusingTerminalCwd = reusingTerminal
-      ? this.terminalTracker?.getTerminal(reusingTerminal)?.cwd
-      : undefined;
-
-    let effectiveBaseBranch = input.baseBranch;
-    if (
-      !reviewDetachedWorktree &&
-      !effectiveBaseBranch?.trim() &&
-      this.isRunIntegrationBranchLive(run) &&
-      run.integrationBranch &&
-      run.integrationRepoRootPath
-    ) {
-      const [sameRepo, branchOid] = await Promise.all([
-        isSameGitRepo(baseCwd, run.integrationRepoRootPath),
-        resolveBranchRefOid(run.integrationRepoRootPath, run.integrationBranch),
-      ]);
-      if (sameRepo && branchOid) {
-        effectiveBaseBranch = run.integrationBranch;
-      }
-    }
-
-    const placement = reviewDetachedWorktree
-      ? {
-          cwd: reviewDetachedWorktree.worktreePath,
-          worktreePath: reviewDetachedWorktree.worktreePath,
-          branch: null,
-          baseCommit: reviewRunBaseCommit ?? reviewBaseCommit ?? reviewTarget?.baseCommit ?? null,
-          ownsWorktree: true,
-          ownsBranch: false,
-          repoRootPath: reviewDetachedWorktree.mainRepoRoot,
-        }
-      : await prepareWorkerWorktreePlacement({
-          baseCwd: reviewTarget?.worktreePath ?? baseCwd,
-          taskId: task.id,
-          taskTitle: task.taskTitle,
-          name: input.name,
-          worktree: reviewTarget ? false : input.worktree,
-          noWorktree: reviewTarget ? true : input.noWorktree,
-          branch: input.branch,
-          baseBranch: effectiveBaseBranch,
-          reusingTerminalCwd,
-        });
-
-    try {
-      await this.verifyCodeInputs(task, placement.cwd);
-    } catch (error) {
-      if (placement.ownsWorktree) await this.rollbackWorkerResources(undefined, placement.worktreePath);
-      if (createdTask) this.failTaskIfReady(task.id);
-      throw error;
-    }
-    // A run a session coordinates runs every non-reused task of a headless-capable driver as a
-    // headless Worker, even when the Codex pilot setting is off; terminal-coordinated runs keep the
-    // read-only Codex pilot gate. A driver that cannot enforce the task's policy keeps a terminal.
-    const runIsSessionCoordinated =
-      AGENT_SESSION_ID.test(run.coordinatorPaneId ?? '') || this.isActiveSessionCoordinator(from);
-    const readOnlyTask = input.readOnly === true || input.policy === 'read-only' || Boolean(reviewTarget || reviewRunTarget);
-    const workerPolicy: AgentSessionPolicy = readOnlyTask ? 'read-only' : input.policy ?? 'workspace-write';
-    if (!reusingTerminal && runIsSessionCoordinated && isHeadlessWorkerDriver(launchConfig.cliId)) {
-      // An explicit control the driver cannot enforce is refused; an implied read-only tier keeps a terminal.
-      const unsupported = headlessWorkerControlsError(launchConfig.cliId, {
-        ...(input.policy !== undefined ? { policy: input.policy } : {}),
-        ...(input.network !== undefined ? { network: input.network } : {}),
-      });
-      if (unsupported) {
-        if (placement.ownsWorktree && placement.worktreePath) await this.rollbackWorkerResources(undefined, placement.worktreePath);
-        if (createdTask) this.failTaskIfReady(task.id);
-        throw new OrchestrationError('operation_rejected', unsupported, { cliId: launchConfig.cliId });
-      }
-    }
-    const headlessCli = !reusingTerminal && headlessWorkerSupports(launchConfig.cliId, workerPolicy)
-      ? launchConfig.cliId as HeadlessWorkerDriver : null;
-    const usePilot = headlessCli === 'codex'
-      ? Boolean(this.codexPilot && (runIsSessionCoordinated || (readOnlyTask && this.codexPilot.enabled())))
-      : Boolean(headlessCli && runIsSessionCoordinated && this.headlessWorkers &&
-        this.headlessWorkers.available?.(headlessCli) !== false);
-    const coordinatorSession =
-      (run.coordinatorPaneId && this.isActiveSessionCoordinator(run.coordinatorPaneId)
-        ? this.sessionCoordinator(run.coordinatorPaneId)
-        : null) ??
-      (this.isActiveSessionCoordinator(from) ? this.sessionCoordinator(from) : null);
-    // Inherited network access is dropped on drivers that cannot sandbox it per turn.
-    const workerNetwork = !reviewTarget && !reviewRunTarget && Boolean(headlessCli && driverCapabilities(headlessCli).network) &&
-      (input.network ?? (runIsSessionCoordinated && Boolean(coordinatorSession?.network)));
-    const allowSubWorkers = input.allowSubWorkers === true;
-    const pilot = usePilot && headlessCli
-      ? await this.openCodexWorker(headlessCli, placement.cwd ?? process.cwd(), launchConfig.model, {
-          policy: workerPolicy,
-          network: workerNetwork,
-          allowSubWorkers,
-        })
-      : null;
-
-    const spawnPane = async (): Promise<string> => {
-      try {
-        const spawned = await this.spawnWorkerPty!({
-          runId: run.id,
-          task,
-          cliId: launchConfig.cliId,
-          cwd: placement.cwd,
-          extraArgs: usePilot && headlessCli === 'codex' && readOnlyTask
-            ? [...launchConfig.extraArgs, '--sandbox', 'read-only', '--ask-for-approval', 'on-request']
-            : launchConfig.extraArgs,
-        });
-        if (!spawned) {
-          throw new OrchestrationError(
-            'terminal_unavailable',
-            `Failed to spawn worker terminal for CLI "${launchConfig.cliId}".`,
-            { taskId: task.id, cliId: launchConfig.cliId }
-          );
-        }
-        this.exitedPanes.delete(spawned.ptyId);
-        return spawned.ptyId;
-      } catch (err) {
-        if (placement.ownsWorktree && placement.worktreePath) {
-          await this.rollbackWorkerResources(undefined, placement.worktreePath);
-        }
-        if (createdTask) this.failTaskIfReady(task.id);
-        if (err instanceof OrchestrationError) {
-          if (err.code === 'terminal_unavailable' && !err.data?.taskId) {
-            throw new OrchestrationError(err.code, err.message, {
-              ...(err.data ?? {}),
-              taskId: task.id,
-              cliId: launchConfig.cliId,
-            });
-          }
-          throw err;
-        }
-        throw new OrchestrationError(
-          'terminal_unavailable',
-          err instanceof Error ? err.message : String(err),
-          { taskId: task.id, cliId: launchConfig.cliId }
-        );
-      }
-    };
-
-    let ptyId = pilot ? null : reusingTerminal ?? await spawnPane();
-    let ownsPane = !pilot && !reusingTerminal;
-    let ctx: OrchestrationDispatchRecord;
-    try {
-      ctx = this.store.createDispatchContext({
-        approvedQueueLaunch: task.queuedLaunch?.state === 'claimed' && this.claimedLaunches.has(task.id),
-        taskId: task.id,
-        assigneeHandle: pilot?.id ?? ptyId!,
-        assigneePaneId: ptyId,
-        ...(pilot ? {
-          providerSessionId: pilot.sessionId, workerPolicy, workerNetwork, allowSubWorkers,
-        } : {}),
-        creator: from,
-        creatorRunId: run.id,
-        creatorDispatchId: callerDispatch?.id ?? null,
-        parentDepth: this.resolveCallerDepth(from),
-        parentPaneId,
-        worktreePath: placement.worktreePath,
-        branch: placement.branch,
-        baseCommit: placement.baseCommit,
-        repoRootPath: placement.repoRootPath,
-        ownsWorktree: placement.ownsWorktree,
-        taskKind: input.taskKind ?? (readOnlyTask ? 'research' : undefined),
-        ownsBranch: placement.ownsBranch,
-        isDetachedReviewWorktree: Boolean(reviewDetachedWorktree),
-        reviewOfDispatchId: reviewTarget?.id ?? null,
-        reviewOfRunId: reviewRunTarget?.id ?? null,
-        reviewFocus: input.reviewFocus?.trim() || null,
-        reviewBatchId,
-        reviewSnapshotOid,
-        reviewBaseCommit: reviewRunBaseCommit ?? reviewBaseCommit,
-        ...(reviewTarget || reviewRunTarget ? { reviewRound: reviewRoundForTarget } : {}),
-        ownsPane,
-        cliId: launchConfig.cliId,
-        model: launchConfig.model,
-        effort: launchConfig.effort,
-        processGeneration: 1,
-        retained: Boolean(input.keepOpen),
-        maxDepth: this.maxDepth,
-      });
-      if (reviewTarget) {
-        const latestTarget = this.store.getDispatchContext(reviewTarget.id);
-        const alreadyRejectedSameBatch =
-          Boolean(reviewBatchId) &&
-          latestTarget?.reviewBatchId === reviewBatchId &&
-          (latestTarget.reviewStatus === 'rejected' || latestTarget.reviewStatus === 'escalated');
-        this.store.updateDispatchReviewState(reviewTarget.id, {
-          reviewStatus: alreadyRejectedSameBatch ? latestTarget!.reviewStatus : 'pending',
-          reviewRound: reviewRoundForTarget,
-          reviewBatchId,
-          reviewSnapshotOid,
-          reviewBaseCommit,
-        });
-      }
-      if (reviewRunTarget) {
-        const latestRunTarget = this.store.getRun(reviewRunTarget.id);
-        const alreadyRejectedSameRunBatch =
-          Boolean(reviewBatchId) &&
-          latestRunTarget?.runReviewBatchId === reviewBatchId &&
-          (latestRunTarget.runReviewStatus === 'rejected' || latestRunTarget.runReviewStatus === 'escalated');
-        this.store.updateRunReviewState(reviewRunTarget.id, {
-          runReviewStatus: alreadyRejectedSameRunBatch ? latestRunTarget!.runReviewStatus : 'pending',
-          runReviewRound: reviewRoundForTarget,
-          runReviewBatchId: reviewBatchId,
-          runReviewSnapshotOid: reviewSnapshotOid,
-          runReviewBaseCommit: reviewRunBaseCommit,
-        });
-      }
-    } catch (err) {
-      if (pilot) await pilot.session.close();
-      await this.rollbackWorkerResources(
-        ownsPane ? ptyId ?? undefined : undefined,
-        placement.ownsWorktree ? placement.worktreePath : null,
-      );
-      if (createdTask) this.failTaskIfReady(task.id);
-      throw err;
-    }
-
-    const announcePane = (id: string) => {
-      this.emitPaneSpawned({
-        ptyId: id,
-        runId: run.id,
-        taskId: task.id,
-        dispatchId: ctx.id,
-        parentPaneId,
-        cwd: placement.cwd,
-        worktreePath: placement.worktreePath,
-        branch: placement.branch,
-        cliId: launchConfig.cliId,
-        ownsWorktree: placement.ownsWorktree,
-        ownsPane: true,
-        displayName: task.displayName ?? null,
-        taskTitle: task.taskTitle,
-      });
-    };
-    if (ownsPane && ptyId) announcePane(ptyId);
-
-    const coordinatorHandle = callerDispatch ? `dispatch:${callerDispatch.id}` : `run:${run.id}`;
-    const effectiveMcpEnabled =
-      input.mcpEnabled ?? this.isMcpEnabledForCliDep?.(launchConfig.cliId) ?? false;
-    const preambleRole =
-      (input.role ?? input.displayName)?.trim().replace(/^@+/, '') || null;
-    if (normalizedInputContext && (input.taskId || input.retryOfDispatchId)) {
-      task = this.store.mergeTaskContext(task.id, normalizedInputContext);
-    }
-    const makePreamble = () => this.buildWorkerDispatchBrief({
-      taskId: task.id,
-      dispatchId: ctx.id,
-      runId: run.id,
-      taskSpec: task.spec,
-      taskContext: task.taskContext,
-      coordinatorHandle,
-      workerHandle: ctx.assigneeHandle,
-      worktreePath: placement.worktreePath,
-      branch: placement.branch,
-      canDispatchSubWorkers: (ctx.executionMode !== 'codex-app-server' || ctx.allowSubWorkers === true) &&
-        ctx.depth < this.maxDepth,
-      mcpEnabled: ctx.executionMode === 'codex-app-server' || effectiveMcpEnabled,
-      headless: ctx.executionMode === 'codex-app-server',
-      leaveUncommitted: ctx.executionMode === 'codex-app-server' && workerPolicy !== 'read-only',
-      role: preambleRole,
-    });
-
-    let preamble = makePreamble();
-    if (task.queuedLaunch || task.codeDeps?.length) {
-      try {
-        await this.store.flushDurable();
-        await this.verifyCodeInputs(task, placement.cwd);
-      } catch (error) {
-        if (pilot) await pilot.session.close();
-        await this.rollbackWorkerResources(ownsPane ? ptyId ?? undefined : undefined, placement.ownsWorktree ? placement.worktreePath : null);
-        this.store.failDispatch(ctx.id, 'Worker launch preflight failed before submission', { forceFailTask: true });
-        throw error;
-      }
-    }
-    let acceptedByCodex = false;
-    if (pilot) {
-      const outcome = await this.submitCodexTurn(ctx, pilot.session, preamble);
-      if (outcome.status === 'not_accepted') {
-        await pilot.session.close();
-        if (this.disposed) throw new OrchestrationError('operation_rejected', 'Orchestration is closing.');
-        try {
-          ptyId = await spawnPane();
-          ctx = this.store.switchUnacceptedCodexDispatchToPane(ctx.id, ptyId);
-        } catch (error) {
-          if (ptyId) await this.rollbackWorkerResources(ptyId);
-          this.failCodexDispatch(ctx.id, 'not_accepted', outcome.reason);
-          throw error;
-        }
-        ownsPane = true;
-        this.store.cleanupDispatchBrief(ctx.id);
-        preamble = makePreamble();
-        announcePane(ptyId);
-      } else if (outcome.status === 'unknown_acceptance') {
-        await pilot.session.close();
-        throw new OrchestrationError('prompt_delivery_failed', `${HEADLESS_DRIVER_LABELS[headlessCli!]} turn acceptance is unknown. Check Worker output before retrying.`, {
-          dispatchId: ctx.id, taskId: task.id, acceptance: outcome.status,
-        });
-      } else {
-        acceptedByCodex = true;
-        this.emitPaneSpawned({
-          ptyId: pilot.id, runId: run.id, taskId: task.id, dispatchId: ctx.id, parentPaneId,
-          cwd: placement.cwd, worktreePath: placement.worktreePath, branch: placement.branch,
-          cliId: launchConfig.cliId, ownsWorktree: placement.ownsWorktree, ownsPane: false,
-          displayName: task.displayName ?? null, taskTitle: task.taskTitle, headless: true,
-        });
-      }
-    }
-
-    if (reusingTerminal) {
-      const mismatch = this.paneMismatch(reusingTerminal, placement.cwd, launchConfig.cliId);
-      if (mismatch) {
-        this.store.failDispatch(ctx.id, mismatch, { forceFailTask: true });
-        throw new OrchestrationError('terminal_unavailable', mismatch);
-      }
-    }
-    const delivery = acceptedByCodex ? null : await this.deliverAndObserveDispatchTurn(ctx.id, {
-      ptyId: ptyId!,
-      prompt: preamble,
-      submit: true,
-    });
-
-    if (delivery && !delivery.ok) {
-      const reason = delivery.error ?? `Failed to deliver worker prompt to ${ptyId}`;
-      this.store.failDispatch(ctx.id, reason);
-      if (ctx.reviewOfDispatchId || ctx.reviewOfRunId) {
-        this.store.updateDispatchReviewState(ctx.id, { reviewStatus: 'rejected' });
-        this.failTaskIfReady(task.id);
-        this.reconcileAnyReviewBatch(ctx.id, {
-          overrideVerdict: 'reject',
-          failedReason: 'Reviewer prompt delivery failed',
-        });
-      }
-      const closed = await this.rollbackWorkerResources(
-        ownsPane ? ptyId ?? undefined : undefined,
-        placement.ownsWorktree ? placement.worktreePath : null,
-      );
-      if (closed && ownsPane && ptyId) {
-        this.emitPaneClosed({ ptyId, runId: run.id, taskId: task.id, dispatchId: ctx.id });
-      }
-      this.emitChanged('dispatch:failed', run.id);
-      throw new OrchestrationError('prompt_delivery_failed', reason, {
-        dispatchId: ctx.id,
-        taskId: task.id,
-        ptyId,
-      });
-    }
-
-    const updatedCtx = delivery
-      ? this.store.updateDispatchObservation(ctx.id, delivery.startObservation, {
-        reason: delivery.observationReason ?? null,
-        refreshHeartbeat:
-          delivery.startObservation === 'observed' ||
-          delivery.startObservation === 'queued' ||
-          delivery.startObservation === 'permission',
-        ...(delivery.promptDeferred ? {} : { promptSent: true }),
-      }) ?? ctx
-      : this.store.getDispatchContext(ctx.id)?.stage === 'awaiting_review' ? this.store.getDispatchContext(ctx.id)!
-      : this.store.updateDispatchObservation(ctx.id, 'observed', { refreshHeartbeat: true, promptSent: true }) ?? ctx;
-
-    const briefFromRole = callerDispatch
-      ? this.resolveRoleNameForDispatch(callerDispatch).toLowerCase() || 'worker'
-      : 'coordinator';
-    const briefWorkerRole =
-      (input.role ?? input.displayName)?.trim().replace(/^@+/, '').toLowerCase() ||
-      this.resolveRoleNameForDispatch(ctx).toLowerCase() ||
-      ctx.id;
-    const auditMsg = this.store.insertMessage({
-      runId: run.id,
-      from,
-      to: `dispatch:${ctx.id}`,
-      type: 'dispatch',
-      subject: `Started worker for ${task.id}`,
-      body: this.store.redactDispatchCredentials(preamble),
-      fromRole: briefFromRole,
-      mentions: briefWorkerRole ? [briefWorkerRole] : undefined,
-      kind: 'brief',
-    });
-    this.store.markAsReadAndDelivered([auditMsg.id]);
-    if (typeof auditMsg.boardSeq === 'number') {
-      if (briefWorkerRole) {
-        this.store.advanceMemberCursor(run.id, briefWorkerRole, {
-          lastReadSeq: auditMsg.boardSeq,
-          lastDeliveredSeq: auditMsg.boardSeq,
-        });
-      }
-      this.store.advanceMemberCursor(run.id, briefFromRole, {
-        lastPostSeq: auditMsg.boardSeq,
-      });
-    }
-
-    this.emitChanged('worker:started', run.id);
-    return {
-      dispatch: this.store.getDispatchContext(ctx.id) ?? updatedCtx,
-      task: this.store.requireTask(task.id),
-      run: this.store.requireRun(run.id),
-      ptyId,
-      worktreePath: placement.worktreePath,
-      branch: placement.branch,
-      ownsWorktree: placement.ownsWorktree,
-      ownsPane,
-      cliId: launchConfig.cliId,
-      model: launchConfig.model,
-      effort: launchConfig.effort,
-      injected: true,
-      ...(typeof auditMsg.boardSeq === 'number' ? { briefBoardSeq: auditMsg.boardSeq } : {}),
-    };
-  }
-
-  /** Starts a headless Worker on `cliId`'s native protocol; null when it could not start, before any turn. */
-  private async openCodexWorker(
-    cliId: HeadlessWorkerDriver, cwd: string, model: string | null, options: HeadlessWorkerControls,
-  ) {
-    const codexPilot = this.codexPilot;
-    const headlessWorkers = this.headlessWorkers;
-    if (this.disposed || (cliId === 'codex' ? !codexPilot : !headlessWorkers)) return null;
-    const id = `${cliId}-worker-${randomUUID()}`;
-    let session: AgentSessionDriver | undefined;
-    const timeline = this.createWorkerTimeline(
-      id, cliId, model, { policy: options.policy, network: options.network }, (text) => session?.redactText(text) ?? text,
-    );
-    this.codexWorkerControls.set(id, { ...options });
-    try {
-      const launch = (events: AgentSessionEvents): AgentSessionDriver => cliId === 'codex'
-        ? codexPilot!.launch(id, cwd, events, { ...options })
-        : headlessWorkers!.launch(cliId, id, cwd, events, { ...options });
-      session = launch({
-        onTimeline: (dispatchId, event) => {
-          if (timeline.activeTurn?.dispatchId === dispatchId) timeline.apply(event);
-        },
-        onTurnStarted: (dispatchId) => {
-          const waiting = this.approvals.hasOpenApprovalForDispatch(dispatchId);
-          const asking = this.nativeQuestions.hasOpenQuestionForDispatch(dispatchId);
-          const updated = this.store.updateDispatchObservation(dispatchId, waiting ? 'permission' : 'observed', {
-            promptSent: true, refreshHeartbeat: true,
-          });
-          if (updated && !waiting && !asking) this.store.updateDispatchStage(dispatchId, 'working');
-          if (updated) this.emitChanged('worker:turn-started', updated.runId);
-        },
-        onTurnCompleted: (dispatchId, result) => this.completeCodexTurn(id, cwd, dispatchId, result),
-        onRequest: async (dispatchId, request) => {
-          const dispatch = this.store.getDispatchContext(dispatchId);
-          if (!dispatch || dispatch.assigneeHandle !== id) return { decision: 'decline' };
-          if (request.kind === 'question') {
-            return this.nativeQuestions.holdQuestion(dispatch, {
-              provider: headlessWorkerDriver(id) ?? dispatch.cliId ?? 'codex',
-              method: request.method,
-              questions: request.questions ?? [],
-              signal: request.signal,
-              redact: (text) => session?.redactText(text) ?? text,
-            });
-          }
-          // Anything that is neither a question nor an approval fails closed.
-          const allowed = request.kind === 'approval' && await this.approvals.holdCodexRequest(dispatch, request);
-          return { decision: allowed ? 'accept' : 'decline' };
-        },
-        onExit: (reason, exitCode) => {
-          const dispatchId = session?.latestTurnKey;
-          if (session && dispatchId) this.archiveCodexOutput(session, dispatchId);
-          timeline.endActiveTurn(session?.closing ? 'interrupted' : 'failed', reason);
-          timeline.setMeta({ alive: false });
-          this.archiveWorkerTimeline(id, dispatchId);
-          this.workerTimelines.delete(id);
-          this.codexWorkers.delete(id);
-          this.codexMailbox.delete(id);
-          this.codexWorkerControls.delete(id);
-          this.approvals.cancelForPane(id, reason);
-          this.nativeQuestions.cancelForWorker(id, reason);
-          this.waiters.cancel(id);
-          this.waiters.cancelConsumer(id);
-          const announced = Boolean(dispatchId && !this.codexSubmitting.has(dispatchId) &&
-            this.handleCodexExit(dispatchId, reason, exitCode));
-          const exited = !announced && dispatchId ? this.store.getDispatchContext(dispatchId) : undefined;
-          if (exited) this.emitChanged('worker:exited', exited.runId);
-        },
-      });
-      this.codexWorkers.set(id, session);
-      const sessionId = await session.open({ cwd, model, policy: options.policy, network: options.network });
-      if (!session.alive || this.disposed) throw new Error(`${HEADLESS_DRIVER_LABELS[cliId]} closed during initialization`);
-      timeline.setMeta({ providerSessionId: sessionId });
-      return { id, session, sessionId };
-    } catch (error) {
-      // No turn was sent, so PTY fallback can safely proceed after process teardown.
-      const reason = error instanceof Error ? error.message : String(error);
-      console.warn(`[orchestration] ${HEADLESS_DRIVER_LABELS[cliId]} headless Worker startup failed:`, session ? session.redactText(reason) : reason);
-      this.codexWorkers.delete(id);
-      this.codexWorkerControls.delete(id);
-      await session?.close();
-      this.workerTimelines.delete(id);
-      return null;
-    }
-  }
-
-  private archiveCodexOutput(session: AgentSessionDriver, dispatchId: string): void {
-    const result = session.read(dispatchId, 0, undefined, true);
-    if (result) this.store.archiveDispatchOutput(dispatchId, result.text);
-  }
-
-  private publishCodexStatus(
-    dispatch: OrchestrationDispatchRecord, subject: string, body: string, payload: Record<string, unknown>,
-  ): void {
-    const to = this.resolveActiveParentMailbox(dispatch);
-    this.store.insertMessage({
-      runId: dispatch.runId, from: `dispatch:${dispatch.id}`, to,
-      type: 'status', subject, body: this.store.redactDispatchCredentials(body),
-      payload: this.store.redactDispatchCredentials(JSON.stringify({ dispatchId: dispatch.id, ...payload })),
-      mentions: ['coordinator'], kind: 'post',
-    });
-    this.notifyTargetAndAliases(to, 'status');
-    this.emitChanged('dispatch:codex-status', dispatch.runId);
-  }
-
-  private completeCodexTurn(workerId: string, cwd: string, dispatchId: string, result: AgentTurnResult): void {
-    const session = this.codexWorkers.get(workerId);
-    if (session) this.archiveCodexOutput(session, dispatchId);
-    const label = this.headlessLabel(workerId);
-    this.approvals.cancelForDispatch(dispatchId, `${label} turn ended`);
-    this.nativeQuestions.cancelForDispatch(dispatchId, `${label} turn ended`);
-    const timeline = this.workerTimelines.get(workerId);
-    const status: WorkerTimelineTurnStatus = result.stopReason === 'completed' ? 'completed'
-      : result.stopReason === 'interrupted' ? 'interrupted' : 'failed';
-    timeline?.completeTurn({
-      turnId: result.turnId, status, stopReason: result.stopReason, usage: result.usage, error: result.error,
-    });
-    this.store.recordCodexTurn(dispatchId, result);
-    this.archiveWorkerTimeline(workerId, dispatchId);
-    const dispatch = this.store.getDispatchContext(dispatchId);
-    if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
-    const announce = (diff: string | null) => {
-      if (this.disposed) return;
-      const current = this.store.getDispatchContext(dispatchId);
-      if (!current || !ACTIVE_DISPATCH_STATUSES.has(current.status) || current.codexTurn?.turnId !== result.turnId) return;
-      if (diff !== result.diff) this.store.recordCodexTurn(dispatchId, { ...result, diff }, false);
-      const liveTimeline = this.workerTimelines.get(workerId);
-      liveTimeline?.addSettlement(dispatchId, {
-        settlement: 'turn_pending_confirmation', stopReason: result.stopReason, outcome: null, verdict: null,
-        findings: [], summary: result.finalText.slice(0, 4_000), diff,
-        diffSource: diff === null ? null : result.diff !== null ? 'provider' : 'git',
-      });
-      this.archiveWorkerTimeline(workerId, dispatchId);
-      this.publishCodexStatus(current, `${label} turn ended; result pending confirmation`,
-        `${label} turn ${result.stopReason} without a recorded report_done. Read the Worker output and diff evidence before deciding what to do.\n\n${result.finalText.slice(0, 4_000)}`,
-        { turnId: result.turnId, stopReason: result.stopReason, error: result.error, usage: result.usage, diff });
-      this.deliverCodexMailbox(workerId);
-    };
-    if (result.diff !== null) {
-      announce(result.diff);
-    } else if (!this.disposed) {
-      // Working-tree files can contain Worker credentials; redact before the diff is stored or published.
-      const redactDiff = (diff: string) => this.store.redactDispatchCredentials(session?.redactText(diff) ?? diff);
-      const task: Promise<void> = Promise.all([
-        runGitCommand(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], {
-          cwd, readOnly: true, maxBytes: 128 * 1024, timeoutMs: 3_000,
-        }),
-        runGitCommand(['ls-files', '--others', '--exclude-standard', '-z'], {
-          cwd, readOnly: true, maxBytes: 32 * 1024, timeoutMs: 3_000,
-        }),
-      ]).then(([git, untracked]) => {
-        if (git.exitCode !== 0) {
-          announce(null);
-          return;
-        }
-        const rawUntracked = untracked.exitCode === 0 || untracked.truncated ? untracked.stdout : '';
-        const safeUntracked = untracked.truncated
-          ? rawUntracked.slice(0, Math.max(0, rawUntracked.lastIndexOf('\0')))
-          : rawUntracked;
-        const untrackedPaths = safeUntracked.split('\0').filter(Boolean);
-        const untrackedDiff = untrackedPaths
-          .map((file) => `diff --git a/${file} b/${file}\nnew file (untracked)\n--- /dev/null\n+++ b/${file}`)
-          .join('\n');
-        const combined = untrackedPaths.length === 0
-          ? git.stdout
-          : `${[git.stdout.trimEnd(), untrackedDiff].filter(Boolean).join('\n')}\n`;
-        announce(redactDiff(combined));
-      }, () => announce(null)).finally(() => {
-        this.pendingCodexTurnDiffs.delete(task);
-      });
-      this.pendingCodexTurnDiffs.add(task);
-    }
-  }
-
-  private failCodexDispatch(dispatchId: string, failure: 'not_accepted' | 'unknown_acceptance', reason: string): void {
-    const dispatch = this.store.getDispatchContext(dispatchId);
-    if (!dispatch || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return;
-    if (failure === 'unknown_acceptance') return; // submitCodexTurn has already parked and archived it.
-    const label = this.headlessLabel(dispatch.assigneeHandle);
-    this.store.recordCodexDeliveryFailure(dispatchId, failure);
-    this.store.failDispatch(dispatchId, `${label} ${failure}`, {
-      forceFailTask: true, summary: this.store.redactDispatchCredentials(reason),
-    });
-    this.cleanupCodexDispatch(dispatch, `${label} delivery ${failure}`);
-    this.publishCodexStatus(dispatch, `${label} delivery: ${failure}`, reason, { acceptance: failure });
-  }
-
-  private cleanupCodexDispatch(dispatch: OrchestrationDispatchRecord, reason: string): void {
-    this.approvals.cancelForDispatch(dispatch.id, reason);
-    this.nativeQuestions.cancelForDispatch(dispatch.id, reason);
-    this.waiters.cancel(`dispatch:${dispatch.id}`);
-    this.waiters.notifyPrefix(`question:${dispatch.id}:`, 'status');
-    this.store.cleanupDispatchBrief(dispatch.id);
-    if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
-      this.store.updateDispatchReviewState(dispatch.id, { reviewStatus: 'rejected' });
-      this.reconcileAnyReviewBatch(dispatch.id, { overrideVerdict: 'reject', failedReason: reason });
-    }
-  }
-
-  private handleCodexExit(dispatchId: string, reason: string, exitCode: number | null): boolean {
-    const dispatch = this.store.getDispatchContext(dispatchId);
-    if (!dispatch?.promptSentAt || dispatch.stage === 'needs_reconciliation' || !ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) return false;
-    if (exitCode === 0 && dispatch.stage === 'awaiting_review') return false;
-    const label = this.headlessLabel(dispatch.assigneeHandle);
-    this.store.failDispatch(dispatch.id, dispatch.assigneeHandle.startsWith('codex-') ? 'Codex app-server exited' : `${label} exited`, {
-      forceFailTask: true, summary: reason,
-    });
-    this.cleanupCodexDispatch(dispatch, reason);
-    this.publishCodexStatus(dispatch, `${label} Worker exited before report_done`, reason, { exitCode });
-    return true;
-  }
-
-  /** The agent a headless Worker runs, for coordinator-facing status text. */
-  private headlessLabel(workerId: string): string {
-    const driver = headlessWorkerDriver(workerId);
-    return driver ? HEADLESS_DRIVER_LABELS[driver] : 'Codex';
-  }
-
-  private async submitCodexTurn(dispatch: OrchestrationDispatchRecord, session: AgentSessionDriver, prompt: string) {
-    this.codexSubmitting.add(dispatch.id);
-    const timeline = this.workerTimelines.get(dispatch.assigneeHandle);
-    timeline?.beginTurn({ dispatchId: dispatch.id, prompt });
-    try {
-      const controls = this.headlessControls(dispatch);
-      const result = await session.startTurn({
-        turnKey: dispatch.id, prompt, effort: dispatch.effort ?? null, policy: controls.policy, network: controls.network,
-      });
-      if (result.status !== 'accepted') timeline?.endActiveTurn('failed', result.reason);
-      if (result.status === 'unknown_acceptance') {
-        this.store.recordCodexDeliveryFailure(dispatch.id, result.status);
-        this.archiveCodexOutput(session, dispatch.id);
-        this.archiveWorkerTimeline(dispatch.assigneeHandle, dispatch.id);
-        const cwd = dispatch.worktreePath;
-        if (cwd) {
-          const diff = await runGitCommand(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], {
-            cwd, readOnly: true, timeoutMs: 3000, maxBytes: 128 * 1024,
-          }).catch(() => null);
-          const files = await runGitCommand(['ls-files', '--others', '--exclude-standard'], {
-            cwd, readOnly: true, timeoutMs: 3000, maxBytes: 16 * 1024,
-          }).catch(() => null);
-          this.store.recordReconciliationDiff(dispatch.id, diff?.exitCode === 0
-            ? session.redactText([diff.stdout, files?.stdout].filter(Boolean).join('\n')) : null);
-        }
-        await this.store.flushDurable();
-        this.publishCodexStatus(dispatch, '接单结果需核对', result.reason, { acceptance: result.status });
-      }
-      if (result.status === 'accepted' && !session.alive) {
-        this.handleCodexExit(dispatch.id, `${this.headlessLabel(dispatch.assigneeHandle)} disconnected after accepting the turn`, null);
-      }
-      return result;
-    } finally {
-      this.codexSubmitting.delete(dispatch.id);
-    }
-  }
-
-  private queueCodexMail(workerId: string, message?: OrchestrationMessageRecord): void {
-    if (message) {
-      const firewall = this.getReviewFirewallContext(workerId);
-      if (firewall && this.isPostHiddenByReviewFirewall(message, firewall)) return;
-    }
-    const pending = this.codexMailbox.get(workerId) ?? { messages: [], opaque: false };
-    if (!message) pending.opaque = true;
-    else if (!pending.messages.some((entry) => entry.id === message.id)) pending.messages.push(message);
-    this.codexMailbox.set(workerId, pending);
-  }
-
-  /** Inlines one or two short messages, like PTY direct delivery; anything else points the Worker at read_board. */
-  private codexMailboxPrompt(pending: { messages: OrchestrationMessageRecord[]; opaque: boolean }) {
-    const pointer = 'You have a new message from AhaStation. Use the Aha read_board tool to read unread messages for your role, then continue the current assignment.';
-    const messages = pending.messages
-      .map((message) => this.store.getMessageById(message.id) ?? message)
-      .filter((message) => message.lifecycleRejectedReason === null && message.type !== 'heartbeat');
-    const lookups = pending.opaque ? null : boardLookupCommands(messages);
-    const notification = {
-      prompt: lookups ? pointer + ' Fetch the referenced posts with ' + lookups + '.' : pointer,
-      messages,
-      inlined: false,
-    };
-    if (pending.opaque || messages.length === 0 || messages.length > 2) return notification;
-    const rendered = this.store.redactDispatchCredentials(messages.map((message) => formatBoardPostForAgent(message)).join('\n\n'));
-    if (rendered.length > 1_000) return notification;
-    const prompt = `${rendered}\n\n(Full message above from AhaStation; no read_board call is needed for it. Continue the current assignment.)`;
-    return { prompt, messages, inlined: true };
-  }
-
-  private acknowledgeCodexMail(workerId: string, messages: OrchestrationMessageRecord[]): void {
-    this.store.markAsDeliveredForConsumer(messages.map((message) => message.id), workerId);
-    const member = this.resolveBoardMemberForPane(workerId);
-    const maxSeq = Math.max(0, ...messages
-      .filter((message) => member && message.runId === member.runId && typeof message.boardSeq === 'number')
-      .map((message) => message.boardSeq as number));
-    if (member && maxSeq > 0) this.store.advanceMemberCursor(member.runId, member.memberKey, { lastDeliveredSeq: maxSeq });
-  }
-
-  private deliverCodexMailbox(workerId: string): void {
-    const session = this.codexWorkers.get(workerId);
-    const pending = this.codexMailbox.get(workerId);
-    if (!session?.alive || session.busy || !pending) return;
-    this.codexMailbox.delete(workerId);
-    const dispatch = this.store.getActiveDispatchForIdentity(workerId, null);
-    if (!dispatch || dispatch.stage === 'needs_reconciliation' || this.codexSubmitting.has(dispatch.id)) {
-      if (dispatch) this.codexMailbox.set(workerId, pending);
-      return;
-    }
-    const member = this.resolveBoardMemberForPane(workerId);
-    const unreadMessages = pending.messages.filter(
-      (message) => !(member && message.runId === member.runId && this.store.wasBoardPostRead(message.id, member.memberKey))
-    );
-    if (!pending.opaque && unreadMessages.length === 0) return;
-    const { prompt, messages, inlined } = this.codexMailboxPrompt({
-      opaque: pending.opaque,
-      messages: unreadMessages,
-    });
-    if (!pending.opaque && messages.length === 0) return;
-    void this.submitCodexTurn(dispatch, session, prompt).then(async (outcome) => {
-      if (outcome.status === 'accepted') {
-        const member = this.resolveBoardMemberForPane(workerId);
-        this.acknowledgeCodexMail(workerId, messages);
-        if (member && inlined) this.store.recordBoardRead(member.runId, member.memberKey, messages.map(m => m.id));
-        if (member && this.store.recordBoardReceipt(messages.map(m => m.id), member.memberKey, inlined ? 'delivered' : 'notified')) {
-          this.emitChanged('board:delivery', member.runId);
-        }
-      } else {
-        this.failCodexDispatch(dispatch.id, outcome.status, outcome.reason);
-        await session.close();
-      }
-    }).catch((error) => console.warn(`[orchestration] ${this.headlessLabel(workerId)} mailbox delivery failed:`, error));
-  }
-
-  private async followUpSettledWorker(
-    settledDispatch: OrchestrationDispatchRecord,
-    input: {
-      from?: string;
-      to: string;
-      type?: OrchestrationMessageType;
-      priority?: OrchestrationMessagePriority;
-      subject: string;
-      body?: string;
-      payload?: string | Record<string, unknown> | null;
-      runId?: string;
-      threadId?: string;
-      fromRole?: string;
-      mentions?: readonly string[];
-      refs?: readonly number[];
-      kind?: OrchestrationBoardPostKind;
-      existingMessage?: OrchestrationMessageRecord;
-    }
-  ): Promise<OrchestrationSendResult> {
-    return this.mutateWorkerResources(settledDispatch, () => this.startFollowUp(settledDispatch, input));
-  }
-
-  private async startFollowUp(
-    settledDispatch: OrchestrationDispatchRecord,
-    input: Parameters<OrchestrationService['followUpSettledWorker']>[1]
-  ): Promise<OrchestrationSendResult> {
-    if (settledDispatch.releasedAt) {
-      throw new OrchestrationError(
-        'dispatch_inactive',
-        `Worker dispatch ${settledDispatch.id} has already been released; start a new worker with worker-start.`
-      );
-    }
-
-    const from = input.from?.trim() || 'coordinator';
-    const run = this.store.requireRun(settledDispatch.runId);
-    if (run.status !== 'active') {
-      this.store.updateRunStatus(run.id, 'active');
-    }
-    const prevTask = this.store.getTask(settledDispatch.taskId);
-    const followUpInstructions = [
-      input.subject,
-      ...(input.body?.trim() ? ['', input.body.trim()] : []),
-    ].join('\n');
-
-    const existingPaneId = settledDispatch.assigneePaneId ?? settledDispatch.assigneeHandle;
-    if (this.retiringPanes.has(existingPaneId)) {
-      throw new OrchestrationError('operation_rejected', 'This worker terminal is still closing. Retry once it exits.');
-    }
-    const isHeadless = settledDispatch.executionMode === 'codex-app-server';
-    const session = isHeadless ? this.codexWorkers.get(existingPaneId) : undefined;
-    if (isHeadless && (!session?.alive || !await session.waitForIdle(15_000) || !session.alive ||
-        this.store.getActiveDispatchForIdentity(existingPaneId, null))) {
-      throw new OrchestrationError('dispatch_inactive', `${this.headlessLabel(existingPaneId)} Worker is unavailable or still finishing its previous turn.`);
-    }
-    const canReuseLivePane =
-      Boolean(existingPaneId) &&
-      this.isPaneAlive(existingPaneId) &&
-      !this.store.getActiveDispatchForIdentity(existingPaneId, existingPaneId);
-
-    const originalDispatchId = this.store.listDispatchAncestorIds(settledDispatch.id).at(-1);
-    const originalDispatch = originalDispatchId ? this.store.getDispatchContext(originalDispatchId) : undefined;
-    const originalTask = originalDispatch ? this.store.getTask(originalDispatch.taskId) : prevTask;
-    const followUpSpec = !canReuseLivePane && originalTask
-      ? ['### Follow-up Instructions', followUpInstructions, '### Original Task', originalTask.spec].join('\n\n')
-      : followUpInstructions;
-    const followUpTask = this.store.createTask({
-      singleShot: true,
-      runId: settledDispatch.runId,
-      spec: followUpSpec,
-      taskContext: prevTask?.taskContext ?? originalTask?.taskContext,
-      taskTitle: 'Follow-up: ' + input.subject.slice(0, 80),
-      priority: input.priority ?? prevTask?.priority ?? 'normal',
-      worktreePath: settledDispatch.worktreePath ?? prevTask?.worktreePath ?? null,
-    });
-
-    let targetPtyId: string;
-    let reusedPane = false;
-    let spawnedNewPane = false;
-
-    if (canReuseLivePane) {
-      targetPtyId = existingPaneId;
-      reusedPane = !session;
-    } else {
-      if (!this.spawnWorkerPty) {
-        throw new OrchestrationError(
-          'dispatch_inactive',
-          `Worker pane ${existingPaneId} is no longer alive and worker respawning is unavailable.`
-        );
-      }
-      const launch = resolveWorkerLaunchConfig({
-        cliId: settledDispatch.cliId ?? 'claude',
-        model: settledDispatch.model,
-        effort: settledDispatch.effort,
-      });
-      const spawned = await this.spawnWorkerPty({
-        runId: settledDispatch.runId,
-        task: followUpTask,
-        cliId: launch.cliId,
-        cwd: settledDispatch.worktreePath ?? undefined,
-        extraArgs: launch.extraArgs,
-      });
-      if (!spawned) {
-        throw new OrchestrationError(
-          'terminal_unavailable',
-          `Failed to respawn worker terminal for follow-up on ${settledDispatch.id}.`
-        );
-      }
-      targetPtyId = spawned.ptyId;
-      spawnedNewPane = true;
-      this.exitedPanes.delete(targetPtyId);
-    }
-
-    const nextGeneration = (settledDispatch.processGeneration ?? 1) + 1;
-    const controls = session ? this.headlessControls(settledDispatch) : null;
-    let nextCtx: OrchestrationDispatchRecord;
-    try {
-      nextCtx = this.store.createDispatchContext({
-        taskId: followUpTask.id,
-        taskKind: settledDispatch.taskKind,
-        assigneeHandle: targetPtyId,
-        assigneePaneId: session ? null : targetPtyId,
-        ...(session?.sessionId ? { providerSessionId: session.sessionId } : {}),
-        ...(controls ? {
-          workerPolicy: controls.policy, workerNetwork: controls.network, allowSubWorkers: controls.allowSubWorkers,
-        } : {}),
-        creator: from,
-        creatorRunId: settledDispatch.runId,
-        creatorDispatchId: settledDispatch.creatorDispatchId ?? null,
-        parentPaneId: settledDispatch.parentPaneId ?? null,
-        worktreePath: settledDispatch.worktreePath ?? null,
-        branch: settledDispatch.branch ?? null,
-        baseCommit: settledDispatch.baseCommit ?? null,
-        repoRootPath: settledDispatch.repoRootPath ?? null,
-        ownsWorktree: Boolean(settledDispatch.ownsWorktree),
-        ownsBranch: Boolean(settledDispatch.ownsBranch),
-        reviewRound: settledDispatch.reviewRound ?? 0,
-        ownsPane: spawnedNewPane ? true : Boolean(settledDispatch.ownsPane),
-        cliId: settledDispatch.cliId ?? null,
-        model: settledDispatch.model ?? null,
-        effort: settledDispatch.effort ?? null,
-        processGeneration: nextGeneration,
-        followUpOfDispatchId: settledDispatch.id,
-        retained: Boolean(settledDispatch.retained),
-        maxDepth: Math.max(this.maxDepth, settledDispatch.depth),
-      });
-    } catch (error) {
-      if (spawnedNewPane) {
-        if (await this.rollbackWorkerResources(targetPtyId)) this.markPtyExited(targetPtyId);
-      }
-      throw error;
-    }
-
-    this.store.transferCustodyToFollowUp(settledDispatch.id, nextCtx.id);
-
-    if (spawnedNewPane) {
-      this.emitPaneSpawned({
-        ptyId: targetPtyId,
-        runId: settledDispatch.runId,
-        taskId: followUpTask.id,
-        dispatchId: nextCtx.id,
-        parentPaneId: settledDispatch.parentPaneId ?? null,
-        cwd: settledDispatch.worktreePath ?? undefined,
-        worktreePath: settledDispatch.worktreePath ?? null,
-        branch: settledDispatch.branch ?? null,
-        cliId: settledDispatch.cliId ?? undefined,
-        ownsWorktree: Boolean(nextCtx.ownsWorktree),
-        ownsPane: true,
-        displayName: followUpTask.displayName ?? null,
-        taskTitle: followUpTask.taskTitle,
-      });
-    }
-
-    const payloadString =
-      input.payload === undefined || input.payload === null
-        ? null
-        : typeof input.payload === 'string'
-          ? input.payload
-          : JSON.stringify(input.payload);
-
-    const followUpRole = this.resolveRoleNameForDispatch(settledDispatch) || null;
-    const followUpFromRole =
-      input.fromRole?.trim().replace(/^@+/, '').toLowerCase() ||
-      (from === 'user' ? 'user' : 'coordinator');
-    const msg =
-      input.existingMessage ??
-      this.store.insertMessage({
-        runId: settledDispatch.runId,
-        from,
-        to: `dispatch:${nextCtx.id}`,
-        type: input.type ?? 'status',
-        priority: input.priority ?? 'normal',
-        subject: input.subject,
-        body: input.body,
-        payload: payloadString,
-        threadId: input.threadId,
-        fromRole: followUpFromRole,
-        mentions:
-          input.mentions && input.mentions.length > 0
-            ? input.mentions
-            : followUpRole
-              ? [followUpRole.toLowerCase()]
-              : undefined,
-        refs: input.refs,
-        kind: input.kind ?? 'post',
-      });
-    this.store.linkFollowUpMessage(nextCtx.id, msg.id);
-    if (!input.existingMessage) {
-      this.store.markAsReadAndDelivered([msg.id]);
-    }
-    const coordinatorHandle = this.resolveActiveParentMailbox(nextCtx);
-    const followUpMcpEnabled = nextCtx.cliId
-      ? (this.isMcpEnabledForCliDep?.(nextCtx.cliId) ?? false)
-      : false;
-    const preamble = this.buildWorkerDispatchBrief({
-      taskId: followUpTask.id,
-      dispatchId: nextCtx.id,
-      runId: settledDispatch.runId,
-      taskSpec: followUpTask.spec,
-      taskContext: reusedPane || session ? null : followUpTask.taskContext,
-      coordinatorHandle,
-      workerHandle: targetPtyId,
-      worktreePath: nextCtx.worktreePath,
-      branch: nextCtx.branch,
-      canDispatchSubWorkers: (!session || controls?.allowSubWorkers === true) && nextCtx.depth < this.maxDepth,
-      isFollowUp: reusedPane || Boolean(session),
-      previousDispatchId: settledDispatch.id,
-      mcpEnabled: Boolean(session) || followUpMcpEnabled,
-      headless: Boolean(session),
-      leaveUncommitted: controls !== null && controls.policy !== 'read-only',
-      role: followUpRole,
-    });
-
-    if (session) {
-      const outcome = await this.submitCodexTurn(nextCtx, session, preamble);
-      if (outcome.status !== 'accepted') {
-        this.failCodexDispatch(nextCtx.id, outcome.status, outcome.reason);
-        await session.close();
-        throw new OrchestrationError('prompt_delivery_failed', `${this.headlessLabel(targetPtyId)} follow-up delivery failed.`, {
-          dispatchId: nextCtx.id, acceptance: outcome.status,
-        });
-      }
-      if (followUpRole) this.store.recordBoardRead(settledDispatch.runId, followUpRole.toLowerCase(), [msg.id]);
-      this.emitChanged('worker:follow-up', settledDispatch.runId);
-      return {
-        message: exposeMessage(msg),
-        followUp: {
-          reactivated: true, previousDispatchId: settledDispatch.id,
-          dispatch: this.store.getDispatchContext(nextCtx.id)!,
-          task: this.store.requireTask(followUpTask.id), reusedPane: false,
-        },
-      };
-    }
-
-    const delivery = await this.deliverAndObserveDispatchTurn(nextCtx.id, {
-      ptyId: targetPtyId,
-      prompt: preamble,
-      submit: true,
-    });
-    if (!delivery.ok) {
-      const reason = delivery.error ?? `Failed to deliver follow-up prompt to ${targetPtyId}`;
-      this.store.failDispatch(nextCtx.id, reason);
-      if (spawnedNewPane && await this.rollbackWorkerResources(targetPtyId)) {
-        this.spawnedWorkerPanes.delete(targetPtyId);
-        this.spawnedWorkerMeta.delete(targetPtyId);
-        this.markPtyExited(targetPtyId);
-        this.emitPaneClosed({
-          ptyId: targetPtyId,
-          runId: settledDispatch.runId,
-          taskId: followUpTask.id,
-          dispatchId: nextCtx.id,
-        });
-      }
-      this.emitChanged('dispatch:failed', settledDispatch.runId);
-      throw new OrchestrationError('prompt_delivery_failed', reason, {
-        dispatchId: nextCtx.id,
-        previousDispatchId: settledDispatch.id,
-      });
-    }
-
-    if (!delivery.promptDeferred && followUpRole) {
-      this.store.recordBoardRead(settledDispatch.runId, followUpRole.toLowerCase(), [msg.id]);
-    }
-    this.store.updateDispatchObservation(nextCtx.id, delivery.startObservation, {
-      reason: delivery.observationReason ?? null,
-      refreshHeartbeat:
-        delivery.startObservation === 'observed' ||
-        delivery.startObservation === 'queued' ||
-        delivery.startObservation === 'permission',
-      ...(delivery.promptDeferred ? {} : { promptSent: true }),
-    });
-
-    this.emitChanged('worker:follow-up', settledDispatch.runId);
-    return {
-      message: exposeMessage(msg),
-      followUp: {
-        reactivated: true,
-        previousDispatchId: settledDispatch.id,
-        dispatch: this.store.getDispatchContext(nextCtx.id)!,
-        task: this.store.requireTask(followUpTask.id),
-        reusedPane,
-      },
-    };
+    return this.workers.workerStart(input, queueClaim);
   }
 
   workerList(input: {
@@ -6569,21 +4187,7 @@ export class OrchestrationService {
     workers: OrchestrationWorkerSummary[];
     count: number;
   } {
-    const includeSettled = input.includeSettled !== false;
-    const firewall = callerPaneId !== undefined ? this.getReviewFirewallContext(callerPaneId) : null;
-    const dispatches = this.store
-      .listDispatches({
-        ...(input.runId ? { runId: input.runId } : {}),
-        ...(input.status ? { status: input.status } : {}),
-      })
-      .filter((d) => includeSettled || ACTIVE_DISPATCH_STATUSES.has(d.status))
-      .filter(
-        (d) =>
-          !firewall ||
-          (!firewall.targetDispatchIds.has(d.id) && !firewall.targetTaskIds.has(d.taskId)),
-      );
-    const workers = dispatches.map((d) => this.toWorkerSummary(d));
-    return { workers, count: workers.length };
+    return this.workers.workerList(input, callerPaneId);
   }
 
   workerShow(input: {
@@ -6591,12 +4195,7 @@ export class OrchestrationService {
     worker?: string;
     taskId?: string;
   }, callerPaneId?: string): OrchestrationWorkerSummary {
-    const dispatch = this.resolveTargetDispatch(input);
-    if (callerPaneId !== undefined) {
-      this.authorizeRunAccess(dispatch.runId, callerPaneId);
-      this.assertNotFirewalledReviewRead(callerPaneId, dispatch, 'worker-show');
-    }
-    return this.toWorkerSummary(dispatch);
+    return this.workers.workerShow(input, callerPaneId);
   }
 
   workerRead(input: {
@@ -6607,74 +4206,7 @@ export class OrchestrationService {
     limit?: number;
     screen?: boolean;
   }, callerPaneId?: string): TerminalReadResult & { dispatchId: string; archived: boolean } {
-    const dispatch = this.resolveTargetDispatch(input);
-    if (callerPaneId !== undefined) {
-      this.authorizeRunAccess(dispatch.runId, callerPaneId);
-      this.assertNotFirewalledReviewRead(callerPaneId, dispatch, 'worker-read');
-    }
-    const paneId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
-    const codex = this.codexWorkers.get(dispatch.assigneeHandle);
-    const headlessRead = codex?.read(dispatch.id, input.cursor, input.limit, input.screen);
-    if (headlessRead) {
-      return {
-        ...headlessRead, ptyId: dispatch.assigneeHandle, dispatchId: dispatch.id,
-        text: this.store.redactDispatchCredentials(headlessRead.text),
-        archived: !headlessRead.alive || Boolean(dispatch.releasedAt),
-      };
-    }
-
-    if (dispatch.executionMode !== 'codex-app-server' && paneId && this.terminalTracker) {
-      const liveRead = this.terminalTracker.readOutput(paneId, {
-        cursor: input.cursor,
-        limit: input.limit,
-        screen: input.screen,
-      });
-      if (liveRead && (liveRead.alive || !dispatch.archivedOutput)) {
-        return {
-          ...liveRead,
-          text: this.store.redactDispatchCredentials(liveRead.text),
-          dispatchId: dispatch.id,
-          archived: !liveRead.alive || Boolean(dispatch.releasedAt),
-        };
-      }
-    }
-
-    const archived = this.store.redactDispatchCredentials(dispatch.archivedOutput ?? '');
-    if (input.screen) {
-      return {
-        ptyId: paneId ?? dispatch.id,
-        dispatchId: dispatch.id,
-        screen: true,
-        text: archived,
-        cursor: archived.length,
-        nextCursor: archived.length,
-        truncated: false,
-        hasMore: false,
-        alive: false,
-        exitCode: null,
-        archived: true,
-      };
-    }
-
-    const limit = Math.max(1, Math.min(256_000, Math.floor(input.limit ?? 16_384)));
-    const start = Math.min(
-      archived.length,
-      Math.max(0, typeof input.cursor === 'number' ? Math.floor(input.cursor) : 0)
-    );
-    const slice = archived.slice(start, start + limit);
-    return {
-      ptyId: paneId ?? dispatch.id,
-      dispatchId: dispatch.id,
-      screen: false,
-      text: slice,
-      cursor: start,
-      nextCursor: start + slice.length,
-      truncated: false,
-      hasMore: start + slice.length < archived.length,
-      alive: false,
-      exitCode: null,
-      archived: true,
-    };
+    return this.workers.workerRead(input, callerPaneId);
   }
 
   workerKeepOpen(input: {
@@ -6683,77 +4215,10 @@ export class OrchestrationService {
     taskId?: string;
     keepOpen?: boolean;
   }): { dispatch: OrchestrationDispatchRecord; retained: boolean } {
-    const target = this.resolveTargetDispatch(input);
-    const retained = input.keepOpen ?? true;
-    const updated = this.store.setDispatchRetained(target.id, retained);
-    this.emitChanged('worker:retained', updated.runId);
-    return { dispatch: updated, retained };
+    return this.workers.workerKeepOpen(input);
   }
 
-  private async confirmWorkerPaneClosed(ptyId: string): Promise<void> {
-    try {
-      if (!this.closeWorkerPty) {
-        if (!this.isPaneAlive(ptyId)) return;
-        throw new Error('Terminal termination is unavailable');
-      }
-      const result = await this.closeWorkerPty(ptyId);
-      if (result === false) throw new Error('Terminal termination could not be confirmed');
-      if (result && typeof result === 'object' && 'ok' in result && result.ok === false) {
-        throw new Error('error' in result && typeof result.error === 'string'
-          ? result.error
-          : 'Terminal termination could not be confirmed');
-      }
-    } catch (error) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        `Could not close worker terminal ${ptyId}: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-  }
-
-  private async rollbackWorkerResources(ptyId?: string, worktreePath?: string | null): Promise<boolean> {
-    if (ptyId) {
-      try {
-        await this.confirmWorkerPaneClosed(ptyId);
-      } catch (error) {
-        console.warn('[orchestration] worker launch cleanup could not confirm terminal closure:', error);
-        return false;
-      }
-    }
-    if (worktreePath) {
-      try {
-        await removeOwnedWorkerWorktree({ worktreePath });
-      } catch (error) {
-        console.warn('[orchestration] worker launch cleanup retained its worktree:', error);
-      }
-    }
-    return true;
-  }
-
-  private async mutateWorkerResources<T>(
-    dispatch: OrchestrationDispatchRecord,
-    mutation: () => Promise<T>,
-  ): Promise<T> {
-    const lineage = new Set([dispatch.id]);
-    let root = dispatch;
-    while (root.followUpOfDispatchId && !lineage.has(root.followUpOfDispatchId)) {
-      const parent = this.store.getDispatchContext(root.followUpOfDispatchId);
-      if (!parent) break;
-      root = parent;
-      lineage.add(root.id);
-    }
-    if (this.workerMutations.has(root.id)) {
-      throw new OrchestrationError('operation_rejected', 'Another operation is updating this worker. Retry after it finishes.');
-    }
-    this.workerMutations.add(root.id);
-    try {
-      return await mutation();
-    } finally {
-      this.workerMutations.delete(root.id);
-    }
-  }
-
-  async workerRelease(input: {
+  workerRelease(input: {
     dispatchId?: string;
     worker?: string;
     taskId?: string;
@@ -6769,312 +4234,23 @@ export class OrchestrationService {
     removedBranch?: boolean;
     worktreeError?: string;
   }> {
-    const rawTarget = this.resolveTargetDispatch(input);
-    const dispatch = this.store.resolveDispatchLineage(rawTarget.id) ?? rawTarget;
-    return this.mutateWorkerResources(dispatch, () => this.releaseWorker(dispatch, input));
+    return this.workers.workerRelease(input);
   }
 
-  private async releaseWorker(
-    dispatch: OrchestrationDispatchRecord,
-    input: Parameters<OrchestrationService['workerRelease']>[0],
-    integratedSnapshotOid?: string,
-  ) {
-    if (ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        `Worker dispatch ${dispatch.id} is still active (${dispatch.status}). Call worker-stop to abort an active worker or wait for it to finish.`
-      );
-    }
-    if (dispatch.releasedAt && (!dispatch.ownsWorktree || input.keepWorktree)) {
-      return { dispatch, closedPane: false, removedWorktree: false };
-    }
-
-    if (!input.force && !integratedSnapshotOid && this.store.hasUnreadReportFromDispatch(dispatch.id)) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        `Unread worker report mail remains from ${dispatch.id}. Run \`${this.cliCommand} orchestration check\` before releasing, or pass --force.`
-      );
-    }
-
-    const paneId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
-    if (paneId && this.terminalTracker) {
-      const transcript = this.terminalTracker.readFullTranscript(paneId);
-      if (transcript) {
-        this.store.archiveDispatchOutput(dispatch.id, transcript);
-      }
-    }
-
-    const repoRootPath =
-      dispatch.repoRootPath ??
-      (dispatch.parentPaneId
-        ? this.terminalTracker?.getTerminal(dispatch.parentPaneId)?.cwd ??
-          this.sessionCoordinator(dispatch.parentPaneId)?.cwd
-        : undefined) ??
-      this.getDefaultCwd?.() ??
-      null;
-
-    const codex = this.codexWorkers.get(dispatch.assigneeHandle);
-    const shouldCloseCodex = codex && !input.keepPane &&
-      (!dispatch.retained || Boolean(input.force) || Boolean(integratedSnapshotOid));
-    let closedPane = false;
-    const shouldClosePane =
-      Boolean(dispatch.ownsPane) &&
-      Boolean(paneId) &&
-      this.isPaneAlive(paneId) &&
-      !input.keepPane &&
-      (!dispatch.retained || Boolean(input.force) || Boolean(integratedSnapshotOid));
-    // A pane explicitly kept open continues to use its worktree.
-    const worktreeToRemove = dispatch.ownsWorktree && !input.keepWorktree &&
-      (shouldClosePane || shouldCloseCodex || !this.isPaneAlive(paneId)) ? dispatch.worktreePath : null;
-    const forceRemoveWorktree = Boolean(input.force || dispatch.isDetachedReviewWorktree);
-    if (worktreeToRemove && !forceRemoveWorktree && !integratedSnapshotOid) await assertWorkerWorktreeClean(worktreeToRemove);
-
-    if (shouldCloseCodex) await codex.close(true);
-
-    if (shouldClosePane && paneId) {
-      await this.confirmWorkerPaneClosed(paneId);
-      this.spawnedWorkerPanes.delete(paneId);
-      this.spawnedWorkerMeta.delete(paneId);
-      this.markPtyExited(paneId);
-      this.store.markDispatchPaneClosed(dispatch.id);
-      closedPane = true;
-      this.emitPaneClosed({
-        ptyId: paneId,
-        runId: dispatch.runId,
-        taskId: dispatch.taskId,
-        dispatchId: dispatch.id,
-      });
-    }
-
-    if (integratedSnapshotOid && dispatch.ownsWorktree) {
-      const verified = worktreeToRemove && !this.isPaneAlive(paneId)
-        ? await Promise.all([
-            captureWorkerSnapshotOid(worktreeToRemove, { rejectStagedDivergence: false }),
-            dispatch.ownsBranch && dispatch.branch?.startsWith(WORKER_BRANCH_PREFIX) && repoRootPath
-              ? resolveBranchRefOid(repoRootPath, dispatch.branch)
-              : Promise.resolve(null),
-          ]).catch(() => null)
-        : null;
-      const snapAfterShutdown = verified?.[0] ?? null;
-      const branchOidAfterShutdown = verified?.[1] ?? null;
-      const snapshotStillMatches = Boolean(
-        snapAfterShutdown &&
-          snapAfterShutdown.snapshotOid === integratedSnapshotOid &&
-          snapAfterShutdown.stagedDivergentFiles.length === 0,
-      );
-      const branchStillMatches =
-        !input.expectedBranchOid ||
-        !branchOidAfterShutdown ||
-        branchOidAfterShutdown === input.expectedBranchOid;
-      if (!verified || !snapshotStillMatches || !branchStillMatches) {
-        this.emitChanged('worker:release-incomplete', dispatch.runId);
-        return {
-          dispatch: this.store.getDispatchContext(dispatch.id) ?? dispatch,
-          closedPane,
-          removedWorktree: false,
-          removedBranch: false,
-          worktreeError:
-            'Worker workspace changed after shutdown or could not be verified; retained worktree and branch.',
-        };
-      }
-    }
-
-    let removedWorktree = false;
-    let removedBranch = false;
-    let worktreeError: string | undefined;
-    if (worktreeToRemove) {
-      if (dispatch.isDetachedReviewWorktree && repoRootPath) {
-        const res = await removeDetachedReviewWorktree(repoRootPath, worktreeToRemove);
-        removedWorktree = res.removed;
-        if (!res.removed) {
-          worktreeError = res.error || `Failed to remove detached review worktree: ${worktreeToRemove}`;
-        }
-      } else {
-        const shouldDeleteBranch =
-          !input.keepBranch &&
-          Boolean(dispatch.ownsBranch && dispatch.branch?.startsWith(WORKER_BRANCH_PREFIX)) &&
-          Boolean(dispatch.integrationStatus === 'merged' || input.force) &&
-          (!integratedSnapshotOid || Boolean(input.expectedBranchOid));
-        const res = await removeOwnedWorkerWorktree({
-          worktreePath: worktreeToRemove,
-          repoRootPath,
-          // When integratedSnapshotOid has been verified after terminal shutdown, every uncommitted
-          // tracked/untracked file in this worktree is already committed into the target branch.
-          force: forceRemoveWorktree || Boolean(integratedSnapshotOid),
-          deleteBranch: shouldDeleteBranch ? dispatch.branch : null,
-          expectedBranchOid: input.expectedBranchOid ?? null,
-          allowSquashCasDelete: Boolean(integratedSnapshotOid && input.expectedBranchOid),
-        });
-        removedWorktree = res.removed;
-        removedBranch = res.removedBranch;
-        if (!res.removed) {
-          worktreeError = `Worktree was not removed: ${worktreeToRemove}`;
-        }
-      }
-    }
-
-    for (const id of this.store.listDispatchAncestorIds(dispatch.id)) this.store.cleanupDispatchBrief(id);
-    if (worktreeToRemove && !removedWorktree) {
-      // Do NOT mark releasedAt when worktree deletion failed so cleanup remains retryable and honest.
-      this.emitChanged('worker:release-incomplete', dispatch.runId);
-      return {
-        dispatch: this.store.getDispatchContext(dispatch.id) ?? dispatch,
-        closedPane,
-        removedWorktree: false,
-        removedBranch,
-        worktreeError,
-      };
-    }
-
-    const released = this.store.markDispatchReleased(dispatch.id, {
-      keepPane: !closedPane,
-      keepWorktree: !removedWorktree,
-    });
-    this.emitChanged('worker:released', released.runId);
-    return { dispatch: released, closedPane, removedWorktree, removedBranch };
-  }
-
-  async workerStop(
-    input: {
+  workerStop(input: {
       dispatchId?: string;
       worker?: string;
       taskId?: string;
       reason?: string;
       removeWorktree?: boolean;
       force?: boolean;
-    },
-    visitedDispatchIds = new Set<string>()
-  ): Promise<{
+    }, visitedDispatchIds = new Set<string>()): Promise<{
     dispatch: OrchestrationDispatchRecord;
     closedPane: boolean;
     removedWorktree: boolean;
     stoppedHelperIds: string[];
   }> {
-    const rawTarget = this.resolveTargetDispatch(input);
-    const dispatch = this.store.resolveDispatchLineage(rawTarget.id) ?? rawTarget;
-    return this.mutateWorkerResources(dispatch, () => this.stopWorker(dispatch, input, visitedDispatchIds));
-  }
-
-  private async stopWorker(
-    dispatch: OrchestrationDispatchRecord,
-    input: Parameters<OrchestrationService['workerStop']>[0],
-    visitedDispatchIds: Set<string>,
-  ) {
-    if (input.removeWorktree && dispatch.ownsWorktree && dispatch.worktreePath && !input.force) {
-      await assertWorkerWorktreeClean(dispatch.worktreePath);
-    }
-    visitedDispatchIds.add(dispatch.id);
-    const paneId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
-
-    const lineageIds = new Set(this.store.listDispatchAncestorIds(dispatch.id));
-
-    const stoppedHelperIds: string[] = [];
-    const childSeedDispatches = this.store
-      .listDispatches({ runId: dispatch.runId })
-      .filter((child) => Boolean(child.creatorDispatchId && lineageIds.has(child.creatorDispatchId)));
-
-    for (const seed of childSeedDispatches) {
-      const child = this.store.resolveDispatchLineage(seed.id) ?? seed;
-      if (visitedDispatchIds.has(child.id) || child.releasedAt) continue;
-      if (child.retained && !input.force) continue;
-      if (!ACTIVE_DISPATCH_STATUSES.has(child.status) && !child.ownsPane &&
-          !this.codexWorkers.has(child.assigneeHandle)) continue;
-      const childStopped = await this.workerStop(
-        {
-          dispatchId: child.id,
-          reason: input.reason?.trim() || `Parent worker ${dispatch.id} stopped`,
-          removeWorktree: input.removeWorktree,
-          force: input.force,
-        },
-        visitedDispatchIds
-      );
-      stoppedHelperIds.push(child.id, ...childStopped.stoppedHelperIds);
-    }
-
-    const headless = dispatch.executionMode === 'codex-app-server';
-    const codex = this.codexWorkers.get(dispatch.assigneeHandle);
-    const shouldClosePane = !headless && Boolean(paneId && (dispatch.ownsPane || input.force));
-    if (shouldClosePane) await this.confirmWorkerPaneClosed(paneId);
-
-    this.approvals.cancelForDispatch(dispatch.id, input.reason || 'Worker stopped');
-    this.nativeQuestions.cancelForDispatch(dispatch.id, input.reason || 'Worker stopped');
-    if (!headless && paneId) {
-      this.turnStopMonitor.cancelForPane(paneId);
-      if (this.terminalTracker) {
-        const transcript = this.terminalTracker.readFullTranscript(paneId);
-        if (transcript) {
-          this.store.archiveDispatchOutput(dispatch.id, transcript);
-        }
-      }
-    }
-
-    let settled = dispatch;
-    if (ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) {
-      this.store.deleteDeferredDispatchPrompt(dispatch.id);
-      this.waiters.cancel(`dispatch:${dispatch.id}`);
-      this.waiters.notifyPrefix(`question:${dispatch.id}:`, 'status');
-      settled = this.store.failDispatch(dispatch.id, 'worker_stopped', {
-        forceFailTask: true,
-        summary: input.reason?.trim() || 'Worker stopped by coordinator',
-      });
-      if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
-        this.store.updateDispatchReviewState(dispatch.id, { reviewStatus: 'rejected' });
-        this.reconcileAnyReviewBatch(dispatch.id, {
-          overrideVerdict: 'reject',
-          failedReason: 'Reviewer stopped before completing verification',
-        });
-      }
-    } else {
-      this.store.updateDispatchStage(dispatch.id, 'stopped');
-      settled = this.store.getDispatchContext(dispatch.id) ?? settled;
-    }
-
-    if (codex) {
-      this.archiveWorkerTimeline(dispatch.assigneeHandle, dispatch.id);
-      await codex.close(true);
-    }
-
-    let closedPane = false;
-    if (shouldClosePane) {
-      this.spawnedWorkerPanes.delete(paneId);
-      this.spawnedWorkerMeta.delete(paneId);
-      this.markPtyExited(paneId);
-      closedPane = true;
-      this.emitPaneClosed({
-        ptyId: paneId,
-        runId: dispatch.runId,
-        taskId: dispatch.taskId,
-        dispatchId: dispatch.id,
-      });
-    }
-
-    const repoRootPath =
-      dispatch.repoRootPath ??
-      (dispatch.parentPaneId
-        ? this.terminalTracker?.getTerminal(dispatch.parentPaneId)?.cwd ??
-          this.sessionCoordinator(dispatch.parentPaneId)?.cwd
-        : undefined) ??
-      this.getDefaultCwd?.() ??
-      null;
-
-    let removedWorktree = false;
-    if (input.removeWorktree && dispatch.ownsWorktree && dispatch.worktreePath) {
-      const res = await removeOwnedWorkerWorktree({
-        worktreePath: dispatch.worktreePath,
-        repoRootPath,
-        force: input.force,
-      });
-      removedWorktree = res.removed;
-    }
-
-    for (const id of lineageIds) this.store.cleanupDispatchBrief(id);
-    this.emitChanged('worker:stopped', settled.runId);
-    return {
-      dispatch: this.store.getDispatchContext(settled.id) ?? settled,
-      closedPane,
-      removedWorktree,
-      stoppedHelperIds,
-    };
+    return this.workers.workerStop(input, visitedDispatchIds);
   }
 
   workerAbandon(input: {
@@ -7087,53 +4263,7 @@ export class OrchestrationService {
     task: OrchestrationTaskRecord;
     warning: string;
   } {
-    const rawTarget = this.resolveTargetDispatch(input);
-    const dispatch = this.store.resolveDispatchLineage(rawTarget.id) ?? rawTarget;
-    const paneId = dispatch.assigneePaneId ?? dispatch.assigneeHandle;
-    const headless = dispatch.executionMode === 'codex-app-server';
-    const codex = headless ? this.codexWorkers.get(dispatch.assigneeHandle) : undefined;
-    if (codex) this.archiveCodexOutput(codex, dispatch.id);
-
-    this.approvals.cancelForDispatch(dispatch.id, input.reason || 'Worker abandoned');
-    this.nativeQuestions.cancelForDispatch(dispatch.id, input.reason || 'Worker abandoned');
-    if (codex) this.archiveWorkerTimeline(dispatch.assigneeHandle, dispatch.id);
-    if (!headless && paneId) {
-      this.turnStopMonitor.cancelForPane(paneId);
-      if (this.terminalTracker) {
-        const transcript = this.terminalTracker.readFullTranscript(paneId);
-        if (transcript) {
-          this.store.archiveDispatchOutput(dispatch.id, transcript);
-        }
-      }
-    }
-
-    let settled = dispatch;
-    if (ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) {
-      this.store.deleteDeferredDispatchPrompt(dispatch.id);
-      this.waiters.cancel(`dispatch:${dispatch.id}`);
-      this.waiters.notifyPrefix(`question:${dispatch.id}:`, 'status');
-      settled = this.store.failDispatch(dispatch.id, 'abandoned', {
-        forceFailTask: true,
-        summary: input.reason?.trim() || 'Worker dispatch abandoned by coordinator',
-      });
-      if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
-        this.store.updateDispatchReviewState(dispatch.id, { reviewStatus: 'rejected' });
-        this.reconcileAnyReviewBatch(dispatch.id, {
-          overrideVerdict: 'reject',
-          failedReason: 'Reviewer dispatch abandoned before completing verification',
-        });
-      }
-    }
-    if (codex) void codex.close(true);
-    const warning = headless
-      ? 'Dispatch abandoned; its headless Codex session has been retired.'
-      : 'Dispatch abandoned in orchestration state without killing any external process; use worker-stop to terminate the PTY.';
-    this.emitChanged('worker:abandoned', settled.runId);
-    return {
-      dispatch: this.store.getDispatchContext(settled.id) ?? settled,
-      task: this.store.requireTask(settled.taskId),
-      warning,
-    };
+    return this.workers.workerAbandon(input);
   }
 
   reset(input: {
@@ -7177,7 +4307,7 @@ export class OrchestrationService {
         const pty = d.assigneePaneId ?? d.assigneeHandle;
         if (pty) this.turnStopMonitor.cancelForPane(pty);
       }
-      for (const codex of this.codexWorkers.values()) void codex.close(true);
+      for (const codex of this.workers.codexWorkers.values()) void codex.close(true);
       this.proposals.cancelAllPendingProposals('Orchestration state reset');
       this.inFlightObservationDispatches.clear();
     }
@@ -7261,125 +4391,21 @@ export class OrchestrationService {
     }).map(entry => ({ ...entry, idlePanes: entry.idlePanes.filter(pane => !this.paneMismatch(pane.ptyId, cwd, entry.cliId)) }));
   }
 
-  approveDispatchProposal(
-    id: string,
-    overrides?: DispatchProposalOverrides
-  ): { proposal: OrchestrationDispatchProposal } {
-    return this.proposals.approveProposal(id, overrides);
+  approveDispatchProposal(id: string, overrides?: DispatchProposalOverrides): { proposal: OrchestrationDispatchProposal } {
+    return this.delegation.approveDispatchProposal(id, overrides);
   }
 
-  rejectDispatchProposal(
-    id: string,
-    reason?: string
-  ): { proposal: OrchestrationDispatchProposal } {
-    return this.proposals.rejectProposal(id, reason);
+  rejectDispatchProposal(id: string, reason?: string): { proposal: OrchestrationDispatchProposal } {
+    return this.delegation.rejectDispatchProposal(id, reason);
   }
 
-  private resolveRoleNameForDispatch(dispatch: OrchestrationDispatchRecord): string {
-    const visited = new Set<string>();
-    let current: OrchestrationDispatchRecord | undefined = dispatch;
-    let fallbackName = '';
-    while (current && !visited.has(current.id)) {
-      visited.add(current.id);
-      const task = this.store.getTask(current.taskId);
-      const rawDisplay = task?.displayName?.trim().replace(/^@+/, '') ?? '';
-      if (rawDisplay) {
-        if (!current.followUpOfDispatchId) {
-          return rawDisplay;
-        }
-        if (!fallbackName && !rawDisplay.startsWith('Follow-up:')) {
-          fallbackName = rawDisplay;
-        }
-      }
-      current = current.followUpOfDispatchId
-        ? this.store.getDispatchContext(current.followUpOfDispatchId)
-        : undefined;
-    }
-    return fallbackName;
-  }
-
-  private listManagedDispatchesForCaller(callerPaneId: string): OrchestrationDispatchRecord[] {
-    const cleanCaller = callerPaneId.trim();
-    const callerActive = this.store.getActiveDispatchForIdentity(cleanCaller, cleanCaller);
-    const callerBoundRun = this.store.getCurrentRunForConsumer(cleanCaller);
-    const all = this.store.listDispatches();
-    const byHeadId = new Map<string, OrchestrationDispatchRecord>();
-
-    const ownDispatchIds = new Set<string>();
-    if (callerActive) {
-      let cur: OrchestrationDispatchRecord | undefined = callerActive;
-      while (cur && !ownDispatchIds.has(cur.id)) {
-        ownDispatchIds.add(cur.id);
-        cur = cur.followUpOfDispatchId
-          ? this.store.getDispatchContext(cur.followUpOfDispatchId)
-          : undefined;
-      }
-    }
-
-    for (const d of all) {
-      const isManaged = callerActive
-        ? Boolean(d.creatorDispatchId && ownDispatchIds.has(d.creatorDispatchId))
-        : d.parentPaneId === cleanCaller ||
-          d.creator === cleanCaller ||
-          Boolean(
-            callerBoundRun &&
-              d.runId === callerBoundRun.id &&
-              (callerBoundRun.coordinatorPaneId === cleanCaller ||
-                callerBoundRun.coordinatorHandle === cleanCaller)
-          );
-      if (!isManaged) continue;
-      const head = this.store.resolveDispatchLineage(d.id) ?? d;
-      if (head.assigneePaneId === cleanCaller || head.assigneeHandle === cleanCaller) continue;
-      byHeadId.set(head.id, head);
-    }
-
-    return [...byHeadId.values()];
-  }
-
-  private resolveDispatchByRoleOrTarget(
-    rawTarget: string,
-    callerHint?: string,
-    runIdHint?: string,
-  ): OrchestrationDispatchRecord {
-    const cleaned = rawTarget.trim();
-    if (!cleaned) {
-      throw new OrchestrationError('invalid_argument', 'Missing target worker role or dispatch id.');
-    }
-    const idCandidate = cleaned.startsWith('dispatch:')
-      ? cleaned.slice('dispatch:'.length).trim()
-      : cleaned;
-    const direct = this.store.resolveDispatchLineage(idCandidate) ?? this.store.getDispatchContext(idCandidate);
-    if (direct) return direct;
-
-    const byTask = this.store.getLatestDispatchForTask(idCandidate);
-    if (byTask) return this.store.resolveDispatchLineage(byTask.id) ?? byTask;
-
-    const cleanRole = cleaned.replace(/^@+/, '').toLowerCase();
-    const scopedRunId =
-      runIdHint?.trim() ||
-      (callerHint ? this.inferRunIdOptional(callerHint) : undefined);
-    const candidates = this.store
-      .listDispatches(scopedRunId ? { runId: scopedRunId } : undefined)
-      .reverse();
-    for (const d of candidates) {
-      const role = this.resolveRoleNameForDispatch(d).toLowerCase();
-      if (role === cleanRole || d.assigneePaneId === cleaned || d.assigneeHandle === cleaned) {
-        return this.store.resolveDispatchLineage(d.id) ?? d;
-      }
-    }
-    throw new OrchestrationError('dispatch_not_found', `Worker not found: ${rawTarget}`);
-  }
-
-  async workerDiff(
-    input: {
+  workerDiff(input: {
       dispatchId?: string;
       worker?: string;
       taskId?: string;
       files?: string[];
       maxDiffBytes?: number;
-    },
-    callerPaneId?: string,
-  ): Promise<WorkerDiffInspection & {
+    }, callerPaneId?: string): Promise<WorkerDiffInspection & {
     dispatchId: string;
     taskId: string;
     role: string;
@@ -7387,56 +4413,10 @@ export class OrchestrationService {
     reviewRound: number;
     integrationStatus: string;
   }> {
-    const rawTarget = input.dispatchId?.trim() || input.worker?.trim() || input.taskId?.trim() || '';
-    const dispatch = rawTarget
-      ? this.resolveDispatchByRoleOrTarget(rawTarget, callerPaneId)
-      : this.resolveTargetDispatch(input);
-    if (callerPaneId !== undefined) {
-      this.authorizeRunAccess(dispatch.runId, callerPaneId);
-      this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
-    }
-    const worktreePath =
-      dispatch.worktreePath ??
-      (dispatch.assigneePaneId
-        ? this.terminalTracker?.getTerminal(dispatch.assigneePaneId)?.cwd
-        : undefined) ??
-      this.getDefaultCwd?.() ??
-      process.cwd();
-    const run = this.store.getRun(dispatch.runId);
-    const mainRepoRoot = run
-      ? await resolveMainRepoRoot(worktreePath, dispatch.repoRootPath ?? this.getDefaultCwd?.() ?? null).catch(() => null)
-      : null;
-    const snapForBase = mainRepoRoot
-      ? await captureWorkerSnapshotOid(worktreePath, { rejectStagedDivergence: false }).catch(() => null)
-      : null;
-    const effectiveBaseCommit = run
-      ? await this.resolveEffectiveWorkerDiffBase(
-          run,
-          dispatch,
-          worktreePath,
-          mainRepoRoot,
-          snapForBase?.snapshotOid ?? null,
-        )
-      : dispatch.baseCommit;
-    const inspection = await inspectWorkerDiff({
-      worktreePath,
-      baseCommit: effectiveBaseCommit,
-      files: input.files,
-      maxDiffBytes: input.maxDiffBytes,
-    });
-    return {
-      ...inspection,
-      dispatchId: dispatch.id,
-      taskId: dispatch.taskId,
-      role: this.resolveRoleNameForDispatch(dispatch) || dispatch.id,
-      reviewStatus: dispatch.reviewStatus ?? 'none',
-      reviewRound: dispatch.reviewRound ?? 0,
-      integrationStatus: dispatch.integrationStatus ?? 'none',
-    };
+    return this.integration.workerDiff(input, callerPaneId);
   }
 
-  async workerIntegrate(
-    input: {
+  workerIntegrate(input: {
       dispatchId?: string;
       worker?: string;
       taskId?: string;
@@ -7447,9 +4427,7 @@ export class OrchestrationService {
       releaseAfter?: boolean;
       deleteBranch?: boolean;
       force?: boolean;
-    },
-    callerPaneId?: string,
-  ): Promise<WorkerIntegrationResult & {
+    }, callerPaneId?: string): Promise<WorkerIntegrationResult & {
     dispatchId: string;
     taskId: string;
     role: string;
@@ -7460,567 +4438,14 @@ export class OrchestrationService {
     cleanupWarnings?: string[];
     recommendedNextStep?: string;
   }> {
-    const rawTarget = input.dispatchId?.trim() || input.worker?.trim() || input.taskId?.trim() || '';
-    const dispatch = rawTarget
-      ? this.resolveDispatchByRoleOrTarget(rawTarget, callerPaneId)
-      : this.resolveTargetDispatch(input);
-    if (callerPaneId !== undefined) {
-      this.authorizeRunAccess(dispatch.runId, callerPaneId);
-      this.assertRunCoordinator(dispatch.runId, callerPaneId);
-    }
-    if (ACTIVE_DISPATCH_STATUSES.has(dispatch.status)) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        `Worker ${dispatch.id} is still active (${dispatch.status}). Wait for completion before integrating.`,
-      );
-    }
-    if (dispatch.reviewOfDispatchId || dispatch.reviewOfRunId) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        `Dispatch ${dispatch.id} is a read-only adversarial review and cannot be integrated.`,
-      );
-    }
-
-    const mode: WorkerIntegrateMode = input.mode ?? 'squash';
-    const role = this.resolveRoleNameForDispatch(dispatch) || dispatch.id;
-    const task = this.store.requireTask(dispatch.taskId);
-    this.store.requireRun(dispatch.runId);
-    const worktreePath = dispatch.worktreePath;
-    if (!worktreePath) {
-      return {
-        mode,
-        checkStatus: 'clean',
-        integrated: false,
-        noChanges: true,
-        clean: true,
-        targetRepoPath: '',
-        targetBranch: null,
-        targetRef: null,
-        snapshotOid: '',
-        integratedCommit: null,
-        conflictFiles: [],
-        ignoredCollisionFiles: [],
-        changedFiles: [],
-        message: 'Worker has no recorded worktree path; nothing to merge.',
-        dispatchId: dispatch.id,
-        taskId: dispatch.taskId,
-        role,
-        usedRunIntegrationBranch: false,
-        released: false,
-        releasedReviews: 0,
-      };
-    }
-
-    const mainRepoRoot = await resolveMainRepoRoot(
-      worktreePath,
-      dispatch.repoRootPath ?? this.getDefaultCwd?.() ?? null,
-    );
-    const normWt = process.platform === 'win32' ? worktreePath.toLowerCase() : worktreePath;
-    const normMain = mainRepoRoot
-      ? process.platform === 'win32'
-        ? mainRepoRoot.toLowerCase()
-        : mainRepoRoot
-      : null;
-
-    if (!mainRepoRoot || (!dispatch.ownsWorktree && normMain === normWt)) {
-      this.store.updateDispatchIntegrationState(dispatch.id, { integrationStatus: 'skipped' });
-      return {
-        mode,
-        checkStatus: 'clean',
-        integrated: false,
-        noChanges: false,
-        clean: true,
-        targetRepoPath: mainRepoRoot ?? worktreePath,
-        targetBranch: dispatch.branch ?? null,
-        targetRef: null,
-        snapshotOid: '',
-        integratedCommit: null,
-        conflictFiles: [],
-        ignoredCollisionFiles: [],
-        changedFiles: [],
-        message: !mainRepoRoot
-          ? 'Non-git workspace: no branch merge required. Review files directly and release when ready.'
-          : 'Worker ran directly in the main workspace (no isolated branch to merge). Review changes and release when ready.',
-        dispatchId: dispatch.id,
-        taskId: dispatch.taskId,
-        role,
-        usedRunIntegrationBranch: false,
-        released: false,
-        releasedReviews: 0,
-      };
-    }
-
-    const executeIntegrate = async () => {
-      const run = this.store.requireRun(dispatch.runId);
-      if (run.integrationIntent) throw new OrchestrationError('operation_rejected', '上一次 Git 交付尚待核对。');
-      const latestDispatch = this.store.getDispatchContext(dispatch.id) ?? dispatch;
-      const hasActiveRunIntegrationBranch = this.isRunIntegrationBranchLive(run);
-      const sameRunRepo = run.integrationRepoRootPath
-        ? await isSameGitRepo(mainRepoRoot, run.integrationRepoRootPath)
-        : true;
-
-      if (hasActiveRunIntegrationBranch && !sameRunRepo) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          `Run ${run.id} already has an active integration branch (${run.integrationBranch}) in a different Git repository (${run.integrationRepoRootPath}). Finalize it before integrating workers from another repository.`,
-          { runId: run.id, integrationBranch: run.integrationBranch },
-        );
-      }
-      if (run.integrationRepoRootPath && !sameRunRepo) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          `Run ${run.id} integration tracking is bound to a different Git repository (${run.integrationRepoRootPath}) and cannot integrate workers from ${mainRepoRoot}. Start a separate Run for the other repository.`,
-          {
-            runId: run.id,
-            integrationRepoRootPath: run.integrationRepoRootPath,
-            workerRepoRootPath: mainRepoRoot,
-          },
-        );
-      }
-      const effectiveTargetBranch: WorkerIntegrateTargetBranch = input.targetBranch ?? 'auto';
-      if (effectiveTargetBranch === 'main' && hasActiveRunIntegrationBranch) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          `Run ${run.id} already has an active integration branch (${run.integrationBranch}). Integrate into targetBranch="integration" or finalize the Run integration branch first to avoid splitting Run changes.`,
-          { runId: run.id, integrationBranch: run.integrationBranch },
-        );
-      }
-
-      let useRunIntegrationBranch = false;
-      if (effectiveTargetBranch === 'integration') {
-        useRunIntegrationBranch = true;
-      } else if (effectiveTargetBranch === 'auto') {
-        if (hasActiveRunIntegrationBranch) {
-          useRunIntegrationBranch = true;
-        } else {
-          const mainStatus = await getGitStatus(mainRepoRoot);
-          useRunIntegrationBranch = Boolean(
-            mainStatus.ok && mainStatus.isGitRepo && mainStatus.entries.length > 0,
-          );
-        }
-      }
-
-      if (
-        useRunIntegrationBranch &&
-        !hasActiveRunIntegrationBranch &&
-        (run.integrationBranch || run.integrationWorktreePath)
-      ) {
-        const retainedBranchExists = run.integrationBranch
-          ? Boolean(await resolveBranchRefOid(mainRepoRoot, run.integrationBranch))
-          : false;
-        const retainedWorktreeExists = run.integrationWorktreePath
-          ? existsSync(run.integrationWorktreePath)
-          : false;
-        if (retainedBranchExists || retainedWorktreeExists) {
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Run ${run.id} retained a previous integration branch or worktree (${run.integrationBranch ?? run.integrationWorktreePath}). Remove it before starting a new integration branch wave.`,
-            {
-              runId: run.id,
-              integrationBranch: run.integrationBranch,
-              integrationWorktreePath: run.integrationWorktreePath,
-            },
-          );
-        }
-      }
-
-      // Server-side adversarial review gate for write modes (`squash` / `merge`).
-      // Terminal/HTTP callers (`callerPaneId !== undefined`) cannot override review gates with `force`.
-      const manualUserOverride = callerPaneId === undefined && input.force === true;
-      const callerExpectedOid = input.expectedSnapshotOid?.trim() || undefined;
-      let authoritativeExpectedOid: string | undefined = callerExpectedOid;
-
-      if (mode !== 'check') {
-        const reviewStatus = latestDispatch.reviewStatus ?? 'none';
-        if (reviewStatus === 'passed') {
-          const approvedOid = latestDispatch.reviewSnapshotOid?.trim() || '';
-          if (!approvedOid) {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Worker ${latestDispatch.id} has reviewStatus=passed but no server-recorded approved snapshot OID. Re-run adversarial review before integrating.`,
-            );
-          }
-          if (callerExpectedOid && callerExpectedOid !== approvedOid) {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Caller expectedSnapshotOid (${callerExpectedOid}) does not match server-approved review snapshot (${approvedOid}).`,
-              { callerExpectedOid, approvedSnapshotOid: approvedOid },
-            );
-          }
-          authoritativeExpectedOid = approvedOid;
-        } else if (!manualUserOverride) {
-          if (reviewStatus === 'pending') {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Integration blocked: adversarial review for ${latestDispatch.id} is still pending. Wait for all reviewers in batch ${latestDispatch.reviewBatchId ?? '(current)'} to report PASS.`,
-            );
-          }
-          if (reviewStatus === 'rejected' || reviewStatus === 'escalated') {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Integration blocked: adversarial review for ${latestDispatch.id} is ${reviewStatus}. Fix blocking findings and pass a new review round before integrating.`,
-            );
-          }
-          // reviewStatus === 'none': only explicit L0 changes are exempt from adversarial review.
-          // Evaluate L0 against the exact merge-base(targetHead, snapshotOid)..snapshotOid range
-          // that integration will actually merge (never a stale or fallback HEAD~1).
-          const l0Snap = await captureWorkerSnapshotOid(worktreePath, { rejectStagedDivergence: true });
-          if (!l0Snap.snapshotOid) {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Integration blocked: could not capture worker snapshot for L0 review exemption on ${latestDispatch.id}.`,
-            );
-          }
-          const l0TargetRepo =
-            useRunIntegrationBranch && hasActiveRunIntegrationBranch
-              ? run.integrationWorktreePath!
-              : mainRepoRoot;
-          const mergeBase = await resolveIntegrationMergeBase(l0TargetRepo, l0Snap.snapshotOid);
-          if (!mergeBase) {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Integration blocked: could not determine common Git merge-base for L0 review exemption on ${latestDispatch.id}.`,
-            );
-          }
-          const diffPreview = await inspectWorkerDiff({
-            worktreePath,
-            baseCommit: mergeBase,
-            maxDiffBytes: 8 * 1024,
-          });
-          if (!diffPreview.snapshotOid || diffPreview.snapshotOid !== l0Snap.snapshotOid ||
-              diffPreview.diffError || diffPreview.stagedDivergentFiles.length > 0 ||
-              diffPreview.recommendedReviewTier !== 'L0') {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Integration blocked: ${diffPreview.recommendedReviewTier} change (${diffPreview.diffError || diffPreview.tierReason}) requires a passing adversarial review before ${mode} integration.`,
-              {
-                recommendedReviewTier: diffPreview.recommendedReviewTier,
-                tierReason: diffPreview.tierReason,
-                dispatchId: latestDispatch.id,
-              },
-            );
-          }
-          if (callerExpectedOid && callerExpectedOid !== diffPreview.snapshotOid) {
-            throw new OrchestrationError('operation_rejected', 'Worker snapshot changed since inspection. Inspect it again.');
-          }
-          authoritativeExpectedOid = diffPreview.snapshotOid;
-        }
-      }
-
-      const branchOidBeforeIntegrate =
-        latestDispatch.ownsBranch && latestDispatch.branch?.startsWith(WORKER_BRANCH_PREFIX)
-          ? await resolveBranchRefOid(mainRepoRoot, latestDispatch.branch)
-          : null;
-
-      const commitMessage =
-        input.commitMessage?.trim() ||
-        `chore(orchestration): integrate @${role} (${task.taskTitle.slice(0, 72)})`;
-
-      const targetRepoForBase =
-        useRunIntegrationBranch && hasActiveRunIntegrationBranch
-          ? run.integrationWorktreePath!
-          : mainRepoRoot;
-      const currentSnapForBase =
-        authoritativeExpectedOid ??
-        (await captureWorkerSnapshotOid(worktreePath, { rejectStagedDivergence: false }).catch(() => null))
-          ?.snapshotOid ??
-        null;
-      let effectiveIntegrationBaseCommit: string | null = latestDispatch.baseCommit ?? null;
-      if (
-        latestDispatch.reviewStatus === 'passed' &&
-        latestDispatch.reviewSnapshotOid &&
-        latestDispatch.reviewBaseCommit &&
-        (mode !== 'check' || latestDispatch.reviewSnapshotOid === currentSnapForBase)
-      ) {
-        effectiveIntegrationBaseCommit = latestDispatch.reviewBaseCommit;
-      } else if (latestDispatch.baseCommit && currentSnapForBase) {
-        const stillDescendsFromRecordedBase = await isGitCommitAncestor(
-          worktreePath,
-          latestDispatch.baseCommit,
-          currentSnapForBase,
-        );
-        if (!stillDescendsFromRecordedBase) {
-          effectiveIntegrationBaseCommit = await resolveIntegrationMergeBase(
-            targetRepoForBase,
-            currentSnapForBase,
-          );
-        }
-      }
-
-      const beforePublish: NonNullable<Parameters<typeof integrateWorkerChanges>[0]['beforePublish']> = async evidence => {
-        this.store.updateRunIntegrationState(run.id, { integrationIntent: { ...evidence, repo: mainRepoRoot, dispatchId: latestDispatch.id } });
-        await this.store.flushDurable();
-      };
-      let result: WorkerIntegrationResult;
-      let runBranchResult: Awaited<ReturnType<typeof integrateWorkerIntoRunBranch>> | null = null;
-      if (useRunIntegrationBranch) {
-        runBranchResult = await integrateWorkerIntoRunBranch({
-          beforePublish,
-          mainRepoRoot,
-          runId: run.id,
-          existingBranch: hasActiveRunIntegrationBranch ? run.integrationBranch : null,
-          existingWorktreePath: hasActiveRunIntegrationBranch ? run.integrationWorktreePath : null,
-          existingBaseCommit: run.integrationBaseCommit ?? null,
-          existingBaseBranch: run.integrationBaseBranch ?? null,
-          worktreePath,
-          baseCommit: effectiveIntegrationBaseCommit,
-          recordedBaseCommit: latestDispatch.baseCommit,
-          expectedSnapshotOid: authoritativeExpectedOid,
-          strictReviewedTree: true,
-          mode,
-          commitMessage,
-        });
-        result = runBranchResult.result;
-      } else {
-        const expectedMainRef =
-          sameRunRepo && run.integrationBaseBranch?.trim()
-            ? `refs/heads/${run.integrationBaseBranch.trim()}`
-            : null;
-        result = await integrateWorkerChanges({
-          beforePublish,
-          targetRepoPath: mainRepoRoot,
-          worktreePath,
-          baseCommit: effectiveIntegrationBaseCommit,
-          recordedBaseCommit: latestDispatch.baseCommit,
-          expectedSnapshotOid: authoritativeExpectedOid,
-          expectedTargetRef: expectedMainRef,
-          strictReviewedTree: true,
-          mode,
-          commitMessage,
-        });
-      }
-
-      if (mode === 'check') {
-        this.store.updateDispatchIntegrationState(latestDispatch.id, {
-          integrationStatus: result.clean ? 'checked' : 'conflict',
-        });
-        this.emitChanged('worker:integration-checked', latestDispatch.runId);
-        return {
-          ...result,
-          dispatchId: latestDispatch.id,
-          taskId: latestDispatch.taskId,
-          role,
-          usedRunIntegrationBranch: useRunIntegrationBranch,
-          released: false,
-          releasedReviews: 0,
-        };
-      }
-
-      if (!result.integrated && !result.noChanges) {
-        this.store.updateDispatchIntegrationState(latestDispatch.id, { integrationStatus: 'conflict' });
-        this.emitChanged('worker:integration-conflict', latestDispatch.runId);
-        return {
-          ...result,
-          dispatchId: latestDispatch.id,
-          taskId: latestDispatch.taskId,
-          role,
-          usedRunIntegrationBranch: useRunIntegrationBranch,
-          released: false,
-          releasedReviews: 0,
-        };
-      }
-
-      // If this was a brand-new Run integration branch with zero diff, integrateWorkerIntoRunBranch
-      // rolled back the empty branch/worktree so no Run integration branch became active.
-      const effectiveUsedRunBranch =
-        useRunIntegrationBranch && (hasActiveRunIntegrationBranch || result.integrated);
-
-      this.store.updateDispatchIntegrationState(latestDispatch.id, {
-        integrationStatus: 'merged',
-        noChanges: result.noChanges,
-        integratedCommit: result.integratedCommit,
-        integratedTargetBranch: effectiveUsedRunBranch ? result.targetBranch : (useRunIntegrationBranch ? null : result.targetBranch),
-      });
-
-      const latestRun = this.store.requireRun(run.id);
-      this.store.updateRunIntegrationState(run.id, { integrationIntent: null });
-      if (effectiveUsedRunBranch && runBranchResult) {
-        this.store.updateRunIntegrationState(run.id, {
-          integrationBranch: runBranchResult.integrationBranch,
-          integrationWorktreePath: runBranchResult.integrationWorktreePath,
-          integrationBaseCommit: latestRun.integrationBaseCommit ?? runBranchResult.integrationBaseCommit,
-          integrationBaseBranch: latestRun.integrationBaseBranch ?? runBranchResult.integrationBaseBranch,
-          integrationRepoRootPath: mainRepoRoot,
-          integrationStatus: 'active',
-          integrationHeadCommit: result.integratedCommit,
-          finalizedCommit: null,
-        });
-      } else if (!useRunIntegrationBranch && sameRunRepo) {
-        const reopeningAfterFinalized =
-          result.integrated && !result.noChanges && latestRun.integrationStatus === 'finalized';
-        this.store.updateRunIntegrationState(run.id, {
-          integrationBaseCommit: latestRun.integrationBaseCommit ?? result.targetHeadBefore ?? null,
-          integrationBaseBranch: latestRun.integrationBaseBranch ?? result.targetBranch ?? null,
-          integrationRepoRootPath: latestRun.integrationRepoRootPath ?? mainRepoRoot,
-          integrationHeadCommit: result.integratedCommit,
-          ...(reopeningAfterFinalized
-            ? { integrationStatus: 'none', finalizedCommit: null }
-            : {}),
-        });
-      }
-
-      // Reset Wave 1's completed Run-level review metadata when starting a brand-new
-      // integration wave AFTER a prior finalization (whether via aha/run/* or directly on main).
-      // Within an active wave, preserve `runReviewStatus === 'passed'` + `runReviewSnapshotOid`
-      // so `runFinalizeIntegration` strictly enforces TOCTOU until a fresh Run-level review passes.
-      if (
-        (effectiveUsedRunBranch || (!useRunIntegrationBranch && sameRunRepo)) &&
-        result.integrated &&
-        !result.noChanges &&
-        latestRun.integrationStatus === 'finalized'
-      ) {
-        this.store.updateRunReviewState(run.id, {
-          runReviewStatus: 'none',
-          runReviewRound: 0,
-          runReviewBatchId: null,
-          runReviewSnapshotOid: null,
-          runReviewBaseCommit: null,
-          runReviewFindings: [],
-        });
-      }
-
-      const runDispatches = this.store
-        .listDispatches({ runId: latestDispatch.runId })
-        .filter((d) => !d.reviewOfDispatchId && !d.reviewOfRunId);
-      const latestByTask = new Map<string, OrchestrationDispatchRecord>();
-      for (const d of runDispatches) {
-        const prev = latestByTask.get(d.taskId);
-        if (!prev || (d.processGeneration ?? 0) >= (prev.processGeneration ?? 0)) {
-          latestByTask.set(d.taskId, d);
-        }
-      }
-      const implWorkers = [...latestByTask.values()];
-      const remainingWorkers = implWorkers.filter(
-        (d) =>
-          d.id !== latestDispatch.id &&
-          d.integrationStatus !== 'merged' &&
-          d.integrationStatus !== 'skipped' &&
-          d.status !== 'failed' &&
-          d.status !== 'circuit_broken' &&
-          !d.releasedAt,
-      );
-      const mergedCount = implWorkers.filter((d) => d.integrationStatus === 'merged').length;
-      let recommendedNextStep: string | undefined;
-      if (effectiveUsedRunBranch && result.targetBranch) {
-        recommendedNextStep =
-          remainingWorkers.length === 0
-            ? `All active workers are staged on ${result.targetBranch} (main workspace untouched). Next: inspect_run_diff(), optionally delegate_task(reviewRun=true), and call finalize_run_integration() once main is clean.`
-            : `Staged on ${result.targetBranch} (${remainingWorkers.length} other worker(s) remaining). Continue integrating remaining workers, then finalize_run_integration().`;
-      } else if (remainingWorkers.length === 0 && mergedCount >= 2) {
-        recommendedNextStep =
-          'All workers integrated into main. You may run inspect_run_diff() / delegate_task(reviewRun=true) for a combined Run-level check before reporting final results.';
-      }
-
-      const boardMsg = this.store.insertMessage({
-        runId: latestDispatch.runId,
-        from: callerPaneId || 'coordinator',
-        to: `run:${latestDispatch.runId}`,
-        type: 'status',
-        subject: `Integrated @${role}${effectiveUsedRunBranch && result.targetBranch ? ` -> ${result.targetBranch}` : ''}`,
-        body: result.noChanges
-          ? `[@${role}] No diff relative to ${result.targetBranch ?? 'HEAD'}; marked integrated.`
-          : `[@${role}] ${result.message}${effectiveUsedRunBranch && result.targetBranch ? ` on ${result.targetBranch}` : ''}`,
-        fromRole: 'coordinator',
-        mentions: [role.toLowerCase()],
-        kind: 'update',
-        artifacts: {
-          branch: result.targetBranch,
-          headCommit: result.integratedCommit?.slice(0, 10) ?? null,
-          snapshotOid: result.snapshotOid,
-          changedFiles: result.changedFiles.slice(0, 20),
-          changedFileCount: result.changedFiles.length,
-          ...(recommendedNextStep ? { recommendedNextStep } : {}),
-        },
-      });
-      this.store.markAsReadAndDelivered([boardMsg.id]);
-
-      let released = false;
-      let releasedReviews = 0;
-      let releaseSkippedReason: string | undefined;
-      const cleanupWarnings: string[] = result.cleanupWarning ? [result.cleanupWarning] : [];
-
-      if (input.releaseAfter !== false) {
-        // Collect reviews attached to any dispatch in this author's lineage.
-        const lineageIds = this.store.listDispatchAncestorIds(latestDispatch.id);
-        const seenReviewIds = new Set<string>();
-        for (const ancestorId of lineageIds) {
-          const reviews = this.store.listReviewDispatchesForTarget(ancestorId);
-          for (const rev of reviews) {
-            if (seenReviewIds.has(rev.id)) continue;
-            seenReviewIds.add(rev.id);
-            if ((!rev.releasedAt || rev.ownsWorktree) && !ACTIVE_DISPATCH_STATUSES.has(rev.status)) {
-              try {
-                const revRel = await this.workerRelease({ dispatchId: rev.id, force: true });
-                if (revRel.worktreeError) {
-                  cleanupWarnings.push(`Review ${rev.id} worktree cleanup failed: ${revRel.worktreeError}`);
-                } else if (revRel.dispatch.releasedAt) {
-                  releasedReviews += 1;
-                }
-              } catch (err) {
-                cleanupWarnings.push(
-                  `Review ${rev.id} cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
-                );
-              }
-            }
-          }
-        }
-
-        try {
-          const rel = await this.mutateWorkerResources(latestDispatch, async () => {
-            const current = this.store.getDispatchContext(latestDispatch.id);
-            const head = this.store.resolveDispatchLineage(latestDispatch.id);
-            if (!current || head?.id !== latestDispatch.id) {
-              throw new OrchestrationError('operation_rejected', 'Worker lineage changed; retained worktree and branch.');
-            }
-            return this.releaseWorker(current, {
-              dispatchId: latestDispatch.id,
-              keepBranch: input.deleteBranch === false,
-              expectedBranchOid: branchOidBeforeIntegrate,
-            }, result.snapshotOid);
-          });
-          if (rel.worktreeError) {
-            releaseSkippedReason = rel.worktreeError;
-            cleanupWarnings.push(rel.worktreeError);
-          } else {
-            released = Boolean(rel.dispatch.releasedAt);
-            if (rel.removedWorktree && latestDispatch.ownsBranch && input.deleteBranch !== false && !rel.removedBranch) {
-              cleanupWarnings.push('Worker branch was retained because Git could not safely delete it.');
-            }
-          }
-        } catch (error) {
-          releaseSkippedReason = 'Worker cleanup deferred: ' + (error instanceof Error ? error.message : String(error));
-          cleanupWarnings.push(releaseSkippedReason);
-        }
-      }
-
-      this.emitChanged('worker:integrated', latestDispatch.runId);
-      return {
-        ...result,
-        dispatchId: latestDispatch.id,
-        taskId: latestDispatch.taskId,
-        role,
-        usedRunIntegrationBranch: effectiveUsedRunBranch,
-        released,
-        releasedReviews,
-        ...(releaseSkippedReason ? { releaseSkippedReason } : {}),
-        ...(cleanupWarnings.length > 0 ? { cleanupWarnings } : {}),
-        ...(recommendedNextStep ? { recommendedNextStep } : {}),
-      };
-    };
-
-    return mode === 'check'
-      ? executeIntegrate()
-      : this.withRunIntegrationLock(dispatch.runId, executeIntegrate);
+    return this.integration.workerIntegrate(input, callerPaneId);
   }
 
-  async runDiff(
-    input: {
+  runDiff(input: {
       runId?: string;
       files?: string[];
       maxDiffBytes?: number;
-    },
-    callerPaneId?: string,
-  ): Promise<RunCommitRangeDiffInspection & {
+    }, callerPaneId?: string): Promise<RunCommitRangeDiffInspection & {
     runId: string;
     hasIntegratedChanges: boolean;
     integrationStatus: string;
@@ -8037,67 +4462,10 @@ export class OrchestrationService {
     }>;
     message?: string;
   }> {
-    const run = this.resolveTargetRunForOperation(input.runId, callerPaneId);
-    const target = await this.resolveRunCombinedDiffTarget(run);
-    const workersSummary = target.integratedWorkers.map((w) => ({
-      dispatchId: w.dispatchId,
-      role: w.role,
-      cliId: w.cliId ?? null,
-      integratedCommit: w.integratedCommit ?? null,
-    }));
-
-    if (!target.hasChanges || !target.repoPath || !target.baseCommit || !target.targetCommit) {
-      return {
-        isGitRepo: Boolean(target.mainRepoRoot),
-        repoPath: target.repoPath ?? '',
-        branch: target.branch,
-        baseCommit: target.baseCommit,
-        targetCommit: target.targetCommit,
-        commitsAhead: 0,
-        commits: [],
-        changedFiles: [],
-        diffStat: '',
-        diff: '',
-        diffTruncated: false,
-        recommendedReviewTier: 'L0',
-        tierReason: 'no integrated changes recorded for run',
-        runId: run.id,
-        hasIntegratedChanges: false,
-        integrationStatus: run.integrationStatus ?? 'none',
-        integrationBranch: run.integrationBranch ?? null,
-        integrationWorktreePath: run.integrationWorktreePath ?? null,
-        runReviewStatus: run.runReviewStatus ?? 'none',
-        runReviewRound: run.runReviewRound ?? 0,
-        runReviewSnapshotOid: run.runReviewSnapshotOid ?? null,
-        integratedWorkers: workersSummary,
-        message: 'No integrated changes recorded for this run yet.',
-      };
-    }
-
-    const inspection = await inspectCommitRangeDiff({
-      repoPath: target.repoPath,
-      baseCommit: target.baseCommit,
-      targetCommit: target.targetCommit,
-      branch: target.branch,
-      files: input.files,
-      maxDiffBytes: input.maxDiffBytes,
-    });
-    return {
-      ...inspection,
-      runId: run.id,
-      hasIntegratedChanges: inspection.changedFiles.length > 0 || inspection.commitsAhead > 0,
-      integrationStatus: run.integrationStatus ?? 'none',
-      integrationBranch: run.integrationBranch ?? null,
-      integrationWorktreePath: run.integrationWorktreePath ?? null,
-      runReviewStatus: run.runReviewStatus ?? 'none',
-      runReviewRound: run.runReviewRound ?? 0,
-      runReviewSnapshotOid: run.runReviewSnapshotOid ?? null,
-      integratedWorkers: workersSummary,
-    };
+    return this.integration.runDiff(input, callerPaneId);
   }
 
-  async runFinalizeIntegration(
-    input: {
+  runFinalizeIntegration(input: {
       runId?: string;
       mode?: WorkerIntegrateMode;
       expectedSnapshotOid?: string;
@@ -8105,9 +4473,7 @@ export class OrchestrationService {
       deleteBranch?: boolean;
       keepWorktree?: boolean;
       force?: boolean;
-    },
-    callerPaneId?: string,
-  ): Promise<WorkerIntegrationResult & {
+    }, callerPaneId?: string): Promise<WorkerIntegrationResult & {
     runId: string;
     integrationBranch: string;
     integrationWorktreePath: string;
@@ -8116,226 +4482,14 @@ export class OrchestrationService {
     releasedReviews: number;
     cleanupWarnings?: string[];
   }> {
-    const initialRun = this.resolveTargetRunForOperation(input.runId, callerPaneId);
-    const mode: WorkerIntegrateMode = input.mode ?? 'squash';
-    const executeFinalize = async () => {
-      const run = this.store.requireRun(initialRun.id);
-      if (run.integrationIntent) throw new OrchestrationError('operation_rejected', '上一次 Git 交付尚待核对。');
-      if (
-        !this.isRunIntegrationBranchLive(run) ||
-        !run.integrationBranch ||
-        !run.integrationWorktreePath ||
-        !run.integrationRepoRootPath
-      ) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          `Run ${run.id} does not have an active integration branch to finalize (status=${run.integrationStatus ?? 'none'}).`,
-          { runId: run.id, integrationStatus: run.integrationStatus ?? 'none' },
-        );
-      }
-
-      const manualUserOverride = callerPaneId === undefined && input.force === true;
-      const callerExpectedOid = input.expectedSnapshotOid?.trim() || undefined;
-      let authoritativeExpectedOid: string | undefined = callerExpectedOid;
-
-      if (mode !== 'check') {
-        const activeDispatches = this.store
-          .listDispatches({ runId: run.id })
-          .filter((d) => ACTIVE_DISPATCH_STATUSES.has(d.status));
-        if (activeDispatches.length > 0) {
-          throw new OrchestrationError(
-            'operation_rejected',
-            `Run ${run.id} still has ${activeDispatches.length} active dispatch(es) (${activeDispatches.map((d) => d.id).join(', ')}). Wait for all workers/reviews to settle before finalizing.`,
-            { activeDispatchIds: activeDispatches.map((d) => d.id) },
-          );
-        }
-
-        const runReviewStatus = run.runReviewStatus ?? 'none';
-        if (runReviewStatus === 'passed') {
-          const approvedOid = run.runReviewSnapshotOid?.trim() || '';
-          if (!approvedOid) {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Run ${run.id} has runReviewStatus=passed without a recorded snapshot OID. Re-run Run-level adversarial review before finalizing.`,
-            );
-          }
-          if (callerExpectedOid && callerExpectedOid !== approvedOid) {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Caller expectedSnapshotOid (${callerExpectedOid}) does not match Run-level approved snapshot (${approvedOid}).`,
-              { callerExpectedOid, approvedSnapshotOid: approvedOid },
-            );
-          }
-          authoritativeExpectedOid = approvedOid;
-        } else if (!manualUserOverride) {
-          if (runReviewStatus === 'pending') {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Finalization blocked: Run-level adversarial review for ${run.id} is still pending (batch ${run.runReviewBatchId ?? '(current)'}).`,
-            );
-          }
-          if (runReviewStatus === 'rejected' || runReviewStatus === 'escalated') {
-            throw new OrchestrationError(
-              'operation_rejected',
-              `Finalization blocked: Run-level adversarial review for ${run.id} is ${runReviewStatus}. Fix blocking findings and pass a new Run-level review before finalizing.`,
-            );
-          }
-        }
-      }
-
-      const expectedBaseBranch = run.integrationBaseBranch?.trim() || '';
-      if (!expectedBaseBranch) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          `Run ${run.id} has no recorded target branch (started from detached HEAD); refusing to finalize ${run.integrationBranch} into an arbitrary checked-out branch. Checkout the intended branch and merge ${run.integrationBranch} manually.`,
-          { runId: run.id, integrationBranch: run.integrationBranch },
-        );
-      }
-      const expectedTargetRef = `refs/heads/${expectedBaseBranch}`;
-      const commitMessage =
-        input.commitMessage?.trim() ||
-        `chore(orchestration): finalize run ${run.id} (${run.objective.slice(0, 72)})`;
-
-      const members: Record<string, string> = {};
-      let sourceHead = '';
-      const finalized: RunFinalizeIntegrationResult = await finalizeRunIntegrationBranch({
-        beforePublish: async evidence => {
-          sourceHead = evidence.sourceHead;
-          for (const worker of this.store.listDispatches({ runId: run.id })) {
-            if (worker.integrationStatus === 'merged' && worker.integratedTargetBranch === run.integrationBranch &&
-                worker.integratedCommit && await isGitCommitAncestor(run.integrationRepoRootPath!, worker.integratedCommit, sourceHead)) {
-              members[worker.id] = worker.integratedCommit;
-            }
-          }
-          this.store.updateRunIntegrationState(run.id, { integrationIntent: { ...evidence, repo: run.integrationRepoRootPath!, members } });
-          await this.store.flushDurable();
-        },
-        mainRepoRoot: run.integrationRepoRootPath,
-        integrationBranch: run.integrationBranch,
-        integrationWorktreePath: run.integrationWorktreePath,
-        baseCommit: run.integrationBaseCommit ?? null,
-        expectedTargetRef,
-        expectedSnapshotOid: authoritativeExpectedOid,
-        strictReviewedTree: true,
-        mode,
-        commitMessage,
-        deleteBranch: input.deleteBranch,
-        keepWorktree: input.keepWorktree,
-      });
-
-      if (mode === 'check') {
-        return {
-          ...finalized.result,
-          runId: run.id,
-          integrationBranch: finalized.integrationBranch,
-          integrationWorktreePath: finalized.integrationWorktreePath,
-          removedWorktree: false,
-          removedBranch: false,
-          releasedReviews: 0,
-        };
-      }
-
-      if (!finalized.result.integrated && !finalized.result.noChanges) {
-        this.store.updateRunIntegrationState(run.id, { integrationStatus: 'conflict' });
-        this.emitChanged('run:integration-conflict', run.id);
-        return {
-          ...finalized.result,
-          runId: run.id,
-          integrationBranch: finalized.integrationBranch,
-          integrationWorktreePath: finalized.integrationWorktreePath,
-          removedWorktree: false,
-          removedBranch: false,
-          releasedReviews: 0,
-          ...(finalized.cleanupWarnings.length > 0 ? { cleanupWarnings: finalized.cleanupWarnings } : {}),
-        };
-      }
-
-      const cleanupWarnings = [...finalized.cleanupWarnings];
-      let releasedReviews = 0;
-      for (const rev of this.store.listReviewDispatchesForRun(run.id)) {
-        if ((!rev.releasedAt || rev.ownsWorktree) && !ACTIVE_DISPATCH_STATUSES.has(rev.status)) {
-          try {
-            const revRel = await this.workerRelease({ dispatchId: rev.id, force: true });
-            if (revRel.worktreeError) {
-              cleanupWarnings.push(`Run review ${rev.id} worktree cleanup failed: ${revRel.worktreeError}`);
-            } else if (revRel.dispatch.releasedAt) {
-              releasedReviews += 1;
-            }
-          } catch (err) {
-            cleanupWarnings.push(
-              `Run review ${rev.id} cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        }
-      }
-
-
-      this.store.updateRunIntegrationState(run.id, {
-        integrationIntent: null,
-        ...(sourceHead && finalized.result.integratedCommit ? { finalizedBatch: {
-          sourceHead, targetCommit: finalized.result.integratedCommit, branch: expectedBaseBranch, members,
-        } } : {}),
-        integrationStatus: 'finalized',
-        finalizedCommit: finalized.result.integratedCommit,
-        integrationHeadCommit: finalized.result.integratedCommit,
-        integrationWorktreePath: finalized.removedWorktree ? null : run.integrationWorktreePath,
-        integrationBranch: finalized.removedBranch ? null : run.integrationBranch,
-      });
-
-      const boardMsg = this.store.insertMessage({
-        runId: run.id,
-        from: callerPaneId || 'coordinator',
-        to: `run:${run.id}`,
-        type: 'status',
-        subject: `Finalized ${finalized.integrationBranch} -> ${finalized.result.targetBranch ?? 'main'}`,
-        body: finalized.result.noChanges
-          ? `[Run ${run.id}] No diff between ${finalized.integrationBranch} and ${finalized.result.targetBranch ?? 'HEAD'}; marked finalized.`
-          : `[Run ${run.id}] Promoted ${finalized.integrationBranch} into ${finalized.result.targetBranch ?? 'main'}: ${finalized.result.message}`,
-        fromRole: 'coordinator',
-        kind: 'update',
-        artifacts: {
-          branch: finalized.result.targetBranch,
-          headCommit: finalized.result.integratedCommit?.slice(0, 10) ?? null,
-          snapshotOid: finalized.result.snapshotOid,
-          changedFiles: finalized.result.changedFiles.slice(0, 20),
-          changedFileCount: finalized.result.changedFiles.length,
-        },
-      });
-      this.store.markAsReadAndDelivered([boardMsg.id]);
-
-      this.emitChanged('run:integration-finalized', run.id);
-      return {
-        ...finalized.result,
-        runId: run.id,
-        integrationBranch: finalized.integrationBranch,
-        integrationWorktreePath: finalized.integrationWorktreePath,
-        removedWorktree: finalized.removedWorktree,
-        removedBranch: finalized.removedBranch,
-        releasedReviews,
-        ...(cleanupWarnings.length > 0 ? { cleanupWarnings } : {}),
-      };
-    };
-
-    return mode === 'check'
-      ? executeFinalize()
-      : this.withRunIntegrationLock(initialRun.id, executeFinalize);
+    return this.integration.runFinalizeIntegration(input, callerPaneId);
   }
 
   setRunAutoReview(input: { runId: string; enabled: boolean }): { run: OrchestrationRunRecord } {
-    const cleanId = input.runId.trim();
-    if (!cleanId) {
-      throw new OrchestrationError('invalid_argument', 'runId is required.');
-    }
-    const updated = this.store.setRunAutoReviewAuthorized(cleanId, Boolean(input.enabled));
-    if (!updated) {
-      throw new OrchestrationError('run_not_found', `Run not found: ${cleanId}`);
-    }
-    this.emitChanged('run:auto-review-updated', updated.id);
-    return { run: updated };
+    return this.review.setRunAutoReview(input);
   }
 
-  async delegateTask(
-    input: {
+  delegateTask(input: {
       from?: string;
       role?: string;
       task?: string;
@@ -8368,451 +4522,8 @@ export class OrchestrationService {
       planSummary?: string;
       runId?: string;
       callerCwd?: string;
-    },
-    signal?: AbortSignal
-  ): Promise<OrchestrationDelegateTaskResult> {
-    const reviewOfRaw = input.reviewOf?.trim() || '';
-    const isReviewRunRequest =
-      input.reviewRun === true ||
-      (typeof input.reviewRun === 'string' && input.reviewRun.trim().length > 0);
-    const reviewFocus = input.reviewFocus?.trim() || '';
-    if (reviewOfRaw && isReviewRunRequest) {
-      throw new OrchestrationError(
-        'invalid_argument',
-        'Cannot combine reviewOf and reviewRun in the same delegate_task call.',
-      );
-    }
-    if ((reviewOfRaw || isReviewRunRequest) && input.terminal?.trim()) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        'Adversarial review cannot reuse an existing terminal. Spawn a fresh reviewer in an isolated detached worktree.',
-      );
-    }
-    const from = input.from?.trim() || 'coordinator';
-    const reviewTargetDispatch = reviewOfRaw
-      ? this.resolveDispatchByRoleOrTarget(reviewOfRaw, input.callerPaneId ?? from, input.runId)
-      : null;
-    if (reviewTargetDispatch && input.callerPaneId !== undefined) {
-      this.authorizeRunAccess(reviewTargetDispatch.runId, input.callerPaneId);
-    }
-    if (
-      typeof input.reviewRun === 'string' &&
-      input.reviewRun.trim() &&
-      input.runId?.trim() &&
-      input.reviewRun.trim() !== input.runId.trim()
-    ) {
-      throw new OrchestrationError(
-        'invalid_argument',
-        `Conflicting runId (${input.runId.trim()}) and reviewRun (${input.reviewRun.trim()}).`,
-      );
-    }
-    const reviewRunTarget = isReviewRunRequest
-      ? this.resolveTargetRunForOperation(
-          typeof input.reviewRun === 'string' ? input.reviewRun.trim() : input.runId,
-          input.callerPaneId,
-          from,
-        )
-      : null;
-    const isAdversarialReview = Boolean(reviewTargetDispatch || reviewRunTarget);
-
-    const reviewTargetRole = reviewTargetDispatch
-      ? this.resolveRoleNameForDispatch(reviewTargetDispatch) || reviewTargetDispatch.id
-      : '';
-    const fallbackReviewTask = reviewTargetDispatch
-      ? `Adversarial review of @${reviewTargetRole}${reviewFocus ? ` (${reviewFocus})` : ''}`
-      : reviewRunTarget
-        ? `Run-level adversarial review of ${reviewRunTarget.id}${reviewFocus ? ` (${reviewFocus})` : ''}`
-        : '';
-    const taskText = this.store.redactDispatchCredentials(input.task?.trim() || fallbackReviewTask);
-    if (!taskText) {
-      throw new OrchestrationError('invalid_argument', 'Missing task specification.');
-    }
-    let normalizedTaskContext = this.redactTaskContext(normalizeTaskContext(input));
-
-    this.assertCanDelegateFrom(from);
-    const defaultReviewRole = reviewTargetDispatch
-      ? `review-${reviewTargetRole.replace(/^@+/, '')}`
-      : reviewRunTarget
-        ? 'review-run'
-        : '';
-    const role = this.store.redactDispatchCredentials(
-      (input.role ?? defaultReviewRole).trim().replace(/^@+/, ''),
-    );
-    const firstLine =
-      taskText
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find(Boolean) ?? taskText;
-    const displayName = role || undefined;
-    const taskTitle = role ? `@${role}: ${firstLine}` : firstLine;
-
-    const effectiveTaskKind = input.taskKind ?? (isAdversarialReview ? 'review' : undefined);
-    let workerPolicy: AgentSessionPolicy | undefined = input.policy;
-    let workerNetwork: boolean | undefined = input.network;
-    let allowSubWorkers = input.allowSubWorkers === true;
-    if (effectiveTaskKind === 'review' && ((workerPolicy !== undefined && workerPolicy !== 'read-only') ||
-        workerNetwork === true || allowSubWorkers)) {
-      throw new OrchestrationError('operation_rejected', 'Review Workers stay read-only, without network access or sub-Workers.');
-    }
-    if (allowSubWorkers && this.resolveCallerDepth(from) + 1 >= this.maxDepth) {
-      throw new OrchestrationError(
-        'operation_rejected',
-        `A Worker at depth ${this.resolveCallerDepth(from) + 1} cannot start sub-Workers (max depth ${this.maxDepth}).`,
-        { maxDepth: this.maxDepth },
-      );
-    }
-    let worktree = isAdversarialReview
-      ? false
-      : (input.worktree ?? this.getDefaultWorktreeDep?.() ?? true);
-    const requestedAgent = input.agent?.trim() || 'auto';
-    const roster = this.listCodingAgents(from);
-    const coordinatorCliId =
-      this.agentStatusStore.get(from)?.agentId ??
-      this.terminalTracker?.getTerminal(from)?.cliId ??
-      this.sessionCoordinator(from)?.provider ??
-      null;
-    const authorCliId = reviewTargetDispatch?.cliId ?? null;
-    const authorCliIds = reviewRunTarget
-      ? [
-          ...new Set(
-            this.store
-              .listIntegratedDispatchesForRun(reviewRunTarget.id)
-              .map((d) => d.cliId)
-              .filter((c): c is string => Boolean(c)),
-          ),
-        ]
-      : undefined;
-
-    let resolvedAgent: string;
-    let selectionReason: string;
-    let resolvedModel: string | undefined = input.model?.trim() || undefined;
-    let resolvedEffort: string | undefined = input.effort?.trim() || undefined;
-    let fallbacks: string[] = [];
-
-    if (this.selectAgentForTaskDep && roster.length > 0) {
-      let selection: OrchestrationAgentSelectionResult;
-      try {
-        selection = this.selectAgentForTaskDep({
-          roster,
-          requestedAgent,
-          taskKind: effectiveTaskKind ?? null,
-          coordinatorCliId,
-          authorCliId,
-          ...(authorCliIds && authorCliIds.length > 0 ? { authorCliIds } : {}),
-          preferIdle: Boolean(input.terminal),
-        });
-      } catch (err) {
-        if (err instanceof OrchestrationError) throw err;
-        throw new OrchestrationError(
-          'invalid_argument',
-          err instanceof Error ? err.message : String(err)
-        );
-      }
-      resolvedAgent = selection.cliId;
-      selectionReason = selection.reason;
-      if (!resolvedModel && selection.model) {
-        resolvedModel = selection.model;
-      }
-      if (!resolvedEffort && resolvedModel && selection.effort) {
-        resolvedEffort = selection.effort;
-      }
-      fallbacks = selection.fallbacks;
-    } else if (requestedAgent && requestedAgent.toLowerCase() !== 'auto') {
-      resolvedAgent = normalizeWorkerCliId(requestedAgent);
-      selectionReason = 'explicit';
-    } else {
-      const firstAvailable = roster.find((entry) => entry.available);
-      resolvedAgent = firstAvailable?.cliId ?? coordinatorCliId ?? 'claude';
-      selectionReason = firstAvailable ? 'roster-default' : 'default';
-      if (!resolvedModel && firstAvailable?.defaultModel) {
-        resolvedModel = firstAvailable.defaultModel;
-      }
-      if (!resolvedEffort && resolvedModel && firstAvailable?.defaultEffort) {
-        resolvedEffort = firstAvailable.defaultEffort;
-      }
-      fallbacks = roster
-        .filter((entry) => entry.available && entry.cliId !== resolvedAgent)
-        .map((entry) => entry.cliId);
-    }
-
-    if (!resolvedModel) {
-      resolvedEffort = undefined;
-    }
-
-    const planSummary =
-      input.planSummary?.trim() ||
-      (role ? `@${role} (${resolvedAgent}): ${firstLine}` : `${resolvedAgent}: ${firstLine}`);
-    const explicitRunId = input.runId?.trim();
-    const inferredRunId =
-      explicitRunId ||
-      reviewRunTarget?.id ||
-      reviewTargetDispatch?.runId ||
-      (input.callerPaneId === undefined
-        ? this.inferRunIdOptional(from)
-        : this.resolveBoardMemberForPane(from)?.runId) ||
-      null;
-    let dispatchRunId = explicitRunId ?? reviewRunTarget?.id ?? reviewTargetDispatch?.runId;
-    if (explicitRunId && input.callerPaneId !== undefined) {
-      this.resolveBoardCallerContext({ from: input.callerPaneId, runId: explicitRunId });
-    }
-    const isReviewDispatch = Boolean(reviewTargetDispatch || reviewRunTarget);
-    const targetRunForAuth = inferredRunId ? this.store.getRun(inferredRunId) : null;
-    const requestedAuthorizeReviews =
-      typeof input.authorizeReviews === 'boolean' ? input.authorizeReviews : undefined;
-    const proposalInput = {
-      coordinatorPaneId: from,
-      runId: inferredRunId,
-      role,
-      task: taskText,
-      deps: [...new Set(input.deps ?? [])].sort(),
-      codeDeps: [...new Set(input.codeDeps ?? [])].sort(),
-      baseBranch: input.baseBranch,
-      ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
-      planSummary: this.store.redactDispatchCredentials(planSummary),
-      requestedAgent,
-      resolvedAgent,
-      taskKind: effectiveTaskKind ?? null,
-      worktree,
-      model: resolvedModel ?? null,
-      effort: resolvedEffort ?? null,
-      terminal: input.terminal?.trim() || null,
-      ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
-      ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
-      ...(allowSubWorkers ? { allowSubWorkers: true } : {}),
-      ...(requestedAuthorizeReviews !== undefined
-        ? { authorizeReviews: requestedAuthorizeReviews }
-        : {}),
-    };
-    // A headless Worker has no chat turn with the person, so chat confirmation becomes a UI card.
-    const confirmMode = this.effectiveConfirmMode(from);
-    // A Coordinator can ask for full-auto only through a proposal the person approves in the UI.
-    if (workerPolicy === 'full-auto' && input.userInitiated !== true && confirmMode !== 'always-ui') {
-      throw new OrchestrationError(
-        'operation_rejected',
-        'A Coordinator cannot start a full-auto Worker on its own. Use workspace-write, or ask the person to start or approve a full-auto Worker in AhaStation.',
-      );
-    }
-    let approvedByPerson = input.userInitiated === true;
-    // Review dispatches bypass repeated confirmation ONLY when the user explicitly pre-authorized
-    // review execution for this Run (via a prior confirmed proposal or UI toggle).
-    const autoReviewBypass = Boolean(isReviewDispatch && targetRunForAuth?.reviewAutoAuthorized);
-    const bypassGate =
-      input.userInitiated === true ||
-      confirmMode === 'auto' ||
-      autoReviewBypass;
-
-    let grantRunAutoReview = Boolean(input.userInitiated === true && requestedAuthorizeReviews === true);
-
-    if (!bypassGate) {
-      if (confirmMode === 'chat-and-guard') {
-        const guard = this.proposals.evaluateChatGuard(
-          proposalInput,
-          Boolean(input.confirmed),
-          input.proposalId,
-          explicitRunId,
-        );
-        if (!guard.allowed) {
-          return {
-            status: 'confirmation_required',
-            proposal: guard.proposal,
-            message: guard.changed
-              ? '派发内容与待确认方案不一致，请让用户重新确认后再派发。'
-              : '尚未经用户确认派发。请先向用户确认拟派角色、Agent、任务、约束与 worktree，待用户回复后带 confirmed=true 和 proposalId 调用 delegate_task。',
-          };
-        }
-        normalizedTaskContext = guard.taskContext;
-        dispatchRunId = guard.proposal.runId ?? undefined;
-        if (isReviewDispatch || guard.proposal.authorizeReviews === true) {
-          grantRunAutoReview = true;
-        }
-      } else if (confirmMode === 'always-ui') {
-        const held = await this.proposals.createHeldProposal(proposalInput, signal);
-        if (held.decision !== 'approved') {
-          return {
-            status: 'rejected',
-            proposal: held.proposal,
-            message:
-              held.reason ||
-              (held.decision === 'expired' ? '派发确认已超时。' : '用户已取消本次派发。'),
-          };
-        }
-        if (typeof held.overrides?.authorizeReviews === 'boolean') {
-          grantRunAutoReview = held.overrides.authorizeReviews;
-        } else if (isReviewDispatch || held.proposal.authorizeReviews === true) {
-          grantRunAutoReview = true;
-        }
-        approvedByPerson = true;
-        if (held.overrides) {
-          if (held.overrides.policy !== undefined) workerPolicy = held.overrides.policy ?? undefined;
-          if (held.overrides.network !== undefined) workerNetwork = held.overrides.network ?? undefined;
-          if (typeof held.overrides.allowSubWorkers === 'boolean') allowSubWorkers = held.overrides.allowSubWorkers;
-          const prevAgent = resolvedAgent;
-          if (held.overrides.agent?.trim()) {
-            resolvedAgent = normalizeWorkerCliId(held.overrides.agent);
-            selectionReason = 'user-override';
-            fallbacks = [];
-          }
-          if (typeof held.overrides.worktree === 'boolean') {
-            worktree = held.overrides.worktree;
-          }
-          if (held.overrides.model !== undefined) {
-            resolvedModel = held.overrides.model?.trim() || undefined;
-          } else if (resolvedAgent !== prevAgent) {
-            const newProfile = roster.find((entry) => entry.cliId === resolvedAgent);
-            resolvedModel = newProfile?.defaultModel ?? undefined;
-          }
-          if (held.overrides.effort !== undefined) {
-            resolvedEffort = held.overrides.effort?.trim() || undefined;
-          } else if (resolvedAgent !== prevAgent) {
-            const newProfile = roster.find((entry) => entry.cliId === resolvedAgent);
-            resolvedEffort = resolvedModel ? (newProfile?.defaultEffort ?? undefined) : undefined;
-          }
-          if (!resolvedModel) {
-            resolvedEffort = undefined;
-          }
-          if (isHeadlessWorkerDriver(resolvedAgent)) {
-            // Switching to a driver without network access drops the Coordinator's request; an explicit override still fails.
-            if (workerNetwork === true && held.overrides.network === undefined && !driverCapabilities(resolvedAgent).network) {
-              workerNetwork = false;
-            }
-            const unsupported = headlessWorkerControlsError(resolvedAgent, {
-              ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
-              ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
-            });
-            if (unsupported) throw new OrchestrationError('operation_rejected', unsupported, { proposalId: held.proposal.id });
-          }
-          if (allowSubWorkers && this.resolveCallerDepth(from) + 1 >= this.maxDepth) allowSubWorkers = false;
-        }
-      }
-    }
-
-    if (proposalInput.deps.length || proposalInput.codeDeps.length) {
-      const run = this.store.requireRun(dispatchRunId ?? inferredRunId ?? '');
-      if (isReviewDispatch) throw new OrchestrationError('invalid_argument', 'Review dispatches already target an immutable snapshot.');
-      if (input.callerPaneId) this.assertRunCoordinator(run.id, input.callerPaneId);
-      const task = this.store.createTask({
-        runId: run.id, spec: taskText, taskTitle, displayName, taskContext: normalizedTaskContext,
-        deps: proposalInput.deps, codeDeps: proposalInput.codeDeps, singleShot: true,
-        queuedLaunch: {
-          from, callerPaneId: input.callerPaneId, callerCwd: input.callerCwd ?? this.sessionCoordinator(from)?.cwd ?? this.terminalTracker?.getTerminal(from)?.cwd ?? this.getDefaultCwd?.(),
-          authorizedNetwork: Boolean(this.sessionCoordinator(from)?.network), requiresPaneMode: this.isPaneOrchestrationMode(from),
-          coordinatorGeneration: run.consumerGeneration, baseBranch: input.baseBranch, agent: resolvedAgent,
-          role, terminal: input.terminal, model: resolvedModel, effort: resolvedEffort, taskKind: effectiveTaskKind,
-          ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
-          ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
-          ...(allowSubWorkers ? { allowSubWorkers: true } : {}),
-          ...(approvedByPerson ? { userInitiated: true } : {}),
-          worktree, authorizeReviews: grantRunAutoReview, state: 'waiting',
-        },
-      });
-      this.emitChanged('task:queued', run.id);
-      return { status: 'queued', task, message: '依赖和派发条件满足后启动。' };
-    }
-
-    const candidates = input.terminal?.trim()
-      ? [resolvedAgent]
-      : [resolvedAgent, ...fallbacks.filter((cli) => cli !== resolvedAgent)];
-    let fallbackFrom: string | null = null;
-    let reusableTaskId: string | undefined;
-
-    for (let i = 0; i < candidates.length; i += 1) {
-      const candidateCli = candidates[i]!;
-      const isFallback = i > 0;
-      const candidateProfile = isFallback
-        ? roster.find((entry) => entry.cliId === candidateCli)
-        : undefined;
-      const candidateModel = isFallback
-        ? (candidateProfile?.defaultModel ?? undefined)
-        : resolvedModel;
-      const candidateEffort = isFallback
-        ? candidateModel
-          ? (candidateProfile?.defaultEffort ?? undefined)
-          : undefined
-        : resolvedEffort;
-      const mcpEnabled = this.isMcpEnabledForCliDep?.(candidateCli) ?? false;
-
-      const existingTask = reusableTaskId ? this.store.getTask(reusableTaskId) : null;
-      if (existingTask && existingTask.status !== 'ready') {
-        this.store.requeueTaskForRetry(reusableTaskId!);
-      }
-
-      try {
-        const started = await this.workerStart({
-          from,
-          runId: dispatchRunId,
-          callerPaneId: input.callerPaneId,
-          ...(reusableTaskId
-            ? { taskId: reusableTaskId }
-            : isReviewDispatch && !input.task?.trim()
-              ? {}
-              : { spec: taskText }),
-          taskKind: effectiveTaskKind,
-          ...(reviewTargetDispatch ? { reviewOf: reviewTargetDispatch.id } : {}),
-          ...(reviewRunTarget ? { reviewRun: reviewRunTarget.id } : {}),
-          ...(reviewFocus ? { reviewFocus } : {}),
-          ...((effectiveTaskKind === 'review' || effectiveTaskKind === 'research') && workerPolicy === undefined
-            ? { readOnly: true } : {}),
-          ...(workerPolicy !== undefined ? { policy: workerPolicy } : {}),
-          ...(workerNetwork !== undefined ? { network: workerNetwork } : {}),
-          ...(allowSubWorkers ? { allowSubWorkers: true } : {}),
-          userInitiated: approvedByPerson,
-          ...(normalizedTaskContext ? { taskContext: normalizedTaskContext } : {}),
-          taskTitle,
-          displayName,
-          name: role || undefined,
-          agent: candidateCli,
-          model: candidateModel,
-          effort: candidateEffort,
-          terminal: input.terminal?.trim() || undefined,
-          noWorktree: !worktree,
-          callerCwd: input.callerCwd,
-          baseBranch: input.baseBranch,
-          mcpEnabled,
-          role: role || undefined,
-        });
-        if (grantRunAutoReview && !started.run.reviewAutoAuthorized) {
-          const updatedRun = this.store.setRunAutoReviewAuthorized(started.run.id, true);
-          if (updatedRun) {
-            started.run = updatedRun;
-            this.emitChanged('run:auto-review-updated', updatedRun.id);
-          }
-        }
-        return {
-          status: 'started',
-          role,
-          agent: started.cliId,
-          selectionReason,
-          fallbackFrom,
-          dispatch: started.dispatch,
-          task: started.task,
-          run: started.run,
-          ptyId: started.ptyId,
-          worktreePath: started.worktreePath,
-          branch: started.branch,
-          ...(started.briefBoardSeq !== undefined ? { briefBoardSeq: started.briefBoardSeq } : {}),
-        };
-      } catch (err) {
-        const canRetryFallback =
-          err instanceof OrchestrationError &&
-          err.code === 'terminal_unavailable' &&
-          !input.terminal?.trim() &&
-          i + 1 < candidates.length;
-        if (!canRetryFallback) {
-          throw err;
-        }
-        if (fallbackFrom === null) {
-          fallbackFrom = resolvedAgent;
-        }
-        if (!isReviewDispatch && typeof err.data?.taskId === 'string' && err.data.taskId) {
-          reusableTaskId = err.data.taskId;
-        }
-      }
-    }
-
-    throw new OrchestrationError(
-      'terminal_unavailable',
-      `Failed to start worker with any candidate CLI (${candidates.join(', ')}).`
-    );
+    }, signal?: AbortSignal): Promise<OrchestrationDelegateTaskResult> {
+    return this.delegation.delegateTask(input, signal);
   }
 
   async workerDoneByPane(
@@ -8836,7 +4547,7 @@ export class OrchestrationService {
       );
     }
     const capability = this.store.getDispatchCapability(active.id);
-    const fromRole = this.resolveRoleNameForDispatch(active).toLowerCase() || undefined;
+    const fromRole = this.delegation.resolveRoleNameForDispatch(active).toLowerCase() || undefined;
     return this.workerDoneWithArtifacts({
       from: cleanCaller,
       dispatchId: active.id,
@@ -8882,189 +4593,26 @@ export class OrchestrationService {
   }
 
   resolveWorkerByRoleOrId(callerPaneId: string, target: string): OrchestrationDispatchRecord {
-    const cleanCaller = callerPaneId.trim();
-    const rawTarget = target.trim();
-    if (!rawTarget) {
-      throw new OrchestrationError('invalid_argument', 'Missing target worker role or dispatch id.');
-    }
-
-    if (rawTarget.startsWith('dispatch:')) {
-      const id = rawTarget.slice('dispatch:'.length).trim();
-      const ctx = this.store.resolveDispatchLineage(id) ?? this.store.getDispatchContext(id);
-      if (ctx) {
-        this.assertWorkerController({ dispatchId: ctx.id }, cleanCaller);
-        return ctx;
-      }
-    }
-
-    const direct = this.store.getDispatchContext(rawTarget);
-    if (direct) {
-      const resolved = this.store.resolveDispatchLineage(direct.id) ?? direct;
-      this.assertWorkerController({ dispatchId: resolved.id }, cleanCaller);
-      return resolved;
-    }
-
-    const cleanRole = rawTarget.replace(/^@+/, '').trim().toLowerCase();
-    const managed = this.listManagedDispatchesForCaller(callerPaneId);
-    const matching = managed.filter((d) => {
-      const roleName = this.resolveRoleNameForDispatch(d).toLowerCase();
-      if (roleName && roleName === cleanRole) return true;
-      const task = this.store.getTask(d.taskId);
-      const taskDisplay = task?.displayName?.trim().replace(/^@+/, '').toLowerCase() ?? '';
-      if (taskDisplay && taskDisplay === cleanRole) return true;
-      return d.assigneePaneId === rawTarget || d.assigneeHandle === rawTarget;
-    });
-
-    if (matching.length > 0) {
-      matching.sort((a, b) => {
-        const aActive = ACTIVE_DISPATCH_STATUSES.has(a.status) ? 1 : 0;
-        const bActive = ACTIVE_DISPATCH_STATUSES.has(b.status) ? 1 : 0;
-        if (aActive !== bActive) return bActive - aActive;
-        return b.createdAt.localeCompare(a.createdAt);
-      });
-      return matching[0]!;
-    }
-
-    throw new OrchestrationError('dispatch_not_found', `Worker not found: ${rawTarget}`);
+    return this.delegation.resolveWorkerByRoleOrId(callerPaneId, target);
   }
 
-  async messageWorkerByRole(
-    callerPaneId: string,
-    input: { role: string; message: string; subject?: string; questionId?: string }
-  ): Promise<
+  messageWorkerByRole(callerPaneId: string, input: { role: string; message: string; subject?: string; questionId?: string }): Promise<
     | ({ mode: 'replied'; dispatch: OrchestrationDispatchRecord } & ReturnType<
         OrchestrationService['reply']
       >)
     | ({ mode: 'sent' | 'reactivated'; dispatch: OrchestrationDispatchRecord } & OrchestrationSendResult)
   > {
-    const cleanMessage = input.message?.trim() ?? '';
-    if (!cleanMessage) {
-      throw new OrchestrationError('invalid_argument', 'Missing message body.');
-    }
-    const dispatch = this.resolveWorkerByRoleOrId(callerPaneId, input.role);
-    this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
-    const questionId = input.questionId?.trim();
-    if (questionId) {
-      const targetQuestion = this.store.getQuestion(questionId);
-      if (!targetQuestion || targetQuestion.dispatchId !== dispatch.id) {
-        throw new OrchestrationError('invalid_argument', 'The question does not belong to the selected worker.');
-      }
-      this.assertCanReply(targetQuestion.messageId, callerPaneId);
-      const replied = this.reply({
-        id: targetQuestion.messageId,
-        body: cleanMessage,
-        from: callerPaneId,
-      });
-      return { mode: 'replied', dispatch, ...replied };
-    }
-    const callerDispatch = this.store.getActiveDispatchForIdentity(callerPaneId, callerPaneId);
-    const senderRole = callerDispatch
-      ? this.resolveRoleNameForDispatch(callerDispatch).toLowerCase() || 'worker'
-      : 'coordinator';
-    const targetRole = this.resolveRoleNameForDispatch(dispatch).toLowerCase() || dispatch.id;
-    const refs = parseBoardRefs(cleanMessage);
-    const sent = await this.send({
-      from: callerPaneId,
-      to: `dispatch:${dispatch.id}`,
-      runId: dispatch.runId,
-      subject: input.subject?.trim() || 'Coordinator message',
-      body: cleanMessage,
-      fromRole: senderRole,
-      mentions: [targetRole],
-      refs: refs.length > 0 ? refs : undefined,
-      kind: 'post',
-    });
-    if (senderRole === 'coordinator') {
-      this.peerPingPong.recordCoordinatorOrUserActivity(dispatch.runId);
-    }
-    if (typeof sent.message.boardSeq === 'number') {
-      this.store.advanceMemberCursor(dispatch.runId, senderRole, {
-        lastPostSeq: sent.message.boardSeq,
-      });
-    }
-    return {
-      mode: sent.followUp ? 'reactivated' : 'sent',
-      dispatch: sent.followUp?.dispatch ?? dispatch,
-      ...sent,
-    };
+    return this.delegation.messageWorkerByRole(callerPaneId, input);
   }
 
-  async manageWorkerByRole(
-    callerPaneId: string,
-    input: {
+  manageWorkerByRole(callerPaneId: string, input: {
       role: string;
       action: 'read' | 'approve' | 'deny' | 'release' | 'stop';
       reason?: string;
       force?: boolean;
       screen?: boolean;
-    }
-  ): Promise<Record<string, unknown>> {
-    const dispatch = this.resolveWorkerByRoleOrId(callerPaneId, input.role);
-    this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
-    switch (input.action) {
-      case 'read': {
-        const output = this.workerRead({
-          dispatchId: dispatch.id,
-          screen: input.screen ?? true,
-        });
-        return { action: 'read', dispatch, output };
-      }
-      case 'approve': {
-        const open = this.approvals.listOpenApprovals({ dispatchId: dispatch.id });
-        if (open.length === 0) {
-          throw new OrchestrationError(
-            'approval_not_found',
-            `No pending permission approval for worker "${input.role}".`
-          );
-        }
-        const res = this.approve(
-          {
-            id: open[0]!.approvalId,
-            dispatchId: dispatch.id,
-            from: callerPaneId,
-            reason: input.reason,
-          },
-          callerPaneId
-        );
-        return { action: 'approve', dispatch, ...res };
-      }
-      case 'deny': {
-        const open = this.approvals.listOpenApprovals({ dispatchId: dispatch.id });
-        if (open.length === 0) {
-          throw new OrchestrationError(
-            'approval_not_found',
-            `No pending permission approval for worker "${input.role}".`
-          );
-        }
-        const res = this.deny(
-          {
-            id: open[0]!.approvalId,
-            dispatchId: dispatch.id,
-            from: callerPaneId,
-            reason: input.reason,
-          },
-          callerPaneId
-        );
-        return { action: 'deny', dispatch, ...res };
-      }
-      case 'release': {
-        this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
-        const res = await this.workerRelease({
-          dispatchId: dispatch.id,
-          force: input.force,
-        });
-        return { action: 'release', ...res };
-      }
-      case 'stop': {
-        this.assertWorkerController({ dispatchId: dispatch.id }, callerPaneId);
-        const res = await this.workerStop({
-          dispatchId: dispatch.id,
-          reason: input.reason,
-          force: input.force,
-        });
-        return { action: 'stop', ...res };
-      }
-    }
+    }): Promise<Record<string, unknown>> {
+    return this.delegation.manageWorkerByRole(callerPaneId, input);
   }
 
   getMcpContextForPane(callerPaneId: string): OrchestrationMcpContext {
@@ -9077,11 +4625,11 @@ export class OrchestrationService {
       ? this.canHeadlessWorkerDelegate(cleanCaller)
       : this.resolveCallerDepth(cleanCaller) < this.maxDepth;
     const roster = this.listCodingAgents(cleanCaller);
-    const managed = this.listManagedDispatchesForCaller(cleanCaller);
+    const managed = this.delegation.listManagedDispatchesForCaller(cleanCaller);
     const workers: OrchestrationMcpWorkerBrief[] = managed.map((d) => {
-      const summary = this.toWorkerSummary(d);
+      const summary = this.workers.toWorkerSummary(d);
       const roleName =
-        this.resolveRoleNameForDispatch(d) ||
+        this.delegation.resolveRoleNameForDispatch(d) ||
         summary.task?.displayName?.trim().replace(/^@+/, '') ||
         d.id;
       return {
@@ -9128,664 +4676,12 @@ export class OrchestrationService {
     return cliId ? this.isMcpEnabledForCliDep(cliId) : false;
   }
 
-  private resolveBoardMemberForPane(
-    ptyId: string
-  ): { runId: string; memberKey: string; role: string; dispatchId?: string } | null {
-    const clean = ptyId.trim();
-    if (!clean) return null;
-    const active = this.store.getActiveDispatchForIdentity(clean, clean);
-    if (active) {
-      const role = this.resolveRoleNameForDispatch(active).toLowerCase() || active.id;
-      return { runId: active.runId, memberKey: role, role, dispatchId: active.id };
-    }
-    const bound = this.store.getCurrentRunForConsumer(clean);
-    if (bound && (bound.coordinatorPaneId === clean || bound.coordinatorHandle === clean)) {
-      return { runId: bound.id, memberKey: 'coordinator', role: 'coordinator' };
-    }
-    for (const run of this.store.listRuns({ status: 'active' })) {
-      if (run.coordinatorPaneId === clean || run.coordinatorHandle === clean) {
-        return { runId: run.id, memberKey: 'coordinator', role: 'coordinator' };
-      }
-    }
-    return null;
-  }
-
-  private findRunWorkerByRole(
-    runId: string,
-    targetRole: string
-  ): OrchestrationDispatchRecord | undefined {
-    const cleanRole = targetRole.trim().replace(/^@+/, '').toLowerCase();
-    if (!cleanRole) return undefined;
-    const byHeadId = new Map<string, OrchestrationDispatchRecord>();
-    for (const d of this.store.listDispatches({ runId })) {
-      const head = this.store.resolveDispatchLineage(d.id) ?? d;
-      byHeadId.set(head.id, head);
-    }
-    const matches = [...byHeadId.values()].filter((d) => {
-      const roleName = this.resolveRoleNameForDispatch(d).toLowerCase();
-      if (roleName && roleName === cleanRole) return true;
-      const task = this.store.getTask(d.taskId);
-      const taskDisplay = task?.displayName?.trim().replace(/^@+/, '').toLowerCase() ?? '';
-      if (taskDisplay && taskDisplay === cleanRole) return true;
-      return d.id.toLowerCase() === cleanRole;
-    });
-    if (matches.length === 0) return undefined;
-    matches.sort((a, b) => {
-      const aActive = ACTIVE_DISPATCH_STATUSES.has(a.status) ? 1 : 0;
-      const bActive = ACTIVE_DISPATCH_STATUSES.has(b.status) ? 1 : 0;
-      if (aActive !== bActive) return bActive - aActive;
-      return b.createdAt.localeCompare(a.createdAt);
-    });
-    return matches[0];
-  }
-
-  private doesBoardPostWakeMember(
-    msg: OrchestrationMessageRecord,
-    memberRole: string,
-    memberHandle: string,
-    runId: string,
-    activeDispatchId?: string
-  ): boolean {
-    if (msg.runId !== runId || msg.type === 'heartbeat' || msg.lifecycleRejectedReason !== null) {
-      return false;
-    }
-    const normMember = memberRole.toLowerCase();
-    const normFromRole = msg.fromRole?.trim().replace(/^@+/, '').toLowerCase() ?? '';
-    if (normFromRole && normFromRole === normMember) return false;
-    if (msg.fromHandle === memberHandle) return false;
-    if (activeDispatchId && msg.fromHandle === `dispatch:${activeDispatchId}`) return false;
-
-    const mentions = msg.mentions ?? [];
-    if (mentions.includes(normMember)) {
-      return true;
-    }
-    if (
-      mentions.includes('all') &&
-      (normFromRole === 'coordinator' || normFromRole === 'user' || normFromRole === 'system')
-    ) {
-      return true;
-    }
-
-    if (normMember === 'coordinator') {
-      if (
-        msg.kind === 'report' ||
-        msg.kind === 'approval' ||
-        msg.kind === 'question' ||
-        msg.kind === 'stall' ||
-        msg.type === 'worker_done' ||
-        msg.type === 'decision_gate'
-      ) {
-        return true;
-      }
-      if (
-        msg.kind === 'post' ||
-        msg.kind === 'handoff' ||
-        msg.kind === 'answer' ||
-        msg.kind === 'brief'
-      ) {
-        return normFromRole === 'user' && mentions.length === 0;
-      }
-      if (msg.toHandle === `run:${runId}` || msg.toHandle === memberHandle) {
-        return true;
-      }
-      return false;
-    }
-
-    if (activeDispatchId && msg.toHandle === `dispatch:${activeDispatchId}`) {
-      return msg.kind !== 'brief';
-    }
-    if (msg.toHandle === memberHandle) {
-      return true;
-    }
-    return false;
-  }
-
-  private findUndeliveredBoardPostsForPane(ptyId: string): OrchestrationMessageRecord[] {
-    const member = this.resolveBoardMemberForPane(ptyId);
-    if (!member) return [];
-    const cursor = this.store.getMemberCursor(member.runId, member.memberKey);
-    const firewall = this.getReviewFirewallContext(ptyId);
-    return this.store.listBoardPosts(member.runId, {
-      since: cursor.lastDeliveredSeq,
-      limit: 50,
-      matches: (post) =>
-        !this.store.wasBoardPostRead(post.id, member.memberKey) &&
-        !(firewall && this.isPostHiddenByReviewFirewall(post, firewall)) &&
-        this.doesBoardPostWakeMember(post, member.role, ptyId, member.runId, member.dispatchId),
-    });
-  }
-
   buildBoardTeamSummary(runId: string): string {
-    const headSeq = this.store.getHeadBoardSeq(runId);
-    const byHeadId = new Map<string, OrchestrationDispatchRecord>();
-    for (const d of this.store.listDispatches({ runId })) {
-      const head = this.store.resolveDispatchLineage(d.id) ?? d;
-      byHeadId.set(head.id, head);
-    }
-    const workers = [...byHeadId.values()].map((d) => {
-      const summary = this.toWorkerSummary(d);
-      const role =
-        this.resolveRoleNameForDispatch(d) ||
-        summary.task?.displayName?.trim().replace(/^@+/, '') ||
-        d.id;
-      return {
-        role,
-        cliId: d.cliId ?? null,
-        stage: summary.stage,
-        openApprovalCount: summary.openApprovals.length,
-        openQuestionCount: summary.openQuestions.length + summary.openNativeQuestions.length,
-      };
-    });
-    const pendingProposalCount = this.proposals.listPendingProposals({ runId }).length;
-    return formatBoardTeamSummary({ headSeq, workers, pendingProposalCount });
+    return this.board.buildBoardTeamSummary(runId);
   }
 
-  private notifyBoardPost(
-    runId: string,
-    msg: OrchestrationMessageRecord,
-    woke: readonly string[],
-    senderPaneId?: string
-  ): void {
-    this.waiters.notify(`board:${runId}:all`, msg.type);
-    const run = this.store.getRun(runId);
-
-    const schedulePane = (paneId: string | null | undefined) => {
-      if (!paneId || paneId === senderPaneId) return;
-      this.waiters.notify(paneId, msg.type);
-      this.waiters.notify(`board-pane:${paneId}`, msg.type);
-      if (HEADLESS_WORKER_ID.test(paneId)) {
-        const member = this.resolveBoardMemberForPane(paneId);
-        if (member?.runId === runId && this.store.wasBoardPostRead(msg.id, member.memberKey)) return;
-        this.queueCodexMail(paneId, msg);
-        this.deliverCodexMailbox(paneId);
-      } else {
-        this.pointerDelivery.scheduleRedriveForPane(paneId);
-      }
-    };
-
-    const wokeSet = new Set(woke);
-    if (wokeSet.has('all')) {
-      this.waiters.notifyPrefix(`board:${runId}:role:`, msg.type);
-      this.waiters.notify(`run:${runId}`, msg.type);
-      if (run?.coordinatorPaneId && run.coordinatorPaneId !== senderPaneId) {
-        schedulePane(run.coordinatorPaneId);
-      }
-      for (const d of this.store.listDispatches({ runId })) {
-        if (!ACTIVE_DISPATCH_STATUSES.has(d.status)) continue;
-        this.waiters.notify(`dispatch:${d.id}`, msg.type);
-        schedulePane(d.assigneePaneId ?? d.assigneeHandle);
-      }
-      return;
-    }
-
-    if (wokeSet.has('coordinator')) {
-      this.waiters.notify(`board:${runId}:role:coordinator`, msg.type);
-      this.waiters.notify(`run:${runId}`, msg.type);
-      schedulePane(run?.coordinatorPaneId ?? run?.coordinatorHandle);
-    }
-
-    for (const targetRole of wokeSet) {
-      if (targetRole === 'coordinator' || targetRole === 'all' || targetRole === 'user') continue;
-      this.waiters.notify(`board:${runId}:role:${targetRole}`, msg.type);
-      const targetDispatch = this.findRunWorkerByRole(runId, targetRole);
-      if (targetDispatch && ACTIVE_DISPATCH_STATUSES.has(targetDispatch.status)) {
-        this.waiters.notify(`dispatch:${targetDispatch.id}`, msg.type);
-        schedulePane(targetDispatch.assigneePaneId ?? targetDispatch.assigneeHandle);
-      }
-    }
-  }
-
-  private resolveBoardCallerContext(input: {
-    from: string;
-    runId?: string;
-    isUser?: boolean;
-  }): {
-    runId: string;
-    fromHandle: string;
-    callerRole: string;
-    memberKey: string;
-    isPrivileged: boolean;
-    activeDispatch?: OrchestrationDispatchRecord;
-  } {
-    const isUser = input.isUser === true;
-    if (isUser) {
-      const explicitRunId = input.runId?.trim();
-      const resolvedRunId =
-        explicitRunId ||
-        this.inferRunIdOptional(input.from) ||
-        this.store.listRuns({ status: 'active' }).at(-1)?.id ||
-        this.store.listRuns().at(-1)?.id;
-      if (!resolvedRunId) {
-        throw new OrchestrationError(
-          'run_not_found',
-          'No orchestration run found for board access.'
-        );
-      }
-      this.store.requireRun(resolvedRunId);
-      return {
-        runId: resolvedRunId,
-        fromHandle: 'user',
-        callerRole: 'user',
-        memberKey: 'user',
-        isPrivileged: true,
-      };
-    }
-
-    const fromHandle = input.from?.trim() || 'coordinator';
-    const explicitRunId = input.runId?.trim();
-    const activeDispatch = this.store.getActiveDispatchForIdentity(fromHandle, fromHandle);
-    if (activeDispatch) {
-      if (explicitRunId && explicitRunId !== activeDispatch.runId) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          'Workers may only access their own run board.'
-        );
-      }
-      const workerRole =
-        this.resolveRoleNameForDispatch(activeDispatch).toLowerCase() || activeDispatch.id;
-      return {
-        runId: activeDispatch.runId,
-        fromHandle,
-        callerRole: workerRole,
-        memberKey: workerRole,
-        isPrivileged: false,
-        activeDispatch,
-      };
-    }
-
-    const isCoordinatorForRun = (run: OrchestrationRunRecord, handle: string): boolean => {
-      if (handle === 'coordinator') return true;
-      if (run.coordinatorPaneId === handle || run.coordinatorHandle === handle) return true;
-      return this.store.getCurrentRunForConsumer(handle)?.id === run.id;
-    };
-
-    // Check if caller coordinates an explicit or bound run before falling back to settled worker history.
-    if (fromHandle === 'coordinator') {
-      const resolvedRunId =
-        explicitRunId ||
-        this.inferRunIdOptional(fromHandle) ||
-        this.store.listRuns({ status: 'active' }).at(-1)?.id ||
-        this.store.listRuns().at(-1)?.id;
-      if (!resolvedRunId) {
-        throw new OrchestrationError(
-          'run_not_found',
-          'No active run specified or bound to caller. Start a worker or create a run first.'
-        );
-      }
-      this.store.requireRun(resolvedRunId);
-      return {
-        runId: resolvedRunId,
-        fromHandle,
-        callerRole: 'coordinator',
-        memberKey: 'coordinator',
-        isPrivileged: true,
-      };
-    }
-
-    const boundRun = this.store.getCurrentRunForConsumer(fromHandle);
-    const ownedRuns = this.store
-      .listRuns()
-      .filter((r) => isCoordinatorForRun(r, fromHandle));
-    const coordinatedExplicitRun = explicitRunId
-      ? ownedRuns.find((r) => r.id === explicitRunId)
-      : undefined;
-
-    if (coordinatedExplicitRun) {
-      return {
-        runId: coordinatedExplicitRun.id,
-        fromHandle,
-        callerRole: 'coordinator',
-        memberKey: 'coordinator',
-        isPrivileged: true,
-      };
-    }
-
-    // Keep settled/kept-open worker panes strictly scoped to their own run as non-privileged workers.
-    const latestSettledDispatch = this.store
-      .listDispatches()
-      .filter((d) => d.assigneePaneId === fromHandle || d.assigneeHandle === fromHandle)
-      .at(-1);
-    if (latestSettledDispatch) {
-      const isCoordOfSettledRun = ownedRuns.some((r) => r.id === latestSettledDispatch.runId);
-      if (!isCoordOfSettledRun) {
-        if (explicitRunId && explicitRunId !== latestSettledDispatch.runId) {
-          throw new OrchestrationError(
-            'operation_rejected',
-            'Workers may only access their own run board.'
-          );
-        }
-        const workerRole =
-          this.resolveRoleNameForDispatch(latestSettledDispatch).toLowerCase() ||
-          latestSettledDispatch.id;
-        return {
-          runId: latestSettledDispatch.runId,
-          fromHandle,
-          callerRole: workerRole,
-          memberKey: workerRole,
-          isPrivileged: false,
-        };
-      }
-    }
-
-    if (explicitRunId) {
-      const targetRun = this.store.requireRun(explicitRunId);
-      if (!isCoordinatorForRun(targetRun, fromHandle)) {
-        throw new OrchestrationError(
-          'operation_rejected',
-          `Caller ${fromHandle} is not the coordinator of run ${targetRun.id}.`
-        );
-      }
-      return {
-        runId: targetRun.id,
-        fromHandle,
-        callerRole: 'coordinator',
-        memberKey: 'coordinator',
-        isPrivileged: true,
-      };
-    }
-
-    const resolvedRun =
-      (boundRun && isCoordinatorForRun(boundRun, fromHandle) ? boundRun : undefined) ??
-      ownedRuns.filter((r) => r.status === 'active').at(-1) ??
-      ownedRuns.at(-1);
-    if (!resolvedRun) {
-      throw new OrchestrationError(
-        'run_not_found',
-        'No active run specified or bound to caller. Start a worker or create a run first.'
-      );
-    }
-    return {
-      runId: resolvedRun.id,
-      fromHandle,
-      callerRole: 'coordinator',
-      memberKey: 'coordinator',
-      isPrivileged: true,
-    };
-  }
-
-  async boardPost(input: BoardPostInput) {
-    const reference = input.replyTo === undefined || input.replyTo === null ? '' : String(input.replyTo).trim();
-    if (!reference) return this.publishBoardPost(input);
-    const caller = this.resolveBoardCallerContext(input);
-    const seq = /^#?(\d+)$/.exec(reference);
-    const original = seq
-      ? this.store.listBoardPosts(caller.runId, { seqs: [Number(seq[1])] })[0]
-      : this.store.getMessageById(reference);
-    const firewall = this.getReviewFirewallContext(input.from);
-    if (!original?.fromRole || !original.boardSeq || original.runId !== caller.runId ||
-        original.lifecycleRejectedReason ||
-        !original.mentions?.some((m) => m.replace(/^@+/, '').toLowerCase() === caller.memberKey) ||
-        (firewall && this.isPostHiddenByReviewFirewall(original, firewall))) {
-      throw new OrchestrationError('invalid_argument', 'replyTo must identify a visible post addressed to your role in this Run.');
-    }
-    if (original.type === 'question' || original.type === 'worker_done' || original.kind === 'approval') {
-      throw new OrchestrationError('invalid_argument', 'Use the dedicated question, completion or approval action for this post.');
-    }
-    const result = await this.publishBoardPost(input, original);
-    this.store.recordBoardRead(caller.runId, caller.memberKey, [original.id]);
-    if (this.store.recordBoardReceipt([original.id], caller.memberKey, 'replied')) this.emitChanged('board:delivery', caller.runId);
-    return result;
-  }
-
-  private async publishBoardPost(input: BoardPostInput, original?: OrchestrationMessageRecord): Promise<{
-    post: OrchestrationExposedMessage;
-    boardSeq: number;
-    headSeq: number;
-    woke: string[];
-    escalatedToCoordinator: boolean;
-  }> {
-    const text = input.text?.trim() ?? '';
-    if (!text) {
-      throw new OrchestrationError('invalid_argument', 'Board post text cannot be empty.');
-    }
-
-    const caller = this.resolveBoardCallerContext({
-      from: input.from,
-      runId: input.runId,
-      isUser: input.isUser,
-    });
-    const runId = caller.runId;
-    const callerRole = original || caller.isPrivileged
-      ? caller.callerRole
-      : input.fromRole?.trim().replace(/^@+/, '').toLowerCase() || caller.callerRole;
-    const mentions = parseBoardMentions(text);
-    const refs = parseBoardRefs(text);
-    const replyAuthorRole = original?.fromRole?.trim().replace(/^@+/, '').toLowerCase();
-    if (replyAuthorRole && !mentions.includes(replyAuthorRole)) mentions.push(replyAuthorRole);
-    if (original?.boardSeq && !refs.includes(original.boardSeq)) refs.push(original.boardSeq);
-    const threadId = original?.threadId ?? original?.id;
-    const woke = new Set<string>();
-    let escalatedToCoordinator = false;
-    const senderPaneId = input.isUser ? undefined : caller.fromHandle;
-
-    if (caller.isPrivileged) {
-      this.peerPingPong.recordCoordinatorOrUserActivity(runId);
-
-      // A single settled target reuses the follow-up message as its board post.
-      if (mentions.length === 1 && mentions[0] !== 'all' && mentions[0] !== 'coordinator' && mentions[0] !== 'user') {
-        const targetRole = mentions[0]!;
-        const targetDispatch = this.findRunWorkerByRole(runId, targetRole);
-        if (targetDispatch) {
-          // Settled (and not released) worker mentioned by coordinator/user -> reactivate!
-          if (!ACTIVE_DISPATCH_STATUSES.has(targetDispatch.status) && !targetDispatch.releasedAt) {
-            const sent = await this.followUpSettledWorker(targetDispatch, {
-              from: caller.fromHandle,
-              to: `dispatch:${targetDispatch.id}`,
-              threadId,
-              subject: input.subject?.trim() || `Board follow-up from @${callerRole}`,
-              body: text,
-              fromRole: callerRole,
-              mentions: [targetRole],
-              refs: refs.length > 0 ? refs : undefined,
-              kind: input.kind ?? 'post',
-            });
-            const boardSeq = sent.message.boardSeq ?? this.store.getHeadBoardSeq(runId);
-            this.store.advanceMemberCursor(runId, callerRole, {
-              lastPostSeq: boardSeq,
-            });
-            const storedMsg = this.store.getMessageById(sent.message.id);
-            if (storedMsg) {
-              this.notifyBoardPost(runId, storedMsg, [targetRole], senderPaneId);
-            }
-            this.emitChanged('board:posted', runId);
-            return {
-              post: sent.message,
-              boardSeq,
-              headSeq: this.store.getHeadBoardSeq(runId),
-              woke: [targetRole],
-              escalatedToCoordinator: false,
-            };
-          }
-        }
-      }
-
-      // Multi-mention or active worker / @all / general coordinator or user board post.
-      const settledToReactivate: Array<{
-        dispatch: OrchestrationDispatchRecord;
-        role: string;
-      }> = [];
-      let singleActiveWorkerDispatch: OrchestrationDispatchRecord | null = null;
-
-      for (const mention of mentions) {
-        if (mention === 'all') {
-          woke.add('all');
-        } else if (mention === 'coordinator') {
-          if (input.isUser) woke.add('coordinator');
-        } else if (mention === 'user') {
-          // Visible to human user in Board UI.
-        } else {
-          const targetDispatch = this.findRunWorkerByRole(runId, mention);
-          if (!targetDispatch) continue;
-          if (!ACTIVE_DISPATCH_STATUSES.has(targetDispatch.status) && !targetDispatch.releasedAt) {
-            settledToReactivate.push({ dispatch: targetDispatch, role: mention });
-            woke.add(mention);
-          } else if (ACTIVE_DISPATCH_STATUSES.has(targetDispatch.status)) {
-            woke.add(mention);
-            if (mentions.length === 1) {
-              singleActiveWorkerDispatch = targetDispatch;
-            }
-          }
-        }
-      }
-
-      // Human user posting without explicit @mention still wakes coordinator so human guidance is noticed.
-      if (input.isUser && mentions.length === 0) {
-        woke.add('coordinator');
-      }
-
-      const toHandle = woke.has('all')
-        ? '@all'
-        : singleActiveWorkerDispatch
-          ? `dispatch:${singleActiveWorkerDispatch.id}`
-          : `run:${runId}`;
-
-      const msg = this.store.insertMessage({
-        runId,
-        from: caller.fromHandle,
-        to: toHandle,
-        threadId,
-        type: 'status',
-        priority: input.isUser ? 'high' : 'normal',
-        subject: input.subject?.trim() || text.split(/\r?\n/)[0]!.slice(0, 80),
-        body: text,
-        fromRole: callerRole,
-        mentions: mentions.length > 0 ? mentions : undefined,
-        refs: refs.length > 0 ? refs : undefined,
-        kind: input.kind ?? 'post',
-      });
-
-      const boardSeq = msg.boardSeq ?? this.store.getHeadBoardSeq(runId);
-      this.store.advanceMemberCursor(runId, callerRole, {
-        lastPostSeq: boardSeq,
-      });
-
-      for (const item of settledToReactivate) {
-        await this.followUpSettledWorker(item.dispatch, {
-          from: caller.fromHandle,
-          to: `dispatch:${item.dispatch.id}`,
-          subject: input.subject?.trim() || `Board follow-up from @${callerRole}`,
-          body: text,
-          fromRole: callerRole,
-          mentions: [item.role],
-          refs: refs.length > 0 ? refs : undefined,
-          kind: input.kind ?? 'post',
-          existingMessage: msg,
-        });
-      }
-
-      this.notifyBoardPost(runId, msg, [...woke], senderPaneId);
-      this.emitChanged('board:posted', runId);
-      return {
-        post: exposeMessage(msg),
-        boardSeq,
-        headSeq: this.store.getHeadBoardSeq(runId),
-        woke: [...woke],
-        escalatedToCoordinator: false,
-      };
-    }
-
-    // Worker posting on board: enforce Controlled P2P Guardrails.
-    const peerMode: OrchestrationPeerMessagingMode =
-      this.getPeerMessagingModeDep?.() ?? 'controlled-p2p';
-    const effectiveMentions = new Set<string>();
-    let hasPeerMention = false;
-    let singleDirectPeerDispatch: OrchestrationDispatchRecord | null = null;
-    const redirectedRoles: string[] = [];
-
-    for (const mention of mentions) {
-      if (mention === callerRole) continue;
-      if (mention === 'all') {
-        // Worker @all is posted publicly on the board, but NEVER wakes peers.
-        effectiveMentions.add('all');
-        continue;
-      }
-      if (mention === 'coordinator') {
-        effectiveMentions.add('coordinator');
-        woke.add('coordinator');
-        continue;
-      }
-      if (mention === 'user') {
-        effectiveMentions.add('user');
-        continue;
-      }
-
-      const targetDispatch = this.findRunWorkerByRole(runId, mention);
-      // Workers may ONLY wake active sibling workers (never reactivate settled/released siblings).
-      if (!targetDispatch || !ACTIVE_DISPATCH_STATUSES.has(targetDispatch.status)) {
-        effectiveMentions.add(mention);
-        continue;
-      }
-
-      hasPeerMention = true;
-      if (peerMode === 'hub-only') {
-        escalatedToCoordinator = true;
-        redirectedRoles.push(mention);
-        woke.add('coordinator');
-        effectiveMentions.add('coordinator');
-      } else {
-        const exchange = this.peerPingPong.recordPeerExchange(
-          runId,
-          callerRole,
-          mention,
-          DEFAULT_PEER_PING_PONG_LIMIT
-        );
-        effectiveMentions.add(mention);
-        woke.add(mention);
-        if (woke.size === 1 && !exchange.exceeded) {
-          singleDirectPeerDispatch = targetDispatch;
-        }
-        if (exchange.exceeded) {
-          escalatedToCoordinator = true;
-          woke.add('coordinator');
-          effectiveMentions.add('coordinator');
-          singleDirectPeerDispatch = null;
-        }
-      }
-    }
-
-    const postKind: OrchestrationBoardPostKind =
-      input.kind ?? (hasPeerMention ? 'handoff' : 'post');
-    const finalBody =
-      redirectedRoles.length > 0
-        ? `${text}\n[Hub-only mode: peer handoff to ${redirectedRoles.map((r) => `@${r}`).join(', ')} redirected to @coordinator]`
-        : text;
-    const toHandle =
-      singleDirectPeerDispatch && woke.size === 1
-        ? `dispatch:${singleDirectPeerDispatch.id}`
-        : `run:${runId}`;
-
-    const msg = this.store.insertMessage({
-      runId,
-      from: caller.activeDispatch ? `dispatch:${caller.activeDispatch.id}` : caller.fromHandle,
-      to: toHandle,
-      threadId,
-      type: postKind === 'handoff' ? 'handoff' : 'status',
-      priority: escalatedToCoordinator ? 'high' : 'normal',
-      subject: input.subject?.trim() || text.split(/\r?\n/)[0]!.slice(0, 80),
-      body: finalBody,
-      fromRole: callerRole,
-      mentions: effectiveMentions.size > 0 ? [...effectiveMentions] : undefined,
-      refs: refs.length > 0 ? refs : undefined,
-      kind: postKind,
-    });
-
-    const boardSeq = msg.boardSeq ?? this.store.getHeadBoardSeq(runId);
-    this.store.advanceMemberCursor(runId, callerRole, {
-      lastPostSeq: boardSeq,
-    });
-    if (caller.activeDispatch) {
-      this.store.recordHeartbeat(caller.activeDispatch.id);
-    }
-
-    this.notifyBoardPost(runId, msg, [...woke], senderPaneId);
-    this.emitChanged('board:posted', runId);
-    return {
-      post: exposeMessage(msg),
-      boardSeq,
-      headSeq: this.store.getHeadBoardSeq(runId),
-      woke: [...woke],
-      escalatedToCoordinator,
-    };
+  boardPost(input: BoardPostInput) {
+    return this.board.boardPost(input);
   }
 
   boardRead(input: {
@@ -9804,65 +4700,17 @@ export class OrchestrationService {
     formatted: string;
     teamSummary: string;
   } {
-    const caller = this.resolveBoardCallerContext({
-      from: input.from,
-      runId: input.runId,
-      isUser: input.isUser,
-    });
-    const firewall = input.isUser ? null : this.getReviewFirewallContext(input.from);
-    const posts = this.store.listBoardPosts(caller.runId, {
-      since: input.since,
-      seqs: input.seqs,
-      limit: input.limit,
-      matches: firewall ? post => !this.isPostHiddenByReviewFirewall(post, firewall) : undefined,
-    });
-    const headSeq = this.store.getHeadBoardSeq(caller.runId);
-    const isNamedSeqLookup = Boolean(input.seqs && input.seqs.length > 0);
-    if (input.markRead !== false && !input.isUser) {
-      const ids = posts.map(post => post.id);
-      if (isNamedSeqLookup) this.store.recordBoardRead(caller.runId, caller.memberKey, ids);
-      if (this.store.recordBoardReceipt(ids, caller.memberKey, 'delivered')) this.emitChanged('board:delivery', caller.runId);
-    }
-    if (input.markRead !== false && posts.length > 0 && !isNamedSeqLookup) {
-      const maxSeq = Math.max(...posts.map((p) => p.boardSeq ?? 0));
-      if (maxSeq > 0) {
-        this.store.advanceMemberCursor(caller.runId, caller.memberKey, {
-          lastReadSeq: maxSeq,
-          lastDeliveredSeq: maxSeq,
-        });
-      }
-      this.store.markAsReadAndDeliveredForConsumer(
-        posts.map((p) => p.id),
-        caller.fromHandle
-      );
-    }
-    const cursor = this.store.getMemberCursor(caller.runId, caller.memberKey);
-    const formatted =
-      posts.length > 0
-        ? posts.map((post) => formatBoardPostForAgent(post)).join('\n\n')
-        : '(no board posts)';
-    const teamSummary = this.buildBoardTeamSummary(caller.runId);
-    return {
-      runId: caller.runId,
-      headSeq,
-      lastReadSeq: cursor.lastReadSeq,
-      posts: exposeMessages(this.store, posts),
-      formatted,
-      teamSummary,
-    };
+    return this.board.boardRead(input);
   }
 
-  async boardWait(
-    input: {
+  boardWait(input: {
       runId?: string;
       from: string;
       since?: number;
       mentionsOnly?: boolean;
       peek?: boolean;
       timeoutMs?: number;
-    },
-    signal?: AbortSignal
-  ): Promise<{
+    }, signal?: AbortSignal): Promise<{
     runId: string;
     headSeq: number;
     lastReadSeq: number;
@@ -9872,303 +4720,20 @@ export class OrchestrationService {
     timedOut: boolean;
     cancelled: boolean;
   }> {
-    const caller = this.resolveBoardCallerContext({
-      from: input.from,
-      runId: input.runId,
-    });
-    const runId = caller.runId;
-    const mentionsOnly = input.mentionsOnly !== false;
-    // A targeted wait can skip general posts that a later full-board wait still needs.
-    const readPosition = (position: OrchestrationMemberCursor) => mentionsOnly
-      ? Math.max(position.lastReadSeq, position.lastMentionReadSeq ?? 0)
-      : position.lastReadSeq;
-    const explicitSince =
-      typeof input.since === 'number' && Number.isFinite(input.since)
-        ? Math.max(0, Math.floor(input.since))
-        : undefined;
-    const timeoutMs = input.timeoutMs ?? ORCHESTRATION_MESSAGE_WAIT_DEFAULT_TIMEOUT_MS;
-
-    const firewall = this.getReviewFirewallContext(input.from);
-    const findMatchingBatch = () => this.store.listBoardPosts(runId, {
-      since: explicitSince ?? readPosition(this.store.getMemberCursor(runId, caller.memberKey)),
-      limit: 200,
-      matches: (post) => {
-        if (firewall && this.isPostHiddenByReviewFirewall(post, firewall)) return false;
-        if (mentionsOnly && explicitSince === undefined && this.store.wasBoardPostRead(post.id, caller.memberKey)) return false;
-        if (!mentionsOnly) {
-          const fromRole = post.fromRole?.trim().replace(/^@+/, '').toLowerCase() ?? '';
-          if (fromRole === caller.callerRole || post.fromHandle === caller.fromHandle) {
-            return false;
-          }
-          if (caller.activeDispatch && post.fromHandle === `dispatch:${caller.activeDispatch.id}`) {
-            return false;
-          }
-          return true;
-        }
-        return this.doesBoardPostWakeMember(
-          post,
-          caller.callerRole,
-          caller.fromHandle,
-          runId,
-          caller.activeDispatch?.id
-        );
-      },
-    });
-
-    const buildReturn = (
-      posts: OrchestrationMessageRecord[],
-      flags: { timedOut: boolean; cancelled: boolean }
-    ) => {
-      if (!input.peek && posts.length > 0) {
-        const maxSeq = Math.max(...posts.map((p) => p.boardSeq ?? 0));
-        if (maxSeq > 0) {
-          this.store.advanceMemberCursor(runId, caller.memberKey, {
-            ...(mentionsOnly ? { lastMentionReadSeq: maxSeq } : { lastReadSeq: maxSeq }),
-            lastDeliveredSeq: maxSeq,
-          });
-        }
-        this.store.recordBoardReceipt(posts.map(p => p.id), caller.memberKey, 'delivered');
-        this.store.markAsReadAndDeliveredForConsumer(
-          posts.map((p) => p.id),
-          caller.fromHandle
-        );
-        this.emitChanged('board:read', runId);
-      }
-      const nextCursor = this.store.getMemberCursor(runId, caller.memberKey);
-      const formatted =
-        posts.length > 0
-          ? posts.map((post) => formatBoardPostForAgent(post)).join('\n\n')
-          : '';
-      return {
-        runId,
-        headSeq: this.store.getHeadBoardSeq(runId),
-        lastReadSeq: readPosition(nextCursor),
-        posts: exposeMessages(this.store, posts),
-        formatted,
-        teamSummary: this.buildBoardTeamSummary(runId),
-        timedOut: flags.timedOut,
-        cancelled: flags.cancelled,
-      };
-    };
-
-    const deadline = Date.now() + timeoutMs;
-    while (true) {
-      const ready = findMatchingBatch();
-      if (ready.length || input.peek) {
-        return buildReturn(ready, { timedOut: false, cancelled: false });
-      }
-      if (signal?.aborted) {
-        return buildReturn([], { timedOut: false, cancelled: true });
-      }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        return buildReturn([], { timedOut: true, cancelled: false });
-      }
-
-      const internalAbort = new AbortController();
-      const onExternalAbort = () => internalAbort.abort();
-      signal?.addEventListener('abort', onExternalAbort, { once: true });
-
-      const handles = [
-        `board:${runId}:role:${caller.callerRole}`,
-        `board-pane:${caller.fromHandle}`,
-      ];
-      if (!mentionsOnly) {
-        handles.push(`board:${runId}:all`);
-      }
-
-      let outcome: MessageWake | 'timed_out' | 'cancelled';
-      try {
-        outcome = await Promise.race(
-          handles.map((handle) =>
-            this.waiters.wait(handle, {
-              timeoutMs: remaining,
-              signal: internalAbort.signal,
-              consumerHandle: caller.fromHandle,
-            })
-          )
-        );
-      } finally {
-        signal?.removeEventListener('abort', onExternalAbort);
-        internalAbort.abort();
-      }
-
-      if (outcome === 'cancelled') {
-        return buildReturn([], { timedOut: false, cancelled: true });
-      }
-      if (outcome === 'timed_out') {
-        const lastCheck = findMatchingBatch();
-        if (lastCheck.length) {
-          return buildReturn(lastCheck, { timedOut: false, cancelled: false });
-        }
-        return buildReturn([], { timedOut: true, cancelled: false });
-      }
-    }
+    return this.board.boardWait(input, signal);
   }
 
   consumeMidTurnBoardInjections(ptyId: string): string | null {
-    const member = this.resolveBoardMemberForPane(ptyId);
-    if (!member) return null;
-    const matched = this.findUndeliveredBoardPostsForPane(ptyId);
-    if (matched.length === 0) return null;
-
-    const maxDelivered = Math.max(...matched.map((p) => p.boardSeq ?? 0));
-    if (maxDelivered > 0) {
-      this.store.advanceMemberCursor(member.runId, member.memberKey, {
-        lastDeliveredSeq: maxDelivered,
-      });
-    }
-    this.store.markAsDeliveredForConsumer(
-      matched.map((p) => p.id),
-      ptyId
-    );
-
-    const MAX_CHARS = 1_200;
-    const header = `[AhaStation Board Update — @${member.role}]`;
-    const body = matched.map((p) => formatBoardPostForAgent(p)).join('\n\n');
-    const full = `${header}\n${body}`;
-    if (full.length <= MAX_CHARS) {
-      const ids = matched.map(post => post.id);
-      this.store.recordBoardRead(member.runId, member.memberKey, ids);
-      this.store.recordBoardReceipt(ids, member.memberKey, 'delivered');
-      return full;
-    }
-    const suffix = `\n… (call ${boardLookupCommands(matched) ?? 'read_board'} for full details)`;
-    const budget = Math.max(0, MAX_CHARS - suffix.length);
-    return `${full.slice(0, budget).trimEnd()}${suffix}`;
-  }
-
-  private listCoordinatorReadUnansweredQuestions(
-    runId: string,
-    pendingQuestions?: readonly OrchestrationQuestionRecord[]
-  ): OrchestrationQuestionRecord[] {
-    const pending = pendingQuestions ?? this.store.listQuestions({ runId, status: 'pending' });
-    const runMailbox = `run:${runId}`;
-    // Broad read_board calls advance the cursor without recording exact reads, so a post counts
-    // as seen when it was either read exactly or lies within the coordinator's broad-read cursor.
-    const coordinatorCursor = this.store.getMemberCursor(runId, 'coordinator');
-    return pending.filter((question) => {
-      if (question.toHandle !== runMailbox) return false;
-      if (this.store.wasBoardPostRead(question.messageId, 'coordinator')) return true;
-      const boardSeq = this.store.getMessageById(question.messageId)?.boardSeq;
-      return typeof boardSeq === 'number' && boardSeq <= coordinatorCursor.lastReadSeq;
-    });
-  }
-
-  private inspectRunsForStallWatchdog(): BoardStallRunState[] {
-    const states: BoardStallRunState[] = [];
-    for (const run of this.store.listRuns({ status: 'active' })) {
-      const dispatches = this.store.listDispatches({ runId: run.id });
-      const headDispatches = new Map<string, OrchestrationDispatchRecord>();
-      for (const d of dispatches) {
-        const head = this.store.resolveDispatchLineage(d.id) ?? d;
-        headDispatches.set(head.id, head);
-      }
-      const heads = [...headDispatches.values()];
-      let hasActiveWorkers = false;
-      let hasSettledOrWaitingWorkers = false;
-      for (const d of heads) {
-        const stage = this.deriveLiveStage(d);
-        if (ACTIVE_DISPATCH_STATUSES.has(d.status) && (stage === 'starting' || stage === 'working')) {
-          hasActiveWorkers = true;
-        } else {
-          hasSettledOrWaitingWorkers = true;
-        }
-      }
-
-      const pendingQuestions = this.store.listQuestions({ runId: run.id, status: 'pending' });
-      const coordinatorReadUnanswered = new Set(
-        this.listCoordinatorReadUnansweredQuestions(run.id, pendingQuestions).map((question) => question.messageId)
-      );
-      const hasPendingStoreQuestion = pendingQuestions.some(
-        (question) => !coordinatorReadUnanswered.has(question.messageId)
-      );
-      const hasPendingAttention =
-        this.approvals.listOpenApprovals({ runId: run.id }).length > 0 ||
-        this.nativeQuestions.listOpenQuestions({ runId: run.id }).length > 0 ||
-        hasPendingStoreQuestion ||
-        this.store.listGates({ runId: run.id, status: 'pending' }).length > 0 ||
-        this.proposals.listPendingProposals({ runId: run.id }).length > 0;
-
-      const coordPaneId = run.coordinatorPaneId;
-      const coordStatus = coordPaneId ? this.agentStatusStore.get(coordPaneId) : null;
-      const coordSession = coordPaneId ? this.sessionCoordinator(coordPaneId) : null;
-      const coordinatorIdle = coordSession?.active
-        ? coordSession.idle === true
-        : !coordStatus || coordStatus.state === 'idle' || coordStatus.state === 'done';
-      const coordinatorHasWaiter = Boolean(
-        (coordPaneId &&
-          (this.waiters.hasActiveWaiterFor(coordPaneId) ||
-            this.waiters.hasActiveWaiterFor(`board-pane:${coordPaneId}`))) ||
-          this.waiters.hasActiveWaiterFor(`run:${run.id}`) ||
-          this.waiters.hasActiveWaiterFor(`board:${run.id}:role:coordinator`)
-      );
-
-      const latestPosts = this.store.listBoardPosts(run.id, { limit: 1 });
-      const lastPost = latestPosts[latestPosts.length - 1];
-      const headSeq = this.store.getHeadBoardSeq(run.id);
-      const lastPostAtMs = lastPost ? Date.parse(lastPost.createdAt) : Date.parse(run.updatedAt);
-      const lastPostIsDone = Boolean(
-        lastPost &&
-          (/\[\s*done\s*\]/i.test(lastPost.body) ||
-            lastPost.kind === 'stall')
-      );
-
-      states.push({
-        runId: run.id,
-        coordinatorPaneId: coordPaneId,
-        coordinatorIdle,
-        coordinatorHasWaiter,
-        hasActiveWorkers,
-        hasSettledOrWaitingWorkers,
-        hasPendingAttention,
-        headSeq,
-        lastPostAtMs: Number.isFinite(lastPostAtMs) ? lastPostAtMs : this.clock(),
-        lastPostIsDone,
-      });
-    }
-    return states;
-  }
-
-  private handleBoardStallDetected(runId: string, headSeq: number, idleMs: number): void {
-    const run = this.store.getRun(runId);
-    if (!run || run.status !== 'active') return;
-    const secs = Math.max(1, Math.round(idleMs / 1000));
-    const readUnansweredQuestions = this.listCoordinatorReadUnansweredQuestions(runId);
-    const readUnansweredSummary = readUnansweredQuestions
-      .map((question) => {
-        const boardSeq = this.store.getMessageById(question.messageId)?.boardSeq;
-        const seqLabel = typeof boardSeq === 'number' ? `#${boardSeq}` : '#?';
-        return `${seqLabel} (questionId ${question.messageId})`;
-      })
-      .join(', ');
-    const body = readUnansweredQuestions.length > 0
-      ? `@coordinator You already read ${readUnansweredQuestions.length} unanswered question(s): ${readUnansweredSummary}. Answer each with message_worker using its questionId. No active workers and board quiet for ${secs}s since #${headSeq} — review reports, follow up, or wrap up the run.`
-      : `@coordinator No active workers and board has been quiet for ${secs}s since #${headSeq}. Review reports, follow up, or wrap up the run.`;
-    const msg = this.store.insertMessage({
-      runId,
-      from: 'system',
-      to: `run:${runId}`,
-      type: 'escalation',
-      priority: 'normal',
-      subject: `Board stall detected at #${headSeq}`,
-      body,
-      fromRole: 'system',
-      mentions: ['coordinator'],
-      refs: headSeq > 0 ? [headSeq] : undefined,
-      kind: 'stall',
-    });
-    this.notifyBoardPost(runId, msg, ['coordinator']);
-    this.emitChanged('board:stalled', runId);
+    return this.board.consumeMidTurnBoardInjections(ptyId);
   }
 
   // ==================== Snapshot & Agent Text Views ====================
 
   private withHeadlessLive(dispatch: OrchestrationDispatchRecord): OrchestrationDispatchRecord {
     if (dispatch.executionMode !== 'codex-app-server') return dispatch;
-    const session = this.codexWorkers.get(dispatch.assigneeHandle);
+    const session = this.workers.codexWorkers.get(dispatch.assigneeHandle);
     const alive = Boolean(session?.alive && !dispatch.releasedAt);
-    const busy = alive && (session!.busy || this.codexSubmitting.has(dispatch.id));
+    const busy = alive && (session!.busy || this.workers.codexSubmitting.has(dispatch.id));
     return { ...dispatch, headlessLive: { alive, busy } };
   }
 
@@ -10184,9 +4749,9 @@ export class OrchestrationService {
         Object.entries(base.currentRunByConsumer).filter(([, id]) => id === scope),
       );
       if (base.activeCoordinatorRun?.runId !== scope) base.activeCoordinatorRun = null;
-      const firewall = this.getReviewFirewallContext(callerPaneId);
+      const firewall = this.review.getReviewFirewallContext(callerPaneId);
       if (firewall) {
-        base.messages = base.messages.filter((message) => !this.isPostHiddenByReviewFirewall(message, firewall)).map(({ receipts: _receipts, ...message }) => message);
+        base.messages = base.messages.filter((message) => !this.review.isPostHiddenByReviewFirewall(message, firewall)).map(({ receipts: _receipts, ...message }) => message);
         base.runs = base.runs.map(({ finalizedBatches: _batches, integrationIntent: _intent, ...run }) => run);
         base.dispatches = base.dispatches.filter((dispatch) => !firewall.targetDispatchIds.has(dispatch.id));
         base.tasks = base.tasks.filter((task) => !firewall.targetTaskIds.has(task.id));
@@ -10224,345 +4789,16 @@ export class OrchestrationService {
   }
 
   formatActionReceiptText(action: string, data: unknown, options: { full?: boolean } = {}): string {
-    const record = (typeof data === 'object' && data !== null ? data : {}) as Record<
-      string,
-      unknown
-    >;
-
-    if (action === 'check') {
-      const formatted = typeof record.formatted === 'string' ? record.formatted : '';
-      const count = typeof record.count === 'number' ? record.count : 0;
-      const deliveryId = typeof record.deliveryId === 'string' ? record.deliveryId : null;
-      const mailbox = typeof record.mailbox === 'string' ? record.mailbox : '';
-      const header = formatAgentFieldsText(
-        [
-          ['Mailbox', mailbox],
-          ['Messages', String(count)],
-          ['Delivery', deliveryId],
-          ['Acknowledged', typeof record.acknowledged === 'string' ? record.acknowledged : null],
-          ['Replayed', record.replayed ? 'true' : undefined],
-          ['TimedOut', record.timedOut ? 'true' : undefined],
-          ['Cancelled', record.cancelled ? 'true' : undefined],
-        ],
-        count > 0
-          ? deliveryId
-            ? `Review the messages above; acknowledgment ${deliveryId} recorded.`
-            : 'Messages checked.'
-          : 'No unread messages.'
-      );
-      if (count === 0) return header;
-      if (options.full && formatted) {
-        return `${header}\n\n${formatted}`;
-      }
-      return formatted ? `${header}\n\n${formatted}` : header;
-    }
-
-    if (action === 'inbox') {
-      const messages = Array.isArray(record.messages)
-        ? (record.messages as OrchestrationExposedMessage[])
-        : [];
-      const count = typeof record.count === 'number' ? record.count : messages.length;
-      const mailbox = typeof record.mailbox === 'string' ? record.mailbox : '';
-      const header = formatAgentFieldsText(
-        [
-          ['Mailbox', mailbox],
-          ['Messages', String(count)],
-        ],
-        count > 0 ? 'Inbox history (read-only).' : 'Inbox is empty.'
-      );
-      if (messages.length === 0) return header;
-      const banners = messages
-        .map((m) =>
-          formatMessageBanner(
-            {
-              ...m,
-              seq: 0,
-              read: true,
-            },
-            { cliCommand: this.cliCommand, followUp: m.followUp }
-          )
-        )
-        .join('\n\n');
-      return `${header}\n\n${banners}`;
-    }
-
-    if (action === 'send') {
-      const msg = record.message as OrchestrationExposedMessage | undefined;
-      const followUp = record.followUp as
-        | {
-            previousDispatchId?: string;
-            dispatch?: OrchestrationDispatchRecord;
-            task?: OrchestrationTaskRecord;
-            reusedPane?: boolean;
-          }
-        | undefined;
-      return formatAgentFieldsText(
-        [
-          ['Message', msg?.id],
-          ['From', msg?.fromHandle],
-          ['To', msg?.toHandle],
-          ['Type', msg?.type],
-          ['Run', msg?.runId],
-          ['ReactivatedDispatch', followUp?.dispatch?.id],
-          ['ReactivatedTask', followUp?.task?.id],
-          ['ReusedPane', followUp ? (followUp.reusedPane ? 'true' : 'false') : undefined],
-        ],
-        followUp
-          ? `Settled worker ${followUp.previousDispatchId} reactivated as ${followUp.dispatch?.id}.`
-          : 'Message sent.'
-      );
-    }
-
-    if (action === 'worker-done' || action === 'task-done' || action === 'task-fail') {
-      const task = record.task as OrchestrationTaskRecord | undefined;
-      const dispatch = record.dispatch as OrchestrationDispatchRecord | undefined;
-      return formatAgentFieldsText(
-        [
-          ['Task', task?.id],
-          ['TaskStatus', task?.status],
-          ['Dispatch', dispatch?.id],
-          ['DispatchStatus', dispatch?.status],
-        ],
-        'Worker completion report settled.'
-      );
-    }
-
-    if (action === 'worker-start') {
-      const dispatch = record.dispatch as OrchestrationDispatchRecord | undefined;
-      const task = record.task as OrchestrationTaskRecord | undefined;
-      return formatAgentFieldsText(
-        [
-          ['Dispatch', dispatch?.id],
-          ['Worker', typeof record.ptyId === 'string' ? record.ptyId : dispatch?.assigneePaneId],
-          ['Task', task?.id],
-          ['Run', dispatch?.runId],
-          ['Agent', typeof record.cliId === 'string' ? record.cliId : dispatch?.cliId],
-          ['Model', typeof record.model === 'string' ? record.model : dispatch?.model],
-          ['Effort', typeof record.effort === 'string' ? record.effort : dispatch?.effort],
-          ['Worktree', typeof record.worktreePath === 'string' ? record.worktreePath : null],
-          ['Branch', typeof record.branch === 'string' ? record.branch : null],
-          ['OwnsWorktree', record.ownsWorktree ? 'true' : 'false'],
-        ],
-        `${dispatch?.startObservation === 'observed' ? 'Worker started' : 'Dispatch observation: ' + (dispatch?.startObservation ?? 'pending')}. Wait for updates with: ${this.cliCommand} orchestration check --wait`
-      );
-    }
-
-    if (action === 'worker-show') {
-      const dispatch = record.dispatch as OrchestrationDispatchRecord | undefined;
-      const task = record.task as OrchestrationTaskRecord | null | undefined;
-      return formatAgentFieldsText(
-        [
-          ['Dispatch', dispatch?.id],
-          ['Worker', dispatch?.assigneePaneId ?? dispatch?.assigneeHandle],
-          ['Stage', typeof record.stage === 'string' ? record.stage : dispatch?.stage],
-          ['Status', dispatch?.status],
-          ['PaneAlive', record.paneAlive ? 'true' : 'false'],
-          ['Task', task?.id],
-          ['Agent', dispatch?.cliId],
-          ['Model', dispatch?.model],
-          ['Effort', dispatch?.effort],
-          ['Generation', String(dispatch?.processGeneration ?? 1)],
-          ['Worktree', dispatch?.worktreePath],
-          ['Branch', dispatch?.branch],
-          ['FollowUpChild', typeof record.followUpChildDispatchId === 'string' ? record.followUpChildDispatchId : null],
-        ],
-        dispatch ? `Worker ${dispatch.id} (${String(record.stage ?? dispatch.status)}).` : 'Worker details.'
-      );
-    }
-
-    if (action === 'worker-read') {
-      const text = typeof record.text === 'string' ? record.text : '';
-      const header = formatAgentFieldsText([
-        ['Dispatch', typeof record.dispatchId === 'string' ? record.dispatchId : undefined],
-        ['Terminal', typeof record.ptyId === 'string' ? record.ptyId : undefined],
-        ['Mode', record.screen ? 'screen' : 'cursor'],
-        ['Cursor', typeof record.cursor === 'number' ? String(record.cursor) : undefined],
-        ['NextCursor', typeof record.nextCursor === 'number' ? String(record.nextCursor) : undefined],
-        ['HasMore', record.hasMore ? 'true' : 'false'],
-        ['Archived', record.archived ? 'true' : undefined],
-      ]);
-      return text ? `${header}\n\n${text}` : `${header}\n\n(empty)`;
-    }
-
-    if (action === 'worker-release' || action === 'worker-stop') {
-      const dispatch = record.dispatch as OrchestrationDispatchRecord | undefined;
-      return formatAgentFieldsText(
-        [
-          ['Dispatch', dispatch?.id],
-          ['Stage', dispatch?.stage],
-          ['ClosedPane', record.closedPane ? 'true' : 'false'],
-          ['RemovedWorktree', record.removedWorktree ? 'true' : 'false'],
-        ],
-        action === 'worker-release' ? 'Worker released.' : 'Worker stopped.'
-      );
-    }
-
-    if (action === 'worker-abandon') {
-      const dispatch = record.dispatch as OrchestrationDispatchRecord | undefined;
-      return formatAgentFieldsText(
-        [
-          ['Dispatch', dispatch?.id],
-          ['Status', dispatch?.status],
-          ['Warning', typeof record.warning === 'string' ? record.warning : undefined],
-        ],
-        'Worker dispatch abandoned.'
-      );
-    }
-
-    if (action === 'reset') {
-      const removed = (record.removed ?? {}) as Record<string, unknown>;
-      return formatAgentFieldsText(
-        [
-          ['Scope', typeof record.reset === 'string' ? record.reset : undefined],
-          ['RemovedRuns', removed.runs !== undefined ? String(removed.runs) : undefined],
-          ['RemovedTasks', removed.tasks !== undefined ? String(removed.tasks) : undefined],
-          ['RemovedDispatches', removed.dispatches !== undefined ? String(removed.dispatches) : undefined],
-          ['RemovedMessages', removed.messages !== undefined ? String(removed.messages) : undefined],
-        ],
-        'Orchestration state reset.'
-      );
-    }
-
-    if (action === 'approve' || action === 'deny') {
-      const approval = record.approval as WorkerApprovalPayload | undefined;
-      return formatAgentFieldsText(
-        [
-          ['Approval', approval?.approvalId],
-          ['Status', approval?.status],
-          ['Dispatch', approval?.dispatchId],
-          ['Tool', approval?.toolName],
-          ['Reason', approval?.reason ?? null],
-        ],
-        action === 'approve' ? 'Permission approved.' : 'Permission denied.'
-      );
-    }
-
-    if (action === 'ask') {
-      const pending = record.pending === true;
-      return formatAgentFieldsText(
-        [
-          ['Question', String(record.messageId ?? '')],
-          ['Pending', pending ? 'true' : 'false'],
-          ['Answer', typeof record.answer === 'string' ? record.answer : null],
-          ['TimedOut', record.timedOut ? 'true' : undefined],
-        ],
-        pending
-          ? `Question pending; resume with: ${this.cliCommand} orchestration ask --resume ${String(record.messageId ?? '')} --wait`
-          : 'Question answered.'
-      );
-    }
-
-    if (action === 'reply') {
-      const msg = record.message as OrchestrationExposedMessage | undefined;
-      return formatAgentFieldsText(
-        [
-          ['Reply', msg?.id],
-          ['To', msg?.toHandle],
-          ['Thread', msg?.threadId],
-          ['Duplicate', record.duplicate ? 'true' : undefined],
-        ],
-        'Reply delivered.'
-      );
-    }
-
-    if (action === 'task-show') {
-      const task = record.task as OrchestrationTaskRecord | undefined;
-      const latestDispatch = record.latestDispatch as OrchestrationDispatchRecord | null | undefined;
-      const gates = Array.isArray(record.gates) ? record.gates : [];
-      return formatAgentFieldsText(
-        [
-          ['Task', task?.id],
-          ['Title', task?.taskTitle],
-          ['Status', task?.status],
-          ['Run', task?.runId],
-          ['Deps', task?.deps?.length ? task.deps.join(', ') : null],
-          ['LatestDispatch', latestDispatch?.id ?? null],
-          ['DispatchStatus', latestDispatch?.status ?? null],
-          ['Gates', String(gates.length)],
-        ],
-        task ? `Task ${task.id} (${task.status}).` : 'Task details.'
-      );
-    }
-
-    if (action === 'coordinator-status') {
-      const counts = (record.taskCounts ?? {}) as Partial<
-        OrchestrationCoordinatorStatusResult['taskCounts']
-      >;
-      return formatAgentFieldsText(
-        [
-          ['Running', record.running ? 'true' : 'false'],
-          ['Run', typeof record.runId === 'string' ? record.runId : null],
-          ['Tasks', counts.total !== undefined ? String(counts.total) : undefined],
-          ['Ready', counts.ready !== undefined ? String(counts.ready) : undefined],
-          ['Dispatched', counts.dispatched !== undefined ? String(counts.dispatched) : undefined],
-          ['Completed', counts.completed !== undefined ? String(counts.completed) : undefined],
-          [
-            'ActiveDispatches',
-            typeof record.activeDispatches === 'number' ? String(record.activeDispatches) : undefined,
-          ],
-          [
-            'PendingGates',
-            typeof record.pendingGates === 'number' ? String(record.pendingGates) : undefined,
-          ],
-        ],
-        record.running ? 'Coordinator is running.' : 'Coordinator is idle.'
-      );
-    }
-
-    if (action === 'agents') {
-      const agents = Array.isArray(record.agents)
-        ? (record.agents as OrchestrationAgentRosterEntry[])
-        : [];
-      if (agents.length === 0) {
-        return 'No coding agents discovered.';
-      }
-      return agents
-        .map((a) => {
-          const state = a.available
-            ? 'available'
-            : !a.installed
-              ? 'not-installed'
-              : 'disabled';
-          const idle = a.idlePanes.length > 0 ? `, ${a.idlePanes.length} idle pane(s)` : '';
-          const model = a.defaultModel ? `, model=${a.defaultModel}` : '';
-          const mcp = a.mcpReady ? `mcp=${a.mcpMode}` : 'mcp=fallback';
-          return `- ${a.cliId} (${a.label}) [${state}; ${mcp}${model}${idle}]: ${a.specialty}`;
-        })
-        .join('\n');
-    }
-
-    if (action === 'delegate-task') {
-      if (record.status === 'confirmation_required' || record.status === 'rejected') {
-        return typeof record.message === 'string' ? record.message : JSON.stringify(data, null, 2);
-      }
-      const dispatch = record.dispatch as OrchestrationDispatchRecord | undefined;
-      return formatAgentFieldsText(
-        [
-          ['Role', typeof record.role === 'string' && record.role ? `@${record.role}` : null],
-          ['Agent', typeof record.agent === 'string' ? record.agent : dispatch?.cliId],
-          ['Dispatch', dispatch?.id],
-          ['Worker', typeof record.ptyId === 'string' ? record.ptyId : dispatch?.assigneePaneId],
-          ['FallbackFrom', typeof record.fallbackFrom === 'string' ? record.fallbackFrom : null],
-          ['Worktree', typeof record.worktreePath === 'string' ? record.worktreePath : null],
-          ['Branch', typeof record.branch === 'string' ? record.branch : null],
-        ],
-        'Task delegated.'
-      );
-    }
-
-    return JSON.stringify(data, null, 2);
+    return formatActionReceiptText(action, data, { ...options, cliCommand: this.cliCommand });
   }
 
   hasCodexWorkers(): boolean {
-    return this.codexWorkers.size > 0;
+    return this.workers.hasCodexWorkers();
   }
 
   async stopCodexWorkers(): Promise<void> {
     this.disposed = true;
-    await Promise.all([
-      ...[...this.codexWorkers.values()].map((codex) => codex.close(true)),
-      ...this.pendingCodexTurnDiffs,
-    ]);
+    await this.workers.closeAllCodexWorkers();
   }
 
   dispose(): void {
@@ -10647,7 +4883,7 @@ export class OrchestrationService {
             );
             if (latest.reviewOfDispatchId || latest.reviewOfRunId) {
               this.store.updateDispatchReviewState(dispatchId, { reviewStatus: 'rejected' });
-              this.reconcileAnyReviewBatch(dispatchId, {
+              this.review.reconcileAnyReviewBatch(dispatchId, {
                 overrideVerdict: 'reject',
                 failedReason: 'Deferred reviewer prompt delivery failed',
               });
@@ -10787,10 +5023,10 @@ export class OrchestrationService {
     }
     // Runs before retirement and outside the loop: a run whose only reviewer was already failed
     // elsewhere has no active dispatch left to put it in `runIds`.
-    this.settleUnreportedReviewDispatches();
+    this.review.settleUnreportedReviewDispatches();
     for (const runId of runIds) {
       this.retireFinishedSpawnedWorkers(runId);
     }
-    this.retireFinishedCodexWorkers();
+    this.workers.retireFinishedCodexWorkers();
   }
 }

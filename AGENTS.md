@@ -80,6 +80,10 @@ node --import ./tests/register-electron-stub.mjs --test --test-concurrency=2 tes
   writer via `orchestration-state-repository.ts`. Group multi-entity writes in `store.runMutation(fn)`
   (synchronous, validate before mutating, no rollback) and `await store.flushDurable()` before
   crash-sensitive side effects (queue claims, integration intent, reconciliation evidence).
+- `orchestration-service.ts` keeps auth, runs/tasks, messaging and the coordinator loop, and delegates to
+  `board-service.ts`, `review-service.ts`, `integration-service.ts`, `delegation-service.ts` and
+  `worker-lifecycle-service.ts` (receipt text: `orchestration-text-views.ts`). Each sub-service reaches
+  the service only through its explicit `*Host` interface and imports it as a type only.
 - `src/components/AgentSessionView.tsx` + `src/components/agent-session/` — headless Worker
   session UI; pure logic lives in `src/lib/worker-timeline-model.ts` and
   `src/lib/timeline-scroll-anchoring.ts`.
