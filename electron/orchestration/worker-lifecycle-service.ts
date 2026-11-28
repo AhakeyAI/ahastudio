@@ -2660,6 +2660,19 @@ export class OrchestrationWorkerLifecycleService {
     }
   }
 
+  async workerRetire({ dispatchId }: { dispatchId: string }) {
+    const d = this.host.store.getDispatchContext(dispatchId);
+    if (!d) throw new OrchestrationError('operation_rejected', '找不到指定的 Worker');
+    return this.mutateWorkerResources(d, () => {
+      if (d.releasedAt) throw new OrchestrationError('operation_rejected', 'Worker 已释放');
+      if (!d.residentAfterIntegration) throw new OrchestrationError('operation_rejected', '只有合入后常驻的 Worker 可以退休');
+      if (ACTIVE_DISPATCH_STATUSES.has(d.status) || this.codexWorkers.get(d.assigneeHandle)?.busy || this.codexSubmitting.has(d.id)) {
+        throw new OrchestrationError('operation_rejected', 'Worker 仍在执行任务，暂不能退休');
+      }
+      return this.releaseWorker(d, {}, undefined, true);
+    });
+  }
+
   async workerRelease(input: {
     dispatchId?: string;
     worker?: string;

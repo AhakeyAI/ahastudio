@@ -1,3 +1,4 @@
+import { cleanupTerminal } from './cleanup-outbox.js';
 import { ACTIVE_DISPATCH_STATUSES } from './orchestration-lifecycle-graph.js';
 import { OrchestrationError, UNBOUND_RUN_ID } from './orchestration-types.js';
 import type { OrchestrationStoreState } from './orchestration-state-repository.js';
@@ -90,7 +91,7 @@ export class OrchestrationSecurityStore extends OrchestrationStoreSlice {
   }
 
   protectedRunReason(runId: string): string | null {
-    if (this.state.cleanupOutbox.some(e => e.runId === runId && e.status !== 'done')) return '资源清理尚未完成';
+    if (this.state.cleanupOutbox.some(e => e.runId === runId && !cleanupTerminal(e))) return '资源清理尚未完成';
     const run = this.state.runs.get(runId);
     if (run?.integrationIntent) return 'Git 操作中断，交付位置待核对';
     if (run?.integrationStatus === 'active' || run?.integrationStatus === 'conflict') return '集成分支尚未交付';

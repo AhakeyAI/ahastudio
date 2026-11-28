@@ -685,7 +685,7 @@ export interface OrchestrationWorkerHandoff {
 
 export type OrchestrationObservationFactKind =
   | 'turn_started' | 'turn_completed' | 'approval' | 'native_question' | 'snapshot'
-  | 'dormant' | 'resumed' | 'handoff' | 'integrated' | 'wave_started';
+  | 'dormant' | 'resumed' | 'handoff' | 'integrated' | 'wave_started' | 'cleanup_dismissed';
 
 /**
  * Append-only record of something that happened to a Worker attempt, for audit and recovery.
@@ -729,7 +729,10 @@ export interface OrchestrationPersistedState {
 }
 
 export interface OrchestrationSnapshot {
-  cleanupAttention?: Pick<import('./cleanup-outbox.js').OrchestrationCleanupOutboxEntry, 'id' | 'kind' | 'runId' | 'dispatchId' | 'attempts' | 'lastError'>[];
+  cleanupAttention?: Array<Pick<import('./cleanup-outbox.js').OrchestrationCleanupOutboxEntry,
+    'id' | 'kind' | 'runId' | 'dispatchId' | 'worktreePath' | 'attempts' | 'lastError' | 'updatedAt' | 'nextAttemptAt'> & {
+      status: 'needs_attention' | 'pending'; branch: string | null;
+    }>;
   runs: OrchestrationRunRecord[];
   tasks: OrchestrationTaskWithDispatch[];
   dispatches: OrchestrationDispatchRecord[];

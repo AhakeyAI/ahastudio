@@ -1,3 +1,4 @@
+import { cleanupTerminal } from './cleanup-outbox.js';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { isProcessTreeAlive } from '../agent-drivers/process-tree.js';
@@ -829,7 +830,7 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
 
   saveCleanupEntry(entry: import('./cleanup-outbox.js').OrchestrationCleanupOutboxEntry) {
     const entries = this.state.cleanupOutbox.filter(e => e.id !== entry.id);
-    const done = entries.filter(e => e.status === 'done');
+    const done = entries.filter(cleanupTerminal);
     if (done.length >= 64) entries.splice(entries.indexOf(done[0]), 1);
     if (entries.length >= 4096 && !this.state.cleanupOutbox.some(e => e.id === entry.id)) throw new Error('Cleanup outbox full; manual attention required');
     entries.push({ ...entry, lastError: entry.lastError && this.security.redactDispatchCredentials(entry.lastError).slice(0, 500) });

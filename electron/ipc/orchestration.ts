@@ -838,6 +838,15 @@ export function registerOrchestrationIpc(ctx: IpcContext): { dispose: () => void
     handler: (payload) => act(() => requireService().workerKeepOpen(payload)),
   });
 
+  handleSecure('orchestration:cleanup-resolve', {
+    schema: z.object({ entryId: nonEmptyId, action: z.enum(['recheck', 'dismiss']) }).strict(), authorize, authorizeError,
+    handler: payload => act(() => requireService().cleanupResolve(payload)),
+  });
+  handleSecure('orchestration:worker-retire', {
+    schema: z.object({ dispatchId: nonEmptyId }).strict(), authorize, authorizeError,
+    handler: payload => act(() => requireService().workerRetire(payload)),
+  });
+
   handleSecure('orchestration:worker-release', {
     schema: workerReleaseSchema,
     authorize,

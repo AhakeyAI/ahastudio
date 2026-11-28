@@ -23,13 +23,18 @@ export interface CleanupIntent {
 }
 export interface OrchestrationCleanupOutboxEntry extends CleanupIntent {
   id: string;
-  status: 'pending' | 'done' | 'needs_attention';
+  status: 'pending' | 'done' | 'needs_attention' | 'dismissed';
   attempts: number;
   createdAt: number;
   updatedAt: number;
   nextAttemptAt?: number;
   lastError?: string;
   locked?: boolean;
+}
+type Entry = OrchestrationCleanupOutboxEntry;
+export function cleanupTerminal(e: Entry) { return e.status === 'done' || e.status === 'dismissed'; }
+export function cleanupNeedsUser(e: Entry): e is Entry & { status: 'pending' | 'needs_attention' } {
+  return e.status === 'needs_attention' || (e.status === 'pending' && e.attempts >= 6);
 }
 export function pathKey(path: string): string {
   return process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path);
@@ -50,7 +55,7 @@ export interface CleanupHost {
   now(): number;
   disposed(): boolean;
   guard(intent: CleanupIntent): void;
-  lock(entry: CleanupIntent, fn: () => Promise<void>): Promise<void>;
+  lock<T>(entry: CleanupIntent, fn: () => Promise<T>): Promise<T>;
   execute(entry: CleanupIntent, force: boolean, guard: () => void): Promise<CleanupResult>;
 }
 
@@ -69,25 +74,25 @@ export class CleanupOutbox {
     this.check(intent);
     const { store } = this.host;
     const now = this.host.now();
-    const entries = store.listCleanupEntries().filter(e => e.kind === intent.kind && pathKey(e.repoRootPath) === pathKey(intent.repoRootPath));
+    const entries = store.listCleanupEntries().filter(e => !cleanupTerminal(e) && e.kind === intent.kind && pathKey(e.repoRootPath) === pathKey(intent.repoRootPath));
     const previous = entries.find(e => pathKey(e.worktreePath) === pathKey(intent.worktreePath));
-    if (intent.deleteBranch && entries.some(e => e.id !== previous?.id && e.status !== 'done' && e.deleteBranch && e.worktreeBranch === intent.worktreeBranch)) {
+    if (intent.deleteBranch && entries.some(e => e.id !== previous?.id && e.deleteBranch && e.worktreeBranch === intent.worktreeBranch)) {
       throw new CleanupAttention('Branch already has an outstanding cleanup intent');
     }
     // A later wave may legitimately reuse a completed resource name. Never rebase an outstanding CAS.
     const unlock = manualForce && force && previous?.locked && previous.dispatchId === intent.dispatchId && previous.worktreeBranch === intent.worktreeBranch && (!previous.deleteBranch || previous.expectedBranchOid === intent.expectedBranchOid);
-    if (!unlock && previous && previous.status !== 'done' && (previous.dispatchId !== intent.dispatchId || previous.runId !== intent.runId || previous.worktreeBranch !== intent.worktreeBranch || previous.expectedBranchOid !== intent.expectedBranchOid || !!previous.deleteBranch !== !!intent.deleteBranch)) throw new CleanupAttention('Another cleanup intent already owns this resource');
-    const entry: OrchestrationCleanupOutboxEntry = previous && previous.status !== 'done' && !unlock ? previous : {
+    if (!unlock && previous && (previous.dispatchId !== intent.dispatchId || previous.runId !== intent.runId || previous.worktreeBranch !== intent.worktreeBranch || previous.expectedBranchOid !== intent.expectedBranchOid || !!previous.deleteBranch !== !!intent.deleteBranch)) throw new CleanupAttention('Another cleanup intent already owns this resource');
+    const entry: OrchestrationCleanupOutboxEntry = previous && !unlock ? previous : {
       ...intent, id: previous?.id ?? randomUUID(), status: 'pending', attempts: 0, createdAt: now, updatedAt: now,
     };
     if (entry.status === 'needs_attention') throw new CleanupAttention(entry.lastError);
     store.runMutation(() => store.saveCleanupEntry(entry));
-    try {
-      return await this.attempt(entry, force && (!previous || previous.status === 'done' || !!unlock));
-    } catch (error) {
-      if (error instanceof CleanupBranchRetained) return { removed: true, removedBranch: false };
-      throw error;
+    const outcome = await this.attempt(entry, force && (!previous || !!unlock));
+    if ('error' in outcome) {
+      if (outcome.error instanceof CleanupBranchRetained) return { removed: true, removedBranch: false };
+      throw outcome.error;
     }
+    return outcome.result;
   }
 
   private async attempt(entry: OrchestrationCleanupOutboxEntry, force: boolean) {
@@ -105,11 +110,11 @@ export class CleanupOutbox {
         if (err instanceof CleanupDeferred) throw err;
         const attempts = entry.attempts + 1;
         const reason = err instanceof CleanupBranchRetained ? err.reason : err;
-        const attention = reason instanceof CleanupAttention || attempts >= 6;
+        const attention = reason instanceof CleanupAttention;
         store.saveCleanupEntry({ ...entry, attempts, status: attention ? 'needs_attention' : 'pending',
-          locked: err instanceof CleanupLocked, lastError: String(err), updatedAt: this.host.now(), nextAttemptAt: attention ? undefined : this.host.now() + 1000 * 2 ** (attempts - 1) });
+          locked: err instanceof CleanupLocked, lastError: String(err), updatedAt: this.host.now(), nextAttemptAt: attention ? undefined : this.host.now() + Math.min(1000 * 2 ** (attempts - 1), 600_000) });
         await store.flushDurable();
-        throw err;
+        return { error: err } as const;
       }
       store.runMutation(() => {
         if (entry.dispatchId) store.markDispatchReleased(entry.dispatchId, { keepPane: true, keepWorktree: false });
@@ -119,8 +124,35 @@ export class CleanupOutbox {
         store.saveCleanupEntry({ ...entry, status: 'done', attempts: entry.attempts + 1, updatedAt: this.host.now(), lastError: undefined, nextAttemptAt: undefined });
       });
       await store.flushDurable();
-      return result;
+      return { result } as const;
     } finally { this.busy.delete(entry.id); }
+  }
+
+  async resolve(entryId: string, action: 'recheck' | 'dismiss') {
+    const { store } = this.host;
+    const eligible = () => {
+      const e = store.listCleanupEntries().find(item => item.id === entryId);
+      if (!e || !cleanupNeedsUser(e) || this.busy.has(entryId)) throw new CleanupAttention('此清理条目不存在、正在执行或无需人工处理');
+      return e;
+    };
+    return this.host.lock(eligible(), async () => {
+      const entry = eligible();
+      const updatedAt = this.host.now();
+      if (action === 'dismiss') {
+        store.runMutation(() => {
+          store.saveCleanupEntry({ ...entry, status: 'dismissed', updatedAt, nextAttemptAt: undefined });
+          store.appendObservationFact({ kind: 'cleanup_dismissed', runId: entry.runId, dispatchId: entry.dispatchId ?? null, workerId: null,
+            data: { entryId, cleanupKind: entry.kind, worktreePath: entry.worktreePath, branch: entry.worktreeBranch } });
+        });
+        await store.flushDurable();
+        return { status: 'dismissed' as const };
+      }
+      const pending = { ...entry, status: 'pending' as const, attempts: 0, updatedAt, locked: false, lastError: undefined, nextAttemptAt: undefined };
+      store.saveCleanupEntry(pending);
+      try { await this.attempt(pending, false); } catch (error) { if (!(error instanceof CleanupDeferred)) throw error; }
+      const { status, lastError } = store.listCleanupEntries().find(item => item.id === entryId)!;
+      return { status, lastError };
+    });
   }
 
   async recover(startup = false) {
