@@ -170,7 +170,7 @@ export class AcpSessionDriver implements AgentSessionDriver {
     options: AcpDriverOptions = {},
   ) {
     this.provider = spec.driver;
-    this.capabilities = { resume: true, steer: false, policies: driverCapabilities(spec.driver).policies };
+    this.capabilities = { resume: true, steer: driverCapabilities(spec.driver).supportsSteer, policies: driverCapabilities(spec.driver).policies };
     this.acceptanceWindowMs = options.acceptanceWindowMs ?? 1_500;
     this.setupTimeoutMs = options.setupTimeoutMs ?? 60_000;
     this.env = options.env ?? process.env;

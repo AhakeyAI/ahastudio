@@ -1,4 +1,7 @@
-import { driverCapabilities, type AgentDriverId } from '../agent-drivers/driver-capabilities.js';
+import { resolve } from 'node:path';
+import {
+  driverCapabilities, type AgentDriverCapabilities, type AgentDriverId,
+} from '../agent-drivers/driver-capabilities.js';
 import type { AgentSessionPolicy } from './agent-session-driver.js';
 import { coordinatorApprovedMcpTools, workerApprovedMcpTools } from './codex-app-server-pilot.js';
 
@@ -17,9 +20,92 @@ export function isHeadlessWorkerDriver(cliId: string | null | undefined): cliId 
   return typeof cliId === 'string' && (HEADLESS_WORKER_DRIVERS as readonly string[]).includes(cliId);
 }
 
+/** Why a driver cannot take a headless Worker turn, for callers that report or branch on it. */
+export interface HeadlessWorkerRefusal {
+  code: 'driver_not_headless' | 'policy_unsupported' | 'resume_unsupported' | 'no_provider_session' | 'cwd_bound_session';
+  message: string;
+}
+
+function driverLabel(cliId: string): string {
+  return isHeadlessWorkerDriver(cliId) ? HEADLESS_DRIVER_LABELS[cliId] : cliId;
+}
+
+/** Why `cliId` cannot run a headless Worker that enforces `policy` itself, or null when it can. */
+export function headlessWorkerSupportError(
+  cliId: string | null | undefined, policy: AgentSessionPolicy,
+): HeadlessWorkerRefusal | null {
+  if (!isHeadlessWorkerDriver(cliId)) {
+    return { code: 'driver_not_headless', message: `${cliId || 'This agent'} has no headless Worker support.` };
+  }
+  if (!driverCapabilities(cliId).policies.includes(policy)) {
+    return { code: 'policy_unsupported', message: `${driverLabel(cliId)} headless Workers do not enforce the ${policy} policy.` };
+  }
+  return null;
+}
+
 /** Whether `cliId` can run a headless Worker that enforces `policy` itself; otherwise the task keeps a terminal. */
 export function headlessWorkerSupports(cliId: string | null | undefined, policy: AgentSessionPolicy): boolean {
-  return isHeadlessWorkerDriver(cliId) && driverCapabilities(cliId).policies.includes(policy);
+  return headlessWorkerSupportError(cliId, policy) === null;
+}
+
+function sameCwd(a: string, b: string): boolean {
+  const left = resolve(a);
+  const right = resolve(b);
+  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+/**
+ * Why a headless Worker's provider conversation cannot be resumed natively in `cwd`, or null when
+ * it can. Drivers that key sessions by directory (`resumeAcrossCwd: false`) only resume where the
+ * conversation started; callers fall back to a portable context handoff instead.
+ */
+export function headlessResumeError(
+  cliId: string | null | undefined,
+  input: { providerSessionId: string | null | undefined; sessionCwd: string; cwd: string },
+): HeadlessWorkerRefusal | null {
+  if (!isHeadlessWorkerDriver(cliId)) {
+    return { code: 'driver_not_headless', message: `${cliId || 'This agent'} has no headless Worker support.` };
+  }
+  const caps = driverCapabilities(cliId);
+  if (!caps.resume || caps.nativeThreadIds === 'none') {
+    return { code: 'resume_unsupported', message: `${driverLabel(cliId)} cannot rejoin a conversation after its process ends.` };
+  }
+  if (!input.providerSessionId?.trim()) {
+    return { code: 'no_provider_session', message: `This ${driverLabel(cliId)} Worker has no provider conversation to resume.` };
+  }
+  if (!caps.resumeAcrossCwd && !sameCwd(input.sessionCwd, input.cwd)) {
+    return {
+      code: 'cwd_bound_session',
+      message: `${driverLabel(cliId)} keys conversations by working directory, so it cannot resume this one from another worktree.`,
+    };
+  }
+  return null;
+}
+
+/**
+ * The provider's ids for an AhaStation-owned conversation. AhaStation ids stay the identity;
+ * these are evidence for resuming or reconciling, never keys.
+ */
+export interface ProviderRefs {
+  driver: AgentDriverId;
+  /** How far `sessionId` can be trusted to name the same conversation later. */
+  idStrength: AgentDriverCapabilities['nativeThreadIds'];
+  sessionId: string | null;
+  turnId?: string;
+  requestId?: string;
+}
+
+export function providerRefs(
+  driver: AgentDriverId,
+  ids: { sessionId?: string | null; turnId?: string | null; requestId?: string | null },
+): ProviderRefs {
+  return {
+    driver,
+    idStrength: driverCapabilities(driver).nativeThreadIds,
+    sessionId: ids.sessionId?.trim() || null,
+    ...(ids.turnId?.trim() ? { turnId: ids.turnId.trim() } : {}),
+    ...(ids.requestId?.trim() ? { requestId: ids.requestId.trim() } : {}),
+  };
 }
 
 export function headlessWorkerDriver(workerId: string): HeadlessWorkerDriver | null {

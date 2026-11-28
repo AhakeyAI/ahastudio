@@ -34,12 +34,36 @@ export interface AgentDriverCapabilities {
   resume: boolean;
   /** The CLI can continue the same conversation in a terminal pane. */
   terminalResume: boolean;
+  /**
+   * How stable the provider's conversation id is: `strong` ids name one conversation for good,
+   * `weak` ones point at storage that can move (Pi's session file), `none` means no id at all.
+   */
+  nativeThreadIds: 'strong' | 'weak' | 'none';
+  /**
+   * The conversation can be resumed from a different working directory. Claude Code keys its
+   * sessions by cwd, so a Worker that moves to another worktree cannot `--resume` there.
+   */
+  resumeAcrossCwd: boolean;
+  /** Coordinator rules can be set as developer/system context instead of leading the first message. */
+  acceptsDeveloperContext: boolean;
+  /** A running turn can take extra input without being interrupted. */
+  supportsSteer: boolean;
+  /** The stdout shape its permission hooks expect back from AhaStation. */
+  hookApprovalDialect: HookApprovalDialect;
 }
+
+/**
+ * `hook-specific`: Claude's `hookSpecificOutput` only. `top-level`: a bare `{ decision, reason }`.
+ * `combined`: both, for Claude-compatible runners that read either.
+ */
+export type HookApprovalDialect = 'hook-specific' | 'top-level' | 'combined';
 
 const NONE: Omit<AgentDriverCapabilities, 'policies'> = {
   policyNeedsRelaunch: false, network: false, models: false, efforts: false, images: false, compact: false,
   goal: false, feedback: false, usageLimits: false, skills: false, plugins: false, history: false,
   orchestration: false, rename: false, resume: false, terminalResume: false,
+  nativeThreadIds: 'strong', resumeAcrossCwd: false, acceptsDeveloperContext: false, supportsSteer: false,
+  hookApprovalDialect: 'combined',
 };
 
 export const AGENT_DRIVER_CAPABILITIES: Readonly<Record<AgentDriverId, AgentDriverCapabilities>> = {
@@ -47,12 +71,15 @@ export const AGENT_DRIVER_CAPABILITIES: Readonly<Record<AgentDriverId, AgentDriv
     policies: ['workspace-write', 'read-only', 'full-auto'], policyNeedsRelaunch: false, network: true, models: true,
     efforts: true, images: true, compact: true, goal: true, feedback: true, usageLimits: true, skills: true,
     plugins: true, history: true, orchestration: true, rename: true, resume: true, terminalResume: true,
+    nativeThreadIds: 'strong', resumeAcrossCwd: true, acceptsDeveloperContext: true, supportsSteer: false,
+    hookApprovalDialect: 'combined',
   },
   // Claude Code runs over bidirectional stream-json stdio with live permission modes and can_use_tool prompts.
   // Orchestration: Aha MCP per process via `--mcp-config`, Coordinator rules via `--append-system-prompt`.
   claude: {
     ...NONE, policies: ['workspace-write', 'read-only', 'full-auto'], models: true, efforts: true, images: true,
     compact: true, orchestration: true, rename: true, resume: true, terminalResume: true,
+    acceptsDeveloperContext: true, hookApprovalDialect: 'hook-specific',
   },
   // ACP agents ask through session/request_permission; AhaStation answers by policy or asks the person.
   // Orchestration: Antigravity starts ACP `mcpServers` under `aha_orchestration` (a global terminal
@@ -60,7 +87,8 @@ export const AGENT_DRIVER_CAPABILITIES: Readonly<Record<AgentDriverId, AgentDriv
   // `_meta.antigravity.systemPrompt.append` (falling back to the first prompt when absent).
   antigravity: {
     ...NONE, policies: ['workspace-write', 'full-auto'], models: true, efforts: true, images: true,
-    orchestration: true, resume: true, terminalResume: true,
+    orchestration: true, resume: true, terminalResume: true, acceptsDeveloperContext: true,
+    hookApprovalDialect: 'top-level',
   },
   // Effort is each agent's `thought_level` session option. Orchestration: Grok starts the ACP
   // `mcpServers` it is given on session/new|load|resume; ACP has no system prompt, so the
@@ -79,7 +107,7 @@ export const AGENT_DRIVER_CAPABILITIES: Readonly<Record<AgentDriverId, AgentDriv
   // No orchestration: its RPC mode has no per-process MCP configuration.
   pi: {
     ...NONE, policies: ['full-auto', 'read-only'], policyNeedsRelaunch: true, models: true, efforts: true,
-    images: true, compact: true, rename: true, resume: true, terminalResume: true,
+    images: true, compact: true, rename: true, resume: true, terminalResume: true, nativeThreadIds: 'weak',
   },
 };
 

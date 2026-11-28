@@ -137,7 +137,7 @@ const AHA_MCP_FINAL_STATES = new Set(['connected', 'failed', 'needs-auth', 'disa
 /** One Claude Code conversation driven over bidirectional stream-json stdio. */
 export class ClaudeSessionDriver implements AgentSessionDriver {
   readonly provider = 'claude' as const;
-  readonly capabilities = { resume: true, steer: false, policies: driverCapabilities('claude').policies };
+  readonly capabilities = { resume: true, steer: driverCapabilities('claude').supportsSteer, policies: driverCapabilities('claude').policies };
   private readonly rpc: JsonlRpc;
   private readonly proc: AgentProcessHandle;
   private readonly disconnect = new AbortController();
