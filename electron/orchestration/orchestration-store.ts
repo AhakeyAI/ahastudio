@@ -1,3 +1,4 @@
+import { cleanupNeedsUser } from './cleanup-outbox.js';
 import { join } from 'node:path';
 import type { AgentSessionPolicy } from './agent-session-driver.js';
 import type { WorkerTimelineSnapshot } from './worker-timeline.js';
@@ -183,8 +184,9 @@ export class OrchestrationStore implements OrchestrationUnitOfWork {
       gates,
       messages,
       questions,
-      cleanupAttention: state.cleanupOutbox.filter(e => e.status === 'needs_attention' && (!runId || e.runId === runId))
-        .map(({ id, kind, runId, dispatchId, attempts, lastError }) => ({ id, kind, runId, dispatchId, attempts, lastError })),
+      cleanupAttention: state.cleanupOutbox.filter(cleanupNeedsUser).filter(e => !runId || e.runId === runId)
+        .map(({ id, kind, runId, dispatchId, status, worktreePath, worktreeBranch: branch, attempts, lastError, updatedAt, nextAttemptAt }) =>
+          ({ id, kind, runId, dispatchId, status, worktreePath, branch, attempts, lastError, updatedAt, nextAttemptAt })),
       memberCursorsByRun: exportMemberCursorsByRun(state, runId),
       coordinatorRuns,
       activeCoordinatorRun,

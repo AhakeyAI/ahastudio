@@ -1,3 +1,4 @@
+import { cleanupTerminal } from './cleanup-outbox.js';
 import { existsSync } from 'node:fs';
 import { resolve as resolveFsPath } from 'node:path';
 import { getGitStatus } from '../git/git-service.js';
@@ -708,7 +709,7 @@ export class OrchestrationIntegrationService {
       let result: WorkerIntegrationResult;
       let runBranchResult: Awaited<ReturnType<typeof integrateWorkerIntoRunBranch>> | null = null;
       if (useRunIntegrationBranch) {
-        if (mode !== 'check' && this.host.store.listCleanupEntries().some(e => e.runId === run.id && e.kind === 'run_branch.cleanup' && e.status === 'pending')) {
+        if (mode !== 'check' && this.host.store.listCleanupEntries().some(e => e.runId === run.id && e.kind === 'run_branch.cleanup' && !cleanupTerminal(e))) {
           throw new OrchestrationError('operation_rejected', 'Previous Run worktree cleanup is still pending; cannot reuse its resources.');
         }
         runBranchResult = await integrateWorkerIntoRunBranch({

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -88,6 +88,104 @@ test('resident ownership and stale claims fence cleanup without starting a proce
   store.acquireResumeClaim({ workerId: 'worker', dispatchId: dispatch.id, cwd: intent.worktreePath, runId: intent.runId, driver: 'codex', providerSessionId: 'thread' });
   await outbox.recover(); assert.equal(store.listCleanupEntries()[0].attempts, 0); assert.ok(existsSync(intent.worktreePath));
 });
+test('recheck never forces dirty worktrees or adopts a changed branch OID', async t => {
+  const { host, intent, repo, branch } = fixture(t);
+  const outbox = new CleanupOutbox(host);
+  const path = join(intent.worktreePath, 'mine'); writeFileSync(path, 'keep');
+  await assert.rejects(outbox.submit(intent), /uncommitted/);
+  const [{ id }] = host.store.listCleanupEntries();
+  assert.equal((await outbox.resolve(id, 'recheck')).status, 'needs_attention');
+  rmSync(path); git(intent.worktreePath, 'commit', '--allow-empty', '-m', 'moved');
+  assert.match((await outbox.resolve(id, 'recheck')).lastError, /OID changed/);
+  assert.equal(host.store.listCleanupEntries()[0].expectedBranchOid, intent.expectedBranchOid);
+  assert.notEqual(git(repo, 'rev-parse', branch), intent.expectedBranchOid);
+  git(intent.worktreePath, 'reset', '--hard', intent.expectedBranchOid);
+  assert.equal((await outbox.resolve(id, 'recheck')).status, 'done');
+  assert.ok(!existsSync(intent.worktreePath));
+  await assert.rejects(outbox.resolve(id, 'dismiss'), { code: 'operation_rejected' });
+});
+
+test('dismiss leaves resources and integration state alone, records a fact and permits fresh intent', async t => {
+  const { host, store, intent, repo, branch } = fixture(t); const outbox = new CleanupOutbox(host);
+  const originalProtection = store.protectedRunReason(intent.runId);
+  const path = join(intent.worktreePath, 'mine'); writeFileSync(path, 'keep');
+  await assert.rejects(outbox.submit(intent), /uncommitted/);
+  const [{ id }] = store.listCleanupEntries();
+  assert.equal(store.protectedRunReason(intent.runId), '资源清理尚未完成');
+  assert.equal((await outbox.resolve(id, 'dismiss')).status, 'dismissed');
+  assert.ok(existsSync(path)); assert.equal(git(repo, 'rev-parse', branch), intent.expectedBranchOid);
+  assert.equal(store.getRun(intent.runId).integrationWorktreePath, intent.worktreePath);
+  assert.equal(store.protectedRunReason(intent.runId), originalProtection);
+  assert.deepEqual(store.listObservationFacts().find(f => f.kind === 'cleanup_dismissed').data,
+    { entryId: id, cleanupKind: intent.kind, worktreePath: intent.worktreePath, branch });
+  await assert.rejects(outbox.resolve(id, 'recheck'), { code: 'operation_rejected' });
+  rmSync(path); assert.ok((await outbox.submit(intent)).removed);
+});
+
+test('transient failures stay pending with capped backoff and disappear from attention upon recovery', async t => {
+  const { host, store, intent } = fixture(t); const outbox = new CleanupOutbox(host);
+  let now = 100; host.now = () => now; host.execute = async () => { throw Error('file busy'); };
+  await assert.rejects(outbox.submit(intent), /file busy/);
+  const [{ id }] = store.listCleanupEntries();
+  await assert.rejects(outbox.resolve(id, 'dismiss'), { code: 'operation_rejected' });
+  for (let attempts = 1; attempts <= 14; attempts++) {
+    const [e] = store.listCleanupEntries(); assert.equal(e.status, 'pending'); assert.equal(e.attempts, attempts);
+    assert.equal(e.nextAttemptAt - now, Math.min(1000 * 2 ** (attempts - 1), 600_000));
+    const list = store.getSnapshot(intent.runId).cleanupAttention;
+    if (attempts < 6) assert.deepEqual(list, []);
+    else assert.deepEqual(list, [{ id, runId: intent.runId, kind: intent.kind, dispatchId: undefined, attempts,
+      lastError: e.lastError, worktreePath: intent.worktreePath, branch: intent.worktreeBranch, status: 'pending', updatedAt: now, nextAttemptAt: e.nextAttemptAt }]);
+    now = e.nextAttemptAt;
+    if (attempts === 14) host.execute = executeCleanup;
+    await outbox.recover();
+  }
+  assert.equal(store.listCleanupEntries()[0].status, 'done'); assert.deepEqual(store.getSnapshot().cleanupAttention, []);
+});
+
+test('resolve rejects in-flight entries and revalidates eligibility after locking', async t => {
+  const { store, intent, host } = fixture(t); const outbox = new CleanupOutbox(host);
+  const entry = { ...intent, id: 'slow', status: 'pending', attempts: 6, createdAt: 1, updatedAt: 1 };
+  store.saveCleanupEntry(entry);
+  let unblock, started;
+  const running = new Promise(resolve => { started = resolve; });
+  const finish = new Promise(resolve => { unblock = resolve; });
+  host.execute = async (_, force) => { assert.equal(force, false); started(); await finish; throw Error('file busy'); };
+  const recovery = outbox.recover(); await running;
+  try { await assert.rejects(outbox.resolve(entry.id, 'dismiss'), { code: 'operation_rejected' }); }
+  finally { unblock(); await recovery; }
+  assert.equal((await outbox.resolve(entry.id, 'recheck')).status, 'pending');
+  assert.equal(store.listCleanupEntries()[0].attempts, 1);
+  store.saveCleanupEntry(entry);
+  host.lock = async (_, fn) => { store.saveCleanupEntry({ ...entry, status: 'done' }); return fn(); };
+  await assert.rejects(outbox.resolve(entry.id, 'dismiss'), { code: 'operation_rejected' });
+  assert.equal(store.listCleanupEntries()[0].status, 'done');
+});
+
+test('retire requires an idle resident and preserves post-integration edits', async t => {
+  const { store, intent } = fixture(t);
+  const task = store.createTask({ runId: intent.runId, spec: 'worker' });
+  const d = store.createDispatchContext({ taskId: task.id, assigneeHandle: 'worker', ownsWorktree: true,
+    worktreePath: intent.worktreePath, repoRootPath: intent.repoRootPath, branch: intent.worktreeBranch });
+  store.completeDispatch(d.id);
+  const service = new OrchestrationService({ store, agentStatusStore: new AgentStatusStore() });
+  try {
+    const retire = () => service.workerRetire({ dispatchId: d.id });
+    await assert.rejects(retire(), { code: 'operation_rejected' });
+    store.setDispatchResident(d.id, { targetBranch: 'main', integratedBranchOid: intent.expectedBranchOid, integratedSnapshotOid: intent.expectedBranchOid });
+    const path = join(intent.worktreePath, 'mine'); writeFileSync(path, 'keep');
+    await assert.rejects(retire(), /uncommitted|dirty/i);
+    assert.equal(readFileSync(path, 'utf8'), 'keep'); assert.ok(store.getDispatchContext(d.id).residentAfterIntegration);
+    rmSync(path); assert.ok((await retire()).removedWorktree);
+    assert.ok(store.getDispatchContext(d.id).releasedAt); assert.ok(!store.getDispatchContext(d.id).residentAfterIntegration);
+    assert.ok(!existsSync(intent.worktreePath));
+  } finally { service.dispose(); await store.flushDurable(); }
+});
+
+test('human cleanup decisions are not HTTP actions', () => {
+  const router = readFileSync(new URL('../dist-electron/orchestration/orchestration-http-router.js', import.meta.url), 'utf8');
+  assert.match(router, /worker-release/); assert.doesNotMatch(router, /cleanup-resolve|worker-retire/);
+});
+
 test('unknown kinds rejected at ingress AND on replay before any executor call', async t => {
   const { host, intent } = fixture(t); let calls = 0; host.execute = async () => { calls++; };
   const outbox = new CleanupOutbox(host);

@@ -510,8 +510,7 @@ export class OrchestrationService {
       execute: executeCleanup, guard: e => guardCleanup(this.store, e, id => this.isPaneAlive(id)),
       lock: async (e, fn) => {
         const dispatch = e.dispatchId && this.store.getDispatchContext(e.dispatchId);
-        if (dispatch) await this.workers.mutateWorkerResources(dispatch, fn);
-        else await this.integration.withRunIntegrationLock(e.runId, fn);
+        return dispatch ? this.workers.mutateWorkerResources(dispatch, fn) : this.integration.withRunIntegrationLock(e.runId, fn);
       },
     });
     this.workers = new OrchestrationWorkerLifecycleService({
@@ -4263,6 +4262,12 @@ export class OrchestrationService {
   }): { dispatch: OrchestrationDispatchRecord; retained: boolean } {
     return this.workers.workerKeepOpen(input);
   }
+
+  cleanupResolve({ entryId, action }: { entryId: string; action: 'recheck' | 'dismiss' }) {
+    return this.cleanup.resolve(entryId, action);
+  }
+
+  workerRetire(input: { dispatchId: string }) { return this.workers.workerRetire(input); }
 
   workerRelease(input: {
     dispatchId?: string;
