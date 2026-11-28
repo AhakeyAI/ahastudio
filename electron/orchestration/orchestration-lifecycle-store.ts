@@ -1107,6 +1107,20 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
     return { ...ctx };
   }
 
+  /** Keeps an integrated Worker resident for a next wave, or clears that once the wave starts. */
+  setDispatchResident(
+    dispatchId: string,
+    resident: NonNullable<OrchestrationDispatchRecord['residentAfterIntegration']> | null,
+  ): OrchestrationDispatchRecord | null {
+    const ctx = this.state.dispatches.get(dispatchId);
+    if (!ctx) return null;
+    if (resident) ctx.residentAfterIntegration = { ...resident };
+    else delete ctx.residentAfterIntegration;
+    ctx.updatedAt = this.now();
+    this.persist();
+    return { ...ctx };
+  }
+
   /** Records a headless Worker's permission tier and network access for its next turns. */
   updateDispatchWorkerControls(
     dispatchId: string,

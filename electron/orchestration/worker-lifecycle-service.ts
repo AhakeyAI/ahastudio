@@ -68,6 +68,7 @@ import {
 } from './worker-git-integration.js';
 import {
   assertWorkerWorktreeClean,
+  deleteOwnedWorkerBranch,
   prepareWorkerWorktreePlacement,
   removeOwnedWorkerWorktree,
   WORKER_BRANCH_PREFIX,
@@ -152,6 +153,16 @@ export interface OrchestrationWorkerLifecycleHost {
   readonly verifyCodeInputs: (task: OrchestrationTaskRecord, cwd?: string | null) => Promise<void>;
   readonly waiters: RuntimeMessageWaiters;
   readonly workerTimelines: Map<string, WorkerTimeline>;
+}
+
+/** Where a resident Worker's next wave runs after integration. */
+interface NextWavePlacement {
+  worktreePath: string;
+  branch: string | null;
+  baseCommit: string | null;
+  ownsWorktree: boolean;
+  ownsBranch: boolean;
+  repoRootPath: string | null;
 }
 
 /** Worker start, follow-up, stop, release and abandon, plus the headless Worker session bridge. */
@@ -1854,7 +1865,107 @@ export class OrchestrationWorkerLifecycleService {
     settledDispatch: OrchestrationDispatchRecord,
     input: SettledWorkerFollowUpInput,
   ): Promise<OrchestrationSendResult> {
-    return this.mutateWorkerResources(settledDispatch, () => this.startFollowUp(settledDispatch, input));
+    return this.mutateWorkerResources(settledDispatch, async () => {
+      if (!settledDispatch.residentAfterIntegration || settledDispatch.releasedAt) return this.startFollowUp(settledDispatch, input);
+      const next = await this.prepareNextWave(settledDispatch);
+      try {
+        const result = await this.startFollowUp(settledDispatch, input, next.replacement, next.wave);
+        this.host.store.setDispatchResident(settledDispatch.id, null);
+        return result;
+      } catch (error) {
+        if (next.replacement?.session.alive) await next.replacement.session.close(true);
+        throw error;
+      }
+    });
+  }
+
+  /**
+   * Starts a resident Worker's next wave after integration. In its own worktree, once clean, it
+   * switches to a fresh branch from the latest target branch so the cwd (and native resume) stay the
+   * same. If the worktree is gone, a new one is placed and a new conversation starts from a portable
+   * context instead, since provider sessions can be tied to the old directory.
+   */
+  private async prepareNextWave(settled: OrchestrationDispatchRecord): Promise<{
+    wave: NextWavePlacement;
+    replacement?: Parameters<OrchestrationWorkerLifecycleService['startFollowUp']>[2];
+  }> {
+    const marker = settled.residentAfterIntegration!;
+    const repoRoot = settled.repoRootPath;
+    if (!repoRoot) throw new OrchestrationError('operation_rejected', 'The resident Worker has no recorded repository.');
+    const baseCommit = await resolveBranchRefOid(repoRoot, marker.targetBranch);
+    if (!baseCommit) {
+      throw new OrchestrationError('operation_rejected', `Cannot resolve ${marker.targetBranch} to start the next wave.`);
+    }
+    const role = this.host.delegation.resolveRoleNameForDispatch(settled) || 'worker';
+    const slug = role.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'worker';
+    const branch = `${WORKER_BRANCH_PREFIX}${slug}-${Date.now().toString(36).slice(-4)}-${randomUUID().slice(0, 4)}`;
+    const cwd = settled.worktreePath;
+    if (cwd && existsSync(cwd)) {
+      if (this.codexWorkers.get(settled.assigneeHandle)?.busy) {
+        throw new OrchestrationError('operation_rejected', 'The Worker is still running a turn. Retry once it is idle.');
+      }
+      // Workers leave their work uncommitted, so the worktree still holds what was integrated. Only
+      // that exact snapshot may be replaced by the new base; anything written since stays put.
+      const current = await captureWorkerSnapshotOid(cwd);
+      if (current.snapshotOid !== marker.integratedSnapshotOid) {
+        throw new OrchestrationError('operation_rejected',
+          `${cwd} changed after it was integrated. Integrate or discard those changes before the next wave.`,
+          { code: 'resident_worktree_changed' });
+      }
+      for (const args of [['reset', '--hard', '--quiet'], ['clean', '-fd', '--quiet']]) {
+        const cleared = await runGitCommand(args, { cwd, timeoutMs: 15_000 });
+        if (cleared.exitCode !== 0) {
+          throw new OrchestrationError('worktree_failed', `Could not clear the integrated wave in ${cwd}: ${cleared.stderr.trim()}`);
+        }
+      }
+      const switched = await runGitCommand(['switch', '-c', branch, baseCommit], { cwd, timeoutMs: 15_000 });
+      if (switched.exitCode !== 0) {
+        throw new OrchestrationError('worktree_failed', `Could not start the next wave in ${cwd}: ${switched.stderr.trim()}`);
+      }
+      await assertWorkerWorktreeClean(cwd);
+      await deleteOwnedWorkerBranch(repoRoot, settled.branch, marker.integratedBranchOid, { allowSquashCasDelete: true }).catch(() => false);
+      return { wave: { worktreePath: cwd, branch, baseCommit, ownsWorktree: true, ownsBranch: true, repoRootPath: repoRoot } };
+    }
+    const driver = headlessWorkerDriver(settled.assigneeHandle);
+    if (!driver) throw new OrchestrationError('operation_rejected', 'The resident Worker\'s Coding Agent is unknown.');
+    const placement = await prepareWorkerWorktreePlacement({
+      baseCwd: repoRoot, taskId: settled.taskId, name: slug, worktree: true, branch, baseBranch: baseCommit,
+    });
+    const controls = this.headlessControls(settled);
+    const context = this.buildHandoffContext(settled, driver, driver,
+      `Your previous worktree is gone. You continue in ${placement.cwd}, a fresh worktree on ${marker.targetBranch}; your earlier changes are already integrated there.`);
+    const opened = await this.openReplacementWorker(settled, driver, placement.cwd, controls);
+    return {
+      wave: {
+        worktreePath: placement.worktreePath ?? placement.cwd, branch: placement.branch, baseCommit: placement.baseCommit,
+        ownsWorktree: placement.ownsWorktree, ownsBranch: placement.ownsBranch, repoRootPath: placement.repoRootPath,
+      },
+      replacement: { session: opened.session, workerId: opened.workerId, cliId: driver, cwd: placement.cwd, context },
+    };
+  }
+
+  /**
+   * Starts a new headless Worker identity in `cwd` under a durable resume claim, for a handoff or a
+   * replacement conversation. The claim is recorded before the agent process exists.
+   */
+  private async openReplacementWorker(
+    source: OrchestrationDispatchRecord, driver: HeadlessWorkerDriver, cwd: string, controls: HeadlessWorkerControls,
+    workerId = `${driver}-worker-${randomUUID()}`,
+  ): Promise<{ session: AgentSessionDriver; workerId: string; sessionId: string }> {
+    const claim = this.host.store.acquireResumeClaim({
+      workerId, runId: source.runId, dispatchId: source.id, cwd, driver, providerSessionId: '',
+    });
+    try {
+      await this.host.store.flushDurable();
+      const network = controls.network && driverCapabilities(driver).network;
+      const opened = await this.openCodexWorker(driver, cwd, null, { ...controls, network }, { workerId });
+      if (!opened) throw new OrchestrationError('dispatch_inactive', `${HEADLESS_DRIVER_LABELS[driver]} could not start in ${cwd}.`);
+      this.host.store.activateResumeClaim(claim.id, opened.session.pid ?? null);
+      return { session: opened.session, workerId, sessionId: opened.sessionId };
+    } catch (error) {
+      this.host.store.releaseResumeClaims(workerId);
+      throw error;
+    }
   }
 
   /**
@@ -1906,18 +2017,12 @@ export class OrchestrationWorkerLifecycleService {
       runId: source.runId, sourceDispatchId: source.id, sourceWorkerId: source.assigneeHandle,
       fromCli: fromCli!, toCli: target, cwd: cwd!, targetWorkerId, snapshotOid, context,
     });
-    const claim = this.host.store.acquireResumeClaim({
-      workerId: targetWorkerId, runId: source.runId, dispatchId: source.id, cwd: cwd!, driver: target, providerSessionId: '',
-    });
     let session: AgentSessionDriver | undefined;
     try {
-      // Durable before the new agent exists, so a crash leaves a record a person can act on.
-      await this.host.store.flushDurable();
-      const network = controls.network && driverCapabilities(target).network;
-      const opened = await this.openCodexWorker(target, cwd!, null, { ...controls, network }, { workerId: targetWorkerId });
-      if (!opened) throw new OrchestrationError('dispatch_inactive', `${HEADLESS_DRIVER_LABELS[target]} could not start in ${cwd}.`);
+      // The handoff record and the claim are durable before the new agent exists, so a crash leaves
+      // a record a person can act on.
+      const opened = await this.openReplacementWorker(source, target, cwd!, controls, targetWorkerId);
       session = opened.session;
-      this.host.store.activateResumeClaim(claim.id, session.pid ?? null);
       this.host.store.updateWorkerHandoff(handoff.id, { status: 'active', providerSessionId: opened.sessionId });
       await this.host.store.flushDurable();
       const result = await this.startFollowUp(source, {
@@ -2002,6 +2107,7 @@ export class OrchestrationWorkerLifecycleService {
     settledDispatch: OrchestrationDispatchRecord,
     input: SettledWorkerFollowUpInput,
     handoff?: { session: AgentSessionDriver; workerId: string; cliId: HeadlessWorkerDriver; cwd: string; context: string },
+    wave?: NextWavePlacement,
   ): Promise<OrchestrationSendResult> {
     if (settledDispatch.releasedAt) {
       throw new OrchestrationError(
@@ -2060,7 +2166,7 @@ export class OrchestrationWorkerLifecycleService {
       taskContext: prevTask?.taskContext ?? originalTask?.taskContext,
       taskTitle: 'Follow-up: ' + input.subject.slice(0, 80),
       priority: input.priority ?? prevTask?.priority ?? 'normal',
-      worktreePath: settledDispatch.worktreePath ?? prevTask?.worktreePath ?? null,
+      worktreePath: wave?.worktreePath ?? settledDispatch.worktreePath ?? prevTask?.worktreePath ?? null,
     });
 
     let targetPtyId: string;
@@ -2107,7 +2213,9 @@ export class OrchestrationWorkerLifecycleService {
       : session ? this.headlessControls(settledDispatch) : null;
     const sessionCwd = handoff?.cwd ?? this.providerCwd(settledDispatch);
     const priorAuthors = settledDispatch.authorCliIds ?? (settledDispatch.cliId ? [normalizeWorkerCliId(settledDispatch.cliId)] : []);
-    const authorCliIds = handoff ? [...new Set([...priorAuthors, handoff.cliId])] : settledDispatch.authorCliIds;
+    // A new wave is new work: its author set starts over with whoever writes it.
+    const authorCliIds = wave ? [handoff?.cliId ?? priorAuthors.at(-1) ?? ''].filter(Boolean)
+      : handoff ? [...new Set([...priorAuthors, handoff.cliId])] : settledDispatch.authorCliIds;
     let nextCtx: OrchestrationDispatchRecord;
     try {
       nextCtx = this.host.store.createDispatchContext({
@@ -2127,12 +2235,12 @@ export class OrchestrationWorkerLifecycleService {
         creatorRunId: settledDispatch.runId,
         creatorDispatchId: settledDispatch.creatorDispatchId ?? null,
         parentPaneId: settledDispatch.parentPaneId ?? null,
-        worktreePath: settledDispatch.worktreePath ?? null,
-        branch: settledDispatch.branch ?? null,
-        baseCommit: settledDispatch.baseCommit ?? null,
-        repoRootPath: settledDispatch.repoRootPath ?? null,
-        ownsWorktree: Boolean(settledDispatch.ownsWorktree),
-        ownsBranch: Boolean(settledDispatch.ownsBranch),
+        worktreePath: wave ? wave.worktreePath : settledDispatch.worktreePath ?? null,
+        branch: wave ? wave.branch : settledDispatch.branch ?? null,
+        baseCommit: wave ? wave.baseCommit : settledDispatch.baseCommit ?? null,
+        repoRootPath: wave ? wave.repoRootPath : settledDispatch.repoRootPath ?? null,
+        ownsWorktree: wave ? wave.ownsWorktree : Boolean(settledDispatch.ownsWorktree),
+        ownsBranch: wave ? wave.ownsBranch : Boolean(settledDispatch.ownsBranch),
         reviewRound: settledDispatch.reviewRound ?? 0,
         ownsPane: spawnedNewPane ? true : Boolean(settledDispatch.ownsPane),
         cliId: handoff ? handoff.cliId : settledDispatch.cliId ?? null,
