@@ -18,6 +18,7 @@ import type {
   OrchestrationRunRecord,
   OrchestrationTaskRecord,
   OrchestrationResumeClaim,
+  OrchestrationWorkerHandoff,
 } from './orchestration-types.js';
 
 export interface DeferredDispatchPrompt {
@@ -47,6 +48,7 @@ export class OrchestrationStoreState {
   nextBoardSeqByRun = new Map<string, number>();
   memberCursorsByRun = new Map<string, Map<string, OrchestrationMemberCursor>>();
   resumeClaims = new Map<string, OrchestrationResumeClaim>();
+  workerHandoffs = new Map<string, OrchestrationWorkerHandoff>();
 }
 
 export function emptyPersistedState(): OrchestrationPersistedState {
@@ -343,6 +345,18 @@ export function hydrateOrchestrationState(state: OrchestrationStoreState, parsed
       state.resumeClaims.set(claim.id, { ...claim, status: 'stale', pid: Number.isSafeInteger(claim.pid) ? claim.pid : null });
     }
   }
+  state.workerHandoffs.clear();
+  for (const handoff of parsed.workerHandoffs ?? []) {
+    if (!handoff || typeof handoff.id !== 'string' || typeof handoff.sourceDispatchId !== 'string') continue;
+    // A handoff cut off mid-way may have left a second agent running; a person decides what happens next.
+    const interrupted = handoff.status === 'pending' || handoff.status === 'active';
+    state.workerHandoffs.set(handoff.id, interrupted
+      ? {
+        ...handoff, status: 'needs_attention', announcedAt: null, updatedAt: now,
+        reason: 'AhaStation stopped during this handoff. Check the worktree and the new agent before retrying.',
+      }
+      : { ...handoff });
+  }
   state.deferredPrompts.clear();
   for (const [id, prompt] of Object.entries(parsed.deferredDispatchPrompts ?? {})) {
     const dispatch = state.dispatches.get(id);
@@ -381,6 +395,7 @@ export function exportOrchestrationState(state: OrchestrationStoreState): Orches
     nextBoardSeqByRun: Object.fromEntries(state.nextBoardSeqByRun.entries()),
     memberCursorsByRun: exportMemberCursorsByRun(state),
     resumeClaims: [...state.resumeClaims.values()],
+    workerHandoffs: [...state.workerHandoffs.values()],
   };
 }
 

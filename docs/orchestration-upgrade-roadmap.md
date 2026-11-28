@@ -199,6 +199,8 @@ flowchart LR
   3. **同 worktree 零成本休眠与按 `providerSessionId` 自动复活**：
      - 改造 `startFollowUp`：当 Headless Worker 进程已退出或应用重启后，若 `settledDispatch.providerSessionId` 存在、worktree 仍在且 `driverCapabilities(cliId).resume === true`，不再直接抛 `dispatch_inactive`，而是获取 `ResumeClaim` 后通过 `open({ cwd, resumeSessionId })` 原位复活会话。
      - 增加**空闲自动休眠**（可配阈值，如空闲 5 分钟且无活跃 turn / 无待答原生提问 / 无待批权限）：先归档 timeline，再安全 `close()` 释放子进程内存，将成员态置为 `dormant（休眠待命）`，下次被 `@role` 呼叫自动 `resume` 秒醒。
+- **PR 3B-2 拆分（已决策）**：3B-2a 跨 CLI 原位接力（约束 1 / 3 / 4 / 5）— **已完成**；3B-2b 合入后常驻角色续接下一波任务（约束 2）随后独立 PR。
+  - 3B-2a 落地：`manage_worker action="handoff" agent=<cli>`（HTTP `role-manage`）把已停止/已结算的 headless Worker 任务交给另一 CLI，同一 worktree、保留未提交改动。目标按 `headlessWorkerSupportError` + 运行时可用性筛选（pi/opencode、grok/antigravity 只读一律拒绝）。写入静止：旧会话关闭且其最后进程树已不存活，再两次快照（间隔 `handoffQuiescenceMs`，默认 2s）OID 一致，否则保留 worktree 并拒绝（`writer_still_running` / `worktree_still_changing`）。两阶段：`pending` 移交记录 + 新 Worker 的 `ResumeClaim` 先 `flushDurable()`，拿到会话后写 `active` 再落盘，follow-up 派发后 `completed`；重启时 `pending/active` 一律转 `needs_attention` 并向协调者发一次告警，绝不自动续跑（不按 pid 盲杀，遗留 claim 保持 `stale` 直到进程确认退出）。新 Agent 从脱敏的 `ContextHandoff`（接力说明、前任报告、末轮输出，12KB 上限）+ 原任务启动；dispatch 记录 `authorCliIds`（单波内累计），单 Worker 与 Run 级评审都回避整个作者集合。
 - **PR 3B-2（跨 CLI 原位接力 + 合入后常驻角色续接下一波任务）五条硬约束**：
   1. **目标 CLI 筛选严格复用现有启动判断**（`workerStart` 内 `headlessWorkerSupports` 调用处）：
      - 必须通过 `headlessWorkerSupports(targetCli, workerPolicy)` 且校验运行时可用性（`headlessWorkers.available?.(targetCli) !== false` / `codexPilot.enabled()`）；
