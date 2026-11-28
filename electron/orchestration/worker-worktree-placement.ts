@@ -292,7 +292,7 @@ async function deletePrefixedOwnedBranch(
   allowedPrefix: string,
   branchName?: string | null,
   expectedOid?: string | null,
-  opts?: { allowSquashCasDelete?: boolean },
+  opts?: { allowSquashCasDelete?: boolean; beforeDelete?: () => void },
 ): Promise<boolean> {
   const trimmed = branchName?.trim();
   if (!trimmed || !trimmed.startsWith(allowedPrefix)) return false;
@@ -311,6 +311,7 @@ async function deletePrefixedOwnedBranch(
     if (opts?.allowSquashCasDelete) {
       // Atomic CAS delete for verified squash-integrated owned branches:
       // refuses deletion if the branch moved concurrently after integration.
+      opts.beforeDelete?.();
       const cas = await runGitCommand(['update-ref', '-d', `refs/heads/${valid}`, cleanExpectedOid], {
         cwd: repoRootPath,
         timeoutMs: 15_000,
@@ -334,7 +335,7 @@ export async function deleteOwnedWorkerBranch(
   repoRootPath: string,
   branchName?: string | null,
   expectedOid?: string | null,
-  opts?: { allowSquashCasDelete?: boolean },
+  opts?: { allowSquashCasDelete?: boolean; beforeDelete?: () => void },
 ): Promise<boolean> {
   return deletePrefixedOwnedBranch(
     repoRootPath,
@@ -349,7 +350,7 @@ export async function deleteRunIntegrationBranch(
   repoRootPath: string,
   branchName?: string | null,
   expectedOid?: string | null,
-  opts?: { allowSquashCasDelete?: boolean },
+  opts?: { allowSquashCasDelete?: boolean; beforeDelete?: () => void },
 ): Promise<boolean> {
   return deletePrefixedOwnedBranch(
     repoRootPath,

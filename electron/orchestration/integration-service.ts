@@ -35,6 +35,7 @@ import { WORKER_BRANCH_PREFIX } from './worker-worktree-placement.js';
 
 /** Service capabilities the OrchestrationIntegrationService relies on; supplied by OrchestrationService. */
 export interface OrchestrationIntegrationHost {
+  readonly cleanup: import('./cleanup-outbox.js').CleanupOutbox;
   readonly assertRunCoordinator: (runId: string, callerPaneId: string) => void;
   readonly assertWorkerController: (targetInput: { dispatchId?: string; worker?: string; taskId?: string; }, callerPaneId: string) => void;
   readonly authorizeRunAccess: (runId: string | undefined, callerPaneId: string) => string;
@@ -46,6 +47,7 @@ export interface OrchestrationIntegrationHost {
     dispatch: OrchestrationDispatchRecord,
     input: Parameters<OrchestrationService['workerRelease']>[0],
     integratedSnapshotOid?: string,
+    finalizeResident?: boolean,
   ) => ReturnType<OrchestrationService['workerRelease']>;
   readonly resolveDispatchByRoleOrTarget: (rawTarget: string, callerHint?: string, runIdHint?: string) => OrchestrationDispatchRecord;
   readonly resolveRoleNameForDispatch: (dispatch: OrchestrationDispatchRecord) => string;
@@ -472,11 +474,7 @@ export class OrchestrationIntegrationService {
       dispatch.repoRootPath ?? this.host.getDefaultCwd?.() ?? null,
     );
     const normWt = process.platform === 'win32' ? worktreePath.toLowerCase() : worktreePath;
-    const normMain = mainRepoRoot
-      ? process.platform === 'win32'
-        ? mainRepoRoot.toLowerCase()
-        : mainRepoRoot
-      : null;
+    const normMain = process.platform === 'win32' ? mainRepoRoot?.toLowerCase() : mainRepoRoot;
 
     if (!mainRepoRoot || (!dispatch.ownsWorktree && normMain === normWt)) {
       this.host.store.updateDispatchIntegrationState(dispatch.id, { integrationStatus: 'skipped' });
@@ -494,9 +492,9 @@ export class OrchestrationIntegrationService {
         conflictFiles: [],
         ignoredCollisionFiles: [],
         changedFiles: [],
-        message: !mainRepoRoot
-          ? 'Non-git workspace: no branch merge required. Review files directly and release when ready.'
-          : 'Worker ran directly in the main workspace (no isolated branch to merge). Review changes and release when ready.',
+        message: mainRepoRoot
+          ? 'Worker ran directly in the main workspace (no isolated branch to merge). Review changes and release when ready.'
+          : 'Non-git workspace: no branch merge required. Review files directly and release when ready.',
         dispatchId: dispatch.id,
         taskId: dispatch.taskId,
         role,
@@ -710,6 +708,9 @@ export class OrchestrationIntegrationService {
       let result: WorkerIntegrationResult;
       let runBranchResult: Awaited<ReturnType<typeof integrateWorkerIntoRunBranch>> | null = null;
       if (useRunIntegrationBranch) {
+        if (mode !== 'check' && this.host.store.listCleanupEntries().some(e => e.runId === run.id && e.kind === 'run_branch.cleanup' && e.status === 'pending')) {
+          throw new OrchestrationError('operation_rejected', 'Previous Run worktree cleanup is still pending; cannot reuse its resources.');
+        }
         runBranchResult = await integrateWorkerIntoRunBranch({
           beforePublish,
           mainRepoRoot,
@@ -785,7 +786,7 @@ export class OrchestrationIntegrationService {
         integrationStatus: 'merged',
         noChanges: result.noChanges,
         integratedCommit: result.integratedCommit,
-        integratedTargetBranch: effectiveUsedRunBranch ? result.targetBranch : (useRunIntegrationBranch ? null : result.targetBranch),
+        integratedTargetBranch: useRunIntegrationBranch && !effectiveUsedRunBranch ? null : result.targetBranch,
       });
 
       const latestRun = this.host.store.requireRun(run.id);
@@ -957,7 +958,7 @@ export class OrchestrationIntegrationService {
             }
           }
         } catch (error) {
-          releaseSkippedReason = 'Worker cleanup deferred: ' + (error instanceof Error ? error.message : String(error));
+          releaseSkippedReason = `Worker cleanup deferred: ${error instanceof Error ? error.message : String(error)}`;
           cleanupWarnings.push(releaseSkippedReason);
         }
       }
@@ -1169,6 +1170,9 @@ export class OrchestrationIntegrationService {
       const members: Record<string, string> = {};
       let sourceHead = '';
       const finalized: RunFinalizeIntegrationResult = await finalizeRunIntegrationBranch({
+        cleanup: oid => this.host.cleanup.submit({ kind: 'run_branch.cleanup', runId: run.id,
+          repoRootPath: run.integrationRepoRootPath!, worktreePath: run.integrationWorktreePath!,
+          worktreeBranch: run.integrationBranch!, expectedBranchOid: oid, deleteBranch: input.deleteBranch !== false, allowUnmerged: true }),
         beforePublish: async evidence => {
           sourceHead = evidence.sourceHead;
           for (const worker of this.host.store.listDispatches({ runId: run.id })) {
@@ -1225,7 +1229,7 @@ export class OrchestrationIntegrationService {
       for (const resident of this.host.store.listDispatches({ runId: run.id })) {
         if (!resident.residentAfterIntegration || resident.releasedAt || ACTIVE_DISPATCH_STATUSES.has(resident.status)) continue;
         try {
-          const rel = await this.host.workerRelease({ dispatchId: resident.id });
+          const rel = await this.host.mutateWorkerResources(resident, () => this.host.releaseWorker(resident, {}, undefined, true));
           if (rel.worktreeError) cleanupWarnings.push(`Resident worker ${resident.id} worktree cleanup failed: ${rel.worktreeError}`);
         } catch (err) {
           cleanupWarnings.push(`Resident worker ${resident.id} kept: ${err instanceof Error ? err.message : String(err)}`);

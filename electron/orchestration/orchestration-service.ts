@@ -395,7 +395,11 @@ export interface SettledWorkerFollowUpInput {
   existingMessage?: OrchestrationMessageRecord;
 }
 
+import { CleanupOutbox } from './cleanup-outbox.js';
+import { executeCleanup, guardCleanup } from './cleanup-git.js';
+
 export class OrchestrationService {
+  private readonly cleanup: CleanupOutbox;
   readonly store: OrchestrationStore;
   readonly waiters: RuntimeMessageWaiters;
   readonly pointerDelivery: MailboxPointerDelivery;
@@ -502,7 +506,16 @@ export class OrchestrationService {
     }
 
     const svc = this;
+    this.cleanup = new CleanupOutbox({ store: this.store, now: () => this.clock(), disposed: () => this.disposed,
+      execute: executeCleanup, guard: e => guardCleanup(this.store, e, id => this.isPaneAlive(id)),
+      lock: async (e, fn) => {
+        const dispatch = e.dispatchId && this.store.getDispatchContext(e.dispatchId);
+        if (dispatch) await this.workers.mutateWorkerResources(dispatch, fn);
+        else await this.integration.withRunIntegrationLock(e.runId, fn);
+      },
+    });
     this.workers = new OrchestrationWorkerLifecycleService({
+      cleanup: this.cleanup,
       get agentStatusStore() { return svc.agentStatusStore; },
       get approvals() { return svc.approvals; },
       archiveWorkerTimeline: (...args) => this.archiveWorkerTimeline(...args),
@@ -599,6 +612,7 @@ export class OrchestrationService {
       handoffWorker: (...args) => this.handoffWorker(...args),
     });
     this.integration = new OrchestrationIntegrationService({
+      cleanup: this.cleanup,
       assertRunCoordinator: (...args) => this.assertRunCoordinator(...args),
       assertWorkerController: (...args) => this.assertWorkerController(...args),
       authorizeRunAccess: (...args) => this.authorizeRunAccess(...args),
@@ -792,10 +806,12 @@ export class OrchestrationService {
     });
 
     void this.integration.recoverGitPublications().catch(error => console.warn('[orchestration] Git recovery:', error)).finally(() => this.delegation.scheduleQueuedLaunches());
+    void this.cleanup.recover(true).catch(error => console.warn('[orchestration] Cleanup recovery:', error));
     const staleSweepIntervalMs = deps.staleSweepIntervalMs ?? 0;
     if (staleSweepIntervalMs > 0) {
       this.staleSweepTimer = setInterval(() => {
         try {
+          void this.cleanup.recover().catch(error => console.warn('[orchestration] Cleanup sweep:', error));
           this.reconcileStaleDispatches();
         } catch (error) {
           console.warn('[orchestration] stale dispatch sweep failed:', error);
@@ -4814,6 +4830,7 @@ export class OrchestrationService {
       if (base.activeCoordinatorRun?.runId !== scope) base.activeCoordinatorRun = null;
       const firewall = this.review.getReviewFirewallContext(callerPaneId);
       if (firewall) {
+        delete base.cleanupAttention;
         base.messages = base.messages.filter((message) => !this.review.isPostHiddenByReviewFirewall(message, firewall)).map(({ receipts: _receipts, ...message }) => message);
         base.runs = base.runs.map(({ finalizedBatches: _batches, integrationIntent: _intent, ...run }) => run);
         base.dispatches = base.dispatches.filter((dispatch) => !firewall.targetDispatchIds.has(dispatch.id));

@@ -133,7 +133,7 @@ async function assertRelPathContainedInWorktree(
 
   for (let i = 0; i < segments.length; i++) {
     current = join(current, segments[i]!);
-    let ls;
+    let ls: import('node:fs').Stats;
     try {
       ls = await lstat(current);
     } catch (err) {
@@ -197,7 +197,7 @@ export async function inspectGitRepo(cwd: string): Promise<GitInspectResult | Gi
     return { ok: false, error: '无效的工作目录路径' };
   }
 
-  let cwdStat;
+  let cwdStat: import('node:fs').Stats;
   try {
     await assertSymlinkChainSafe(validCwd);
     cwdStat = await stat(validCwd);
@@ -792,6 +792,7 @@ export async function addGitWorktree(opts: {
 }
 
 export async function removeGitWorktree(opts: {
+  beforeRemove?: (matched: GitWorktreeEntry) => void;
   cwd: string;
   worktreePath: string;
   force?: boolean;
@@ -830,6 +831,7 @@ export async function removeGitWorktree(opts: {
     }
   }
   args.push('--', matched.path);
+  opts.beforeRemove?.(matched);
 
   const res = await runGitCommand(args, { cwd: execCwd, timeoutMs: 30_000 });
   if (res.exitCode !== 0) {

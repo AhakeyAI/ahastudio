@@ -723,11 +723,13 @@ export interface OrchestrationPersistedState {
   memberCursorsByRun?: Record<string, Record<string, OrchestrationMemberCursor>>;
   resumeClaims?: OrchestrationResumeClaim[];
   workerHandoffs?: OrchestrationWorkerHandoff[];
+  cleanupOutbox?: import('./cleanup-outbox.js').OrchestrationCleanupOutboxEntry[];
   observationFacts?: OrchestrationObservationFact[];
   nextObservationFactSeq?: number;
 }
 
 export interface OrchestrationSnapshot {
+  cleanupAttention?: Pick<import('./cleanup-outbox.js').OrchestrationCleanupOutboxEntry, 'id' | 'kind' | 'runId' | 'dispatchId' | 'attempts' | 'lastError'>[];
   runs: OrchestrationRunRecord[];
   tasks: OrchestrationTaskWithDispatch[];
   dispatches: OrchestrationDispatchRecord[];

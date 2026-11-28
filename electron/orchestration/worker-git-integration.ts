@@ -1887,6 +1887,7 @@ async function assertCleanRunIntegrationWorktree(
  * merge-tree & ignored-file collision checks, and atomic CAS branch cleanup after promotion.
  */
 export async function finalizeRunIntegrationBranch(opts: {
+  cleanup?: (expectedBranchOid: string) => Promise<{ removed: boolean; removedBranch: boolean }>;
   beforePublish?: BeforePublish;
   mainRepoRoot: string;
   integrationBranch: string;
@@ -1973,7 +1974,14 @@ export async function finalizeRunIntegrationBranch(opts: {
 
     let removedWorktree = false;
     let removedBranch = false;
-    if (!opts.keepWorktree) {
+    if (!opts.keepWorktree && opts.cleanup) {
+      try {
+        const cleaned = await opts.cleanup(runBranchOidBefore);
+        removedWorktree = cleaned.removed;
+        removedBranch = cleaned.removedBranch;
+        if (opts.deleteBranch !== false && !removedBranch) cleanupWarnings.push(`Run integration branch ${branchName} was not CAS-deleted.`);
+      } catch (error) { cleanupWarnings.push(`Run cleanup incomplete: ${String(error)}`); }
+    } else if (!opts.keepWorktree) {
       const removed = await removeGitWorktree({
         cwd: opts.mainRepoRoot,
         worktreePath: opts.integrationWorktreePath,

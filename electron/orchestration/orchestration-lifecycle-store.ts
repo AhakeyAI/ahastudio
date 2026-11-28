@@ -825,6 +825,18 @@ export class OrchestrationLifecycleStore extends OrchestrationStoreSlice {
    * Appends a fact; facts are never changed afterwards. Each run keeps its newest
    * `MAX_FACTS_PER_RUN`, and the whole log its newest `MAX_FACTS`.
    */
+  listCleanupEntries() { return this.state.cleanupOutbox.map(e => ({ ...e })); }
+
+  saveCleanupEntry(entry: import('./cleanup-outbox.js').OrchestrationCleanupOutboxEntry) {
+    const entries = this.state.cleanupOutbox.filter(e => e.id !== entry.id);
+    const done = entries.filter(e => e.status === 'done');
+    if (done.length >= 64) entries.splice(entries.indexOf(done[0]), 1);
+    if (entries.length >= 4096 && !this.state.cleanupOutbox.some(e => e.id === entry.id)) throw new Error('Cleanup outbox full; manual attention required');
+    entries.push({ ...entry, lastError: entry.lastError && this.security.redactDispatchCredentials(entry.lastError).slice(0, 500) });
+    this.state.cleanupOutbox = entries;
+    this.persist();
+  }
+
   appendObservationFact(input: Omit<OrchestrationObservationFact, 'seq' | 'at'>): OrchestrationObservationFact {
     const fact: OrchestrationObservationFact = {
       ...input,

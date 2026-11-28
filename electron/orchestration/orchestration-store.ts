@@ -153,6 +153,12 @@ export class OrchestrationStore implements OrchestrationUnitOfWork {
     this.repository.close();
   }
 
+  listCleanupEntries() { return this.lifecycle.listCleanupEntries(); }
+
+  saveCleanupEntry(entry: Parameters<OrchestrationLifecycleStore['saveCleanupEntry']>[0]) {
+    this.lifecycle.saveCleanupEntry(entry);
+  }
+
   getSnapshot(runId?: string): OrchestrationSnapshot {
     const state = this.repository.state;
     const tasks = this.lifecycle.listTasksWithDispatch(runId ? { runId } : undefined);
@@ -177,6 +183,8 @@ export class OrchestrationStore implements OrchestrationUnitOfWork {
       gates,
       messages,
       questions,
+      cleanupAttention: state.cleanupOutbox.filter(e => e.status === 'needs_attention' && (!runId || e.runId === runId))
+        .map(({ id, kind, runId, dispatchId, attempts, lastError }) => ({ id, kind, runId, dispatchId, attempts, lastError })),
       memberCursorsByRun: exportMemberCursorsByRun(state, runId),
       coordinatorRuns,
       activeCoordinatorRun,

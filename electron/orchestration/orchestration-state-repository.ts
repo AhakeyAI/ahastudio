@@ -50,6 +50,7 @@ export class OrchestrationStoreState {
   memberCursorsByRun = new Map<string, Map<string, OrchestrationMemberCursor>>();
   resumeClaims = new Map<string, OrchestrationResumeClaim>();
   workerHandoffs = new Map<string, OrchestrationWorkerHandoff>();
+  cleanupOutbox: import('./cleanup-outbox.js').OrchestrationCleanupOutboxEntry[] = [];
   observationFacts: OrchestrationObservationFact[] = [];
   nextObservationFactSeq = 1;
 }
@@ -153,19 +154,13 @@ export function hydrateOrchestrationState(state: OrchestrationStoreState, parsed
   state.dispatches.clear();
   for (const dispatch of parsed.dispatches ?? []) {
     if (dispatch && typeof dispatch.id === 'string') {
-      const defaultStage: OrchestrationDispatchStage = dispatch.releasedAt
-        ? 'released'
-        : dispatch.status === 'completed'
-          ? 'done'
-          : dispatch.status === 'failed' || dispatch.status === 'circuit_broken'
-            ? dispatch.lastFailureReason === 'worker_stopped'
-              ? 'stopped'
-              : 'failed'
-            : dispatch.startObservation === 'permission'
-              ? 'waiting_permission'
-              : dispatch.startObservation === 'observed'
-                ? 'working'
-                : 'starting';
+      let defaultStage: OrchestrationDispatchStage = 'starting';
+      if (dispatch.releasedAt) defaultStage = 'released';
+      else if (dispatch.status === 'completed') defaultStage = 'done';
+      else if (dispatch.status === 'failed' || dispatch.status === 'circuit_broken') {
+        defaultStage = dispatch.lastFailureReason === 'worker_stopped' ? 'stopped' : 'failed';
+      } else if (dispatch.startObservation === 'permission') defaultStage = 'waiting_permission';
+      else if (dispatch.startObservation === 'observed') defaultStage = 'working';
       state.dispatches.set(dispatch.id, {
         ...dispatch,
         creatorDispatchId: dispatch.creatorDispatchId ?? null,
@@ -360,6 +355,7 @@ export function hydrateOrchestrationState(state: OrchestrationStoreState, parsed
       }
       : { ...handoff });
   }
+  state.cleanupOutbox = parsed.cleanupOutbox ?? [];
   state.observationFacts = (parsed.observationFacts ?? []).filter(
     (fact) => fact && Number.isSafeInteger(fact.seq) && typeof fact.runId === 'string' && typeof fact.kind === 'string',
   ).map((fact) => ({ ...fact, data: { ...(fact.data ?? {}) } }));
@@ -406,6 +402,7 @@ export function exportOrchestrationState(state: OrchestrationStoreState): Orches
     memberCursorsByRun: exportMemberCursorsByRun(state),
     resumeClaims: [...state.resumeClaims.values()],
     workerHandoffs: [...state.workerHandoffs.values()],
+    cleanupOutbox: state.cleanupOutbox,
     observationFacts: state.observationFacts,
     nextObservationFactSeq: state.nextObservationFactSeq,
   };
