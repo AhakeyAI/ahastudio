@@ -64,6 +64,7 @@ export interface OrchestrationBoardHost {
   readonly getPeerMessagingModeDep: (() => OrchestrationPeerMessagingMode) | undefined;
   readonly getWorkerGoalLimit: (workerId: string) => AgentGoalStatus | undefined;
   readonly isPaneAlive: (paneId: string) => boolean;
+  readonly isWorkerDormant: (dispatch: OrchestrationDispatchRecord) => boolean;
   readonly getReviewFirewallContext: (callerHandle?: string | null) => ReviewFirewallContext | null;
   readonly inferRunIdOptional: (from?: string) => string | undefined;
   readonly isPostHiddenByReviewFirewall: (post: OrchestrationMessageRecord, firewall: ReviewFirewallContext) => boolean;
@@ -1192,6 +1193,7 @@ export class OrchestrationBoardService {
         dispatch.codexTurn?.error || dispatch.codexTurn?.stopReason === 'failed' ||
         this.host.agentStatusStore.get(paneId)?.state === 'error') return 'failed';
     if (dispatch.stage === 'needs_reconciliation') return 'delivery needs reconciliation';
+    if (this.host.isWorkerDormant(dispatch)) return 'dormant';
     if (!this.host.isPaneAlive(paneId)) return 'process exited or unavailable';
     if (!ACTIVE_DISPATCH_STATUSES.has(dispatch.status) || dispatch.releasedAt) return 'no active assignment';
     return undefined;
@@ -1251,7 +1253,11 @@ export class OrchestrationBoardService {
       if (!mention || boardSeqOf(mention) <= this.host.store.getMemberCursor(runId, role).lastPostSeq) continue;
       const problem = this.workerStallProblem(worker);
       if (problem || (rePinged.get(role) ?? 0) >= boardSeqOf(mention)) {
-        const action = problem ? 'Consider switching CLIs or handling it manually.' : 'Follow up or handle it manually.';
+        const action = problem === 'dormant'
+          ? 'Follow up to wake it in place or handle it manually.'
+          : problem && problem !== 'no active assignment'
+            ? 'Consider switching CLIs or handling it manually.'
+            : 'Follow up or handle it manually.';
         addCoordinatorDiagnostic(`@coordinator Unanswered mention for @${role} at ${seqLabel(mention)}: ${problem ?? 'no reply after one re-ping'}. ${action}`, [mention]);
       } else {
         retry ??= { role, mention, worker };

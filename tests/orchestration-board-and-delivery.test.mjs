@@ -137,6 +137,7 @@ function createHarness(t, opts = {}) {
     now: opts.now,
     stallThresholdMs: opts.stallThresholdMs,
     stallWatchdogIntervalMs: 0,
+    headlessWorkerDormancyMs: opts.headlessWorkerDormancyMs,
     codexPilot: opts.codexPilot,
     settleDelayMs: 0,
   });
@@ -1171,6 +1172,72 @@ test('semantic stall uses the headless goal status and sends no Worker turn on q
   assert.equal(sent.length, 1);
   assert.equal(s.service.workers.codexMailbox.has(s.worker.dispatch.assigneeHandle), false);
   assert.equal(s.store.getDispatchContext(workerId).status, 'dispatched');
+});
+
+test('semantic stall distinguishes a dormant headless Worker from a crashed process without sending a retry turn', async (t) => {
+  const sent = [];
+  const sessionId = 'agent-session-00000000-0000-0000-0000-00000000000c';
+  const s = await createSemanticStallScenario(t, {
+    coordPaneId: sessionId,
+    headlessWorkerDormancyMs: 1_000,
+    codexPilot: {
+      enabled: () => true,
+      launch(_id, _cwd, callbacks) {
+        const driver = {
+          alive: true,
+          busy: false,
+          closing: false,
+          latestTurnKey: null,
+          open: async () => 'dormant-thread',
+          async close(quiet) {
+            driver.alive = false;
+            if (quiet) callbacks.onExit('closed', 0);
+          },
+          read: () => null,
+          redactText: (text) => String(text ?? ''),
+          async startTurn(input) {
+            driver.latestTurnKey = input.turnKey;
+            sent.push(input);
+            return { status: 'accepted' };
+          },
+        };
+        return driver;
+      },
+    },
+  });
+  t.after(() => s.service.stopCodexWorkers());
+  const workerId = s.worker.dispatch.id;
+  const workerHandle = s.worker.dispatch.assigneeHandle;
+  const peer = await s.launch('peer');
+  assert.equal(sent.length, 2);
+
+  s.store.recordCodexTurn(workerId, { turnId: 'api-turn', stopReason: 'completed', finalText: 'Schema ready', diff: null, error: null, usage: null });
+  const done = await s.service.workerDoneByPane(workerHandle, {
+    outcome: 'completed',
+    summary: 'Schema ready',
+  });
+  await s.coordinatorPost(`Reviewed #${done.message.boardSeq}`);
+  s.read();
+
+  s.advance(2_000);
+  assert.deepEqual(s.service.workers.sleepIdleHeadlessWorkers(), [workerHandle]);
+  assert.equal(s.service.workers.isDormant(s.store.getDispatchContext(workerId)), true);
+  assert.equal(s.service.isPaneAlive(workerHandle), false);
+
+  const mention = await s.service.boardPost({
+    from: peer.dispatch.assigneeHandle,
+    runId: s.runId,
+    text: '@api can you confirm field types?',
+  });
+  s.read();
+  s.store.recordCodexTurn(peer.dispatch.id, { turnId: 'peer-turn', stopReason: 'completed', finalText: '', diff: null, error: null, usage: null });
+  s.advance();
+  assert.equal(s.sweep().length, 1);
+  assert.equal(
+    s.latestStall().body,
+    `@coordinator Unanswered mention for @api at #${mention.boardSeq}: dormant. Follow up to wake it in place or handle it manually.`,
+  );
+  assert.equal(sent.length, 2);
 });
 
 test('semantic stall spends three actual coordinator wakes; chatter cannot reset the budget', async (t) => {

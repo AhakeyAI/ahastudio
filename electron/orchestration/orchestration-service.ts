@@ -630,6 +630,7 @@ export class OrchestrationService {
       followUpSettledWorker: (...args) => this.workers.followUpSettledWorker(...args),
       getWorkerGoalLimit: (...args) => this.workers.getWorkerGoalLimit(...args),
       isPaneAlive: (...args) => this.isPaneAlive(...args),
+      isWorkerDormant: (...args) => this.workers.isDormant(...args),
       get getPeerMessagingModeDep() { return svc.getPeerMessagingModeDep; },
       getReviewFirewallContext: (...args) => this.review.getReviewFirewallContext(...args),
       inferRunIdOptional: (...args) => this.inferRunIdOptional(...args),

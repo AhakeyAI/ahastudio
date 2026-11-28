@@ -163,7 +163,7 @@ flowchart LR
   1. **报告未处理**：不论是否已读或已 `@coordinator`，没有处理证据的 Worker 报告帖 → 点名 `#seq` 提醒 `@coordinator`。
   2. **协调者未读停驻**：按精确已读与宽泛游标的并集，找出未读的 `@coordinator` 或发给 Run 的帖子 → 列出 `#seq` 提醒。
   3. **`@mention` 未获回复（先查状态再决定动作）**：当现算的最新点名 seq 大于等待态 Worker 的 `lastPostSeq` 时：
-     - **先检查 driver / session 诊断状态**（错误码、进程退出或 `usageLimits` 限额信号）：若已确认报错或限额，**绝不浪费 Token 发 re-ping turn**，直接一步升级 `@coordinator` 建议换 CLI 接力或人工处理；
+     - **先检查 driver / session 诊断状态**（错误码、进程退出、`dormant` 休眠态或 `usageLimits` 限额信号）：若已确认报错或限额，**绝不浪费 Token 发 re-ping turn**，直接一步升级 `@coordinator` 建议换 CLI 接力或人工处理；若为 Stage 3B-1 正常休眠态（`dormant`），同样不发空转 re-ping，直接提醒 `@coordinator` follow-up 原位唤醒或人工处理；
      - 仅当 Worker 存活、无报错、无限额信号时，才定向 re-ping 该 `@role` **至多 1 次**；若下个周期仍无新发帖，立刻升级 `@coordinator`。
   4. **兜底全局静默**：未发协调者 `[done]` → 带各成员最后 `#seq` 提醒 `@coordinator`。
 - **停摆预算与防空转重置**：
